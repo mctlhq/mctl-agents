@@ -336,6 +336,14 @@ class AssemblyResult:
     #: reported id that is not `cs_`-prefixed). A defaulted final field, so
     #: every existing `AssemblyResult(...)` construction compiles unchanged.
     store_ref: StoreRef | None = None
+    #: The `observe` shadow pass's sealed candidate snapshot (mctlhq/
+    #: mctl-agents#528), set only when that pass ran and sealed one — `None`
+    #: at `off`/`enforce`/`only`, or when the shadow pass failed or produced
+    #: no candidate. Read ONLY by `_emit_context_eval`'s best-effort second
+    #: `observe-candidate` record: it is never rendered, never returned as
+    #: `snapshot`, and never reaches the work-item store client (`assemble_
+    #: investigator_context` persists `result.snapshot` only).
+    observe_candidate: ContextSnapshot | None = None
 
 
 def _to_context_source(candidate: CandidateSource) -> ContextSource:
@@ -1376,6 +1384,14 @@ def assemble(
     # behaviour-neutral by definition, so a failure here must not fail a run
     # the authoritative pass already completed.
     observe_snapshot_id: str | None = None
+    #: mctlhq/mctl-agents#528: the same shadow snapshot this block already
+    #: seals, now also kept (never re-sealed) so `AssemblyResult.observe_
+    #: candidate` can carry it to `_emit_context_eval`'s best-effort second
+    #: record. Still never rendered, never `AssemblyResult.snapshot`, never
+    #: persisted — only this local's value changes; nothing about what the
+    #: shadow pass does or how it is discarded from the authoritative path
+    #: changes.
+    observe_candidate: ContextSnapshot | None = None
     if (
         resolution is not None
         and resolution.reason == RELEASE_REASON_OBSERVE
@@ -1412,8 +1428,10 @@ def assemble(
                 conflicts=shadow_outcome.conflicts,
             )
             observe_snapshot_id = shadow_snapshot.snapshot_id
+            observe_candidate = shadow_snapshot
         except Exception:  # noqa: BLE001 — observe must never fail an already-completed run
             observe_snapshot_id = None
+            observe_candidate = None
             resolution = replace(resolution, reason=RELEASE_REASON_OBSERVE_FAILED)
 
     # Emitted here, not before the collectors: the reason code must reflect
@@ -1461,7 +1479,9 @@ def assemble(
         strategy_content_hash=resolution.strategy_content_hash if resolution is not None else None,
         override_active=resolution.override_active if resolution is not None else False,
     )
-    return AssemblyResult(mode=mode, snapshot=snapshot, rendered=rendered, metrics=metrics)
+    return AssemblyResult(
+        mode=mode, snapshot=snapshot, rendered=rendered, metrics=metrics, observe_candidate=observe_candidate
+    )
 
 
 def assemble_investigator_context(

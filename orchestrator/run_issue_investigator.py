@@ -2051,7 +2051,18 @@ def _emit_context_eval(result: context_assembly.AssemblyResult) -> None:
     investigation that would otherwise have succeeded (mctlhq/mctl-agents#526,
     ADR 015). Off by default: `ISSUE_INVESTIGATOR_CONTEXT_EVAL` unset or
     anything but `on` prints nothing and never imports `context_eval` at
-    all, so investigator stdout stays byte-identical to today."""
+    all, so investigator stdout stays byte-identical to today.
+
+    mctlhq/mctl-agents#528: after the authoritative `live` record, prints one
+    more, equally best-effort, record for `result.observe_candidate` when the
+    `observe` shadow pass sealed one — the ONLY source of production soak
+    evidence (ADR 019 sec. 2). `evidence_kind="observe-candidate"`, the
+    candidate's OWN catalog identity (never the authoritative snapshot's),
+    and `execution_ref` from the candidate's `work_context`, but only for a
+    real store execution (`we_`-prefixed, `is_store_execution`) — a
+    non-store-backed run has no execution identity to key an observation on
+    (`context_eval._observation_key`), so the candidate record carries no
+    `execution_ref` and is never counted."""
     if not _context_eval_enabled():
         return
     try:
@@ -2071,6 +2082,36 @@ def _emit_context_eval(result: context_assembly.AssemblyResult) -> None:
         print(f"[context] context_eval={json.dumps(record.to_log_dict(), sort_keys=True)}")
     except Exception as exc:  # noqa: BLE001 — a metric bug must never fail an investigation
         print(f"warn: context evaluation failed: {type(exc).__name__}: {exc}")
+        return
+
+    candidate = result.observe_candidate
+    if candidate is None:
+        return
+    try:
+        from orchestrator import context_eval
+        from orchestrator.work_context.snapshots import is_store_execution
+
+        candidate_strategy = candidate.strategy
+        candidate_content_hash, candidate_implementation_hash = _load_catalog_identity(
+            candidate_strategy.name, candidate_strategy.version
+        )
+        execution_ref = None
+        work_context = candidate.work_context
+        if work_context is not None and is_store_execution(work_context.execution_id):
+            execution_ref = context_eval.ExecutionRef(
+                work_item_id=work_context.work_item_id, execution_id=work_context.execution_id
+            )
+        candidate_record = context_eval.evaluate(
+            candidate,
+            observed_at=candidate.created_at,
+            evidence_kind="observe-candidate",
+            execution_ref=execution_ref,
+            strategy_content_hash=candidate_content_hash,
+            strategy_implementation_hash=candidate_implementation_hash,
+        )
+        print(f"[context] context_eval={json.dumps(candidate_record.to_log_dict(), sort_keys=True)}")
+    except Exception as exc:  # noqa: BLE001 — a metric bug must never fail an investigation
+        print(f"warn: observe-candidate context evaluation failed: {type(exc).__name__}: {exc}")
 
 
 # What the staging checks below are, and are not, for.

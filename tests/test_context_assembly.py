@@ -1094,6 +1094,80 @@ def test_observe_shadow_pass_recollects_under_the_bound_strategy(tmp_path, monke
 
 
 # ---------------------------------------------------------------------------
+# mctlhq/mctl-agents#528 — AssemblyResult.observe_candidate
+# ---------------------------------------------------------------------------
+def test_observe_candidate_is_set_only_when_the_shadow_pass_seals_one(tmp_path, monkeypatch, capsys):
+    """The same shadow snapshot `CONTEXT_STRATEGY_COMPARE`'s `bound_snapshot_id`
+    already names is also carried on `AssemblyResult.observe_candidate` —
+    never rendered, never `result.snapshot`, never sealed a second time (its
+    `snapshot_id` must equal the id in the compare line)."""
+    proposal_dir = tmp_path / "proposal"
+    proposal_dir.mkdir()
+    (proposal_dir / "requirements.md").write_text("req")
+
+    monkeypatch.delenv("AGENT_ENVIRONMENT", raising=False)
+    fake_resolved = cr.ResolvedContextStrategy(
+        agent="issue-investigator",
+        environment=rollout.OBSERVE_ENVIRONMENT,
+        strategy=ca.RANKED_STRATEGY_NAME,
+        version=ca.RANKED_STRATEGY_VERSION,
+        ranker_name=ca.RANKER_NAME,
+        ranker_version=ca.RANKER_VERSION,
+        content_hash="sha256:" + "0" * 64,
+        implementation_hash="sha256:" + "1" * 64,
+        release_revision=99,
+        verdict=cr.VERDICT_OK,
+    )
+    monkeypatch.setattr(cr, "resolve", lambda agent, environment: fake_resolved)
+
+    config = ca.AssemblyConfig()
+    assembly_input = _assembly_input(tmp_path, config=config, proposal_dir=proposal_dir)
+    execution = _execution()
+
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.OBSERVE)
+    result = ca.assemble(assembly_input, mode="shadow", execution=execution)
+    out = capsys.readouterr().out
+    compare_lines = [line for line in out.splitlines() if line.startswith("CONTEXT_STRATEGY_COMPARE ")]
+    bound_snapshot_id = json.loads(compare_lines[0].split(" ", 1)[1])["bound_snapshot_id"]
+
+    assert result.observe_candidate is not None
+    assert result.observe_candidate.snapshot_id == bound_snapshot_id
+    assert result.observe_candidate.strategy.name == ca.RANKED_STRATEGY_NAME
+    assert result.observe_candidate.snapshot_id != result.snapshot.snapshot_id
+    assert result.snapshot.strategy.name == ca.STRATEGY_NAME
+    assert all(text not in result.rendered.values() for text in (result.observe_candidate.snapshot_id,))
+
+
+def test_observe_candidate_is_none_at_off_and_when_the_shadow_pass_does_not_fire(tmp_path):
+    assembly_input = _assembly_input(tmp_path)
+    result = _assemble(assembly_input)
+    assert result.observe_candidate is None
+
+
+def test_observe_candidate_is_none_after_a_shadow_pass_failure(tmp_path, monkeypatch):
+    """Same fixture as
+    `test_observe_shadow_pass_failure_logs_observe_pass_failed_and_the_run_still_succeeds`."""
+    monkeypatch.delenv("AGENT_ENVIRONMENT", raising=False)
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.OBSERVE)
+    config = ca.AssemblyConfig(strategy=ca.RANKED_STRATEGY_NAME)
+    assembly_input = _assembly_input(tmp_path, config=config)
+    execution = _execution()
+
+    real_run_pipeline = ca.run_pipeline
+    calls = {"n": 0}
+
+    def flaky_run_pipeline(candidates, cfg, now):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the shadow pass
+            raise RuntimeError("boom")
+        return real_run_pipeline(candidates, cfg, now)
+
+    monkeypatch.setattr(ca, "run_pipeline", flaky_run_pipeline)
+    result = ca.assemble(assembly_input, mode="shadow", execution=execution)
+    assert result.observe_candidate is None
+
+
+# ---------------------------------------------------------------------------
 # T15 — metrics shape at off
 # ---------------------------------------------------------------------------
 def test_metrics_shape_at_off_carries_off_safe_defaults(tmp_path):

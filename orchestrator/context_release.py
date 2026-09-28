@@ -38,6 +38,7 @@ import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,20 @@ BINDING_KIND = "ContextStrategyBinding"
 
 LIFECYCLE_VALUES = frozenset({"published", "deprecated", "disabled"})
 EVIDENCE_KINDS = frozenset({"none", "context-eval"})
+
+#: `promote()`'s environment allow-list (mctlhq/mctl-agents#528, Slice C):
+#: anything outside this set is refused as `unknown` — this module cannot
+#: classify it, never a silent `evidence-missing`.
+PROMOTION_ENVIRONMENTS = frozenset({"shadow", "production"})
+#: Environments that accept `evidence.kind: none` — every other environment
+#: in `PROMOTION_ENVIRONMENTS` requires `assess_production_evidence` to pass.
+EVIDENCE_FREE_ENVIRONMENTS = frozenset({"shadow"})
+#: The only `context_eval.EvalRecord.evidence_kind` this module's production
+#: gate ever counts (mctlhq/mctl-agents#528): `live`, `stored-replay`,
+#: `fixture-baseline` and `none` are dropped before assessment, including a
+#: `live` record of a run where the candidate was itself authoritative — so
+#: "we already rolled it out" can never satisfy the soak gate.
+PRODUCTION_EVIDENCE_KINDS = frozenset({"observe-candidate"})
 
 # The declared implementation surface for every strategy this repository
 # ships today (mirrors `STRATEGIES`, `context_assembly.py:84`). Both
@@ -158,8 +173,26 @@ class ContextStrategyBindingRevision:
     evidence_ref: str | None = None
     evidence_evaluator_version: str | None = None
     rollback_of: int | None = None
+    #: The newest counted observation's `observed_at` and the deduplicated
+    #: observation count a passing production gate recorded (mctlhq/
+    #: mctl-agents#528). `None` for every `evidence.kind: none` revision and
+    #: for every revision that predates this field. Omitted from `to_dict()`
+    #: when `None` — the same omitted-when-unset discipline `rollback_of`
+    #: already uses, so revisions 1-5 of the committed shadow binding stay
+    #: byte-identical.
+    evidence_observed_at: str | None = None
+    evidence_observations: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        evidence: dict[str, Any] = {
+            "kind": self.evidence_kind,
+            "ref": self.evidence_ref,
+            "evaluatorVersion": self.evidence_evaluator_version,
+        }
+        if self.evidence_observed_at is not None:
+            evidence["observedAt"] = self.evidence_observed_at
+        if self.evidence_observations is not None:
+            evidence["observations"] = self.evidence_observations
         doc: dict[str, Any] = {
             "revision": self.revision,
             "strategy": self.strategy,
@@ -169,11 +202,7 @@ class ContextStrategyBindingRevision:
             "promotedBy": self.promoted_by,
             "promotedAt": self.promoted_at,
             "reason": self.reason,
-            "evidence": {
-                "kind": self.evidence_kind,
-                "ref": self.evidence_ref,
-                "evaluatorVersion": self.evidence_evaluator_version,
-            },
+            "evidence": evidence,
         }
         if self.rollback_of is not None:
             doc["rollbackOf"] = self.rollback_of
@@ -504,6 +533,54 @@ def load_binding(agent: str, environment: str, *, bindings_dir: Path = BINDINGS_
         if rollback_of is not None and (not isinstance(rollback_of, int) or isinstance(rollback_of, bool)):
             raise ContextReleaseError(VERDICT_UNKNOWN, f"{path}: revision {revision}: rollbackOf must be an integer")
 
+        # mctlhq/mctl-agents#528: a `context-eval` revision must carry the
+        # production gate's four evidence fields; a `none` revision must
+        # carry neither of the two new ones. Both fail closed with `unknown`,
+        # naming the offending field, in `_require_str_field`'s style.
+        evidence_observed_at: str | None = None
+        evidence_observations: int | None = None
+        if evidence_kind == "context-eval":
+            ref_value = evidence.get("ref")
+            if not isinstance(ref_value, str) or not ref_value:
+                raise ContextReleaseError(
+                    VERDICT_UNKNOWN,
+                    f"{path}: revision {revision}: evidence.kind='context-eval' requires a non-empty "
+                    "evidence.ref",
+                )
+            evaluator_version_value = evidence.get("evaluatorVersion")
+            if not isinstance(evaluator_version_value, str) or not evaluator_version_value:
+                raise ContextReleaseError(
+                    VERDICT_UNKNOWN,
+                    f"{path}: revision {revision}: evidence.kind='context-eval' requires a non-empty "
+                    "evidence.evaluatorVersion",
+                )
+            observed_at_value = evidence.get("observedAt")
+            if not isinstance(observed_at_value, str) or not observed_at_value:
+                raise ContextReleaseError(
+                    VERDICT_UNKNOWN,
+                    f"{path}: revision {revision}: evidence.kind='context-eval' requires a non-empty "
+                    "evidence.observedAt",
+                )
+            observations_value = evidence.get("observations")
+            if (
+                not isinstance(observations_value, int)
+                or isinstance(observations_value, bool)
+                or observations_value < 1
+            ):
+                raise ContextReleaseError(
+                    VERDICT_UNKNOWN,
+                    f"{path}: revision {revision}: evidence.kind='context-eval' requires a positive integer "
+                    "evidence.observations",
+                )
+            evidence_observed_at = observed_at_value
+            evidence_observations = observations_value
+        elif evidence.get("observedAt") is not None or evidence.get("observations") is not None:
+            raise ContextReleaseError(
+                VERDICT_UNKNOWN,
+                f"{path}: revision {revision}: evidence.kind={evidence_kind!r} must not carry "
+                "evidence.observedAt or evidence.observations",
+            )
+
         revisions.append(
             ContextStrategyBindingRevision(
                 revision=revision,
@@ -518,6 +595,8 @@ def load_binding(agent: str, environment: str, *, bindings_dir: Path = BINDINGS_
                 evidence_ref=evidence.get("ref"),
                 evidence_evaluator_version=evidence.get("evaluatorVersion"),
                 rollback_of=rollback_of,
+                evidence_observed_at=evidence_observed_at,
+                evidence_observations=evidence_observations,
             )
         )
 
@@ -588,6 +667,170 @@ def resolve(
 
 
 # ---------------------------------------------------------------------------
+# The production evidence gate (mctlhq/mctl-agents#528, ADR 019 sec. 2).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProductionEvidenceVerdict:
+    """`assess_production_evidence`'s answer, returned only on a pass
+    (every refusal raises `ContextReleaseError` instead): `reason_code` is
+    mctlhq/mctl-agents#526's own `EvidenceAssessment.reason_code` (`"ok"` on
+    a pass); `observations`, `newest_observed_at` and `window_seconds` are
+    exactly what a passing revision's `evidence` block records."""
+
+    code: str
+    reason_code: str
+    observations: int
+    newest_age_seconds: int | None
+    newest_observed_at: str
+    window_seconds: int
+
+
+def assess_production_evidence(
+    *,
+    version: ContextStrategyVersion,
+    records: Sequence[Any],
+    evidence_evaluator_version: str | None,
+    now: datetime,
+) -> ProductionEvidenceVerdict:
+    """The production soak gate. Turns mctlhq/mctl-agents#526's
+    `assess_evidence` status into this module's closed-vocabulary promotion
+    verdict (`ContextReleaseError.code`). Imports `orchestrator.context_eval`
+    INSIDE this function body only — never at module scope
+    (`test_context_release_never_imports_context_eval_at_module_scope` pins
+    this with a source scan) — the same deferred direction
+    `run_issue_investigator._load_catalog_identity` already uses for this
+    module in the opposite direction.
+
+    Counts only `evidence_kind == "observe-candidate"` records
+    (`PRODUCTION_EVIDENCE_KINDS`): a `live`, `stored-replay`,
+    `fixture-baseline` or `none` record — including a `live` record of a run
+    where the candidate was itself authoritative — is dropped before
+    assessment, so "we already rolled it out" can never satisfy this gate on
+    its own.
+
+    Fixed precedence (never order-dependent), each a distinct
+    `ContextReleaseError.code`:
+
+    1. No `observe-candidate` records supplied -> `evidence-missing`.
+    2. Any record whose declared strategy+version match `version` carries
+       `verdict: "hash-mismatch"` -> `hash-mismatch` — checked BEFORE
+       `assess_evidence`, which silently drops a non-`evaluated`-verdict
+       record from `usable` and would otherwise surface this as
+       `evidence-insufficient`, hiding the real fault.
+    3. `evidence_evaluator_version` is empty, or disagrees with the
+       records' own `evaluator_version` -> `evidence-mismatch`.
+    4. `assess_evidence -> missing` -> `evidence-missing`.
+    5. `assess_evidence -> mismatched` -> `evidence-mismatch`.
+    6. `assess_evidence -> stale` -> `evidence-stale`.
+    7. `assess_evidence -> insufficient-observations` -> `evidence-insufficient`.
+    8. `assess_evidence -> fresh` -> accepted.
+
+    (The caller, `promote()`, handles the one precedence step this function
+    never sees: `evidence_kind != "context-eval"`, including `"none"`, is
+    refused as `evidence-missing` before this function is ever called.)
+
+    Every raised message repeats #526's own `reason_code`, the counted
+    observations and the freshness window in seconds, so an operator reading
+    one refusal sees both layers' answers."""
+    from orchestrator import context_eval
+
+    window_seconds = context_eval.ADR019_V1_FRESHNESS_WINDOW_SECONDS
+    min_observations = context_eval.ADR019_V1_MIN_CONSECUTIVE_OBSERVATIONS
+
+    production_records = [r for r in records if getattr(r, "evidence_kind", None) in PRODUCTION_EVIDENCE_KINDS]
+    if not production_records:
+        raise ContextReleaseError(
+            VERDICT_EVIDENCE_MISSING,
+            f"no evidence.kind='observe-candidate' records were supplied for {version.name}@{version.version}; "
+            f"reason_code=no-evidence, observations=0, window={window_seconds}s",
+        )
+
+    matching_hash_mismatch = [
+        r
+        for r in production_records
+        if r.identity.strategy_name == version.name
+        and r.identity.strategy_version == version.version
+        and r.verdict == context_eval.VERDICT_HASH_MISMATCH
+    ]
+    if matching_hash_mismatch:
+        raise ContextReleaseError(
+            VERDICT_HASH_MISMATCH,
+            f"{len(matching_hash_mismatch)} supplied observe-candidate record(s) for {version.name}@"
+            f"{version.version} carry verdict='hash-mismatch'; reason_code=hash-mismatch, "
+            f"observations={len(production_records)}, window={window_seconds}s",
+        )
+
+    evaluator_versions = {r.evaluator_version for r in production_records}
+    if (
+        not evidence_evaluator_version
+        or len(evaluator_versions) != 1
+        or evidence_evaluator_version not in evaluator_versions
+    ):
+        raise ContextReleaseError(
+            VERDICT_EVIDENCE_MISMATCH,
+            f"evidence.evaluatorVersion {evidence_evaluator_version!r} disagrees with the evaluator_version the "
+            f"supplied records carry ({sorted(evaluator_versions)!r}); reason_code=evaluator-version-mismatch, "
+            f"observations={len(production_records)}, window={window_seconds}s",
+        )
+
+    expected = context_eval.EvidenceIdentity(
+        strategy_name=version.name,
+        strategy_version=version.version,
+        ranker_name=version.ranker_name,
+        ranker_version=version.ranker_version,
+        strategy_content_hash=version.content_hash,
+        strategy_implementation_hash=version.implementation_hash,
+        evaluator_name=context_eval.EVALUATOR_NAME,
+        evaluator_version=evidence_evaluator_version,
+        metrics_contract_version=context_eval.METRICS_CONTRACT_VERSION,
+    )
+    policy = context_eval.FreshnessPolicy(
+        window_seconds=window_seconds, min_consecutive_observations=min_observations
+    )
+    assessment = context_eval.assess_evidence(production_records, expected=expected, now=now, policy=policy)
+
+    status_to_code = {
+        "missing": VERDICT_EVIDENCE_MISSING,
+        "mismatched": VERDICT_EVIDENCE_MISMATCH,
+        "stale": VERDICT_EVIDENCE_STALE,
+        "insufficient-observations": VERDICT_EVIDENCE_INSUFFICIENT,
+    }
+    if assessment.status in status_to_code:
+        raise ContextReleaseError(
+            status_to_code[assessment.status],
+            f"production evidence for {version.name}@{version.version} is {assessment.status!r}: "
+            f"reason_code={assessment.reason_code}, observations={assessment.observations}, "
+            f"window={window_seconds}s, minimum={min_observations}",
+        )
+    if assessment.status != "fresh":  # pragma: no cover — assess_evidence's own status set is closed
+        raise ContextReleaseError(
+            VERDICT_UNKNOWN,
+            f"assess_evidence returned an unrecognised status {assessment.status!r}",
+        )
+
+    # `assess_evidence`'s own anchor selection: the newest `verdict:
+    # "evaluated"` record that carries an observation key. Every
+    # `production_records` entry is `evidence_kind == "observe-candidate"`,
+    # so its observation key is always its own `execution_ref` (never a
+    # `store_ref`, which `evaluate()` refuses for this evidence kind).
+    usable = [r for r in production_records if r.verdict == context_eval.VERDICT_EVALUATED]
+    ordered = sorted(usable, key=lambda r: r.observed_at, reverse=True)
+    anchor = next((r for r in ordered if r.execution_ref is not None and r.execution_ref.execution_id), None)
+    newest_observed_at = anchor.observed_at if anchor is not None else ""
+
+    return ProductionEvidenceVerdict(
+        code=VERDICT_OK,
+        reason_code=assessment.reason_code,
+        observations=assessment.observations,
+        newest_age_seconds=assessment.newest_age_seconds,
+        newest_observed_at=newest_observed_at,
+        window_seconds=window_seconds,
+    )
+
+
+# ---------------------------------------------------------------------------
 # promote / rollback — pure document builders. Never write; the CLI writes.
 # ---------------------------------------------------------------------------
 
@@ -605,18 +848,31 @@ def promote(
     evidence_kind: str = "none",
     evidence_ref: str | None = None,
     evidence_evaluator_version: str | None = None,
+    evidence_records: Sequence[Any] | None = None,
+    now: datetime | None = None,
     versions_dir: Path = VERSIONS_DIR,
 ) -> ContextStrategyBinding:
     """Append one new revision, or raise. Never mutates or drops a prior
     revision; `binding=None` starts revision 1 for an agent/environment
-    with no committed binding yet.
+    with no committed binding yet. Still never writes — the CLI writes —
+    and still never reads a clock: `now` is caller-supplied, exactly as
+    `context_eval.assess_evidence` already requires.
 
-    **Slice A**: a promotion to any environment other than `shadow` is
-    *always* refused as `evidence-missing`, whatever its `evidence` block
-    says — the evaluator whose record it would validate is
-    mctlhq/mctl-agents#526, not yet on the running image, so this does not
-    guess at its format. The real checks (exact identity, <= 7 days, >= 3
-    consecutive observe runs, no `hash-mismatch`) are mctlhq/mctl-agents#528."""
+    mctlhq/mctl-agents#528: a `production` promotion is possible for the
+    first time, gated on real `context-eval` evidence
+    (`assess_production_evidence`); `shadow` keeps Slice A's behaviour
+    byte-for-byte — `evidence_kind="none"` is accepted with no records and no
+    clock read, and an explicitly supplied `context-eval` evidence block is
+    also accepted and recorded without running the gate (evidence is never
+    *forbidden*, only *required* for `production`).
+
+    Order: argument validation -> environment allow-list (`unknown` outside
+    `PROMOTION_ENVIRONMENTS`) -> `load_version()` (already raises
+    `version-disabled`/`hash-mismatch`) -> lifecycle `published` check
+    (`version-not-promotable`; an EXISTING binding on a now-`deprecated`
+    version still resolves — `resolve()` is untouched) -> for an environment
+    outside `EVIDENCE_FREE_ENVIRONMENTS`, the production evidence gate ->
+    append exactly one revision."""
     if binding is not None and (binding.agent != agent or binding.environment != environment):
         raise ContextReleaseError(
             VERDICT_UNKNOWN, "binding does not match the requested (agent, environment)"
@@ -627,25 +883,16 @@ def promote(
         raise ContextReleaseError(VERDICT_UNKNOWN, "promoted_by must be a non-empty string")
     if not isinstance(promoted_at, str) or not promoted_at.strip():
         raise ContextReleaseError(VERDICT_UNKNOWN, "promoted_at must be a non-empty string")
-
-    if environment != "shadow":
-        raise ContextReleaseError(
-            VERDICT_EVIDENCE_MISSING,
-            f"{environment!r} promotion is refused until mctlhq/mctl-agents#526's evaluator evidence exists on "
-            "the running image (mctlhq/mctl-agents#528 implements the real checks); only 'shadow' accepts an "
-            "evidence-free promotion in this slice, and this image has no evidence format to validate against "
-            "for anything else, so it does not guess",
-        )
-
     if evidence_kind not in EVIDENCE_KINDS:
         raise ContextReleaseError(
             VERDICT_UNKNOWN, f"evidence.kind must be one of {sorted(EVIDENCE_KINDS)!r}, got {evidence_kind!r}"
         )
-    if evidence_kind != "none":
+
+    if environment not in PROMOTION_ENVIRONMENTS:
         raise ContextReleaseError(
-            VERDICT_EVIDENCE_MISSING,
-            f"{environment!r} promotion accepts evidence.kind='none' only in this slice; 'context-eval' "
-            "evidence validation is mctlhq/mctl-agents#528",
+            VERDICT_UNKNOWN,
+            f"environment must be one of {sorted(PROMOTION_ENVIRONMENTS)!r}, got {environment!r} — this module "
+            "cannot classify anything else",
         )
 
     version_doc = load_version(strategy_name, strategy_version, versions_dir=versions_dir)
@@ -655,6 +902,31 @@ def promote(
             f"{strategy_name}@{strategy_version} is {version_doc.lifecycle!r}; only a 'published' version may "
             "be newly promoted (an existing binding on it may still resolve)",
         )
+
+    evidence_observed_at: str | None = None
+    evidence_observations: int | None = None
+    if environment not in EVIDENCE_FREE_ENVIRONMENTS:
+        # Precedence step 1 (mctlhq/mctl-agents#528, `assess_production_
+        # evidence`'s docstring): the caller must have declared real
+        # evidence at all before this module even looks at the records.
+        if evidence_kind != "context-eval":
+            raise ContextReleaseError(
+                VERDICT_EVIDENCE_MISSING,
+                f"{environment!r} promotion requires evidence.kind='context-eval', got {evidence_kind!r}; "
+                "reason_code=no-evidence-declared, observations=0",
+            )
+        if now is None:
+            raise ContextReleaseError(
+                VERDICT_UNKNOWN, f"{environment!r} promotion requires `now` to assess production evidence"
+            )
+        verdict = assess_production_evidence(
+            version=version_doc,
+            records=evidence_records or (),
+            evidence_evaluator_version=evidence_evaluator_version,
+            now=now,
+        )
+        evidence_observed_at = verdict.newest_observed_at
+        evidence_observations = verdict.observations
 
     next_revision = (binding.active.revision + 1) if binding is not None else 1
     new_entry = ContextStrategyBindingRevision(
@@ -670,6 +942,8 @@ def promote(
         evidence_ref=evidence_ref,
         evidence_evaluator_version=evidence_evaluator_version,
         rollback_of=None,
+        evidence_observed_at=evidence_observed_at,
+        evidence_observations=evidence_observations,
     )
     history = (binding.history if binding is not None else ()) + (new_entry,)
     path = binding.path if binding is not None else None
@@ -722,6 +996,13 @@ def rollback(
         evidence_ref=target.evidence_ref,
         evidence_evaluator_version=target.evidence_evaluator_version,
         rollback_of=to_revision,
+        # A rollback restores the EXACT target revision's evidence block too
+        # (mctlhq/mctl-agents#528): `load_binding()` requires a
+        # `context-eval` revision to carry `observedAt`/`observations`, so
+        # dropping them here would make a rollback of a production
+        # promotion fail its own binding's next load.
+        evidence_observed_at=target.evidence_observed_at,
+        evidence_observations=target.evidence_observations,
     )
     return ContextStrategyBinding(
         agent=binding.agent,

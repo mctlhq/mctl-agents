@@ -31,7 +31,10 @@ retrieval-quality record orders and measures what a model was shown. It
 grants nothing, blocks nothing, and no policy, capability-eligibility or
 authorization decision may ever read one. `tests/test_context_eval.py`
 scans `orchestrator/`'s imports and asserts that only
-`run_issue_investigator` and `run_context_eval` import this module at all.
+`run_issue_investigator`, `run_context_eval` and `context_release` (deferred
+inside a function body — mctlhq/mctl-agents#528's production evidence gate,
+the same direction `context_release` already imports this module's sibling
+`context_snapshot`) import this module at all.
 
 Vocabularies (`WORK_ITEM_STATES`, `EXECUTION_PHASES`) that this module needs
 for outcome linking are duplicated from `orchestrator/work_context/
@@ -82,7 +85,12 @@ OUTCOME_SOURCE_STATUS_YAML = "status-yaml"
 OUTCOME_SOURCES = frozenset({OUTCOME_SOURCE_LEDGER, OUTCOME_SOURCE_STATUS_YAML})
 OUTCOMES = frozenset({"succeeded", "failed", "abandoned", "in-progress", "unknown"})
 
-EVIDENCE_KINDS = frozenset({"none", "fixture-baseline", "stored-replay", "live"})
+#: `"observe-candidate"` (mctlhq/mctl-agents#528, ADR 015's second,
+#: `execution-observed` provenance mode) names a Slice B `observe` shadow
+#: pass's non-authoritative candidate snapshot: never persisted, never
+#: authoritative, evaluated in the same production investigation that ran
+#: it. It carries `execution_ref`, never a borrowed `store_ref`.
+EVIDENCE_KINDS = frozenset({"none", "fixture-baseline", "stored-replay", "live", "observe-candidate"})
 FRESHNESS_STATUSES = frozenset({"fresh", "missing", "stale", "mismatched", "insufficient-observations"})
 
 #: Duplicated from `context_assembly._SAFE_SOURCE_ID` deliberately (see the
@@ -220,6 +228,16 @@ class CoverageEntry:
     def to_dict(self) -> dict[str, Any]:
         return {"kind": self.kind, "candidates": self.candidates, "included": self.included, "bytes": self.bytes}
 
+    @classmethod
+    def from_dict(cls, data: Any) -> CoverageEntry:
+        mapping = data if isinstance(data, dict) else {}
+        return cls(
+            kind=str(mapping.get("kind", "")),
+            candidates=int(mapping.get("candidates", 0)),
+            included=int(mapping.get("included", 0)),
+            bytes=int(mapping.get("bytes", 0)),
+        )
+
 
 @dataclass(frozen=True)
 class AssemblyCounters:
@@ -290,6 +308,31 @@ class EvalMetrics:
             "conflicts_expected_detected": self.conflicts_expected_detected,
             "conflict_sources_capped": self.conflict_sources_capped,
         }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> EvalMetrics:
+        """Exact inverse of `to_dict()` — the evidence file is operator
+        input, so every field is read defensively rather than trusted."""
+        mapping = data if isinstance(data, dict) else {}
+        return cls(
+            selected_precision=mapping.get("selected_precision"),
+            useful_recall=mapping.get("useful_recall"),
+            f1=mapping.get("f1"),
+            missing_expected=tuple(mapping.get("missing_expected", []) or []),
+            stale_rate=float(mapping.get("stale_rate", 0.0)),
+            duplicate_rate=float(mapping.get("duplicate_rate", 0.0)),
+            noise_rate=float(mapping.get("noise_rate", 0.0)),
+            context_bytes=int(mapping.get("context_bytes", 0)),
+            context_tokens_estimate=int(mapping.get("context_tokens_estimate", 0)),
+            assembly_latency_ms=mapping.get("assembly_latency_ms"),
+            capability_calls=mapping.get("capability_calls"),
+            coverage_by_kind=tuple(
+                CoverageEntry.from_dict(entry) for entry in (mapping.get("coverage_by_kind") or [])
+            ),
+            conflicts_detected=int(mapping.get("conflicts_detected", 0)),
+            conflicts_expected_detected=int(mapping.get("conflicts_expected_detected", 0)),
+            conflict_sources_capped=int(mapping.get("conflict_sources_capped", 0)),
+        )
 
 
 def _compute_metrics(
@@ -480,6 +523,17 @@ class OutcomeLink:
             "reason_code": self.reason_code,
         }
 
+    @classmethod
+    def from_dict(cls, data: Any) -> OutcomeLink:
+        mapping = data if isinstance(data, dict) else {}
+        return cls(
+            outcome=str(mapping.get("outcome", "")),
+            outcome_source=str(mapping.get("outcome_source", "")),
+            work_item_state=str(mapping.get("work_item_state", "")),
+            execution_phase=str(mapping.get("execution_phase", "")),
+            reason_code=str(mapping.get("reason_code", "")),
+        )
+
 
 #: mctl-api's `ExecutionRef.phase` (`work_context/contract.py:191`) mapped to
 #: this module's outcome vocabulary. `Pending`/`Running` are provisional.
@@ -574,6 +628,32 @@ def link_outcome(
 
 
 @dataclass(frozen=True)
+class ExecutionRef:
+    """The `execution-observed` provenance mode's identity (ADR 015 sec. 1,
+    amended by mctlhq/mctl-agents#528): the store execution an
+    `evidence_kind: "observe-candidate"` snapshot was assembled in — never a
+    `StoreRef`, because the candidate itself is never persisted. `evaluate()`
+    accepts this only for `evidence_kind == "observe-candidate"` with no
+    `store_ref`, and `_observation_key` keys an `observe-candidate`
+    observation on it exactly as a stored observation is keyed on
+    `store_ref`."""
+
+    work_item_id: str
+    execution_id: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"work_item_id": self.work_item_id, "execution_id": self.execution_id}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ExecutionRef:
+        mapping = data if isinstance(data, dict) else {}
+        return cls(
+            work_item_id=str(mapping.get("work_item_id", "")),
+            execution_id=str(mapping.get("execution_id", "")),
+        )
+
+
+@dataclass(frozen=True)
 class EvalRecord:
     """One evaluation, exactly the shape ADR 015 fixes: `to_log_dict()` is
     the only printing path, so a locator, a selector, a payload byte or
@@ -594,9 +674,14 @@ class EvalRecord:
     outcome: OutcomeLink | None
     observed_at: str
     mismatch_fields: tuple[str, ...] = ()
+    #: `execution-observed` provenance (mctlhq/mctl-agents#528): set only for
+    #: `evidence_kind == "observe-candidate"`, mutually exclusive with
+    #: `store_ref`. Omitted from `to_log_dict()` when `None`, so every record
+    #: shape that existed before #528 stays byte-identical.
+    execution_ref: ExecutionRef | None = None
 
     def to_log_dict(self) -> dict[str, Any]:
-        return {
+        doc: dict[str, Any] = {
             "record_kind": self.record_kind,
             "evaluator_name": self.evaluator_name,
             "evaluator_version": self.evaluator_version,
@@ -611,10 +696,49 @@ class EvalRecord:
             "observed_at": self.observed_at,
             "mismatch_fields": list(self.mismatch_fields),
         }
+        if self.execution_ref is not None:
+            doc["execution_ref"] = self.execution_ref.to_dict()
+        return doc
 
     # `to_dict()` is the same shape as `to_log_dict()` — nothing here is ever
     # NOT safe to log, so there is no second, richer representation.
     to_dict = to_log_dict
+
+    @classmethod
+    def from_dict(cls, data: Any) -> EvalRecord:
+        """Exact inverse of `to_log_dict()`/`to_dict()`. The evidence file is
+        operator input, so it is validated, not trusted: a payload whose
+        `record_kind` is not `RECORD_KIND`, or whose `verdict` is outside
+        `VERDICTS`, raises `ValueError` rather than silently constructing a
+        record no other check in this module would ever produce."""
+        mapping = data if isinstance(data, dict) else {}
+        record_kind = mapping.get("record_kind")
+        if record_kind != RECORD_KIND:
+            raise ValueError(f"record_kind must be {RECORD_KIND!r}, got {record_kind!r}")
+        verdict = mapping.get("verdict")
+        if verdict not in VERDICTS:
+            raise ValueError(f"verdict must be one of {sorted(VERDICTS)!r}, got {verdict!r}")
+
+        store_ref_raw = mapping.get("store_ref")
+        metrics_raw = mapping.get("metrics")
+        outcome_raw = mapping.get("outcome")
+        execution_ref_raw = mapping.get("execution_ref")
+        return cls(
+            record_kind=record_kind,
+            evaluator_name=str(mapping.get("evaluator_name", "")),
+            evaluator_version=str(mapping.get("evaluator_version", "")),
+            verdict=verdict,
+            identity=EvidenceIdentity.from_dict(mapping.get("identity")),
+            evidence_kind=str(mapping.get("evidence_kind", "")),
+            context_snapshot_id=str(mapping.get("context_snapshot_id", "")),
+            content_hash=str(mapping.get("content_hash", "")),
+            store_ref=StoreRef.from_dict(store_ref_raw) if store_ref_raw is not None else None,
+            metrics=EvalMetrics.from_dict(metrics_raw) if metrics_raw is not None else None,
+            outcome=OutcomeLink.from_dict(outcome_raw) if outcome_raw is not None else None,
+            observed_at=str(mapping.get("observed_at", "")),
+            mismatch_fields=tuple(mapping.get("mismatch_fields", []) or []),
+            execution_ref=ExecutionRef.from_dict(execution_ref_raw) if execution_ref_raw is not None else None,
+        )
 
 
 def evaluate(
@@ -629,6 +753,7 @@ def evaluate(
     strategy_content_hash: str = "",
     strategy_implementation_hash: str = "",
     pipeline_source_hash: str = "",
+    execution_ref: ExecutionRef | None = None,
 ) -> EvalRecord:
     """Verify identity first (ADR 015 sec. 1); on a mismatch, return a
     `verdict: "hash-mismatch"` record with `metrics=None` and no metrics
@@ -637,9 +762,23 @@ def evaluate(
     `strategy_implementation_hash` are the caller's (#472's catalog
     `contentHash`/`implementationHash`, loaded via
     `context_release.load_version` at the call site) — this function never
-    reads the catalog itself."""
+    reads the catalog itself.
+
+    `execution_ref` (mctlhq/mctl-agents#528, ADR 015's `execution-observed`
+    provenance mode) is accepted only for `evidence_kind ==
+    "observe-candidate"` with no `store_ref`: the candidate is never
+    persisted, so it can never carry the authoritative snapshot's store
+    identity, and document identity is the only verification that applies
+    (`store_ok` stays `None`, never `True`, because `store_ref` stays `None`
+    all the way through to `verify_identity`)."""
     if evidence_kind not in EVIDENCE_KINDS:
         raise ValueError(f"evidence_kind must be one of {sorted(EVIDENCE_KINDS)!r}, got {evidence_kind!r}")
+    if evidence_kind == "observe-candidate" and store_ref is not None:
+        raise ValueError("evidence_kind='observe-candidate' may not carry a store_ref")
+    if execution_ref is not None and (evidence_kind != "observe-candidate" or store_ref is not None):
+        raise ValueError(
+            "execution_ref is only valid for evidence_kind='observe-candidate' with no store_ref"
+        )
 
     strategy = snapshot.strategy
     identity = EvidenceIdentity(
@@ -671,6 +810,7 @@ def evaluate(
             outcome=outcome,
             observed_at=observed_at,
             mismatch_fields=identity_check.mismatch_fields,
+            execution_ref=execution_ref,
         )
 
     metrics = _compute_metrics(snapshot, labels=labels, assembly=assembly)
@@ -688,6 +828,7 @@ def evaluate(
         outcome=outcome,
         observed_at=observed_at,
         mismatch_fields=(),
+        execution_ref=execution_ref,
     )
 
 
@@ -779,12 +920,23 @@ def _catalog_identity_matches(record: EvalRecord, expected: EvidenceIdentity) ->
 
 
 def _observation_key(record: EvalRecord) -> tuple[str, str] | None:
-    """One promotion observation per store execution, or `None` for a record
-    with no store backing: nothing identifies its execution across retries
-    (a retry restamps its snapshot id, `content_hash` and `observed_at`), so
-    it cannot be told apart from another attempt and is never counted."""
+    """One promotion observation per execution, or `None` for a record with
+    no execution backing: nothing identifies its execution across retries (a
+    retry restamps its snapshot id, `content_hash` and `observed_at`), so it
+    cannot be told apart from another attempt and is never counted. A
+    `store_ref`-backed record (`live`/`stored-replay`) is keyed on the
+    store's own retry identity; an `observe-candidate` record (mctlhq/
+    mctl-agents#528, ADR 015's `execution-observed` mode, never `store_ref`-
+    backed by construction) is keyed on its own `execution_ref` the same
+    way."""
     if record.store_ref is not None and record.store_ref.execution_id:
         return (record.store_ref.work_item_id, record.store_ref.execution_id)
+    if (
+        record.evidence_kind == "observe-candidate"
+        and record.execution_ref is not None
+        and record.execution_ref.execution_id
+    ):
+        return (record.execution_ref.work_item_id, record.execution_ref.execution_id)
     return None
 
 
