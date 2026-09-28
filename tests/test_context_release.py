@@ -668,6 +668,37 @@ def test_promote_production_with_fresh_evidence_appends_one_revision(tmp_path):
     assert shadow_binding.active.evidence_kind == "none"
 
 
+def test_promote_shadow_with_context_eval_evidence_round_trips_through_load_binding(tmp_path):
+    """A `shadow` promotion that declares `evidence.kind: context-eval` must
+    still fill `observedAt`/`observations`: `load_binding()` requires both of
+    those fields on ANY `context-eval` revision, not only a `production` one
+    (`test_load_binding_context_eval_revision_requires_the_four_evidence_fields`).
+    Without running the evidence assessment for `shadow` too, `promote()`
+    would write a revision `load_binding()` can never read back."""
+    versions_dir = tmp_path / "versions"
+    bindings_dir = tmp_path / "bindings"
+    version = _loaded_version(tmp_path)
+    updated = cr.promote(
+        None, agent="issue-investigator", environment="shadow", strategy_name=version.name,
+        strategy_version=version.version, promoted_by="octocat", reason="shadow, with real evidence attached",
+        promoted_at="2026-09-27T00:00:00Z", evidence_kind="context-eval",
+        evidence_ref="argo-workflow-logs://issue-investigator/run-42",
+        evidence_evaluator_version=ce.EVALUATOR_VERSION, evidence_records=_three_fresh_records(version), now=NOW,
+        versions_dir=versions_dir,
+    )
+    assert updated.active.evidence_observed_at == "2026-09-26T00:00:00Z"
+    assert updated.active.evidence_observations == 3
+
+    path = bindings_dir / "shadow" / "issue-investigator.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(updated.to_dict()), encoding="utf-8")
+
+    reloaded = cr.load_binding("issue-investigator", "shadow", bindings_dir=bindings_dir)
+    assert reloaded.active.evidence_kind == "context-eval"
+    assert reloaded.active.evidence_observed_at == "2026-09-26T00:00:00Z"
+    assert reloaded.active.evidence_observations == 3
+
+
 def test_promote_production_never_mutates_a_prior_revision(tmp_path):
     versions_dir = tmp_path / "versions"
     version = _loaded_version(tmp_path)

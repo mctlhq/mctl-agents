@@ -783,7 +783,7 @@ def assess_production_evidence(
         strategy_content_hash=version.content_hash,
         strategy_implementation_hash=version.implementation_hash,
         evaluator_name=context_eval.EVALUATOR_NAME,
-        evaluator_version=evidence_evaluator_version,
+        evaluator_version=context_eval.EVALUATOR_VERSION,
         metrics_contract_version=context_eval.METRICS_CONTRACT_VERSION,
     )
     policy = context_eval.FreshnessPolicy(
@@ -861,10 +861,13 @@ def promote(
     mctlhq/mctl-agents#528: a `production` promotion is possible for the
     first time, gated on real `context-eval` evidence
     (`assess_production_evidence`); `shadow` keeps Slice A's behaviour
-    byte-for-byte — `evidence_kind="none"` is accepted with no records and no
-    clock read, and an explicitly supplied `context-eval` evidence block is
-    also accepted and recorded without running the gate (evidence is never
-    *forbidden*, only *required* for `production`).
+    byte-for-byte for the default case — `evidence_kind="none"` is accepted
+    with no records and no clock read (evidence is never *forbidden*, only
+    *required* for `production`). A `shadow` promotion that explicitly
+    declares `context-eval` evidence still runs `assess_production_evidence`
+    to fill the `observedAt`/`observations` fields `load_binding()` requires
+    of every `context-eval` revision, in any environment — it is accepted
+    only when that evidence is itself well-formed and fresh.
 
     Order: argument validation -> environment allow-list (`unknown` outside
     `PROMOTION_ENVIRONMENTS`) -> `load_version()` (already raises
@@ -915,9 +918,19 @@ def promote(
                 f"{environment!r} promotion requires evidence.kind='context-eval', got {evidence_kind!r}; "
                 "reason_code=no-evidence-declared, observations=0",
             )
+    if evidence_kind == "context-eval":
+        # mctlhq/mctl-agents#528: `load_binding()` requires every
+        # `context-eval` revision — in ANY environment, not only
+        # `production` — to carry a non-empty `observedAt` and a positive
+        # `observations` (`load_binding`, above). Running the assessment
+        # whenever `context-eval` evidence is declared, not only for an
+        # environment outside `EVIDENCE_FREE_ENVIRONMENTS`, is what fills
+        # those two fields; without it a `shadow` promotion that declares
+        # `context-eval` evidence would write a binding `load_binding()`
+        # can never read back.
         if now is None:
             raise ContextReleaseError(
-                VERDICT_UNKNOWN, f"{environment!r} promotion requires `now` to assess production evidence"
+                VERDICT_UNKNOWN, "evidence.kind='context-eval' requires `now` to assess the supplied evidence"
             )
         verdict = assess_production_evidence(
             version=version_doc,
