@@ -714,3 +714,112 @@ promotion policy constants, exported as `ADR019_V1_FRESHNESS_WINDOW_SECONDS`
 for either, so changing them is an ADR 019 amendment, never a runtime knob.
 `assess_evidence` only reports a status — deciding that `fresh` permits a
 production promotion is mctlhq/mctl-agents#528's.
+
+### Context strategy release
+
+`orchestrator/context_release.py` and `tools/context_release.py` (mctlhq/
+mctl-agents#472, ADR 019) are the release lifecycle around a context
+strategy: publish an immutable, content-pinned version, promote it into a
+per-(agent, environment) binding, and roll back to an exact prior revision —
+all as reviewed git commits, never a side effect of a metric crossing a
+threshold. This section runs the whole ladder end to end with no code
+reading: publish -> promote-to-shadow -> soak -> promote-to-production ->
+roll back, plus the one-variable break-glass.
+
+**1. Publish a version.** Computes `implementationHash` (a sha256 over the
+declared implementation files) and `contentHash` (over the document's own
+canonical JSON) from the code in this commit:
+
+```bash
+uv run python tools/context_release.py publish --strategy trust-freshness-ranked --version 1.1.0
+```
+
+**2. Promote to shadow (the candidate).** `shadow` is evidence-free —
+`evidence.kind: none` and a recorded reason are enough, exactly as today:
+
+```bash
+uv run python tools/context_release.py promote --agent issue-investigator --environment shadow \
+    --strategy trust-freshness-ranked --version 1.1.0 --promoted-by "$(git config user.name)" \
+    --reason "candidate for the next soak"
+```
+
+**3. Soak — the ONLY source of production evidence.** Run the production
+investigator with `CONTEXT_RELEASE_ROLLOUT_MODE=observe` and
+`ISSUE_INVESTIGATOR_CONTEXT_EVAL=on`. At `observe`, the shadow binding's
+strategy runs as a second, **non-authoritative** pass over the same
+candidate list — the default strategy stays authoritative, and the
+candidate never reaches the prompt, the sealed `snapshot`, `rendered`, or
+the work-item store. Each such investigation prints two
+`[context] context_eval=` lines: the authoritative one (`evidence_kind:
+"live"`) and one more for the candidate (`evidence_kind:
+"observe-candidate"`, its own `execution_ref`, never a borrowed
+`store_ref`). **Making the candidate authoritative — a binding at
+`enforce`/`only`, or setting `ISSUE_INVESTIGATOR_CONTEXT_STRATEGY` to it —
+produces no soak evidence and is itself a production change; it is not a
+shortcut to a promotion.** The soak gate requires >= 3 consecutive
+`observe-candidate` observations from 3 **distinct** executions of the
+exact strategy/version/`contentHash`/`implementationHash` being promoted,
+the newest at most 7 days old, with no `hash-mismatch` verdict among them —
+`ADR019_V1_MIN_CONSECUTIVE_OBSERVATIONS`/`ADR019_V1_FRESHNESS_WINDOW_SECONDS`
+in `orchestrator/context_eval.py`, changed only by amending ADR 019.
+
+**4. Build the evidence file.** Collect the `observe-candidate`
+`context_eval=` JSON payloads from the Argo workflow log archive (retries of
+one execution count once; three retries of one execution are still one
+observation), one per line (a bare JSON array is also accepted):
+
+```bash
+# soak-evidence.jsonl: one context_eval= payload per line
+```
+
+**5. Inspect the evidence before opening a PR.** `--dry-run` writes
+nothing and is also the documented "inspect the evidence" command — no
+second subcommand:
+
+```bash
+uv run python tools/context_release.py promote --agent issue-investigator --environment production \
+    --strategy trust-freshness-ranked --version 1.1.0 --promoted-by "$(git config user.name)" \
+    --reason "3 clean observe-mode soak runs" --evidence-kind context-eval \
+    --evidence-ref "argo-workflow-logs://issue-investigator/soak-2026-09" \
+    --evidence-evaluator-version 1.0.0 --evidence-file soak-evidence.jsonl --dry-run
+```
+
+prints `gate: status=... reason_code=... observations=... newest_age_seconds=...
+window_seconds=... minimum_observations=...` and writes nothing.
+
+**6. Promote to production.** Drop `--dry-run`; the CLI writes the new
+revision, which a human reviews and merges like any other catalog change —
+passing the gate authorises a PR, it never performs one. The written
+revision's `evidence` block records `kind: context-eval`, `ref`,
+`evaluatorVersion`, the newest counted observation's `observedAt`, and the
+deduplicated `observations` count, so a reviewer can check the gate's
+inputs against mctl-api long after the logs roll off.
+
+**7. Roll back.** Appends a revision restoring an exact prior one — never
+infers "one step back":
+
+```bash
+uv run python tools/context_release.py rollback --agent issue-investigator --environment production \
+    --to-revision <N> --promoted-by "$(git config user.name)" --reason "bad promotion, see incident-XYZ"
+```
+
+**8. Break-glass, no deploy.** `CONTEXT_RELEASE_ROLLOUT_MODE=off` (the
+default) takes any binding out of the decision path instantly, with no
+catalog change and no revert:
+
+```bash
+CONTEXT_RELEASE_ROLLOUT_MODE=off
+```
+
+**Refusal reasons.**
+
+| `ContextReleaseError.code` | Meaning |
+|---|---|
+| `evidence-missing` | No `context-eval` evidence declared, or zero `observe-candidate` records supplied. |
+| `evidence-mismatch` | Evidence names a different strategy/version/`contentHash`/`implementationHash`, or the supplied `evaluatorVersion` disagrees with the records'. |
+| `evidence-stale` | The newest counted observation is older than the 7-day window. |
+| `evidence-insufficient` | Fewer than 3 consecutive observations of the promoted identity. |
+| `hash-mismatch` | A supplied record for the promoted identity carries `verdict: "hash-mismatch"` — checked before freshness/sufficiency, so it is never hidden behind `evidence-insufficient`. |
+| `version-not-promotable` | The version's `spec.lifecycle` is `deprecated` (an existing binding on it still resolves). |
+| `version-disabled` | The version's `spec.lifecycle` is `disabled` (refuses to resolve at all). |
+| `unknown` | An environment outside `{shadow, production}`, or anything else this module cannot classify. |

@@ -11,13 +11,17 @@
 > strategy; it does not reopen `ContextSnapshot`'s schema (ADR 009 sec. 1-7)
 > or the evaluator contract (ADR 015).
 > **Delivery:** split into three slices, each its own review/approval. This
-> ADR fixes the whole contract; only Slice A ships with it. Slice B
-> (mctlhq/mctl-agents#527) wires the rollout ladder and the `observe` shadow
-> pass. Slice C (mctlhq/mctl-agents#528) gates production promotion on
-> mctlhq/mctl-agents#526's evaluator evidence, which does not exist on the
-> running image today. **No production promotion may treat
-> `evidence.kind: none` as sufficient, and Slice A refuses every production
-> promotion outright as `evidence-missing`.**
+> ADR fixes the whole contract; Slice A shipped the catalog and loader.
+> Slice B (mctlhq/mctl-agents#527) wired the rollout ladder and the
+> `observe` shadow pass. Slice C (mctlhq/mctl-agents#528) has now shipped
+> `orchestrator/context_release.assess_production_evidence`, gating a
+> production promotion on mctlhq/mctl-agents#526's evaluator evidence — a
+> production promotion is possible for the first time (sec. 2's refusal
+> precedence table and README.md's "### Context strategy release" runbook).
+> **No production promotion may treat `evidence.kind: none` as sufficient**;
+> that remains true, but it is no longer the ONLY thing this ADR enforces
+> outright — the real checks (exact identity, <= 7 days, >= 3 consecutive
+> `observe-candidate` observations, no `hash-mismatch`) now run.
 
 ## Context
 
@@ -150,26 +154,62 @@ refused, naming the disabled version.
 not an authoritative production selection, so a recorded `reason` is
 sufficient. `production` requires `evidence.kind: context-eval`, naming the
 exact strategy/version/`contentHash`/`implementationHash`, an evaluator
-version, an observation timestamp and a consecutive-run count. Evaluated
-evidence is refused as `evidence-mismatch` unless its identity exactly
-matches the version being promoted, `evidence-stale` when its newest
-observation is older than **7 days**, and `evidence-insufficient` unless it
-represents at least **3 consecutive observe-mode investigations** with no
-`hash-mismatch` verdict. These are validation rules, not automatic
-promotion: a human-reviewed binding PR is still required. The 7-day window
-and the 3-run minimum are **v1 promotion policy constants** — release
-policy, not a property of mctlhq/mctl-agents#526's evaluator — and change
-only by amending this ADR.
+version, an observation timestamp (`evidence.observedAt`) and a
+consecutive-observation count (`evidence.observations`) — the two fields
+Slice C adds to `ContextStrategyBindingRevision`, both required (non-empty
+string / positive integer) for a `context-eval` revision and both absent
+for a `none` one; `load_binding()` fails closed with `unknown` naming
+whichever is wrong. Evaluated evidence is refused as `evidence-mismatch`
+unless its identity exactly matches the version being promoted,
+`evidence-stale` when its newest observation is older than **7 days**, and
+`evidence-insufficient` unless it represents at least **3 consecutive
+observe-mode investigations** with no `hash-mismatch` verdict. These are
+validation rules, not automatic promotion: a human-reviewed binding PR is
+still required. The 7-day window and the 3-run minimum are **v1 promotion
+policy constants** — release policy, not a property of mctlhq/
+mctl-agents#526's evaluator — and change only by amending this ADR.
 
-`mctlhq/mctl-agents#526` is the undelivered evaluator half of #266: while it
-is not implemented on the running image, the release layer allows
-contract/catalog validation and shadow binding work, but creates or accepts
-**no** production promotion revision. Slice A refuses every production
-promotion outright, unconditionally, as `evidence-missing` — it does not
-guess at #526's evidence format. When #526 lands, the release layer
-consumes its closed-vocabulary verdicts and correlation fields rather than
-reimplementing evaluation metrics: `#472` owns release decisions, `#526`
-owns evaluation.
+Production evidence comes ONLY from mctlhq/mctl-agents#526's non-
+authoritative `observe-candidate` (Slice B's `observe` shadow pass's
+candidate snapshot, evaluated in the same production investigation with its
+own `execution_ref`, never a borrowed `store_ref` — the candidate is never
+persisted). Making the candidate authoritative to collect evidence (a
+binding at `enforce`/`only`, or `ISSUE_INVESTIGATOR_CONTEXT_STRATEGY`) is
+production exposure before the gate and does not satisfy it: a `live`
+record of an authoritative run is dropped before assessment, along with
+every `stored-replay`/`fixture-baseline`/`none` record.
+
+`orchestrator/context_release.assess_production_evidence` (Slice C, mctlhq/
+mctl-agents#528) is the soak gate's normative definition, with this fixed
+refusal precedence — never order-dependent, each a distinct
+`ContextReleaseError.code`:
+
+| # | Condition | Code |
+|---|---|---|
+| 1 | `promote()`'s own `evidence_kind != "context-eval"` (including `"none"`) | `evidence-missing` |
+| 2 | No `evidence_kind: "observe-candidate"` records supplied | `evidence-missing` |
+| 3 | A record for the promoted identity carries `verdict: "hash-mismatch"` | `hash-mismatch` |
+| 4 | The supplied `evidence.evaluatorVersion` disagrees with the records' own `evaluator_version` | `evidence-mismatch` |
+| 5 | `context_eval.assess_evidence` -> `missing` | `evidence-missing` |
+| 6 | `context_eval.assess_evidence` -> `mismatched` | `evidence-mismatch` |
+| 7 | `context_eval.assess_evidence` -> `stale` | `evidence-stale` |
+| 8 | `context_eval.assess_evidence` -> `insufficient-observations` | `evidence-insufficient` |
+| 9 | `context_eval.assess_evidence` -> `fresh` | accepted; the revision's `evidence` block records `kind: context-eval`, `ref`, `evaluatorVersion`, the newest counted `observedAt` and the `observations` count |
+
+Step 3 runs before `assess_evidence` (steps 5-9) on purpose:
+`assess_evidence` silently drops a non-`evaluated`-verdict record from
+`usable`, so without step 3 a hash-mismatched soak would surface as
+`evidence-insufficient` and hide the real fault.
+
+`mctlhq/mctl-agents#526` was the undelivered evaluator half of #266; Slice C
+has now landed on top of it. The release layer consumes #526's
+closed-vocabulary verdicts and correlation fields rather than reimplementing
+evaluation metrics: `#472` owns release decisions, `#526` owns evaluation.
+`assess_production_evidence` imports `orchestrator.context_eval` inside its
+own function body only, never at module scope, and reads no environment
+variable and no clock of its own (`now` is caller-supplied, exactly as
+`context_eval.assess_evidence` requires) — both invariants hold a source
+scan in `tests/test_context_release.py`.
 
 ### 3. `orchestrator/context_release.py` — loader, resolver, promote/rollback
 
@@ -205,26 +245,25 @@ from `work_context/rollout.py:mode()`. This ladder and its wiring into
 `context_assembly.assemble()` are Slice B (mctlhq/mctl-agents#527); Slice A
 ships the catalog and loader only, and nothing reads them at runtime yet.
 
-### 5. Observability (Slice B)
+### 5. Observability (Slice B, amended by Slice C)
 
 One structured `CONTEXT_STRATEGY_RELEASE` line per resolution (mode, agent,
 environment, strategy name, the bound strategy name, version, content hash,
 binding revision, `override_active`, verdict) and, at `observe`, one
 `CONTEXT_STRATEGY_COMPARE` line carrying both strategies' identity, both
-`snapshot_id`s and
-`AssemblyMetrics.to_log_dict()`'s counter deltas. Every line carries ids,
-kinds, closed-vocabulary codes, versions, hashes, counts and ratios only —
-never a `locator`, a `selector`, or any byte derived from a retrieved
-payload (ADR 009 sec. 5, ADR 015 sec. 3).
-
-> **Note (Slice B, mctlhq/mctl-agents#527).** The `CONTEXT_STRATEGY_COMPARE`
-> line ships in Slice B carrying only the two strategy identities, the
-> binding revision and the two `snapshot_id`s — no counter deltas. Deltas,
-> ratios and any verdict about which strategy performed better are
-> mctlhq/mctl-agents#526's evaluation semantic, deferred to Slice C once that
-> evaluator exists on the running image; reimplementing them here would risk
-> a second, disagreeing metric. This sentence supersedes the paragraph above
-> until #526 lands and Slice C amends it back.
+`snapshot_id`s and — added by Slice C, mctlhq/mctl-agents#528 — the
+evaluator reference an operator needs to correlate this line with the
+`[context] context_eval=` records it joins on `snapshot_id`: `record_kind`,
+`evaluator_name`, `evaluator_version` and `metrics_contract_version`, read
+through a deferred `orchestrator.context_eval` import that yields four
+`null`s on an `ImportError` rather than failing an already-completed run.
+Every line carries ids, kinds, closed-vocabulary codes, versions, hashes,
+counts and ratios only — never a `locator`, a `selector`, or any byte
+derived from a retrieved payload (ADR 009 sec. 5, ADR 015 sec. 3). The
+compare line still carries no counter delta, no ratio and no verdict about
+which strategy performed better — that stays mctlhq/mctl-agents#526's
+evaluator's own job, never re-derived here against a shadow snapshot that is
+deliberately never persisted.
 
 ### 6. Durable provenance — ADR 009 amendment 2
 
@@ -368,10 +407,10 @@ producer/telemetry/CLI-ergonomics detail, but must not reopen —
     CI preflight on the same commit.
   - *Promotion without valid evidence.* Production accepts only #526
     `context-eval` evidence matching exactly, <= 7 days old, and covering
-    >= 3 consecutive observe-mode investigations with no `hash-mismatch`.
-    Slice A refuses every production promotion outright; missing/stale/
-    mismatched evidence fails closed even once #528 lands. Promotion is
-    still a reviewed commit, never an automatic metric action.
+    >= 3 consecutive `observe-candidate` observations with no
+    `hash-mismatch` (sec. 2's refusal precedence table, shipped by Slice C,
+    mctlhq/mctl-agents#528). Missing/stale/mismatched evidence fails closed;
+    promotion is still a reviewed commit, never an automatic metric action.
   - *A binding or score drifts onto an authorization path.* Mitigated by
     the safety invariant above and its tests.
 - **Security:** no new secret, no new network call, no new credential. The
@@ -398,5 +437,10 @@ tests/test_context_release.py                                   # new tests
 
 Nothing in `orchestrator/context_assembly.py` changes, and no production
 binding is written. Slice B (mctlhq/mctl-agents#527) wires the rollout
-ladder; Slice C (mctlhq/mctl-agents#528) gates production promotion on
-mctlhq/mctl-agents#526.
+ladder. Slice C (mctlhq/mctl-agents#528) has now shipped the production
+evidence gate (`assess_production_evidence`), the `execution-observed`
+provenance mode (ADR 015 sec. 1), the compare line's evaluator reference
+(sec. 5), and the operator runbook (README.md's "### Context strategy
+release"); it ships no `production` binding for `issue-investigator`
+either — that stays a separate, reviewed PR by an operator once real soak
+evidence exists.
