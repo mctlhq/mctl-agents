@@ -283,6 +283,13 @@ class AssemblyMetrics:
     stale_demoted: int = 0
     conflict_count: int = 0
     conflict_sources_capped: int = 0
+    # mctlhq/mctl-agents#527 Slice B: the context-release resolution this run
+    # used. `off`-safe defaults, so a run at `off` is byte-for-byte what this
+    # line looked like before Slice B.
+    release_mode: str = "off"
+    binding_revision: int | None = None
+    strategy_content_hash: str | None = None
+    override_active: bool = False
 
     def to_log_dict(self) -> dict[str, Any]:
         return {
@@ -304,6 +311,10 @@ class AssemblyMetrics:
             "stale_demoted": self.stale_demoted,
             "conflict_count": self.conflict_count,
             "conflict_sources_capped": self.conflict_sources_capped,
+            "release_mode": self.release_mode,
+            "binding_revision": self.binding_revision,
+            "strategy_content_hash": self.strategy_content_hash,
+            "override_active": self.override_active,
             "snapshot": self.snapshot.to_log_dict(),
         }
 
@@ -1087,6 +1098,217 @@ def run_pipeline(candidates: list[CandidateSource], config: AssemblyConfig, now:
     )
 
 
+# ---------------------------------------------------------------------------
+# Context-release selection (mctlhq/mctl-agents#527 Slice B, ADR 019 sec. 4).
+# `orchestrator/context_rollout.py` is this module's stdlib-only sibling
+# ladder; `orchestrator/context_release.py` is the (non-stdlib) catalog
+# loader. Both are imported from inside `resolve_strategy_for_run`'s body
+# only, never at module scope, so this module stays stdlib-only at `off`.
+# ---------------------------------------------------------------------------
+
+# Closed reason vocabulary a `StrategyResolution` can carry.
+RELEASE_REASON_OFF = "off-strategy-var-decides"
+RELEASE_REASON_OBSERVE = "observe-strategy-var-decides"
+RELEASE_REASON_BINDING = "binding-resolved"
+RELEASE_REASON_OBSERVE_SKIPPED = "binding-unresolved-observe-skipped"
+RELEASE_REASON_FALLBACK = "binding-unresolved-fallback-default"
+RELEASE_REASON_OBSERVE_FAILED = "observe-pass-failed"
+
+RELEASE_REASONS = frozenset(
+    {
+        RELEASE_REASON_OFF,
+        RELEASE_REASON_OBSERVE,
+        RELEASE_REASON_BINDING,
+        RELEASE_REASON_OBSERVE_SKIPPED,
+        RELEASE_REASON_FALLBACK,
+        RELEASE_REASON_OBSERVE_FAILED,
+    }
+)
+
+
+@dataclass(frozen=True)
+class StrategyResolution:
+    """What `resolve_strategy_for_run` decided, everything the two release
+    telemetry lines need without a second catalog lookup. `mode` is never
+    `"off"` — at `off`, `resolve_strategy_for_run` returns `None` instead."""
+
+    mode: str
+    reason: str
+    bound_strategy: str | None
+    bound_version: str | None
+    binding_revision: int | None
+    strategy_content_hash: str | None
+    override_active: bool
+    verdict: str | None
+
+
+class ContextStrategyNotResolved(RuntimeError):
+    """The bound strategy could not be resolved at a stage where that blocks
+    the run (`enforce`/`only` with `blocks_on_unknown()`), or `only` found
+    `ISSUE_INVESTIGATOR_CONTEXT_STRATEGY` set. Defined here, beside
+    `SnapshotNotPersisted`, rather than in `orchestrator.context_release`, so
+    this module never needs that module at module scope for a type."""
+
+
+def resolve_strategy_for_run(
+    agent: str, config: AssemblyConfig, *, environment: str | None = None
+) -> tuple[str, StrategyResolution | None]:
+    """Which strategy actually decides this run, and why. Returns
+    `(config.strategy, None)` at rollout `off` with no import of
+    `orchestrator.context_release` — the byte-for-byte-unchanged path. Past
+    `off`, defers both `orchestrator.context_rollout` and
+    `orchestrator.context_release` into this function body, the same pattern
+    `_work_context_active`/`_client`/`_persist_to_work_item_store` already
+    use for `orchestrator.work_context`."""
+    from orchestrator import context_rollout
+
+    stage = context_rollout.mode()
+    if stage == context_rollout.OFF:
+        return config.strategy, None
+
+    from orchestrator import context_release
+
+    override_active = bool(os.environ.get(STRATEGY_ENV_VAR, "").strip())
+
+    if stage == context_rollout.OBSERVE:
+        binding_environment = context_rollout.OBSERVE_ENVIRONMENT
+    else:
+        binding_environment = environment if environment is not None else os.getenv("AGENT_ENVIRONMENT", "production")
+
+    if stage == context_rollout.ONLY and override_active:
+        raise ContextStrategyNotResolved(
+            f"{STRATEGY_ENV_VAR} is set while rollout stage is 'only', where the "
+            f"{agent}/{binding_environment} binding must be the sole selector; unset "
+            f"{STRATEGY_ENV_VAR} or step the rollout down to 'enforce'"
+        )
+
+    try:
+        resolved = context_release.resolve(agent, binding_environment)
+    except context_release.ContextReleaseError as exc:
+        if stage == context_rollout.OBSERVE:
+            return config.strategy, StrategyResolution(
+                mode=stage,
+                reason=RELEASE_REASON_OBSERVE_SKIPPED,
+                bound_strategy=None,
+                bound_version=None,
+                binding_revision=None,
+                strategy_content_hash=None,
+                override_active=override_active,
+                verdict=exc.code,
+            )
+        if context_rollout.blocks_on_unknown():
+            raise ContextStrategyNotResolved(
+                f"{agent}/{binding_environment}: binding unresolved at rollout stage {stage!r} "
+                f"with CONTEXT_RELEASE_REQUIRED in effect ({exc})"
+            ) from exc
+        return STRATEGY_NAME, StrategyResolution(
+            mode=stage,
+            reason=RELEASE_REASON_FALLBACK,
+            bound_strategy=None,
+            bound_version=None,
+            binding_revision=None,
+            strategy_content_hash=None,
+            override_active=override_active,
+            verdict=exc.code,
+        )
+
+    if stage == context_rollout.OBSERVE:
+        return config.strategy, StrategyResolution(
+            mode=stage,
+            reason=RELEASE_REASON_OBSERVE,
+            bound_strategy=resolved.strategy,
+            bound_version=resolved.version,
+            binding_revision=resolved.release_revision,
+            strategy_content_hash=resolved.content_hash,
+            override_active=override_active,
+            verdict=resolved.verdict,
+        )
+
+    return resolved.strategy, StrategyResolution(
+        mode=stage,
+        reason=RELEASE_REASON_BINDING,
+        bound_strategy=resolved.strategy,
+        bound_version=resolved.version,
+        binding_revision=resolved.release_revision,
+        strategy_content_hash=resolved.content_hash,
+        override_active=override_active,
+        verdict=resolved.verdict,
+    )
+
+
+def _emit_release_verdict(
+    execution: ExecutionCorrelation, effective_strategy: str, resolution: StrategyResolution | None
+) -> None:
+    """One `CONTEXT_STRATEGY_RELEASE` line per run, unconditionally
+    (mctlhq/mctl-agents#527 Slice B, ADR 019 sec. 5) — at `off`, `mode` is
+    `"off"` and everything binding-shaped is `null`.
+
+    `strategy` always names the strategy this run actually used
+    (`effective_strategy`); `bound_strategy` always names the strategy the
+    context-release binding decided on (or `None` at `off`). The two agree at
+    every stage except `observe`, where the binding never drives the
+    authoritative run — there, `strategy` is what ran and `bound_strategy` is
+    only the shadow/compare candidate."""
+    line: dict[str, str | int | bool | None]
+    if resolution is None:
+        line = {
+            "mode": "off",
+            "agent": execution.agent,
+            "environment": execution.environment,
+            "strategy": effective_strategy,
+            "bound_strategy": None,
+            "version": None,
+            "content_hash": None,
+            "binding_revision": None,
+            "override_active": False,
+            "verdict": None,
+            "reason": RELEASE_REASON_OFF,
+        }
+    else:
+        line = {
+            "mode": resolution.mode,
+            "agent": execution.agent,
+            "environment": execution.environment,
+            "strategy": effective_strategy,
+            "bound_strategy": resolution.bound_strategy,
+            "version": resolution.bound_version,
+            "content_hash": resolution.strategy_content_hash,
+            "binding_revision": resolution.binding_revision,
+            "override_active": resolution.override_active,
+            "verdict": resolution.verdict,
+            "reason": resolution.reason,
+        }
+    print("CONTEXT_STRATEGY_RELEASE " + json.dumps(line, sort_keys=True), flush=True)
+
+
+def _emit_strategy_compare(
+    resolution: StrategyResolution,
+    *,
+    authoritative_strategy: str,
+    authoritative_version: str,
+    authoritative_snapshot_id: str,
+    bound_snapshot_id: str,
+) -> None:
+    """One `CONTEXT_STRATEGY_COMPARE` line, emitted only when a candidate
+    `snapshot_id` was actually produced (`observe`, bound strategy resolved
+    and different from the authoritative one). Carries only the two strategy
+    identities, the binding revision and the two `snapshot_id`s — no counter
+    arithmetic and no judgment of which strategy produced the preferable
+    outcome: that evaluation semantic belongs to mctlhq/mctl-agents#526,
+    added in Slice C."""
+    line = {
+        "mode": resolution.mode,
+        "authoritative_strategy": authoritative_strategy,
+        "authoritative_version": authoritative_version,
+        "authoritative_snapshot_id": authoritative_snapshot_id,
+        "bound_strategy": resolution.bound_strategy,
+        "bound_version": resolution.bound_version,
+        "bound_snapshot_id": bound_snapshot_id,
+        "binding_revision": resolution.binding_revision,
+    }
+    print("CONTEXT_STRATEGY_COMPARE " + json.dumps(line, sort_keys=True), flush=True)
+
+
 def assemble(
     assembly_input: AssemblyInput,
     *,
@@ -1097,9 +1319,24 @@ def assemble(
     """Runs every collector, the deterministic pipeline (`run_pipeline`), and
     `seal()`. Sealing the same inputs twice at two different `created_at`
     values yields one `snapshot_id` — `created_at` is excluded from the hash
-    by `context_snapshot.seal` (ADR 009 sec. 2)."""
+    by `context_snapshot.seal` (ADR 009 sec. 2).
+
+    mctlhq/mctl-agents#527 Slice B: before the collectors run,
+    `resolve_strategy_for_run` may substitute `config.strategy` with the
+    context-release binding's — done here, not just before `run_pipeline`,
+    because `collect_prior_proposal` reads `assembly_input.config.ranked`
+    (`:821`). At `off` this is a no-op: `resolve_strategy_for_run` returns
+    `(config.strategy, None)` without importing `orchestrator.context_release`,
+    so every snapshot keeps its exact bytes and `snapshot_id`."""
     start = time.monotonic()
     config = assembly_input.config
+
+    effective_strategy, resolution = resolve_strategy_for_run(
+        execution.agent, config, environment=execution.environment
+    )
+    if effective_strategy != config.strategy:
+        config = replace(config, strategy=effective_strategy)
+        assembly_input = replace(assembly_input, config=config)
 
     candidates: list[CandidateSource] = []
     collector_calls = 0
@@ -1130,6 +1367,69 @@ def assemble(
         conflicts=outcome.conflicts,
     )
 
+    # The `observe` shadow pass (mctlhq/mctl-agents#527 Slice B): a second,
+    # non-authoritative `run_pipeline` pass over the same pre-pipeline
+    # candidate list, sealed into a LOCAL solely to read its `snapshot_id`.
+    # `run_pipeline` copies its input before rewriting it (`:1017`) and is
+    # documented pure, so this cannot see or affect the authoritative pass
+    # above. The whole thing is wrapped in `try/except`: `observe` is
+    # behaviour-neutral by definition, so a failure here must not fail a run
+    # the authoritative pass already completed.
+    observe_snapshot_id: str | None = None
+    if (
+        resolution is not None
+        and resolution.reason == RELEASE_REASON_OBSERVE
+        and resolution.bound_strategy not in (None, config.strategy)
+    ):
+        try:
+            # Re-run the collector loop under the substituted (shadow) config,
+            # not just `run_pipeline`, for the same reason the docstring above
+            # gives for the authoritative pass: `collect_prior_proposal` (:815)
+            # branches on `assembly_input.config.ranked`, so reusing the
+            # module-level `candidates` (collected under the authoritative
+            # `config.ranked`) would silently misclassify a prior proposal's
+            # freshness whenever the bound strategy differs from the running
+            # one in `ranked`-ness. T13
+            # (`test_enforce_substitution_reaches_the_collectors_not_only_the_pipeline`)
+            # pins the analogous enforce-path substitution but never reaches
+            # this observe-only branch; the pin for this branch is
+            # `test_observe_shadow_pass_recollects_under_the_bound_strategy`.
+            shadow_config = replace(config, strategy=resolution.bound_strategy)
+            shadow_input = replace(assembly_input, config=shadow_config)
+            shadow_candidates: list[CandidateSource] = []
+            for collector in _COLLECTOR_ORDER:
+                shadow_candidates.extend(collector(shadow_input))
+            shadow_outcome = run_pipeline(shadow_candidates, shadow_config, assembly_input.now)
+            shadow_snapshot = seal(
+                execution=execution,
+                strategy=shadow_outcome.strategy,
+                budget=shadow_outcome.budget,
+                retention=retention,
+                created_at=_iso(assembly_input.now),
+                work_context=work_context,
+                sources=tuple(_to_context_source(c) for c in shadow_outcome.candidates),
+                evidence_refs=(),
+                conflicts=shadow_outcome.conflicts,
+            )
+            observe_snapshot_id = shadow_snapshot.snapshot_id
+        except Exception:  # noqa: BLE001 — observe must never fail an already-completed run
+            observe_snapshot_id = None
+            resolution = replace(resolution, reason=RELEASE_REASON_OBSERVE_FAILED)
+
+    # Emitted here, not before the collectors: the reason code must reflect
+    # RELEASE_REASON_OBSERVE_FAILED when the shadow pass above just failed,
+    # and this is the one place in the function where that is known.
+    _emit_release_verdict(execution, effective_strategy, resolution)
+
+    if observe_snapshot_id is not None and resolution is not None:
+        _emit_strategy_compare(
+            resolution,
+            authoritative_strategy=outcome.strategy.name,
+            authoritative_version=outcome.strategy.version,
+            authoritative_snapshot_id=snapshot.snapshot_id,
+            bound_snapshot_id=observe_snapshot_id,
+        )
+
     latency_ms = (time.monotonic() - start) * 1000
     included_by_kind = _count_by_kind([c for c in outcome.candidates if c.included])
     rendered = {
@@ -1156,6 +1456,10 @@ def assemble(
         stale_demoted=outcome.counters.stale_demoted,
         conflict_count=len(outcome.conflicts),
         conflict_sources_capped=outcome.counters.conflict_sources_capped,
+        release_mode=resolution.mode if resolution is not None else "off",
+        binding_revision=resolution.binding_revision if resolution is not None else None,
+        strategy_content_hash=resolution.strategy_content_hash if resolution is not None else None,
+        override_active=resolution.override_active if resolution is not None else False,
     )
     return AssemblyResult(mode=mode, snapshot=snapshot, rendered=rendered, metrics=metrics)
 

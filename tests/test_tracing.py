@@ -444,6 +444,28 @@ def test_a_string_under_a_usage_counter_is_refused():
     assert tracing_sdk.redact_attributes({"gen_ai.usage.input_tokens": "ghp_" + "a" * 36}) == {}
 
 
+# ---------------------------------------------------------------------------
+# T14 (mctlhq/mctl-agents#527 Slice B, tasks.md): the five names reserved in
+# docs/observability/execution-traces.md must actually clear the export
+# guard's allowlist/denylist, so a reserved catalog name is not silently
+# dropped by the final-segment denylist (orchestrator/redaction.py:26) —
+# `content_hash`'s final segment is `content_hash`, not `content`, and
+# `context` is not `text`.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "key",
+    [
+        "mctl.context.strategy.name",
+        "mctl.context.strategy.version",
+        "mctl.context.strategy.content_hash",
+        "mctl.context.binding.revision",
+        "mctl.context.release.mode",
+    ],
+)
+def test_reserved_context_release_attribute_names_are_allowed(key):
+    assert tracing_sdk.key_allowed(key) is True
+
+
 def test_error_detail_is_opt_in_and_still_credential_filtered(monkeypatch):
     monkeypatch.setenv(tracing.ERROR_DETAIL_ENV, "true")
     exporter = InMemorySpanExporter()

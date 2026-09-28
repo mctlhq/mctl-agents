@@ -8,12 +8,49 @@ spec:
   - revision: 1
     strategy: deterministic-fixed-order
     version: 1.0.0
-    contentHash: sha256:23ce56fca599b0ab13d76f9d404088545f90ea11045a33689d46c5e0435d88ef
-    implementationHash: sha256:1811252a5bc1d39df9dcbc610ea02e27e0b7dceb06a23b48570a12ad9c97a7d5
+    contentHash: sha256:91eed91f07fe0236e0f7da3c62c49f8d478bc05129c143d406637477c58ae680
+    implementationHash: sha256:faab455f51953973cffb524f779bf8ff387cc68d40e29b71e9b3998fbe4b4d50
     promotedBy: mctl-agents-bot
     promotedAt: '2026-09-27T16:16:31Z'
     reason: 'inert shadow baseline: today''s default, made explicit (mctlhq/mctl-agents#472
       Slice A)'
+    evidence:
+      kind: none
+      ref: null
+      evaluatorVersion: null
+  - revision: 2
+    strategy: deterministic-fixed-order
+    version: 1.0.0
+    contentHash: sha256:b754c0c2b2da450f7df7a099e8f4275efed52af7f68f593130a782d2c8a6fcf3
+    implementationHash: sha256:e56ca07ccd6503a6b964f0d683bd37a58b29386020588d2641ea042ffc2d518c
+    promotedBy: implementer-agent
+    promotedAt: '2026-09-27T23:47:51Z'
+    reason: 'republish pins after #527 Slice B'
+    evidence:
+      kind: none
+      ref: null
+      evaluatorVersion: null
+  - revision: 3
+    strategy: deterministic-fixed-order
+    version: 1.0.0
+    contentHash: sha256:5630bb4b957e6d4eaf4f6d71594f5303e4f9ac05734a48a16f9aa52697d03fbf
+    implementationHash: sha256:81cf6e688658248ad3e410842290de2395086400326cf358d827d10a7dde8e31
+    promotedBy: implementer-agent
+    promotedAt: '2026-09-28T00:45:39Z'
+    reason: republish pins after issue-527 Slice B follow-up P2 fixes
+    evidence:
+      kind: none
+      ref: null
+      evaluatorVersion: null
+  - revision: 4
+    strategy: deterministic-fixed-order
+    version: 1.0.0
+    contentHash: sha256:2b7216f5d3d11a69b6bdea5e33e9e78b6ac9823b63973eea9f9d7341eb55f175
+    implementationHash: sha256:ed649ee50812214ea20ff9046036c6dccc276a75fba34fb67f9eccc2a6c86dda
+    promotedBy: implementer-agent
+    promotedAt: '2026-09-28T01:13:59Z'
+    reason: republish pins after issue-527 Slice B follow-up P1/P2 fixes (mypy dict-item,
+      shadow-pass regression test)
     evidence:
       kind: none
       ref: null

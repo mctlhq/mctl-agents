@@ -9,7 +9,7 @@ spec:
     files:
     - orchestrator/context_assembly.py
     - orchestrator/context_snapshot.py
-    implementationHash: sha256:1811252a5bc1d39df9dcbc610ea02e27e0b7dceb06a23b48570a12ad9c97a7d5
-  contentHash: sha256:23ce56fca599b0ab13d76f9d404088545f90ea11045a33689d46c5e0435d88ef
+    implementationHash: sha256:ed649ee50812214ea20ff9046036c6dccc276a75fba34fb67f9eccc2a6c86dda
+  contentHash: sha256:2b7216f5d3d11a69b6bdea5e33e9e78b6ac9823b63973eea9f9d7341eb55f175
   agents:
   - issue-investigator
