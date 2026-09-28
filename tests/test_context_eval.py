@@ -557,7 +557,7 @@ def test_assess_evidence_precedence():
     fresh = ce.assess_evidence(three_agreeing, expected=expected, now=now, policy=policy)
     assert fresh.status == "fresh" and fresh.reason_code == "ok"
 
-    stale_record = _record(expected, observed_at="2026-01-01T00:00:00Z")
+    stale_record = replace(_record(expected, observed_at="2026-01-01T00:00:00Z"), store_ref=_store_ref("we_old"))
     stale = ce.assess_evidence([stale_record], expected=expected, now=now, policy=policy)
     assert stale.status == "stale"
 
@@ -601,6 +601,28 @@ def test_assess_evidence_never_counts_a_record_without_store_backing():
     assert result.status == "fresh" and result.observations == 3
 
 
+def test_assess_evidence_measures_freshness_from_the_newest_observation_not_an_unbacked_record():
+    """ADR 015 sec. 7 step 4: the window is measured from the newest
+    store-backed observation. Three observations older than the window plus
+    one unbacked record from today is `stale`, not `fresh`; a pool with no
+    store-backed record at all is `insufficient-observations`."""
+    expected = _identity()
+    policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=3)
+    now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
+
+    today_unbacked = _record(expected, observed_at="2026-09-26T23:00:00Z")
+    old_backed = [
+        replace(_record(expected, observed_at=f"2026-09-0{i}T00:00:00Z"), store_ref=_store_ref(f"we_{i}"))
+        for i in (3, 2, 1)
+    ]
+    result = ce.assess_evidence([today_unbacked, *old_backed], expected=expected, now=now, policy=policy)
+    assert result.status == "stale" and result.reason_code == "observation-older-than-window"
+    assert result.newest_age_seconds == int((now - datetime(2026, 9, 3, tzinfo=UTC)).total_seconds())
+
+    result = ce.assess_evidence([today_unbacked], expected=expected, now=now, policy=policy)
+    assert result.status == "insufficient-observations" and result.reason_code == "no-store-backed-observation"
+
+
 def test_assess_evidence_counts_store_executions_not_retry_attempts():
     """mctlhq/mctl-agents#526, ADR 015 sec. 7 step 5: the retries of one store
     execution restamp `created_at` (so `observed_at`), `content_hash` and the
@@ -641,7 +663,7 @@ def test_assess_evidence_malformed_observed_at_is_stale_not_a_crash():
     policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=1)
     now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
 
-    malformed = _record(expected, observed_at="not-a-timestamp")
+    malformed = replace(_record(expected, observed_at="not-a-timestamp"), store_ref=_store_ref("we_1"))
     result = ce.assess_evidence([malformed], expected=expected, now=now, policy=policy)
     assert result.status == "stale"
     assert result.reason_code == "observed-at-unparseable"
@@ -657,7 +679,7 @@ def test_assess_evidence_timezone_naive_observed_at_is_stale_not_a_crash():
     policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=1)
     now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
 
-    naive = _record(expected, observed_at="2026-09-26T00:00:00")
+    naive = replace(_record(expected, observed_at="2026-09-26T00:00:00"), store_ref=_store_ref("we_1"))
     result = ce.assess_evidence([naive], expected=expected, now=now, policy=policy)
     assert result.status == "stale"
     assert result.reason_code == "observed-at-unparseable"

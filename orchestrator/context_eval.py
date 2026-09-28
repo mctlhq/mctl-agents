@@ -841,7 +841,17 @@ def assess_evidence(
             observations=observations, newest_age_seconds=None,
         )
 
-    newest_observed_at = _parse_observed_at(newest.observed_at)
+    # The freshness window is measured from the newest OBSERVATION, never from
+    # a record that is not one (a `store_ref: null` record, ADR 015 sec. 7
+    # step 5): otherwise one fresh unbacked record would carry three stale
+    # observations inside the window.
+    anchor = next((r for r in ordered if _observation_key(r) is not None), None)
+    if anchor is None:
+        return EvidenceAssessment(
+            status="insufficient-observations", reason_code="no-store-backed-observation",
+            evidence_kind=newest.evidence_kind, observations=0, newest_age_seconds=None,
+        )
+    newest_observed_at = _parse_observed_at(anchor.observed_at)
     if newest_observed_at is None:
         # A malformed or timezone-naive `observed_at` cannot be trusted for a
         # freshness comparison; fail closed rather than raise or silently

@@ -159,8 +159,9 @@ this fixed precedence (never order-dependent):
    `strategy_implementation_hash`) is empty (the caller could not load the
    version) or differs from the candidate's -> `mismatched`, with
    `catalog-identity-unavailable` when empty.
-4. The newest observation is older than the caller-supplied freshness window
-   -> `stale`.
+4. The newest observation (the newest store-backed record, step 5; none at
+   all -> `insufficient-observations`, `no-store-backed-observation`) is
+   older than the caller-supplied freshness window -> `stale`.
 5. Fewer than the caller-supplied minimum number of consecutive
    newest-first observations agree on the full identity -> `insufficient-
    observations`. Observations, not records, are counted: one per store
