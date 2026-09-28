@@ -58,6 +58,18 @@ AGENTS_DIR = REPO_ROOT / "agents"
 # is a dotted path (`agents-state/.github/`) — every consumer reaches it
 # through `Path.iterdir()` or a git `:(glob)` pathspec, both of which match a
 # leading dot, but a shell glob would not.
+#
+# `newton-mcp-gateway` is a private Python/uv MCP server in tenant `labs`,
+# developed exclusively through the DevLoop (epic
+# `mctlhq/newton-mcp-gateway#1`). Registered here so `run_issue_poller.py`
+# will dispatch its `agents:intake` issues at all — it skips any issue whose
+# repo is not in SERVICES. It has no `agents/newton-mcp-gateway/` scaffold,
+# so it must NOT enter ROTATING_SERVICES: the proactive
+# researcher/analyst/spec-writer rotation reads
+# `AGENTS_DIR / <service> / CLAUDE.md` and would fail immediately. The
+# generic implementer sub-agent
+# (agents/_generic/.claude/agents/implementer.md) covers it. Its PRs stay
+# shepherd-owned — no SHEPHERD_SKIP_SERVICES entry.
 SERVICES = [
     "mctl-web",
     "mctl-openclaw",
@@ -74,6 +86,7 @@ SERVICES = [
     "seerrsense",
     "portfolio",
     ".github",
+    "newton-mcp-gateway",
     # "upwork-mcp",
 ]
 
@@ -88,6 +101,7 @@ NON_ROTATING_SERVICES = {
     "seerrsense",
     "portfolio",
     ".github",
+    "newton-mcp-gateway",
 }
 
 # Subset of SERVICES that the proactive R&D rotation analyzes via
