@@ -1653,29 +1653,65 @@ def _within_settle_window(
     return now - pushed < timedelta(minutes=settle_min)
 
 
+# Severity marker grammar, anchored to the start of a line (re.MULTILINE).
+# Two alternatives, matching what claude[bot] and the Codex connector have
+# actually written:
+#   bold:  **P2 —   **P2 -   **P2:   **P2** —   **P2** -   **P2**:   **P2**
+#   bare:  P2 —     P2 -     P2:
+# The bold span may close before OR after the delimiter, and a closed bold
+# span may end the line with no delimiter at all.
+_SEVERITY_RE = re.compile(
+    r"""
+    ^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?       # optional list bullet
+    (?:
+        \*\*(P[123])(?:
+              \*\*[ \t]*(?::|—|\u2013|-|$)                        # **P2** — / **P2**: / **P2**
+            | \*\*[ \t]*\([^)\n]*\)[ \t]*(?::|—|\u2013|-)         # **P2** (security): / **P2** (x) —
+            | (?:[ \t]*\([^)\n]*\))?[ \t]*(?::|—|\u2013|-)        # **P2 — / **P2: / **P2 (security):
+          )
+      | (P[123])(?:[ \t]*\([^)\n]*\))?[ \t]*(?::|—|\u2013|-)      # P2 — / P2: / P2 (carried over ...):
+    )
+    """,
+    re.MULTILINE | re.VERBOSE,
+)
+
+
 def _extract_severity(body: str) -> str | None:
     """Find the severity marker in a review comment body.
 
-    Supports the observed formats:
-    - Codex badge format:   ``![P2 Badge](...)`` anywhere in body (legacy)
-    - Claude review format: ``**P2 —`` anywhere in body (bold prefix), or
-                            ``P2 —`` / ``P2 -`` / ``P2:`` at the start of
-                            any line. The colon variant appeared 2026-08-28
-                            (mctl-portal#88: every inline finding was
-                            ``P1: ...`` and the shepherd parsed 0 findings,
-                            waiting forever on a changes-requested PR).
+    Recognizes, anchored to the start of a line (optionally preceded only by
+    whitespace and at most one Markdown list bullet -- ``-``, ``*``, ``+``,
+    ``1.`` or ``1)``):
+
+    - Codex badge format: ``![P2 Badge](...)`` anywhere in the body (legacy).
+    - Bold markers, open or closed: ``**P2 —``, ``**P2:`` (delimiter inside
+      the bold span) and ``**P2** —``, ``**P2**:`` (bold closes before the
+      delimiter), plus a closed bold span alone at end of line (``**P2**``).
+    - Bare markers: ``P2 —``, ``P2 -``, ``P2:`` opening a line.
+    - An optional same-line parenthetical qualifier between the marker and
+      its delimiter, e.g. ``P2 (carried over from prior review): ...`` or
+      ``**P2** (security): ...``. After a closed bold span the qualifier
+      still requires a delimiter to follow -- ``**P2** (x)`` alone does not
+      match.
+    - The delimiter class is ``:``, ``—``, ``\u2013``, ``-``, or end-of-line
+      (reachable only directly after a closing ``**``).
+
+    The gap between the marker and its delimiter is ``[ \\t]*`` (never
+    ``\\s*``), so a delimiter separated from the marker by a line break does
+    not bind -- a heading line reading only ``**P2**`` cannot pick up a ``-``
+    that opens the next line as its delimiter.
+
+    Three incidents produced this grammar, each a spelling the previous
+    version missed, each leaving a CHANGES_REQUESTED PR waiting forever:
+    mctl-portal#88 (bare ``P1:``, 2026-08-28), mctl-telegram#674 (closed-bold
+    ``**P2** —``), and newton-mcp-gateway#21 (closed-bold ``**P2**:``, and a
+    second round with a parenthetical qualifier, ``P2 (carried over from
+    prior review, still unaddressed — non-blocking):``).
     """
+    found = {m.group(1) or m.group(2) for m in _SEVERITY_RE.finditer(body)}
     for sev in ("P1", "P2", "P3"):
-        if f"![{sev} Badge]" in body:
+        if f"![{sev} Badge]" in body or sev in found:
             return sev
-        # Claude bold prefix — appears anywhere in the body (inline comment
-        # bodies start with it; top-level review bodies embed it mid-text).
-        if f"**{sev} —" in body or f"**{sev} -" in body or f"**{sev}:" in body:
-            return sev
-        # Bare prefix — matches at the start of the body or any line.
-        for mark in (f"{sev} —", f"{sev} -", f"{sev}:"):
-            if body.startswith(mark) or f"\n{mark}" in body:
-                return sev
     return None
 
 

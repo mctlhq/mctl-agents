@@ -2269,6 +2269,40 @@ def test_connector_issue_comment_finding_time_anchored() -> None:
     assert decision == "address-review"
 
 
+def test_claude_closed_bold_inline_finding_gates_merge() -> None:
+    """T7: a CHANGES_REQUESTED review plus one claude[bot] inline comment
+    written in the closed-bold form (`**P2**: ...`) must reach
+    address-review, not spin on wait -- this is the end-to-end regression
+    for mctl-telegram#674 / newton-mcp-gateway#21: the old parser produced
+    zero findings from this exact shape, and an empty finding set on a
+    CHANGES_REQUESTED head is an explicit `wait`."""
+    pr = make_pr(checks_green=True)
+    reviews = [{
+        "user": {"login": run_shepherd.REVIEW_BOT},
+        "commit_id": HEAD_SHA,
+        "state": "CHANGES_REQUESTED",
+        "submitted_at": "2026-04-29T11:00:00Z",
+    }]
+    review_comments = [{
+        "user": {"login": run_shepherd.REVIEW_BOT},
+        "commit_id": HEAD_SHA,
+        "path": "src/app.py",
+        "line": 159,
+        "body": "**P2**: size check runs after the decode",
+        "created_at": "2026-04-29T11:01:00Z",
+    }]
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert len(review.findings) == 1
+    assert review.findings[0].severity == "P2"
+    decision, _payload = decide(pr, review)
+    assert decision == "address-review"
+
+
 # ---------------------------------------------------------------------------
 # T6: outer-loop MAX_REVIEW_ATTEMPTS cap
 # ---------------------------------------------------------------------------
@@ -3472,6 +3506,107 @@ def test_extract_severity_no_match() -> None:
     assert _extract_severity("Some random review text") is None
     # P3 in prose does not count as a severity marker
     assert _extract_severity("There are P3 nits to consider") is None
+
+
+def test_extract_severity_closed_bold_newton_mcp_gateway_21() -> None:
+    """Verbatim newton-mcp-gateway#21 P2 body: a leading correction
+    paragraph, a blank line, then a closed-bold ``**P2**:`` marker -- the
+    bold span closes BEFORE the delimiter, which the old three-if-branch
+    parser did not recognize (3 findings dropped, >2h of `-> wait` ticks)."""
+    from orchestrator.run_shepherd import _extract_severity
+    body = (
+        '(Correction: the earlier comment on this line saying "test" was an '
+        "accidental artifact ... Real finding below.)\n\n"
+        "**P2**: `base64.b64decode(payload, validate=True)` (line 159) runs "
+        "before the `max_image_bytes` size check (line 162)."
+    )
+    assert _extract_severity(body) == "P2"
+    sibling = (
+        "Some other paragraph.\n\n"
+        "**P3**: minor nit, unrelated to the P2 above."
+    )
+    assert _extract_severity(sibling) == "P3"
+
+
+def test_extract_severity_closed_bold_mctl_telegram_674() -> None:
+    """Verbatim mctl-telegram#674 prefix: closed-bold ``**P2** —`` (7
+    findings dropped on this PR before the fix)."""
+    from orchestrator.run_shepherd import _extract_severity
+    body = (
+        "**P2** — a revoked session with no `connect:*` audit row renders "
+        "as if it were never revoked."
+    )
+    assert _extract_severity(body) == "P2"
+
+
+def test_extract_severity_closed_bold_matrix() -> None:
+    """Closed-bold spellings across severities and delimiters, including a
+    closed-bold marker alone at end of line."""
+    from orchestrator.run_shepherd import _extract_severity
+    assert _extract_severity("**P1**: finding") == "P1"
+    assert _extract_severity("**P2**: finding") == "P2"
+    assert _extract_severity("**P3**: finding") == "P3"
+    assert _extract_severity("**P2** - finding") == "P2"
+    assert _extract_severity("**P2**") == "P2"
+
+
+def test_extract_severity_prose_false_positives() -> None:
+    """Marker-shaped text mid-line, or referencing a marker in prose, must
+    not be parsed as a finding."""
+    from orchestrator.run_shepherd import _extract_severity
+    assert _extract_severity("there are P2: issues here") is None
+    assert _extract_severity("see **P2** above") is None
+    assert _extract_severity("Fixed the **P1** from round 2") is None
+    assert _extract_severity("No P1/P2 findings (2 P3). Good to merge.") is None
+    assert _extract_severity("") is None
+
+
+def test_extract_severity_precedence_regardless_of_position() -> None:
+    """Severity precedence (P1 over P2 over P3) is positional-independent:
+    a plain `search`/first-match regex would get this wrong."""
+    from orchestrator.run_shepherd import _extract_severity
+    body = "P2 — lower\n\nP1 — higher"
+    assert _extract_severity(body) == "P1"
+    assert _extract_severity("![P1 Badge] x\n\n**P2**: y") == "P1"
+
+
+def test_extract_severity_newline_gap_does_not_bind() -> None:
+    """The intra-marker gap is [ \\t]*, never \\s*: a delimiter on the next
+    line must not bind to a marker on the line above."""
+    from orchestrator.run_shepherd import _extract_severity
+    # Matches only via the end-of-line rule after the closed bold; the `-`
+    # bullet on the following line is not this marker's delimiter.
+    assert _extract_severity("**P2**\n- some bullet") == "P2"
+    # Marker and delimiter split across a line break, bold unclosed: no match.
+    assert _extract_severity("**P2\n— text") is None
+
+
+def test_extract_severity_parenthetical_qualifier() -> None:
+    """A same-line parenthetical qualifier between the marker and its
+    delimiter is accepted; qualifiers that cross lines, or that are not
+    followed by a delimiter, are not (owner amendment, newton-mcp-gateway#21
+    round 2: `P3 (carried over from prior review, still unaddressed —
+    non-blocking): ...`)."""
+    from orchestrator.run_shepherd import _extract_severity
+    assert _extract_severity(
+        "P2 (carried over from prior review, still unaddressed — "
+        "non-blocking): x"
+    ) == "P2"
+    round_2_body = (
+        "P3 (carried over from prior review, still unaddressed — "
+        "non-blocking): the same base64 decode ordering issue as before."
+    )
+    assert _extract_severity(round_2_body) == "P3"
+    assert _extract_severity("**P2** (security): x") == "P2"
+    assert _extract_severity("**P2 (security):** x") == "P2"
+    assert _extract_severity("- **P1** (regression) — x") == "P1"
+    # Non-matches: mid-line, no delimiter after the qualifier, or the
+    # qualifier itself spans a line break.
+    assert _extract_severity("there are P2 (maybe): x") is None
+    assert _extract_severity("see **P2** (security): above") is None
+    assert _extract_severity("P2 (x)") is None
+    assert _extract_severity("**P2** (x)") is None
+    assert _extract_severity("P2 (a\nb): x") is None
 
 
 # ---------------------------------------------------------------------------
