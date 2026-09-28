@@ -1300,10 +1300,27 @@ def _emit_strategy_compare(
     """One `CONTEXT_STRATEGY_COMPARE` line, emitted only when a candidate
     `snapshot_id` was actually produced (`observe`, bound strategy resolved
     and different from the authoritative one). Carries only the two strategy
-    identities, the binding revision and the two `snapshot_id`s — no counter
-    arithmetic and no judgment of which strategy produced the preferable
-    outcome: that evaluation semantic belongs to mctlhq/mctl-agents#526,
-    added in Slice C."""
+    identities, the binding revision, the two `snapshot_id`s and — added in
+    Slice C, mctlhq/mctl-agents#528 — the evaluator reference an operator
+    needs to correlate this line with the `[context] context_eval=` records
+    it can join on `snapshot_id`. This line still carries no counter
+    arithmetic and no verdict about the two strategies' outcome; that
+    remains mctlhq/mctl-agents#526's evaluator's own job, never re-derived
+    here against a shadow snapshot that is deliberately never persisted."""
+    record_kind: str | None
+    evaluator_name: str | None
+    evaluator_version: str | None
+    metrics_contract_version: str | None
+    try:
+        from orchestrator import context_eval
+
+        record_kind = context_eval.RECORD_KIND
+        evaluator_name = context_eval.EVALUATOR_NAME
+        evaluator_version = context_eval.EVALUATOR_VERSION
+        metrics_contract_version = context_eval.METRICS_CONTRACT_VERSION
+    except ImportError:
+        record_kind = evaluator_name = evaluator_version = metrics_contract_version = None
+
     line = {
         "mode": resolution.mode,
         "authoritative_strategy": authoritative_strategy,
@@ -1313,6 +1330,10 @@ def _emit_strategy_compare(
         "bound_version": resolution.bound_version,
         "bound_snapshot_id": bound_snapshot_id,
         "binding_revision": resolution.binding_revision,
+        "record_kind": record_kind,
+        "evaluator_name": evaluator_name,
+        "evaluator_version": evaluator_version,
+        "metrics_contract_version": metrics_contract_version,
     }
     print("CONTEXT_STRATEGY_COMPARE " + json.dumps(line, sort_keys=True), flush=True)
 

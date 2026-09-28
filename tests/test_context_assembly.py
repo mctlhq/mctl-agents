@@ -955,8 +955,8 @@ def test_release_telemetry_does_not_reimplement_evaluation_semantics():
     assert "pipelinecounters" not in emitters_source.replace("_", "")
 
 
-def test_compare_line_key_set_is_exactly_the_eight_names_task_9_lists(capsys):
-    resolution = ca.StrategyResolution(
+def _compare_resolution() -> ca.StrategyResolution:
+    return ca.StrategyResolution(
         mode=rollout.OBSERVE,
         reason=ca.RELEASE_REASON_OBSERVE,
         bound_strategy="deterministic-fixed-order",
@@ -966,8 +966,13 @@ def test_compare_line_key_set_is_exactly_the_eight_names_task_9_lists(capsys):
         override_active=True,
         verdict=cr.VERDICT_OK,
     )
+
+
+def test_compare_line_key_set_is_exactly_the_twelve_names_slice_c_lists(capsys):
+    """mctlhq/mctl-agents#528 adds the four evaluation-reference keys the
+    original eight-key set (Slice B) never carried."""
     ca._emit_strategy_compare(
-        resolution,
+        _compare_resolution(),
         authoritative_strategy="trust-freshness-ranked",
         authoritative_version="1.0.0",
         authoritative_snapshot_id="cs-authoritative",
@@ -986,7 +991,57 @@ def test_compare_line_key_set_is_exactly_the_eight_names_task_9_lists(capsys):
         "bound_version",
         "bound_snapshot_id",
         "binding_revision",
+        "record_kind",
+        "evaluator_name",
+        "evaluator_version",
+        "metrics_contract_version",
     }
+
+
+def test_compare_line_evaluation_reference_matches_context_eval(capsys):
+    from orchestrator import context_eval
+
+    ca._emit_strategy_compare(
+        _compare_resolution(),
+        authoritative_strategy="trust-freshness-ranked",
+        authoritative_version="1.0.0",
+        authoritative_snapshot_id="cs-authoritative",
+        bound_snapshot_id="cs-bound",
+    )
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out.partition(" ")[2])
+    assert payload["record_kind"] == context_eval.RECORD_KIND
+    assert payload["evaluator_name"] == context_eval.EVALUATOR_NAME
+    assert payload["evaluator_version"] == context_eval.EVALUATOR_VERSION
+    assert payload["metrics_contract_version"] == context_eval.METRICS_CONTRACT_VERSION
+
+
+def test_compare_line_evaluation_reference_is_null_when_context_eval_is_unimportable(monkeypatch, capsys):
+    """T12: a simulated `ImportError` yields four `null`s and does not fail
+    the run."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "orchestrator" and fromlist and "context_eval" in fromlist:
+            raise ImportError("simulated: context_eval unimportable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked_import)
+    ca._emit_strategy_compare(
+        _compare_resolution(),
+        authoritative_strategy="trust-freshness-ranked",
+        authoritative_version="1.0.0",
+        authoritative_snapshot_id="cs-authoritative",
+        bound_snapshot_id="cs-bound",
+    )
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out.partition(" ")[2])
+    assert payload["record_kind"] is None
+    assert payload["evaluator_name"] is None
+    assert payload["evaluator_version"] is None
+    assert payload["metrics_contract_version"] is None
 
 
 # ---------------------------------------------------------------------------
