@@ -30,3 +30,15 @@ spec:
       kind: none
       ref: null
       evaluatorVersion: null
+  - revision: 3
+    strategy: deterministic-fixed-order
+    version: 1.0.0
+    contentHash: sha256:5630bb4b957e6d4eaf4f6d71594f5303e4f9ac05734a48a16f9aa52697d03fbf
+    implementationHash: sha256:81cf6e688658248ad3e410842290de2395086400326cf358d827d10a7dde8e31
+    promotedBy: implementer-agent
+    promotedAt: '2026-09-28T00:45:39Z'
+    reason: republish pins after issue-527 Slice B follow-up P2 fixes
+    evidence:
+      kind: none
+      ref: null
+      evaluatorVersion: null

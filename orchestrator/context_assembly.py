@@ -1234,13 +1234,21 @@ def _emit_release_verdict(
 ) -> None:
     """One `CONTEXT_STRATEGY_RELEASE` line per run, unconditionally
     (mctlhq/mctl-agents#527 Slice B, ADR 019 sec. 5) — at `off`, `mode` is
-    `"off"` and everything binding-shaped is `null`."""
+    `"off"` and everything binding-shaped is `null`.
+
+    `strategy` always names the strategy this run actually used
+    (`effective_strategy`); `bound_strategy` always names the strategy the
+    context-release binding decided on (or `None` at `off`). The two agree at
+    every stage except `observe`, where the binding never drives the
+    authoritative run — there, `strategy` is what ran and `bound_strategy` is
+    only the shadow/compare candidate."""
     if resolution is None:
         line = {
             "mode": "off",
             "agent": execution.agent,
             "environment": execution.environment,
             "strategy": effective_strategy,
+            "bound_strategy": None,
             "version": None,
             "content_hash": None,
             "binding_revision": None,
@@ -1253,7 +1261,8 @@ def _emit_release_verdict(
             "mode": resolution.mode,
             "agent": execution.agent,
             "environment": execution.environment,
-            "strategy": resolution.bound_strategy if resolution.bound_strategy is not None else effective_strategy,
+            "strategy": effective_strategy,
+            "bound_strategy": resolution.bound_strategy,
             "version": resolution.bound_version,
             "content_hash": resolution.strategy_content_hash,
             "binding_revision": resolution.binding_revision,
@@ -1365,9 +1374,21 @@ def assemble(
         and resolution.bound_strategy not in (None, config.strategy)
     ):
         try:
-            shadow_outcome = run_pipeline(
-                candidates, replace(config, strategy=resolution.bound_strategy), assembly_input.now
-            )
+            # Re-run the collector loop under the substituted (shadow) config,
+            # not just `run_pipeline`, for the same reason the docstring above
+            # gives for the authoritative pass: `collect_prior_proposal` (:815)
+            # branches on `assembly_input.config.ranked`, so reusing the
+            # module-level `candidates` (collected under the authoritative
+            # `config.ranked`) would silently misclassify a prior proposal's
+            # freshness whenever the bound strategy differs from the running
+            # one in `ranked`-ness. See T13
+            # (`test_enforce_substitution_reaches_the_collectors_not_only_the_pipeline`).
+            shadow_config = replace(config, strategy=resolution.bound_strategy)
+            shadow_input = replace(assembly_input, config=shadow_config)
+            shadow_candidates: list[CandidateSource] = []
+            for collector in _COLLECTOR_ORDER:
+                shadow_candidates.extend(collector(shadow_input))
+            shadow_outcome = run_pipeline(shadow_candidates, shadow_config, assembly_input.now)
             shadow_snapshot = seal(
                 execution=execution,
                 strategy=shadow_outcome.strategy,
@@ -1380,7 +1401,7 @@ def assemble(
                 conflicts=shadow_outcome.conflicts,
             )
             observe_snapshot_id = shadow_snapshot.snapshot_id
-        except Exception:
+        except Exception:  # noqa: BLE001 — observe must never fail an already-completed run
             observe_snapshot_id = None
             resolution = replace(resolution, reason=RELEASE_REASON_OBSERVE_FAILED)
 
