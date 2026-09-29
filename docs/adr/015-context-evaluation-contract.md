@@ -30,6 +30,19 @@ regression caused by a ranking, filter or config change.
 
 ### 1. Identity — two hash pairs, verified before any metric
 
+Two provenance modes (mctlhq/mctl-agents#528 amends this section to name
+the second one explicitly):
+
+- **`store-backed`** — the evaluated snapshot was persisted; verification
+  checks both the document identity and the store identity below, and the
+  record carries `store_ref`.
+- **`execution-observed`** — the evaluated snapshot was never persisted (a
+  Slice B `observe` shadow pass's non-authoritative candidate,
+  `evidence_kind: "observe-candidate"`); verification checks document
+  identity only, and the record carries `execution_ref` — the store
+  execution the candidate was assembled in — instead of a `StoreRef`, since
+  there is no stored document for a store identity check to describe.
+
 Every evaluation first recomputes both identities a snapshot can carry,
 and computes no metric until both check out:
 
@@ -164,13 +177,16 @@ this fixed precedence (never order-dependent):
    older than the caller-supplied freshness window -> `stale`.
 5. Fewer than the caller-supplied minimum number of consecutive
    newest-first observations agree on the full identity -> `insufficient-
-   observations`. Observations, not records, are counted: one per store
-   execution (`store_ref.execution_id`, so the retries of one execution
-   count once). A record with `store_ref: null` is not a promotion
-   observation — a retry restamps every local identity field, so nothing
-   tells its attempts apart — and is never counted. The run ends at the
-   first `evidence_kind: none` record. `observations` in the assessment
-   reports this deduplicated count.
+   observations`. Observations, not records, are counted: one per execution
+   — `store_ref.execution_id` for a `store-backed` record, or
+   `execution_ref.execution_id` for an `execution-observed`
+   (`observe-candidate`) record (mctlhq/mctl-agents#528) — so the retries of
+   one execution count once, under either provenance mode. A record with
+   neither `store_ref` nor `execution_ref` is not a promotion observation —
+   a retry restamps every local identity field, so nothing tells its
+   attempts apart — and is never counted. The run ends at the first
+   `evidence_kind: none` record. `observations` in the assessment reports
+   this deduplicated count.
 6. Otherwise -> `fresh`.
 
 The freshness window and minimum-observation count are ADR 019's **v1

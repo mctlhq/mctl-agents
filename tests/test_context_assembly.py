@@ -955,8 +955,8 @@ def test_release_telemetry_does_not_reimplement_evaluation_semantics():
     assert "pipelinecounters" not in emitters_source.replace("_", "")
 
 
-def test_compare_line_key_set_is_exactly_the_eight_names_task_9_lists(capsys):
-    resolution = ca.StrategyResolution(
+def _compare_resolution() -> ca.StrategyResolution:
+    return ca.StrategyResolution(
         mode=rollout.OBSERVE,
         reason=ca.RELEASE_REASON_OBSERVE,
         bound_strategy="deterministic-fixed-order",
@@ -966,8 +966,13 @@ def test_compare_line_key_set_is_exactly_the_eight_names_task_9_lists(capsys):
         override_active=True,
         verdict=cr.VERDICT_OK,
     )
+
+
+def test_compare_line_key_set_is_exactly_the_twelve_names_slice_c_lists(capsys):
+    """mctlhq/mctl-agents#528 adds the four evaluation-reference keys the
+    original eight-key set (Slice B) never carried."""
     ca._emit_strategy_compare(
-        resolution,
+        _compare_resolution(),
         authoritative_strategy="trust-freshness-ranked",
         authoritative_version="1.0.0",
         authoritative_snapshot_id="cs-authoritative",
@@ -986,7 +991,57 @@ def test_compare_line_key_set_is_exactly_the_eight_names_task_9_lists(capsys):
         "bound_version",
         "bound_snapshot_id",
         "binding_revision",
+        "record_kind",
+        "evaluator_name",
+        "evaluator_version",
+        "metrics_contract_version",
     }
+
+
+def test_compare_line_evaluation_reference_matches_context_eval(capsys):
+    from orchestrator import context_eval
+
+    ca._emit_strategy_compare(
+        _compare_resolution(),
+        authoritative_strategy="trust-freshness-ranked",
+        authoritative_version="1.0.0",
+        authoritative_snapshot_id="cs-authoritative",
+        bound_snapshot_id="cs-bound",
+    )
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out.partition(" ")[2])
+    assert payload["record_kind"] == context_eval.RECORD_KIND
+    assert payload["evaluator_name"] == context_eval.EVALUATOR_NAME
+    assert payload["evaluator_version"] == context_eval.EVALUATOR_VERSION
+    assert payload["metrics_contract_version"] == context_eval.METRICS_CONTRACT_VERSION
+
+
+def test_compare_line_evaluation_reference_is_null_when_context_eval_is_unimportable(monkeypatch, capsys):
+    """T12: a simulated `ImportError` yields four `null`s and does not fail
+    the run."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "orchestrator" and fromlist and "context_eval" in fromlist:
+            raise ImportError("simulated: context_eval unimportable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked_import)
+    ca._emit_strategy_compare(
+        _compare_resolution(),
+        authoritative_strategy="trust-freshness-ranked",
+        authoritative_version="1.0.0",
+        authoritative_snapshot_id="cs-authoritative",
+        bound_snapshot_id="cs-bound",
+    )
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out.partition(" ")[2])
+    assert payload["record_kind"] is None
+    assert payload["evaluator_name"] is None
+    assert payload["evaluator_version"] is None
+    assert payload["metrics_contract_version"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -1091,6 +1146,80 @@ def test_observe_shadow_pass_recollects_under_the_bound_strategy(tmp_path, monke
     baseline = ca.assemble(assembly_input_ranked, mode="shadow", execution=execution)
 
     assert bound_snapshot_id == baseline.snapshot.snapshot_id
+
+
+# ---------------------------------------------------------------------------
+# mctlhq/mctl-agents#528 — AssemblyResult.observe_candidate
+# ---------------------------------------------------------------------------
+def test_observe_candidate_is_set_only_when_the_shadow_pass_seals_one(tmp_path, monkeypatch, capsys):
+    """The same shadow snapshot `CONTEXT_STRATEGY_COMPARE`'s `bound_snapshot_id`
+    already names is also carried on `AssemblyResult.observe_candidate` —
+    never rendered, never `result.snapshot`, never sealed a second time (its
+    `snapshot_id` must equal the id in the compare line)."""
+    proposal_dir = tmp_path / "proposal"
+    proposal_dir.mkdir()
+    (proposal_dir / "requirements.md").write_text("req")
+
+    monkeypatch.delenv("AGENT_ENVIRONMENT", raising=False)
+    fake_resolved = cr.ResolvedContextStrategy(
+        agent="issue-investigator",
+        environment=rollout.OBSERVE_ENVIRONMENT,
+        strategy=ca.RANKED_STRATEGY_NAME,
+        version=ca.RANKED_STRATEGY_VERSION,
+        ranker_name=ca.RANKER_NAME,
+        ranker_version=ca.RANKER_VERSION,
+        content_hash="sha256:" + "0" * 64,
+        implementation_hash="sha256:" + "1" * 64,
+        release_revision=99,
+        verdict=cr.VERDICT_OK,
+    )
+    monkeypatch.setattr(cr, "resolve", lambda agent, environment: fake_resolved)
+
+    config = ca.AssemblyConfig()
+    assembly_input = _assembly_input(tmp_path, config=config, proposal_dir=proposal_dir)
+    execution = _execution()
+
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.OBSERVE)
+    result = ca.assemble(assembly_input, mode="shadow", execution=execution)
+    out = capsys.readouterr().out
+    compare_lines = [line for line in out.splitlines() if line.startswith("CONTEXT_STRATEGY_COMPARE ")]
+    bound_snapshot_id = json.loads(compare_lines[0].split(" ", 1)[1])["bound_snapshot_id"]
+
+    assert result.observe_candidate is not None
+    assert result.observe_candidate.snapshot_id == bound_snapshot_id
+    assert result.observe_candidate.strategy.name == ca.RANKED_STRATEGY_NAME
+    assert result.observe_candidate.snapshot_id != result.snapshot.snapshot_id
+    assert result.snapshot.strategy.name == ca.STRATEGY_NAME
+    assert all(text not in result.rendered.values() for text in (result.observe_candidate.snapshot_id,))
+
+
+def test_observe_candidate_is_none_at_off_and_when_the_shadow_pass_does_not_fire(tmp_path):
+    assembly_input = _assembly_input(tmp_path)
+    result = _assemble(assembly_input)
+    assert result.observe_candidate is None
+
+
+def test_observe_candidate_is_none_after_a_shadow_pass_failure(tmp_path, monkeypatch):
+    """Same fixture as
+    `test_observe_shadow_pass_failure_logs_observe_pass_failed_and_the_run_still_succeeds`."""
+    monkeypatch.delenv("AGENT_ENVIRONMENT", raising=False)
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.OBSERVE)
+    config = ca.AssemblyConfig(strategy=ca.RANKED_STRATEGY_NAME)
+    assembly_input = _assembly_input(tmp_path, config=config)
+    execution = _execution()
+
+    real_run_pipeline = ca.run_pipeline
+    calls = {"n": 0}
+
+    def flaky_run_pipeline(candidates, cfg, now):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the shadow pass
+            raise RuntimeError("boom")
+        return real_run_pipeline(candidates, cfg, now)
+
+    monkeypatch.setattr(ca, "run_pipeline", flaky_run_pipeline)
+    result = ca.assemble(assembly_input, mode="shadow", execution=execution)
+    assert result.observe_candidate is None
 
 
 # ---------------------------------------------------------------------------

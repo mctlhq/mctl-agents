@@ -394,6 +394,103 @@ def test_store_hash_is_pinned_to_work_context_snapshots_canonical_bytes():
 
 
 # ---------------------------------------------------------------------------
+# from_dict round-trip (T1, mctlhq/mctl-agents#528)
+# ---------------------------------------------------------------------------
+
+
+def test_eval_record_from_dict_round_trips_a_full_record():
+    snapshot = _seal((_make_source(),))
+    store_ref = wc_snapshots.StoreRef(
+        work_item_id="wi_1", execution_id="we_1", store_snapshot_id="cs_x",
+        store_content_hash=ce.hash_bytes(ce.canonical_json(snapshot.to_dict())),
+    )
+    outcome = ce.OutcomeLink(
+        outcome="succeeded", outcome_source=ce.OUTCOME_SOURCE_LEDGER,
+        work_item_state="completed", execution_phase="Succeeded", reason_code="",
+    )
+    record = ce.evaluate(
+        snapshot, observed_at=CREATED_AT, store_ref=store_ref, outcome=outcome,
+        labels=ce.CaseLabels(useful_source_ids=("s1",)),
+        assembly=ce.AssemblyCounters(candidates_total=1),
+    )
+    assert ce.EvalRecord.from_dict(record.to_log_dict()) == record
+
+
+def test_eval_record_from_dict_round_trips_a_minimal_record():
+    snapshot = _seal((_make_source(),))
+    record = ce.evaluate(snapshot, observed_at=CREATED_AT)
+    assert record.store_ref is None
+    assert record.metrics is not None
+    assert record.outcome is None
+    assert ce.EvalRecord.from_dict(record.to_log_dict()) == record
+
+
+def test_eval_record_from_dict_round_trips_a_hash_mismatch_record_with_no_metrics():
+    snapshot = _seal((_make_source(),))
+    tampered = replace(snapshot, content_hash="sha256:" + "0" * 64)
+    record = ce.evaluate(tampered, observed_at=CREATED_AT)
+    assert record.metrics is None
+    assert ce.EvalRecord.from_dict(record.to_log_dict()) == record
+
+
+def test_eval_record_from_dict_rejects_a_foreign_record_kind():
+    snapshot = _seal((_make_source(),))
+    payload = ce.evaluate(snapshot, observed_at=CREATED_AT).to_log_dict()
+    payload["record_kind"] = "something-else"
+    with pytest.raises(ValueError):
+        ce.EvalRecord.from_dict(payload)
+
+
+def test_eval_record_from_dict_rejects_an_unknown_verdict():
+    snapshot = _seal((_make_source(),))
+    payload = ce.evaluate(snapshot, observed_at=CREATED_AT).to_log_dict()
+    payload["verdict"] = "not-a-real-verdict"
+    with pytest.raises(ValueError):
+        ce.EvalRecord.from_dict(payload)
+
+
+# ---------------------------------------------------------------------------
+# execution-observed provenance (T1b/T17, mctlhq/mctl-agents#528)
+# ---------------------------------------------------------------------------
+
+
+def test_observe_candidate_record_never_carries_a_store_ref():
+    snapshot = _seal((_make_source(),))
+    with pytest.raises(ValueError):
+        ce.evaluate(
+            snapshot, observed_at=CREATED_AT, evidence_kind="observe-candidate",
+            store_ref=_store_ref_for_eval("we_1"),
+        )
+
+
+def test_execution_ref_refused_outside_observe_candidate():
+    snapshot = _seal((_make_source(),))
+    execution_ref = ce.ExecutionRef(work_item_id="wi_9", execution_id="we_9")
+    with pytest.raises(ValueError):
+        ce.evaluate(snapshot, observed_at=CREATED_AT, evidence_kind="live", execution_ref=execution_ref)
+
+
+def test_observe_candidate_record_carries_its_own_execution_ref_and_verifies_on_document_identity_only():
+    snapshot = _seal((_make_source(),))
+    execution_ref = ce.ExecutionRef(work_item_id="wi_9", execution_id="we_9")
+    record = ce.evaluate(
+        snapshot, observed_at=CREATED_AT, evidence_kind="observe-candidate", execution_ref=execution_ref,
+    )
+    assert record.execution_ref == execution_ref
+    assert record.store_ref is None
+    check = ce.verify_identity(snapshot, record.store_ref)
+    assert check.store_ok is None
+    assert ce.EvalRecord.from_dict(record.to_log_dict()) == record
+
+
+def _store_ref_for_eval(execution_id: str) -> wc_snapshots.StoreRef:
+    return wc_snapshots.StoreRef(
+        work_item_id="wi_1", execution_id=execution_id, store_snapshot_id="cs_" + execution_id,
+        store_content_hash="sha256:" + "a" * 64,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Telemetry safety (T8, T9)
 # ---------------------------------------------------------------------------
 
@@ -655,6 +752,35 @@ def test_assess_evidence_counts_store_executions_not_retry_attempts():
     assert result.status == "insufficient-observations" and result.observations == 2
 
 
+def test_assess_evidence_counts_observe_candidate_observations_by_execution_ref():
+    """mctlhq/mctl-agents#528: an `observe-candidate` record has no
+    `store_ref` (it is never persisted) but still counts as one observation
+    per `execution_ref.(work_item_id, execution_id)`, exactly like a stored
+    observation."""
+    expected = _identity()
+    policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=3)
+    now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
+    isos = ("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z")
+
+    records = [
+        replace(
+            _record(expected, observed_at=iso), evidence_kind="observe-candidate",
+            execution_ref=ce.ExecutionRef(work_item_id="wi_1", execution_id=f"we_{i}"),
+        )
+        for i, iso in enumerate(isos)
+    ]
+    result = ce.assess_evidence(records, expected=expected, now=now, policy=policy)
+    assert result.status == "fresh" and result.observations == 3
+
+    # Retries of one execution still count once.
+    retries = [
+        replace(records[0], observed_at=iso, context_snapshot_id=f"cs-{i}", content_hash="sha256:" + str(i) * 64)
+        for i, iso in enumerate(isos)
+    ]
+    result = ce.assess_evidence(retries, expected=expected, now=now, policy=policy)
+    assert result.status == "insufficient-observations" and result.observations == 1
+
+
 def test_assess_evidence_malformed_observed_at_is_stale_not_a_crash():
     """A malformed `observed_at` string (not ISO-8601 at all) cannot be
     parsed for a freshness comparison; `assess_evidence` must fail closed
@@ -721,8 +847,19 @@ def test_context_eval_module_is_pure():
 
 
 def test_only_investigator_and_replay_cli_import_context_eval():
+    """mctlhq/mctl-agents#528 adds two legitimate callers: `orchestrator/
+    context_release.py` imports `context_eval` inside `assess_production_
+    evidence`'s function body only (never at module scope —
+    `test_context_release_never_imports_context_eval_at_module_scope` pins
+    that), and `orchestrator/context_assembly.py` imports it inside
+    `_emit_strategy_compare`'s function body only, for the compare line's
+    evaluator reference — both the same deferred direction `context_release`
+    already imports `context_snapshot`."""
     orchestrator_dir = REPO_ROOT / "orchestrator"
-    allowed = {"run_issue_investigator.py", "run_context_eval.py", "context_eval.py"}
+    allowed = {
+        "run_issue_investigator.py", "run_context_eval.py", "context_eval.py", "context_release.py",
+        "context_assembly.py",
+    }
     offenders = []
     for path in sorted(orchestrator_dir.rglob("*.py")):
         if path.name in allowed:

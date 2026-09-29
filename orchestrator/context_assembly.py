@@ -336,6 +336,14 @@ class AssemblyResult:
     #: reported id that is not `cs_`-prefixed). A defaulted final field, so
     #: every existing `AssemblyResult(...)` construction compiles unchanged.
     store_ref: StoreRef | None = None
+    #: The `observe` shadow pass's sealed candidate snapshot (mctlhq/
+    #: mctl-agents#528), set only when that pass ran and sealed one — `None`
+    #: at `off`/`enforce`/`only`, or when the shadow pass failed or produced
+    #: no candidate. Read ONLY by `_emit_context_eval`'s best-effort second
+    #: `observe-candidate` record: it is never rendered, never returned as
+    #: `snapshot`, and never reaches the work-item store client (`assemble_
+    #: investigator_context` persists `result.snapshot` only).
+    observe_candidate: ContextSnapshot | None = None
 
 
 def _to_context_source(candidate: CandidateSource) -> ContextSource:
@@ -1292,10 +1300,27 @@ def _emit_strategy_compare(
     """One `CONTEXT_STRATEGY_COMPARE` line, emitted only when a candidate
     `snapshot_id` was actually produced (`observe`, bound strategy resolved
     and different from the authoritative one). Carries only the two strategy
-    identities, the binding revision and the two `snapshot_id`s — no counter
-    arithmetic and no judgment of which strategy produced the preferable
-    outcome: that evaluation semantic belongs to mctlhq/mctl-agents#526,
-    added in Slice C."""
+    identities, the binding revision, the two `snapshot_id`s and — added in
+    Slice C, mctlhq/mctl-agents#528 — the evaluator reference an operator
+    needs to correlate this line with the `[context] context_eval=` records
+    it can join on `snapshot_id`. This line still carries no counter
+    arithmetic and no verdict about the two strategies' outcome; that
+    remains mctlhq/mctl-agents#526's evaluator's own job, never re-derived
+    here against a shadow snapshot that is deliberately never persisted."""
+    record_kind: str | None
+    evaluator_name: str | None
+    evaluator_version: str | None
+    metrics_contract_version: str | None
+    try:
+        from orchestrator import context_eval
+
+        record_kind = context_eval.RECORD_KIND
+        evaluator_name = context_eval.EVALUATOR_NAME
+        evaluator_version = context_eval.EVALUATOR_VERSION
+        metrics_contract_version = context_eval.METRICS_CONTRACT_VERSION
+    except ImportError:
+        record_kind = evaluator_name = evaluator_version = metrics_contract_version = None
+
     line = {
         "mode": resolution.mode,
         "authoritative_strategy": authoritative_strategy,
@@ -1305,6 +1330,10 @@ def _emit_strategy_compare(
         "bound_version": resolution.bound_version,
         "bound_snapshot_id": bound_snapshot_id,
         "binding_revision": resolution.binding_revision,
+        "record_kind": record_kind,
+        "evaluator_name": evaluator_name,
+        "evaluator_version": evaluator_version,
+        "metrics_contract_version": metrics_contract_version,
     }
     print("CONTEXT_STRATEGY_COMPARE " + json.dumps(line, sort_keys=True), flush=True)
 
@@ -1376,6 +1405,14 @@ def assemble(
     # behaviour-neutral by definition, so a failure here must not fail a run
     # the authoritative pass already completed.
     observe_snapshot_id: str | None = None
+    #: mctlhq/mctl-agents#528: the same shadow snapshot this block already
+    #: seals, now also kept (never re-sealed) so `AssemblyResult.observe_
+    #: candidate` can carry it to `_emit_context_eval`'s best-effort second
+    #: record. Still never rendered, never `AssemblyResult.snapshot`, never
+    #: persisted — only this local's value changes; nothing about what the
+    #: shadow pass does or how it is discarded from the authoritative path
+    #: changes.
+    observe_candidate: ContextSnapshot | None = None
     if (
         resolution is not None
         and resolution.reason == RELEASE_REASON_OBSERVE
@@ -1412,8 +1449,10 @@ def assemble(
                 conflicts=shadow_outcome.conflicts,
             )
             observe_snapshot_id = shadow_snapshot.snapshot_id
+            observe_candidate = shadow_snapshot
         except Exception:  # noqa: BLE001 — observe must never fail an already-completed run
             observe_snapshot_id = None
+            observe_candidate = None
             resolution = replace(resolution, reason=RELEASE_REASON_OBSERVE_FAILED)
 
     # Emitted here, not before the collectors: the reason code must reflect
@@ -1461,7 +1500,9 @@ def assemble(
         strategy_content_hash=resolution.strategy_content_hash if resolution is not None else None,
         override_active=resolution.override_active if resolution is not None else False,
     )
-    return AssemblyResult(mode=mode, snapshot=snapshot, rendered=rendered, metrics=metrics)
+    return AssemblyResult(
+        mode=mode, snapshot=snapshot, rendered=rendered, metrics=metrics, observe_candidate=observe_candidate
+    )
 
 
 def assemble_investigator_context(

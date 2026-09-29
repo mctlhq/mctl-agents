@@ -13,6 +13,11 @@ trail is git history.
     python tools/context_release.py promote --agent issue-investigator --environment shadow \\
         --strategy deterministic-fixed-order --version 1.0.0 --promoted-by octocat \\
         --reason "inert shadow baseline"
+    python tools/context_release.py promote --agent issue-investigator --environment production \\
+        --strategy trust-freshness-ranked --version 1.0.0 --promoted-by octocat \\
+        --reason "3 clean observe-mode soak runs" --evidence-kind context-eval \\
+        --evidence-ref "argo-workflow-logs://issue-investigator/soak-2026-09" \\
+        --evidence-evaluator-version 1.0.0 --evidence-file soak-evidence.jsonl --dry-run
     python tools/context_release.py rollback --agent issue-investigator --environment shadow \\
         --to-revision 1 --promoted-by octocat --reason "revert bad promotion"
     python tools/context_release.py resolve --agent issue-investigator --environment shadow
@@ -20,10 +25,12 @@ trail is git history.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -31,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from orchestrator import context_eval  # noqa: E402 — after sys.path setup, matches tools/capability_bench.py
 from orchestrator import context_release as cr  # noqa: E402 — after sys.path setup, matches tools/capability_bench.py
 
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -62,6 +70,58 @@ def _write_yaml(path: Path, document: dict, *, dry_run: bool) -> None:
     print(f"  wrote {path.relative_to(REPO_ROOT)}")
 
 
+def _parse_evidence_file(path: Path) -> list[context_eval.EvalRecord]:
+    """`--evidence-file`'s payload: a JSONL file of `context_eval` record
+    payloads (one per line), or a bare JSON array of the same — the
+    `[context] context_eval=` log lines an `observe`-mode production
+    investigation printed, collected out of the Argo workflow log archive
+    (mctlhq/mctl-agents#528, since `observe-candidate` records are never
+    stored, so `run_context_eval` replay cannot read them back). Each
+    payload is parsed with `context_eval.EvalRecord.from_dict`, which is
+    itself validated (`record_kind`/`verdict`) — this is operator input, not
+    trusted. Raises `SystemExit` naming the offending line/element number on
+    a parse failure, prefixed `unknown:` to match `ContextReleaseError`'s
+    code-prefix convention."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"unknown: {path}: could not read evidence file: {exc}") from exc
+
+    stripped = text.strip()
+    if not stripped:
+        return []
+
+    if stripped.startswith("["):
+        try:
+            payloads = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"unknown: {path}: invalid JSON array: {exc}") from exc
+        if not isinstance(payloads, list):
+            raise SystemExit(f"unknown: {path}: a JSON evidence file must be an array of record payloads")
+        records: list[context_eval.EvalRecord] = []
+        for index, payload in enumerate(payloads, start=1):
+            try:
+                records.append(context_eval.EvalRecord.from_dict(payload))
+            except (ValueError, TypeError) as exc:
+                raise SystemExit(f"unknown: {path}: element {index}: {exc}") from exc
+        return records
+
+    records = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"unknown: {path}: line {lineno}: invalid JSON: {exc}") from exc
+        try:
+            records.append(context_eval.EvalRecord.from_dict(payload))
+        except (ValueError, TypeError) as exc:
+            raise SystemExit(f"unknown: {path}: line {lineno}: {exc}") from exc
+    return records
+
+
 def cmd_publish(args: argparse.Namespace) -> bool:
     try:
         document = cr.build_version_document(args.strategy, args.version, lifecycle=args.lifecycle)
@@ -76,6 +136,15 @@ def cmd_publish(args: argparse.Namespace) -> bool:
 
 
 def cmd_promote(args: argparse.Namespace) -> bool:
+    if args.evidence_kind == "context-eval" and not args.evidence_ref:
+        print("  ERROR: unknown: --evidence-ref is required when --evidence-kind=context-eval", file=sys.stderr)
+        return False
+
+    evidence_records: list[Any] = []
+    if args.evidence_file is not None:
+        evidence_records = _parse_evidence_file(args.evidence_file)
+
+    now = datetime.now(UTC)
     try:
         binding = cr.load_binding_or_none(args.agent, args.environment)
         updated = cr.promote(
@@ -90,12 +159,35 @@ def cmd_promote(args: argparse.Namespace) -> bool:
             evidence_kind=args.evidence_kind,
             evidence_ref=args.evidence_ref,
             evidence_evaluator_version=args.evidence_evaluator_version,
+            evidence_records=evidence_records,
+            now=now,
         )
     except cr.ContextReleaseError as exc:
         print(f"  ERROR: {exc}", file=sys.stderr)
         return False
+
     path = cr.BINDINGS_DIR / args.environment / f"{args.agent}.yaml"
     print(f"  {args.agent}/{args.environment} -> revision {updated.active.revision}: {args.strategy}@{args.version}")
+
+    # `--dry-run` doubles as the documented "inspect the evidence" command:
+    # print the gate's full outcome — no second inspection subcommand.
+    if (
+        args.dry_run
+        and args.environment not in cr.EVIDENCE_FREE_ENVIRONMENTS
+        and args.evidence_kind == "context-eval"
+    ):
+        version_doc = cr.load_version(args.strategy, args.version)
+        verdict = cr.assess_production_evidence(
+            version=version_doc, records=evidence_records,
+            evidence_evaluator_version=args.evidence_evaluator_version, now=now,
+        )
+        print(
+            f"  gate: status={verdict.code} reason_code={verdict.reason_code} "
+            f"observations={verdict.observations} newest_age_seconds={verdict.newest_age_seconds} "
+            f"window_seconds={verdict.window_seconds} "
+            f"minimum_observations={context_eval.ADR019_V1_MIN_CONSECUTIVE_OBSERVATIONS}"
+        )
+
     _write_yaml(path, updated.to_dict(), dry_run=args.dry_run)
     return True
 
@@ -158,6 +250,11 @@ def main() -> int:
     promote.add_argument("--evidence-kind", default="none", choices=sorted(cr.EVIDENCE_KINDS))
     promote.add_argument("--evidence-ref", default=None)
     promote.add_argument("--evidence-evaluator-version", default=None)
+    promote.add_argument(
+        "--evidence-file", type=Path, default=None,
+        help="JSONL of context_eval record payloads (a bare JSON array is also accepted); required to satisfy "
+        "a production promotion's evidence gate",
+    )
     promote.add_argument("--dry-run", action="store_true")
     promote.set_defaults(func=cmd_promote)
 

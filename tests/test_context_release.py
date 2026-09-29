@@ -15,14 +15,19 @@ implementation file" gets it for free by naming one that does not exist.
 """
 from __future__ import annotations
 
+import json
+import re
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 import yaml
 
+from orchestrator import context_eval as ce
 from orchestrator import context_release as cr
+from orchestrator.work_context.snapshots import StoreRef
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -245,9 +250,11 @@ def test_active_revision_is_the_highest(tmp_path):
 # ---------------------------------------------------------------------------
 # T5 — promotion rules
 # ---------------------------------------------------------------------------
-def test_production_promotion_is_always_refused_as_evidence_missing(tmp_path):
-    """Whatever the evidence block says, including a well-formed-looking
-    context-eval block — Slice A has no #526 evaluator on the image."""
+def test_production_promotion_with_no_evidence_is_refused_as_evidence_missing(tmp_path):
+    """mctlhq/mctl-agents#528: production still refuses `evidence.kind:
+    none` (or no evidence at all) as `evidence-missing` — this is still true
+    once the real gate exists, now for a stated reason rather than
+    unconditionally for every environment but `shadow`."""
     versions_dir = tmp_path / "versions"
     _write_version(tmp_path, name="deterministic-fixed-order", version="1.0.0")
     with pytest.raises(cr.ContextReleaseError) as excinfo:
@@ -260,18 +267,17 @@ def test_production_promotion_is_always_refused_as_evidence_missing(tmp_path):
             promoted_by="octocat",
             reason="looks ready",
             promoted_at="2026-09-27T00:00:00Z",
-            evidence_kind="context-eval",
-            evidence_ref="context-eval-run-42",
-            evidence_evaluator_version="1.0.0",
+            evidence_kind="none",
             versions_dir=versions_dir,
         )
     assert excinfo.value.code == cr.VERDICT_EVIDENCE_MISSING
 
 
-def test_non_shadow_promotion_is_refused_even_when_not_named_production(tmp_path):
-    """`promote()` allowlists 'shadow' as the only evidence-free environment
-    (commit 8266e37) — any other environment name, not just the literal
-    string 'production', must be refused."""
+def test_non_shadow_promotion_to_an_unrecognised_environment_is_unknown(tmp_path):
+    """mctlhq/mctl-agents#528: `promote()` allowlists exactly `{shadow,
+    production}` (`PROMOTION_ENVIRONMENTS`) — any other environment name is
+    `unknown`, naming both supported ones; this module cannot classify
+    anything else, so it no longer guesses `evidence-missing`."""
     versions_dir = tmp_path / "versions"
     _write_version(tmp_path, name="deterministic-fixed-order", version="1.0.0")
     with pytest.raises(cr.ContextReleaseError) as excinfo:
@@ -286,7 +292,8 @@ def test_non_shadow_promotion_is_refused_even_when_not_named_production(tmp_path
             promoted_at="2026-09-27T00:00:00Z",
             versions_dir=versions_dir,
         )
-    assert excinfo.value.code == cr.VERDICT_EVIDENCE_MISSING
+    assert excinfo.value.code == cr.VERDICT_UNKNOWN
+    assert "shadow" in str(excinfo.value) and "production" in str(excinfo.value)
 
 
 def test_promote_refuses_empty_promoted_by(tmp_path):
@@ -411,6 +418,510 @@ def test_promote_never_mutates_or_drops_a_prior_revision(tmp_path):
     assert [r.revision for r in second.history] == [1, 2]
     assert second.history[0] == binding.history[0]
     assert second.active.revision == 2
+
+
+# ---------------------------------------------------------------------------
+# mctlhq/mctl-agents#528 — the production evidence gate
+# (assess_production_evidence, promote()'s production path)
+# ---------------------------------------------------------------------------
+NOW = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
+
+
+def _loaded_version(tmp_path: Path, *, name: str = "deterministic-fixed-order", version: str = "1.0.0", **overrides):
+    versions_dir = tmp_path / "versions"
+    _write_version(tmp_path, name=name, version=version, **overrides)
+    return cr.load_version(name, version, versions_dir=versions_dir)
+
+
+def _identity_for(version: cr.ContextStrategyVersion, **overrides) -> ce.EvidenceIdentity:
+    base = dict(
+        strategy_name=version.name, strategy_version=version.version,
+        ranker_name=version.ranker_name, ranker_version=version.ranker_version,
+        strategy_content_hash=version.content_hash, strategy_implementation_hash=version.implementation_hash,
+        evaluator_name=ce.EVALUATOR_NAME, evaluator_version=ce.EVALUATOR_VERSION,
+        metrics_contract_version=ce.METRICS_CONTRACT_VERSION,
+    )
+    base.update(overrides)
+    return ce.EvidenceIdentity(**base)
+
+
+def _observe_candidate_record(
+    version: cr.ContextStrategyVersion,
+    *,
+    observed_at: str,
+    execution_id: str,
+    work_item_id: str = "wi_1",
+    verdict: str = ce.VERDICT_EVALUATED,
+    evaluator_version: str = ce.EVALUATOR_VERSION,
+    identity: ce.EvidenceIdentity | None = None,
+) -> ce.EvalRecord:
+    resolved_identity = (
+        identity if identity is not None else _identity_for(version, evaluator_version=evaluator_version)
+    )
+    return ce.EvalRecord(
+        record_kind=ce.RECORD_KIND, evaluator_name=ce.EVALUATOR_NAME, evaluator_version=evaluator_version,
+        verdict=verdict, identity=resolved_identity, evidence_kind="observe-candidate",
+        context_snapshot_id="cs-x", content_hash="sha256:" + "c" * 64, store_ref=None, metrics=None, outcome=None,
+        observed_at=observed_at, execution_ref=ce.ExecutionRef(work_item_id=work_item_id, execution_id=execution_id),
+    )
+
+
+def _three_fresh_records(version: cr.ContextStrategyVersion) -> list[ce.EvalRecord]:
+    isos = ("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z")
+    return [
+        _observe_candidate_record(version, observed_at=iso, execution_id=f"we_{i}") for i, iso in enumerate(isos)
+    ]
+
+
+def test_assess_production_evidence_passes_with_three_fresh_observations(tmp_path):
+    version = _loaded_version(tmp_path)
+    verdict = cr.assess_production_evidence(
+        version=version, records=_three_fresh_records(version), evidence_evaluator_version=ce.EVALUATOR_VERSION,
+        now=NOW,
+    )
+    assert verdict.code == cr.VERDICT_OK
+    assert verdict.observations == 3
+    assert verdict.newest_observed_at == "2026-09-26T00:00:00Z"
+    assert verdict.window_seconds == ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS
+
+
+def test_assess_production_evidence_no_records_is_evidence_missing(tmp_path):
+    version = _loaded_version(tmp_path)
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=[], evidence_evaluator_version=ce.EVALUATOR_VERSION, now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_EVIDENCE_MISSING
+
+
+def test_assess_production_evidence_drops_non_observe_candidate_records(tmp_path):
+    """`live`/`stored-replay`/`fixture-baseline`/`none` records — even a
+    `live` record of a run where the candidate was itself authoritative —
+    never satisfy the soak gate (T16)."""
+    version = _loaded_version(tmp_path)
+    live_records = [
+        ce.EvalRecord(
+            record_kind=ce.RECORD_KIND, evaluator_name=ce.EVALUATOR_NAME, evaluator_version=ce.EVALUATOR_VERSION,
+            verdict=ce.VERDICT_EVALUATED, identity=_identity_for(version), evidence_kind="live",
+            context_snapshot_id="cs-x", content_hash="sha256:" + "c" * 64,
+            store_ref=None, metrics=None, outcome=None, observed_at=iso,
+        )
+        for iso in ("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z")
+    ]
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=live_records, evidence_evaluator_version=ce.EVALUATOR_VERSION, now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_EVIDENCE_MISSING
+
+    # Mixed with `observe-candidate` records of a DIFFERENT identity: still
+    # never satisfies the soak gate for THIS version.
+    other_identity = _identity_for(version, strategy_version="9.9.9")
+    mixed = live_records + [
+        _observe_candidate_record(version, observed_at=iso, execution_id=f"we_{i}", identity=other_identity)
+        for i, iso in enumerate(("2026-09-26T00:00:01Z", "2026-09-25T00:00:01Z", "2026-09-24T00:00:01Z"))
+    ]
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=mixed, evidence_evaluator_version=ce.EVALUATOR_VERSION, now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_EVIDENCE_MISMATCH  # declared-identity mismatch, not missing
+
+
+def test_assess_production_evidence_hash_mismatch_precedes_insufficient(tmp_path):
+    """A `verdict: hash-mismatch` record for the promoted identity is refused
+    as `hash-mismatch`, not `evidence-insufficient` — pinning the precedence
+    (T5): `assess_evidence` would otherwise silently drop it from `usable`
+    and report `insufficient-observations` instead, hiding the real fault."""
+    version = _loaded_version(tmp_path)
+    records = [_observe_candidate_record(version, observed_at="2026-09-26T00:00:00Z", execution_id="we_0",
+                                          verdict=ce.VERDICT_HASH_MISMATCH)]
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=records, evidence_evaluator_version=ce.EVALUATOR_VERSION, now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_HASH_MISMATCH
+
+
+def test_assess_production_evidence_evaluator_version_mismatch(tmp_path):
+    version = _loaded_version(tmp_path)
+    records = _three_fresh_records(version)
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=records, evidence_evaluator_version="9.9.9", now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_EVIDENCE_MISMATCH
+
+
+def test_assess_production_evidence_evaluator_version_required(tmp_path):
+    version = _loaded_version(tmp_path)
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=_three_fresh_records(version), evidence_evaluator_version=None, now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_EVIDENCE_MISMATCH
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"strategy_name": "trust-freshness-ranked"},
+        {"strategy_version": "9.9.9"},
+        {"strategy_content_hash": "sha256:" + "9" * 64},
+        {"strategy_implementation_hash": "sha256:" + "9" * 64},
+    ],
+)
+def test_assess_production_evidence_four_way_identity_mismatch(tmp_path, override):
+    version = _loaded_version(tmp_path)
+    identity = _identity_for(version, **override)
+    records = [
+        _observe_candidate_record(version, observed_at=iso, execution_id=f"we_{i}", identity=identity)
+        for i, iso in enumerate(("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z"))
+    ]
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=records, evidence_evaluator_version=ce.EVALUATOR_VERSION, now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_EVIDENCE_MISMATCH
+
+
+def test_assess_production_evidence_stale(tmp_path):
+    version = _loaded_version(tmp_path)
+    old_records = [
+        _observe_candidate_record(version, observed_at=iso, execution_id=f"we_{i}")
+        for i, iso in enumerate(("2026-01-03T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-01T00:00:00Z"))
+    ]
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=old_records, evidence_evaluator_version=ce.EVALUATOR_VERSION, now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_EVIDENCE_STALE
+
+
+def test_assess_production_evidence_insufficient_observations_and_retries_count_once(tmp_path):
+    """T15: two distinct executions is insufficient; three retries of ONE
+    execution still count once, not three."""
+    version = _loaded_version(tmp_path)
+    two_only = _three_fresh_records(version)[:2]
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=two_only, evidence_evaluator_version=ce.EVALUATOR_VERSION, now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_EVIDENCE_INSUFFICIENT
+
+    retries = [
+        _observe_candidate_record(version, observed_at=iso, execution_id="we_same")
+        for iso in ("2026-09-26T00:00:03Z", "2026-09-26T00:00:02Z", "2026-09-26T00:00:01Z")
+    ]
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=retries, evidence_evaluator_version=ce.EVALUATOR_VERSION, now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_EVIDENCE_INSUFFICIENT
+
+
+def test_assess_production_evidence_rejects_observe_candidate_with_store_ref(tmp_path):
+    """P1 (issue-528 slice C review, second remaining route): an
+    `observe-candidate` record must never carry a `store_ref` — `evaluate()`
+    refuses this at construction time, but a record parsed from a
+    hand-authored `--evidence-file` is not `evaluate()`-built. Left
+    unchecked, such a record's `store_ref`-keyed observation could win
+    `assess_evidence`'s own anchor selection while `assess_production_
+    evidence`'s anchor selection (which only ever looks at `execution_ref`)
+    finds none, writing a `newest_observed_at=''` into an otherwise `fresh`
+    verdict that `load_binding()` then refuses to read back."""
+    version = _loaded_version(tmp_path)
+    identity = _identity_for(version)
+    malformed = ce.EvalRecord(
+        record_kind=ce.RECORD_KIND, evaluator_name=ce.EVALUATOR_NAME, evaluator_version=ce.EVALUATOR_VERSION,
+        verdict=ce.VERDICT_EVALUATED, identity=identity, evidence_kind="observe-candidate",
+        context_snapshot_id="cs-x", content_hash="sha256:" + "c" * 64,
+        store_ref=StoreRef(
+            work_item_id="wi_1", execution_id="we_0", store_snapshot_id="ss-1",
+            store_content_hash="sha256:" + "d" * 64,
+        ),
+        metrics=None, outcome=None, observed_at="2026-09-26T00:00:00Z", execution_ref=None,
+    )
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=[malformed], evidence_evaluator_version=ce.EVALUATOR_VERSION, now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_UNKNOWN
+    assert "store_ref" in str(excinfo.value)
+
+
+def test_assess_production_evidence_rejects_evaluator_version_not_matching_the_image(tmp_path):
+    """P2 (issue-528 slice C review, still-open hole): sourcing `expected.
+    evaluator_version` from `context_eval.EVALUATOR_VERSION` has no effect —
+    `assess_evidence` never compares that field (`_declared_identity_matches`/
+    `_catalog_identity_matches` do not read it). The gate must reject
+    self-consistent-but-stale evidence directly, by comparing the declared
+    `evaluator_version` against the running image's own constant."""
+    version = _loaded_version(tmp_path)
+    stale_version = ce.EVALUATOR_VERSION + "-stale"
+    records = [
+        _observe_candidate_record(version, observed_at=iso, execution_id=f"we_{i}", evaluator_version=stale_version)
+        for i, iso in enumerate(("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z"))
+    ]
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=records, evidence_evaluator_version=stale_version, now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_EVIDENCE_MISMATCH
+
+
+def test_promote_context_eval_requires_non_empty_evidence_ref(tmp_path):
+    """P1 (issue-528 slice C review, first remaining route): `promote()` is
+    a public library function on its own, not only reachable through the
+    CLI's own `--evidence-ref` check (tools/context_release.py). It must not
+    rely on that caller to keep `load_binding()`'s invariant that every
+    `context-eval` revision carries a non-empty `evidence.ref`."""
+    versions_dir = tmp_path / "versions"
+    version = _loaded_version(tmp_path)
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.promote(
+            None, agent="issue-investigator", environment="shadow", strategy_name=version.name,
+            strategy_version=version.version, promoted_by="octocat", reason="missing ref",
+            promoted_at="2026-09-27T00:00:00Z", evidence_kind="context-eval", evidence_ref=None,
+            evidence_evaluator_version=ce.EVALUATOR_VERSION, evidence_records=_three_fresh_records(version),
+            now=NOW, versions_dir=versions_dir,
+        )
+    assert excinfo.value.code == cr.VERDICT_UNKNOWN
+    assert "evidence_ref" in str(excinfo.value)
+
+
+def test_context_release_never_imports_context_eval_at_module_scope():
+    """mctlhq/mctl-agents#528's hard invariant: `assess_production_evidence`
+    imports `orchestrator.context_eval` inside its own function body only —
+    never at column 0 (module scope)."""
+    source = (REPO_ROOT / "orchestrator" / "context_release.py").read_text(encoding="utf-8")
+    assert not re.search(r"^(import|from)\s+orchestrator\.context_eval\b", source, re.MULTILINE)
+    assert not re.search(r"^from\s+orchestrator\s+import\s+.*\bcontext_eval\b", source, re.MULTILINE)
+    # ... but the deferred import genuinely exists, indented, inside a function body.
+    assert re.search(r"^\s+from orchestrator import context_eval\b", source, re.MULTILINE)
+
+
+def test_context_release_never_reads_an_environment_variable():
+    source = (REPO_ROOT / "orchestrator" / "context_release.py").read_text(encoding="utf-8")
+    assert "os.getenv" not in source
+    assert "os.environ" not in source
+
+
+def test_promote_production_with_fresh_evidence_appends_one_revision(tmp_path):
+    """T8: a passing production promotion records `kind: context-eval`, a
+    non-empty `ref`, the `evaluatorVersion`, the newest `observedAt` and the
+    counted `observations`; every prior revision is byte-identical."""
+    versions_dir = tmp_path / "versions"
+    version = _loaded_version(tmp_path)
+    shadow_binding = cr.promote(
+        None, agent="issue-investigator", environment="shadow", strategy_name=version.name,
+        strategy_version=version.version, promoted_by="octocat", reason="shadow baseline",
+        promoted_at="2026-09-20T00:00:00Z", versions_dir=versions_dir,
+    )
+    updated = cr.promote(
+        None, agent="issue-investigator", environment="production", strategy_name=version.name,
+        strategy_version=version.version, promoted_by="octocat", reason="ready for production",
+        promoted_at="2026-09-27T00:00:00Z", evidence_kind="context-eval",
+        evidence_ref="argo-workflow-logs://issue-investigator/run-42",
+        evidence_evaluator_version=ce.EVALUATOR_VERSION, evidence_records=_three_fresh_records(version), now=NOW,
+        versions_dir=versions_dir,
+    )
+    assert updated.active.revision == 1
+    assert updated.active.evidence_kind == "context-eval"
+    assert updated.active.evidence_ref == "argo-workflow-logs://issue-investigator/run-42"
+    assert updated.active.evidence_evaluator_version == ce.EVALUATOR_VERSION
+    assert updated.active.evidence_observed_at == "2026-09-26T00:00:00Z"
+    assert updated.active.evidence_observations == 3
+    # The shadow binding this test also builds is untouched by the
+    # production promotion above — they are different (agent, environment)
+    # documents.
+    assert shadow_binding.active.revision == 1
+    assert shadow_binding.active.evidence_kind == "none"
+
+
+def test_promote_shadow_with_context_eval_evidence_round_trips_through_load_binding(tmp_path):
+    """A `shadow` promotion that declares `evidence.kind: context-eval` must
+    still fill `observedAt`/`observations`: `load_binding()` requires both of
+    those fields on ANY `context-eval` revision, not only a `production` one
+    (`test_load_binding_context_eval_revision_requires_the_four_evidence_fields`).
+    Without running the evidence assessment for `shadow` too, `promote()`
+    would write a revision `load_binding()` can never read back."""
+    versions_dir = tmp_path / "versions"
+    bindings_dir = tmp_path / "bindings"
+    version = _loaded_version(tmp_path)
+    updated = cr.promote(
+        None, agent="issue-investigator", environment="shadow", strategy_name=version.name,
+        strategy_version=version.version, promoted_by="octocat", reason="shadow, with real evidence attached",
+        promoted_at="2026-09-27T00:00:00Z", evidence_kind="context-eval",
+        evidence_ref="argo-workflow-logs://issue-investigator/run-42",
+        evidence_evaluator_version=ce.EVALUATOR_VERSION, evidence_records=_three_fresh_records(version), now=NOW,
+        versions_dir=versions_dir,
+    )
+    assert updated.active.evidence_observed_at == "2026-09-26T00:00:00Z"
+    assert updated.active.evidence_observations == 3
+
+    path = bindings_dir / "shadow" / "issue-investigator.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(updated.to_dict()), encoding="utf-8")
+
+    reloaded = cr.load_binding("issue-investigator", "shadow", bindings_dir=bindings_dir)
+    assert reloaded.active.evidence_kind == "context-eval"
+    assert reloaded.active.evidence_observed_at == "2026-09-26T00:00:00Z"
+    assert reloaded.active.evidence_observations == 3
+
+
+def test_promote_production_never_mutates_a_prior_revision(tmp_path):
+    versions_dir = tmp_path / "versions"
+    version = _loaded_version(tmp_path)
+    first = cr.promote(
+        None, agent="issue-investigator", environment="production", strategy_name=version.name,
+        strategy_version=version.version, promoted_by="octocat", reason="first",
+        promoted_at="2026-09-27T00:00:00Z", evidence_kind="context-eval", evidence_ref="run-1",
+        evidence_evaluator_version=ce.EVALUATOR_VERSION, evidence_records=_three_fresh_records(version), now=NOW,
+        versions_dir=versions_dir,
+    )
+    later_records = [
+        _observe_candidate_record(version, observed_at=iso, execution_id=f"we_later_{i}")
+        for i, iso in enumerate(("2026-09-28T00:00:00Z", "2026-09-27T00:00:00Z", "2026-09-26T00:00:00Z"))
+    ]
+    second = cr.promote(
+        first, agent="issue-investigator", environment="production", strategy_name=version.name,
+        strategy_version=version.version, promoted_by="octocat", reason="second",
+        promoted_at="2026-09-28T00:00:00Z", evidence_kind="context-eval", evidence_ref="run-2",
+        evidence_evaluator_version=ce.EVALUATOR_VERSION, evidence_records=later_records,
+        now=datetime(2026, 9, 28, tzinfo=UTC), versions_dir=versions_dir,
+    )
+    assert [r.revision for r in second.history] == [1, 2]
+    assert second.history[0] == first.history[0]
+    assert second.active.revision == 2
+
+
+def test_promote_production_requires_now(tmp_path):
+    versions_dir = tmp_path / "versions"
+    version = _loaded_version(tmp_path)
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.promote(
+            None, agent="issue-investigator", environment="production", strategy_name=version.name,
+            strategy_version=version.version, promoted_by="octocat", reason="x",
+            promoted_at="2026-09-27T00:00:00Z", evidence_kind="context-eval",
+            evidence_ref="run-1", evidence_evaluator_version=ce.EVALUATOR_VERSION,
+            evidence_records=_three_fresh_records(version), now=None, versions_dir=versions_dir,
+        )
+    assert excinfo.value.code == cr.VERDICT_UNKNOWN
+
+
+def test_promote_production_deprecated_version_refused_while_existing_binding_resolves(tmp_path):
+    versions_dir = tmp_path / "versions"
+    bindings_dir = tmp_path / "bindings"
+    _write_version(tmp_path, name="deterministic-fixed-order", version="1.0.0", lifecycle="deprecated")
+    _write_binding(
+        tmp_path, environment="production",
+        history=[_revision(lifecycle="deprecated", evidence_kind="none")],
+    )
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.promote(
+            None, agent="issue-investigator", environment="production", strategy_name="deterministic-fixed-order",
+            strategy_version="1.0.0", promoted_by="octocat", reason="try again", promoted_at="2026-09-27T00:00:00Z",
+            evidence_kind="context-eval", evidence_ref="run-1", evidence_evaluator_version=ce.EVALUATOR_VERSION,
+            now=NOW, versions_dir=versions_dir,
+        )
+    assert excinfo.value.code == cr.VERDICT_VERSION_NOT_PROMOTABLE
+    resolved = cr.resolve(
+        "issue-investigator", "production", versions_dir=versions_dir, bindings_dir=bindings_dir
+    )
+    assert resolved.verdict == cr.VERDICT_OK
+
+
+def test_promote_production_disabled_version_refused(tmp_path):
+    versions_dir = tmp_path / "versions"
+    _write_version(tmp_path, name="deterministic-fixed-order", version="1.0.0", lifecycle="disabled")
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.promote(
+            None, agent="issue-investigator", environment="production", strategy_name="deterministic-fixed-order",
+            strategy_version="1.0.0", promoted_by="octocat", reason="x", promoted_at="2026-09-27T00:00:00Z",
+            evidence_kind="context-eval", evidence_ref="run-1", evidence_evaluator_version=ce.EVALUATOR_VERSION,
+            now=NOW, versions_dir=versions_dir,
+        )
+    assert excinfo.value.code == cr.VERDICT_VERSION_DISABLED
+
+
+# ---------------------------------------------------------------------------
+# load_binding()'s evidence-shape checks (Task 2 DoD)
+# ---------------------------------------------------------------------------
+def test_load_binding_context_eval_revision_requires_the_four_evidence_fields(tmp_path):
+    doc = _binding_doc(
+        environment="production",
+        history=[
+            {
+                **_revision(evidence_kind="context-eval"),
+                "evidence": {"kind": "context-eval", "ref": None, "evaluatorVersion": "1.0.0"},
+            }
+        ],
+    )
+    path = tmp_path / "bindings" / "production" / "issue-investigator.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    with pytest.raises(cr.ContextReleaseError, match=r"evidence\.ref"):
+        cr.load_binding("issue-investigator", "production", bindings_dir=tmp_path / "bindings")
+
+
+def test_load_binding_context_eval_revision_requires_observations_to_be_a_positive_int(tmp_path):
+    doc = _binding_doc(
+        environment="production",
+        history=[
+            {
+                **_revision(evidence_kind="context-eval"),
+                "evidence": {
+                    "kind": "context-eval", "ref": "run-1", "evaluatorVersion": "1.0.0",
+                    "observedAt": "2026-09-26T00:00:00Z", "observations": 0,
+                },
+            }
+        ],
+    )
+    path = tmp_path / "bindings" / "production" / "issue-investigator.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    with pytest.raises(cr.ContextReleaseError, match=r"evidence\.observations"):
+        cr.load_binding("issue-investigator", "production", bindings_dir=tmp_path / "bindings")
+
+
+def test_load_binding_none_revision_must_not_carry_observed_at_or_observations(tmp_path):
+    doc = _binding_doc(
+        environment="shadow",
+        history=[
+            {
+                **_revision(evidence_kind="none"),
+                "evidence": {"kind": "none", "ref": None, "evaluatorVersion": None, "observations": 3},
+            }
+        ],
+    )
+    path = tmp_path / "bindings" / "shadow" / "issue-investigator.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    with pytest.raises(cr.ContextReleaseError, match="must not carry"):
+        cr.load_binding("issue-investigator", "shadow", bindings_dir=tmp_path / "bindings")
+
+
+def test_load_binding_context_eval_revision_round_trips_through_to_dict(tmp_path):
+    doc = _binding_doc(
+        environment="production",
+        history=[
+            {
+                **_revision(evidence_kind="context-eval"),
+                "evidence": {
+                    "kind": "context-eval", "ref": "run-1", "evaluatorVersion": "1.0.0",
+                    "observedAt": "2026-09-26T00:00:00Z", "observations": 3,
+                },
+            }
+        ],
+    )
+    path = tmp_path / "bindings" / "production" / "issue-investigator.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    binding = cr.load_binding("issue-investigator", "production", bindings_dir=tmp_path / "bindings")
+    assert binding.active.evidence_observed_at == "2026-09-26T00:00:00Z"
+    assert binding.active.evidence_observations == 3
+    assert binding.to_dict()["spec"]["history"][0]["evidence"]["observations"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +1193,147 @@ def test_cli_promote_rejects_unsafe_agent_path_segment(tmp_path):
     )
     assert result.returncode != 0
     assert "must be a single path segment" in result.stderr
+
+
+def test_cli_promote_requires_evidence_ref_for_context_eval_kind(tmp_path):
+    """T13/T6: `--evidence-kind context-eval` without `--evidence-ref` is
+    rejected before any catalog access — this never touches the real
+    committed catalog, so it is safe regardless of its current hash state."""
+    result = subprocess.run(
+        [
+            sys.executable, str(REPO_ROOT / "tools" / "context_release.py"),
+            "promote", "--agent", "issue-investigator", "--environment", "production",
+            "--strategy", "deterministic-fixed-order", "--version", "1.0.0",
+            "--promoted-by", "octocat", "--reason", "x", "--evidence-kind", "context-eval",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "unknown:" in result.stderr
+    assert "--evidence-ref" in result.stderr
+
+
+def test_cli_promote_malformed_evidence_line_exits_nonzero_naming_the_line(tmp_path):
+    """T13: an unparsable evidence file exits non-zero with `unknown:` and
+    the offending line number, before any catalog access."""
+    evidence_path = tmp_path / "evidence.jsonl"
+    valid_line = json.dumps({"record_kind": ce.RECORD_KIND, "verdict": ce.VERDICT_EVALUATED})
+    evidence_path.write_text(f"{valid_line}\nnot-json-at-all\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable, str(REPO_ROOT / "tools" / "context_release.py"),
+            "promote", "--agent", "issue-investigator", "--environment", "production",
+            "--strategy", "deterministic-fixed-order", "--version", "1.0.0",
+            "--promoted-by", "octocat", "--reason", "x", "--evidence-kind", "context-eval",
+            "--evidence-ref", "run-1", "--evidence-file", str(evidence_path),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "unknown:" in result.stderr
+    assert "line 2" in result.stderr
+
+
+def _real_catalog_evidence_records() -> list[str]:
+    """JSONL lines of three fresh, distinct-execution `observe-candidate`
+    records matching the REAL committed `deterministic-fixed-order`@1.0.0
+    identity — read via `cr.load_version` so this never hardcodes a hash
+    that a republish would change."""
+    version = cr.load_version("deterministic-fixed-order", "1.0.0")
+    identity = ce.EvidenceIdentity(
+        strategy_name=version.name, strategy_version=version.version, ranker_name=version.ranker_name,
+        ranker_version=version.ranker_version, strategy_content_hash=version.content_hash,
+        strategy_implementation_hash=version.implementation_hash, evaluator_name=ce.EVALUATOR_NAME,
+        evaluator_version=ce.EVALUATOR_VERSION, metrics_contract_version=ce.METRICS_CONTRACT_VERSION,
+    )
+    isos = ("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z")
+    records = [
+        ce.EvalRecord(
+            record_kind=ce.RECORD_KIND, evaluator_name=ce.EVALUATOR_NAME, evaluator_version=ce.EVALUATOR_VERSION,
+            verdict=ce.VERDICT_EVALUATED, identity=identity, evidence_kind="observe-candidate",
+            context_snapshot_id="cs-x", content_hash="sha256:" + "c" * 64, store_ref=None, metrics=None,
+            outcome=None, observed_at=iso,
+            execution_ref=ce.ExecutionRef(work_item_id="wi_1", execution_id=f"we_{i}"),
+        )
+        for i, iso in enumerate(isos)
+    ]
+    return [json.dumps(r.to_log_dict()) for r in records]
+
+
+def test_cli_promote_production_dry_run_with_fresh_evidence_prints_the_gate_and_writes_nothing(tmp_path):
+    """T13: `promote --environment production --evidence-file <fresh>.jsonl
+    --dry-run` prints the passing gate and writes no file. Runs against the
+    REAL committed catalog (`cr.load_version` inside the CLI has no
+    `--versions-dir` override), so this DoD is only exercised once task 10's
+    republish has run — see `tests/test_context_release.py::test_published_
+    catalog_hashes_are_not_drifted` for that guard."""
+    evidence_path = tmp_path / "evidence.jsonl"
+    evidence_path.write_text("\n".join(_real_catalog_evidence_records()) + "\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable, str(REPO_ROOT / "tools" / "context_release.py"),
+            "promote", "--agent", "issue-investigator", "--environment", "production",
+            "--strategy", "deterministic-fixed-order", "--version", "1.0.0",
+            "--promoted-by", "octocat", "--reason", "3 clean observe-mode soak runs",
+            "--evidence-kind", "context-eval", "--evidence-ref", "argo-workflow-logs://soak-2026-09",
+            "--evidence-evaluator-version", ce.EVALUATOR_VERSION, "--evidence-file", str(evidence_path),
+            "--dry-run",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "gate: status=ok" in result.stdout
+    assert "observations=3" in result.stdout
+    assert "would write" in result.stdout
+    assert not (REPO_ROOT / "config" / "context-strategies" / "bindings" / "production").exists()
+
+
+def test_cli_promote_production_stale_evidence_exits_nonzero_naming_evidence_stale(tmp_path):
+    version = cr.load_version("deterministic-fixed-order", "1.0.0")
+    identity = ce.EvidenceIdentity(
+        strategy_name=version.name, strategy_version=version.version, ranker_name=version.ranker_name,
+        ranker_version=version.ranker_version, strategy_content_hash=version.content_hash,
+        strategy_implementation_hash=version.implementation_hash, evaluator_name=ce.EVALUATOR_NAME,
+        evaluator_version=ce.EVALUATOR_VERSION, metrics_contract_version=ce.METRICS_CONTRACT_VERSION,
+    )
+    stale_isos = ("2026-01-03T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-01T00:00:00Z")
+    records = [
+        ce.EvalRecord(
+            record_kind=ce.RECORD_KIND, evaluator_name=ce.EVALUATOR_NAME, evaluator_version=ce.EVALUATOR_VERSION,
+            verdict=ce.VERDICT_EVALUATED, identity=identity, evidence_kind="observe-candidate",
+            context_snapshot_id="cs-x", content_hash="sha256:" + "c" * 64, store_ref=None, metrics=None,
+            outcome=None, observed_at=iso,
+            execution_ref=ce.ExecutionRef(work_item_id="wi_1", execution_id=f"we_{i}"),
+        )
+        for i, iso in enumerate(stale_isos)
+    ]
+    evidence_path = tmp_path / "evidence.jsonl"
+    evidence_path.write_text("\n".join(json.dumps(r.to_log_dict()) for r in records) + "\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable, str(REPO_ROOT / "tools" / "context_release.py"),
+            "promote", "--agent", "issue-investigator", "--environment", "production",
+            "--strategy", "deterministic-fixed-order", "--version", "1.0.0",
+            "--promoted-by", "octocat", "--reason", "stale evidence", "--evidence-kind", "context-eval",
+            "--evidence-ref", "argo-workflow-logs://soak-2026-01", "--evidence-evaluator-version",
+            ce.EVALUATOR_VERSION, "--evidence-file", str(evidence_path), "--dry-run",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "evidence-stale" in result.stderr
 
 
 def test_cli_help_exits_zero():
