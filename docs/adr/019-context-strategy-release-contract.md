@@ -188,17 +188,18 @@ refusal precedence — never order-dependent, each a distinct
 |---|---|---|
 | 1 | `promote()`'s own `evidence_kind != "context-eval"` (including `"none"`) | `evidence-missing` |
 | 2 | No `evidence_kind: "observe-candidate"` records supplied | `evidence-missing` |
-| 3 | A record for the promoted identity carries `verdict: "hash-mismatch"` | `hash-mismatch` |
-| 4 | The supplied `evidence.evaluatorVersion` disagrees with the records' own `evaluator_version` | `evidence-mismatch` |
-| 5 | `context_eval.assess_evidence` -> `missing` | `evidence-missing` |
-| 6 | `context_eval.assess_evidence` -> `mismatched` | `evidence-mismatch` |
-| 7 | `context_eval.assess_evidence` -> `stale` | `evidence-stale` |
-| 8 | `context_eval.assess_evidence` -> `insufficient-observations` | `evidence-insufficient` |
-| 9 | `context_eval.assess_evidence` -> `fresh` | accepted; the revision's `evidence` block records `kind: context-eval`, `ref`, `evaluatorVersion`, the newest counted `observedAt` and the `observations` count |
+| 3 | A supplied `observe-candidate` record carries a non-null `store_ref` | `unknown` |
+| 4 | A record for the promoted identity carries `verdict: "hash-mismatch"` | `hash-mismatch` |
+| 5 | The supplied `evidence.evaluatorVersion` is empty, disagrees with the records' own `evaluator_version`, or disagrees with this image's own `context_eval.EVALUATOR_VERSION` | `evidence-mismatch` |
+| 6 | `context_eval.assess_evidence` -> `missing` | `evidence-missing` |
+| 7 | `context_eval.assess_evidence` -> `mismatched` | `evidence-mismatch` |
+| 8 | `context_eval.assess_evidence` -> `stale` | `evidence-stale` |
+| 9 | `context_eval.assess_evidence` -> `insufficient-observations` | `evidence-insufficient` |
+| 10 | `context_eval.assess_evidence` -> `fresh` | accepted; the revision's `evidence` block records `kind: context-eval`, `ref`, `evaluatorVersion`, the newest counted `observedAt` and the `observations` count |
 
-Step 3 runs before `assess_evidence` (steps 5-9) on purpose:
+Step 4 runs before `assess_evidence` (steps 6-10) on purpose:
 `assess_evidence` silently drops a non-`evaluated`-verdict record from
-`usable`, so without step 3 a hash-mismatched soak would surface as
+`usable`, so without step 4 a hash-mismatched soak would surface as
 `evidence-insufficient` and hide the real fault.
 
 `mctlhq/mctl-agents#526` was the undelivered evaluator half of #266; Slice C

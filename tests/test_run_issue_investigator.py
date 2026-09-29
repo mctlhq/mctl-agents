@@ -4085,6 +4085,69 @@ def test_context_eval_on_prints_the_observe_candidate_record_second(tmp_path, mo
     assert candidate_payload["store_ref"] is None
 
 
+def test_context_eval_on_still_prints_observe_candidate_record_when_the_live_record_fails(
+    tmp_path, monkeypatch, capsys
+):
+    """Regression for commit b4ce95a (mctlhq/mctl-agents#528 P2 codex
+    finding): `_emit_context_eval` used to `return` right after the
+    authoritative `live` record's try/except block, which meant that a
+    failure evaluating the `live` record silently suppressed the
+    `observe-candidate` record too. b4ce95a removed that early `return` so
+    the function falls through to still emit `observe-candidate` — the
+    ONLY source of production soak evidence (ADR 019 sec. 2) — even when the
+    live evaluation raises. Nothing pinned that fix: this test forces
+    `context_eval.evaluate(..., evidence_kind="live")` to raise and asserts
+    the candidate record is still printed and the investigation still
+    succeeds."""
+    from orchestrator import context_assembly as ca
+    from orchestrator import context_eval, context_release, context_rollout
+
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_EVAL", "on")
+    monkeypatch.setenv(context_rollout.ENV_VAR, context_rollout.OBSERVE)
+    monkeypatch.delenv("AGENT_ENVIRONMENT", raising=False)
+
+    fake_resolved = context_release.ResolvedContextStrategy(
+        agent="issue-investigator",
+        environment=context_rollout.OBSERVE_ENVIRONMENT,
+        strategy=ca.RANKED_STRATEGY_NAME,
+        version=ca.RANKED_STRATEGY_VERSION,
+        ranker_name=ca.RANKER_NAME,
+        ranker_version=ca.RANKER_VERSION,
+        content_hash="sha256:" + "0" * 64,
+        implementation_hash="sha256:" + "1" * 64,
+        release_revision=99,
+        verdict=context_release.VERDICT_OK,
+    )
+    monkeypatch.setattr(context_release, "resolve", lambda agent, environment: fake_resolved)
+
+    real_evaluate = context_eval.evaluate
+
+    def fake_evaluate(*args, **kwargs):
+        if kwargs.get("evidence_kind") == "live":
+            raise RuntimeError("boom: live evaluation exploded")
+        return real_evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(context_eval, "evaluate", fake_evaluate)
+
+    def agent(repo_dir, prompt, proposal_dir):
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v1 {name}")
+
+    issue = _shadow_harness(tmp_path, monkeypatch, mode="shadow", agent=agent)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+    assert result.error is None
+
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    context_eval_lines = [line for line in lines if line.startswith("[context] context_eval=")]
+    assert len(context_eval_lines) == 1
+
+    candidate_payload = json.loads(context_eval_lines[0].split("=", 1)[1])
+    assert candidate_payload["evidence_kind"] == "observe-candidate"
+
+    assert any(line.startswith("warn: context evaluation failed") for line in lines)
+
+
 def test_context_eval_on_carries_the_strategy_catalog_identity(tmp_path, monkeypatch, capsys):
     """Regression for the catalog-identity fix in commit 61d2d79
     (mctlhq/mctl-agents#526): before that fix, `_emit_context_eval` never
