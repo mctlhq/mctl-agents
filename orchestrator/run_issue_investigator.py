@@ -2082,7 +2082,10 @@ def _emit_context_eval(result: context_assembly.AssemblyResult) -> None:
         print(f"[context] context_eval={json.dumps(record.to_log_dict(), sort_keys=True)}")
     except Exception as exc:  # noqa: BLE001 — a metric bug must never fail an investigation
         print(f"warn: context evaluation failed: {type(exc).__name__}: {exc}")
-        return
+        # No return here: the observe-candidate record below is the ONLY
+        # source of production soak evidence (mctlhq/mctl-agents#528, ADR
+        # 019 sec. 2) and must stay independently best-effort — a failure
+        # evaluating the authoritative record must never suppress it.
 
     candidate = result.observe_candidate
     if candidate is None:

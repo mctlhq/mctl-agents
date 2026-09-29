@@ -714,18 +714,33 @@ def assess_production_evidence(
     `ContextReleaseError.code`:
 
     1. No `observe-candidate` records supplied -> `evidence-missing`.
-    2. Any record whose declared strategy+version match `version` carries
+    2. Any supplied record carries a non-null `store_ref` -> `unknown`.
+       `evidence_kind == "observe-candidate"` must never have one
+       (`evaluate()` refuses it at construction time), but a record parsed
+       from a hand-authored `--evidence-file` is not `evaluate()`-built and
+       is not otherwise checked. Left unchecked, such a record's
+       `store_ref`-keyed observation could win the anchor selection inside
+       `assess_evidence` while this function's own anchor selection below —
+       which only ever looks at `execution_ref` — finds none, so a `fresh`
+       verdict would carry an empty `newest_observed_at` that
+       `load_binding()` then refuses to read back.
+    3. Any record whose declared strategy+version match `version` carries
        `verdict: "hash-mismatch"` -> `hash-mismatch` — checked BEFORE
        `assess_evidence`, which silently drops a non-`evaluated`-verdict
        record from `usable` and would otherwise surface this as
        `evidence-insufficient`, hiding the real fault.
-    3. `evidence_evaluator_version` is empty, or disagrees with the
-       records' own `evaluator_version` -> `evidence-mismatch`.
-    4. `assess_evidence -> missing` -> `evidence-missing`.
-    5. `assess_evidence -> mismatched` -> `evidence-mismatch`.
-    6. `assess_evidence -> stale` -> `evidence-stale`.
-    7. `assess_evidence -> insufficient-observations` -> `evidence-insufficient`.
-    8. `assess_evidence -> fresh` -> accepted.
+    4. `evidence_evaluator_version` is empty, disagrees with the records'
+       own `evaluator_version`, or disagrees with this image's own
+       `context_eval.EVALUATOR_VERSION` -> `evidence-mismatch`. The image's
+       own version is checked directly here — `assess_evidence` never reads
+       `EvidenceIdentity.evaluator_version` (`_declared_identity_matches`/
+       `_catalog_identity_matches` do not compare it), so setting it on
+       `expected` below has no effect of its own.
+    5. `assess_evidence -> missing` -> `evidence-missing`.
+    6. `assess_evidence -> mismatched` -> `evidence-mismatch`.
+    7. `assess_evidence -> stale` -> `evidence-stale`.
+    8. `assess_evidence -> insufficient-observations` -> `evidence-insufficient`.
+    9. `assess_evidence -> fresh` -> accepted.
 
     (The caller, `promote()`, handles the one precedence step this function
     never sees: `evidence_kind != "context-eval"`, including `"none"`, is
@@ -745,6 +760,15 @@ def assess_production_evidence(
             VERDICT_EVIDENCE_MISSING,
             f"no evidence.kind='observe-candidate' records were supplied for {version.name}@{version.version}; "
             f"reason_code=no-evidence, observations=0, window={window_seconds}s",
+        )
+
+    malformed_store_ref = [r for r in production_records if r.store_ref is not None]
+    if malformed_store_ref:
+        raise ContextReleaseError(
+            VERDICT_UNKNOWN,
+            f"{len(malformed_store_ref)} supplied observe-candidate record(s) for {version.name}@"
+            f"{version.version} carry a store_ref, which evidence_kind='observe-candidate' must never have "
+            "(evaluate() refuses this at construction time; a hand-authored --evidence-file input might not)",
         )
 
     matching_hash_mismatch = [
@@ -767,11 +791,13 @@ def assess_production_evidence(
         not evidence_evaluator_version
         or len(evaluator_versions) != 1
         or evidence_evaluator_version not in evaluator_versions
+        or evidence_evaluator_version != context_eval.EVALUATOR_VERSION
     ):
         raise ContextReleaseError(
             VERDICT_EVIDENCE_MISMATCH,
             f"evidence.evaluatorVersion {evidence_evaluator_version!r} disagrees with the evaluator_version the "
-            f"supplied records carry ({sorted(evaluator_versions)!r}); reason_code=evaluator-version-mismatch, "
+            f"supplied records carry ({sorted(evaluator_versions)!r}) or with this image's own evaluator_version "
+            f"{context_eval.EVALUATOR_VERSION!r}; reason_code=evaluator-version-mismatch, "
             f"observations={len(production_records)}, window={window_seconds}s",
         )
 
@@ -889,6 +915,16 @@ def promote(
     if evidence_kind not in EVIDENCE_KINDS:
         raise ContextReleaseError(
             VERDICT_UNKNOWN, f"evidence.kind must be one of {sorted(EVIDENCE_KINDS)!r}, got {evidence_kind!r}"
+        )
+    if evidence_kind == "context-eval" and (not isinstance(evidence_ref, str) or not evidence_ref.strip()):
+        # load_binding() requires a non-empty evidence.ref on every
+        # context-eval revision, in any environment (see load_binding above);
+        # the CLI enforces this too (tools/context_release.py's --evidence-ref
+        # check), but promote() is a public library function on its own and
+        # must not rely on that caller to keep this invariant.
+        raise ContextReleaseError(
+            VERDICT_UNKNOWN,
+            "evidence.kind='context-eval' requires a non-empty evidence_ref",
         )
 
     if environment not in PROMOTION_ENVIRONMENTS:

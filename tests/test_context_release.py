@@ -27,6 +27,7 @@ import yaml
 
 from orchestrator import context_eval as ce
 from orchestrator import context_release as cr
+from orchestrator.work_context.snapshots import StoreRef
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -617,6 +618,76 @@ def test_assess_production_evidence_insufficient_observations_and_retries_count_
             version=version, records=retries, evidence_evaluator_version=ce.EVALUATOR_VERSION, now=NOW
         )
     assert excinfo.value.code == cr.VERDICT_EVIDENCE_INSUFFICIENT
+
+
+def test_assess_production_evidence_rejects_observe_candidate_with_store_ref(tmp_path):
+    """P1 (issue-528 slice C review, second remaining route): an
+    `observe-candidate` record must never carry a `store_ref` — `evaluate()`
+    refuses this at construction time, but a record parsed from a
+    hand-authored `--evidence-file` is not `evaluate()`-built. Left
+    unchecked, such a record's `store_ref`-keyed observation could win
+    `assess_evidence`'s own anchor selection while `assess_production_
+    evidence`'s anchor selection (which only ever looks at `execution_ref`)
+    finds none, writing a `newest_observed_at=''` into an otherwise `fresh`
+    verdict that `load_binding()` then refuses to read back."""
+    version = _loaded_version(tmp_path)
+    identity = _identity_for(version)
+    malformed = ce.EvalRecord(
+        record_kind=ce.RECORD_KIND, evaluator_name=ce.EVALUATOR_NAME, evaluator_version=ce.EVALUATOR_VERSION,
+        verdict=ce.VERDICT_EVALUATED, identity=identity, evidence_kind="observe-candidate",
+        context_snapshot_id="cs-x", content_hash="sha256:" + "c" * 64,
+        store_ref=StoreRef(
+            work_item_id="wi_1", execution_id="we_0", store_snapshot_id="ss-1",
+            store_content_hash="sha256:" + "d" * 64,
+        ),
+        metrics=None, outcome=None, observed_at="2026-09-26T00:00:00Z", execution_ref=None,
+    )
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=[malformed], evidence_evaluator_version=ce.EVALUATOR_VERSION, now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_UNKNOWN
+    assert "store_ref" in str(excinfo.value)
+
+
+def test_assess_production_evidence_rejects_evaluator_version_not_matching_the_image(tmp_path):
+    """P2 (issue-528 slice C review, still-open hole): sourcing `expected.
+    evaluator_version` from `context_eval.EVALUATOR_VERSION` has no effect —
+    `assess_evidence` never compares that field (`_declared_identity_matches`/
+    `_catalog_identity_matches` do not read it). The gate must reject
+    self-consistent-but-stale evidence directly, by comparing the declared
+    `evaluator_version` against the running image's own constant."""
+    version = _loaded_version(tmp_path)
+    stale_version = ce.EVALUATOR_VERSION + "-stale"
+    records = [
+        _observe_candidate_record(version, observed_at=iso, execution_id=f"we_{i}", evaluator_version=stale_version)
+        for i, iso in enumerate(("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z"))
+    ]
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.assess_production_evidence(
+            version=version, records=records, evidence_evaluator_version=stale_version, now=NOW
+        )
+    assert excinfo.value.code == cr.VERDICT_EVIDENCE_MISMATCH
+
+
+def test_promote_context_eval_requires_non_empty_evidence_ref(tmp_path):
+    """P1 (issue-528 slice C review, first remaining route): `promote()` is
+    a public library function on its own, not only reachable through the
+    CLI's own `--evidence-ref` check (tools/context_release.py). It must not
+    rely on that caller to keep `load_binding()`'s invariant that every
+    `context-eval` revision carries a non-empty `evidence.ref`."""
+    versions_dir = tmp_path / "versions"
+    version = _loaded_version(tmp_path)
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.promote(
+            None, agent="issue-investigator", environment="shadow", strategy_name=version.name,
+            strategy_version=version.version, promoted_by="octocat", reason="missing ref",
+            promoted_at="2026-09-27T00:00:00Z", evidence_kind="context-eval", evidence_ref=None,
+            evidence_evaluator_version=ce.EVALUATOR_VERSION, evidence_records=_three_fresh_records(version),
+            now=NOW, versions_dir=versions_dir,
+        )
+    assert excinfo.value.code == cr.VERDICT_UNKNOWN
+    assert "evidence_ref" in str(excinfo.value)
 
 
 def test_context_release_never_imports_context_eval_at_module_scope():
