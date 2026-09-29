@@ -147,6 +147,8 @@ def test_the_scope_reaches_a_recorder_built_inside_anyio_run(monkeypatch):
     """The path every runner takes: `correlate` around `anyio.run`, the
     recorder built by `tracing.agent_run` in the task it starts."""
     env = {usage_ledger.TOKEN_ENV: TOKEN, "WORKFLOW_NAME": "mctl-agents-implement-x"}
+    api = FakeApi()
+    monkeypatch.setattr(usage_ledger, "_default_post", api)
 
     async def build() -> usage_ledger.UsageRecorder:
         return usage_ledger.UsageRecorder.from_env("implementer", env)
@@ -155,12 +157,17 @@ def test_the_scope_reaches_a_recorder_built_inside_anyio_run(monkeypatch):
         inside = anyio.run(build)
     after = anyio.run(build)
 
-    (record,) = inside.records_for(_result("u1", {OPUS: _usage(1, 2)}))
+    inside.observe(_result("u1", {OPUS: _usage(1, 2)}))
+    after.observe(_result("u2", {OPUS: _usage(1, 2)}))
+    assert usage_ledger.flush(5)
+
+    by_uuid = {r["result_uuid"]: r for r in api.records}
+    record = by_uuid["u1"]
     assert (record["target_repo"], record["pr_number"], record["argo_workflow_name"]) == (
         "mctlhq/mctl-web", 42, "mctl-agents-implement-x",
     )
     # The next piece of work in the same process starts clean.
-    (record,) = after.records_for(_result("u2", {OPUS: _usage(1, 2)}))
+    record = by_uuid["u2"]
     assert "target_repo" not in record and "pr_number" not in record
 
 

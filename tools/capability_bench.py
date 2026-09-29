@@ -25,8 +25,8 @@ Two independent commands:
   — and renders the markdown table this proposal's benchmark doc expects:
   input, output, cache-read and cache-creation tokens, turns and wall
   clock, with the sample size (1 run per mode, for this pilot) stated
-  explicitly. Token math reuses `orchestrator.usage_ledger.UsageRecorder.
-  records_for` (pure: no delivery, no network — the recorder is
+  explicitly. Token math reuses `orchestrator.usage_ledger.UsageRecorder`'s
+  own `_plan`/`_commit` (no delivery, no network — the recorder is
   unconditionally constructed with no token, which disables delivery by
   construction). USD cost is NOT computed here: the price catalog is
   server-side (mctl-api), not duplicated in this repository.
@@ -172,10 +172,10 @@ def _totals_for_transcript(messages: Sequence[Mapping[str, Any]]) -> dict[str, i
     never asked to deliver, so no network call happens here.
 
     `model_usage` is cumulative per `(session_id, model_key)`. The recorder
-    turns it into per-message deltas only against a committed baseline, and
-    `records_for` never commits one, so each message is planned and then
-    committed here exactly as `UsageRecorder._record` does minus delivery;
-    summing the resulting deltas gives the session's real totals.
+    turns it into per-message deltas only against a committed baseline, so
+    each message is planned and then committed here exactly as
+    `UsageRecorder._record` does minus delivery; summing the resulting
+    deltas gives the session's real totals.
 
     `num_turns`/`duration_api_ms` sit on the ResultMessage itself and are
     cumulative per session too, so each session contributes its largest

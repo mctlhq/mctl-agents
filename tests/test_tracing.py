@@ -505,6 +505,36 @@ def test_valid_traceparent(value, valid):
     assert tracing.valid_traceparent(value) is valid
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        "garbage",
+        f"00-{'0' * 32}-{_PARENT_SPAN}-01",
+        f"00-{_PARENT_TRACE}-{'0' * 16}-01",
+    ],
+)
+def test_trace_ids_rejects_malformed_and_zero_traceparents(value):
+    assert tracing.trace_ids(value) is None
+
+
+def test_trace_ids_parses_a_valid_traceparent_into_its_hex_pair():
+    assert tracing.trace_ids(_TRACEPARENT) == (_PARENT_TRACE, _PARENT_SPAN)
+
+
+def test_current_trace_ids_is_none_when_tracing_is_off():
+    assert tracing.enabled() is False
+    assert tracing.current_trace_ids() is None
+
+
+def test_current_trace_ids_matches_the_current_span(exported):
+    with tracing.span("x"):
+        ids = tracing.current_trace_ids()
+        ctx = tracing.current().otel_span.get_span_context()
+    assert ids == (f"{ctx.trace_id:032x}", f"{ctx.span_id:016x}")
+
+
 def test_pod_root_span_is_parented_on_the_traceparent_env(exported):
     env = {tracing.TRACEPARENT_ENV: _TRACEPARENT, tracing.ARGO_WORKFLOW_NAME_ENV: "mctl-agents-investigate-ab12"}
     with tracing.pod_root_span("investigator.run", {tracing.AGENT_NAME: "issue-investigator"}, environ=env):
