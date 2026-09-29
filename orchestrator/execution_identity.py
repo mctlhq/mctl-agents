@@ -77,6 +77,12 @@ EXECUTOR_TYPES = frozenset({
 
 _TRACE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
+#: seal()'s context_id prefix ("ex-" + content_hash[7:23], ADR 011 sec. 2).
+#: Named so orchestrator/execution_evidence.py's RUNTIME_EXECUTION_ID_PREFIX
+#: can be pinned equal to this one by a prefix-drift test rather than
+#: duplicating a bare literal with no owning symbol to compare against.
+CONTEXT_ID_PREFIX = "ex-"
+
 
 class ExecutionIdentityError(ValueError):
     """Fail-closed schema/validation failure. Every raise site below is
@@ -648,7 +654,7 @@ def seal(
         assertions=assertions,
     )
     content_hash = _hash_bytes(_canonical_json(payload))
-    context_id = "ex-" + content_hash[7:23]
+    context_id = CONTEXT_ID_PREFIX + content_hash[7:23]
     context = ExecutionContext(
         api_version=API_VERSION,
         kind=KIND,
@@ -809,7 +815,7 @@ def load_from_environment(
             # some other (even legitimately sealed) context's id. seal() derives
             # context_id deterministically as "ex-" + content_hash[7:23]; recheck
             # that binding explicitly so a tampered context_id is caught too.
-            expected_context_id = "ex-" + expected_content_hash[7:23]
+            expected_context_id = CONTEXT_ID_PREFIX + expected_content_hash[7:23]
             if not hmac.compare_digest(context.context_id.encode("ascii"), expected_context_id.encode("ascii")):
                 raise ExecutionIdentityError(
                     f"context_id mismatch loaded from {MCTL_EXECUTION_CONTEXT_FILE_ENV}={path!r}: "
