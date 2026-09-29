@@ -1,0 +1,39 @@
+{
+  "api_version": "evidence.mctl.ai/v1alpha1",
+  "approvals": [
+    {
+      "approval_id": "aar_shep0000000000000000000",
+      "intent_hash": "sha256:9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c",
+      "state": "approved"
+    }
+  ],
+  "artifacts": [],
+  "content_hash": "sha256:13362a728651f5ffaa2b899b238545c6aaa77c7dac903cc43c39634700603dd7",
+  "created_at": "2026-09-29T00:00:41Z",
+  "evidence_id": "ev-13362a728651f5ff",
+  "execution": {
+    "execution_id": "we_01J8ZQK7SHEP0000000000000",
+    "runtime_execution_id": "ex-1122334455667788",
+    "trace_id": "dev-loop-mctlhq-mctl-agents-524",
+    "work_item_id": "wi-mctlhq-mctl-agents-524"
+  },
+  "execution_request": null,
+  "gaps": [],
+  "kind": "ExecutionEvidence",
+  "outcome": {
+    "code": "succeeded",
+    "reason_code": "merge-completed"
+  },
+  "policy_decisions": [
+    {
+      "action_digest": "sha256:8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b",
+      "approval_ref": "aar_shep0000000000000000000",
+      "code": "allowed",
+      "policy_version": "mctl-agents/policy/v1",
+      "rule_id": "shepherd-gated-merge",
+      "verdict": "ALLOW"
+    }
+  ],
+  "snapshot_refs": [],
+  "usage": null
+}

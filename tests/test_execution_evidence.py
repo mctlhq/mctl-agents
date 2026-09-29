@@ -20,6 +20,7 @@ import pytest
 
 from orchestrator import action_approvals as aa
 from orchestrator import execution_evidence as ee
+from orchestrator import execution_identity as ei
 from orchestrator import policy_checkpoint as pc
 from orchestrator import redaction as red
 from orchestrator import tracing_sdk as ts
@@ -30,7 +31,32 @@ from orchestrator.work_context import execution_requests as xr
 from orchestrator.work_context import snapshots as wcs
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "evidence" / "investigator-evidence.json"
+EVIDENCE_FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "evidence"
+FIXTURE_PATH = EVIDENCE_FIXTURE_DIR / "investigator-evidence.json"
+IMPLEMENTER_FIXTURE_PATH = EVIDENCE_FIXTURE_DIR / "implementer-evidence.json"
+SHEPHERD_FIXTURE_PATH = EVIDENCE_FIXTURE_DIR / "shepherd-evidence.json"
+
+# (fixture path, literal content_hash, literal evidence_id, expected primary_execution_ref kind)
+GOLDEN_FIXTURES = (
+    (
+        FIXTURE_PATH,
+        "sha256:624602c79c9fe0cf74954f51d838c01c72434071279c52b767dcc43d228dd656",
+        "ev-624602c79c9fe0cf",
+        "work",
+    ),
+    (
+        IMPLEMENTER_FIXTURE_PATH,
+        "sha256:28b12deda5b9a546aa12f004fca51071e956ad4c1ffcad3308e46b0fa2daa564",
+        "ev-28b12deda5b9a546",
+        "runtime",
+    ),
+    (
+        SHEPHERD_FIXTURE_PATH,
+        "sha256:13362a728651f5ffaa2b899b238545c6aaa77c7dac903cc43c39634700603dd7",
+        "ev-13362a728651f5ff",
+        "work",
+    ),
+)
 
 _SOURCE = inspect.getsource(ee)
 
@@ -105,8 +131,8 @@ def _seal(**overrides) -> ee.ExecutionEvidence:
     return ee.seal(**fields)
 
 
-def _load_fixture_evidence() -> ee.ExecutionEvidence:
-    data = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+def _load_fixture_evidence(path: Path = FIXTURE_PATH) -> ee.ExecutionEvidence:
+    data = json.loads(path.read_text(encoding="utf-8"))
     return ee.ExecutionEvidence.from_dict(data)
 
 
@@ -214,14 +240,24 @@ def test_from_dict_rejects_a_forged_self_consistent_hash_and_id(content_hash):
 
 # ---------------------------------------------------------------------------
 # T3 — golden fixture
+#
+# Extended by mctlhq/mctl-agents#539 (T15 in tasks.md) into a parametrized
+# loader over all three golden vectors -- a we_-only envelope (unchanged),
+# an ex--only envelope and a both-identities envelope -- each asserting its
+# literal content_hash, its literal evidence_id, to_dict() round-trip
+# equality, recompute_content_hash() agreement and its expected
+# primary_execution_ref kind. The investigator fixture's two literals stay
+# byte-identical to what T3 asserted before this amendment.
 # ---------------------------------------------------------------------------
-def test_golden_fixture_round_trips_and_hash_and_id_match_literals():
-    raw = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+@pytest.mark.parametrize("path,content_hash,evidence_id,primary_kind", GOLDEN_FIXTURES)
+def test_golden_fixture_round_trips_and_hash_and_id_match_literals(path, content_hash, evidence_id, primary_kind):
+    raw = json.loads(path.read_text(encoding="utf-8"))
     evidence = ee.ExecutionEvidence.from_dict(raw)
     assert evidence.to_dict() == raw
-    assert evidence.content_hash == "sha256:624602c79c9fe0cf74954f51d838c01c72434071279c52b767dcc43d228dd656"
-    assert evidence.evidence_id == "ev-624602c79c9fe0cf"
+    assert evidence.content_hash == content_hash
+    assert evidence.evidence_id == evidence_id
     assert ee.recompute_content_hash(evidence) == evidence.content_hash
+    assert evidence.execution.primary_execution_ref[0] == primary_kind
 
 
 # ---------------------------------------------------------------------------
@@ -493,8 +529,9 @@ def _walk_keys(value):
             yield from _walk_keys(item)
 
 
-def test_no_authorization_field_name_anywhere_in_the_schema():
-    evidence = _load_fixture_evidence()
+@pytest.mark.parametrize("path", (FIXTURE_PATH, IMPLEMENTER_FIXTURE_PATH, SHEPHERD_FIXTURE_PATH))
+def test_no_authorization_field_name_anywhere_in_the_schema(path):
+    evidence = _load_fixture_evidence(path)
     keys = set(_walk_keys(evidence.to_dict()))
     for key in keys:
         lowered = key.lower()
@@ -510,6 +547,25 @@ def test_prefixes_agree_with_their_owning_modules():
     assert ee.SNAPSHOT_ID_PREFIX == wcs.SNAPSHOT_ID_PREFIX == "cs_"
     assert ee.REQUEST_ID_PREFIX == xr.REQUEST_ID_PREFIX == "xr_"
     assert ee.APPROVAL_ID_PREFIX == aa.ID_PREFIX == "aar_"
+    # mctlhq/mctl-agents#539: RUNTIME_EXECUTION_ID_PREFIX must agree with
+    # execution_identity.CONTEXT_ID_PREFIX, the constant seal() derives
+    # ExecutionContext.context_id from -- the same drift-guard pattern as
+    # every prefix above, now that #539 extracted a named constant there.
+    assert ee.RUNTIME_EXECUTION_ID_PREFIX == ei.CONTEXT_ID_PREFIX == "ex-"
+
+
+def test_runtime_execution_id_pattern_matches_a_real_sealed_context_id():
+    # mctlhq/mctl-agents#539 P2 follow-up: the T11 check above only pins the
+    # "ex-" prefix, never the 16-hex *body* shape _RUNTIME_EXECUTION_ID_PATTERN
+    # asserts. Seal a real ExecutionContext through execution_identity.seal()
+    # (CONTEXT_ID_PREFIX + content_hash[7:23]) and confirm it fully matches the
+    # pattern, so a change to that slice (a different length, a different
+    # derivation) fails this test instead of silently making
+    # _check_execution_join reject every legitimate runtime_execution_id.
+    from tests.test_execution_identity import _context
+
+    context = _context()
+    assert ee._RUNTIME_EXECUTION_ID_PATTERN.fullmatch(context.context_id)
 
 
 def test_execution_request_vocabularies_agree_with_their_owning_module():
@@ -562,11 +618,12 @@ def test_to_log_dict_carries_no_unbounded_text():
     evidence = _seal()
     log = evidence.to_log_dict()
     expected_keys = {
-        "evidence_id", "content_hash", "completeness", "outcome_code",
+        "evidence_id", "content_hash", "completeness", "outcome_code", "primary_execution_kind",
         "policy_decision_count", "snapshot_ref_count", "approval_count",
         "artifact_count", "gap_count",
     }
     assert set(log) == expected_keys
+    assert log["primary_execution_kind"] in ee.EXECUTION_REF_KINDS | {""}
     for key, value in log.items():
         if isinstance(value, str):
             assert len(value) <= 128, f"{key} looks unbounded: {value!r}"
@@ -595,3 +652,161 @@ def test_redaction_contains_credential_matches_the_old_tracing_sdk_inline_patter
     old_verdict = bool(ts._CREDENTIAL_VALUE.search(token))
     new_verdict = red.contains_credential(token)
     assert new_verdict == old_verdict
+
+
+# ---------------------------------------------------------------------------
+# T15 — execution join: two typed identities (mctlhq/mctl-agents#539, ADR 018
+# Amendment 1). See also T3's and T11's extensions above.
+# ---------------------------------------------------------------------------
+_RUNTIME_ID = "ex-0123456789abcdef"
+
+
+def test_execution_id_rejects_a_runtime_context_id():
+    with pytest.raises(ee.ExecutionEvidenceError, match="runtime_execution_id"):
+        _seal(execution=_execution(execution_id=_RUNTIME_ID))
+
+
+def test_runtime_execution_id_rejects_a_work_execution_id():
+    with pytest.raises(ee.ExecutionEvidenceError, match="execution_id"):
+        _seal(execution=_execution(execution_id="", runtime_execution_id="we_01J8ZQK7N3XG9F6C2R4D8T1M5W"))
+
+
+@pytest.mark.parametrize(
+    "bad_runtime_id",
+    (
+        "ex-",
+        "ex-XYZ",
+        "ex-0123456789abcde",  # one short
+        "ex-0123456789ABCDEF",  # wrong alphabet (uppercase)
+        "ex-" + "a" * 17,  # one long
+    ),
+)
+def test_runtime_execution_id_rejects_a_malformed_shape(bad_runtime_id):
+    with pytest.raises(ee.ExecutionEvidenceError, match="runtime_execution_id"):
+        _seal(execution=_execution(execution_id="", runtime_execution_id=bad_runtime_id))
+
+
+def test_execution_id_still_rejects_a_foreign_prefix():
+    with pytest.raises(ee.ExecutionEvidenceError, match="execution_id"):
+        _seal(execution=_execution(execution_id="cs_abc"))
+
+
+def test_from_dict_rejects_an_unknown_execution_key():
+    doc = _seal().to_dict()
+    doc["execution"]["runtime_execution"] = "ex-0123456789abcdef"
+    with pytest.raises(ee.ExecutionEvidenceError, match="unknown key"):
+        ee.ExecutionEvidence.from_dict(doc)
+
+
+def test_runtime_only_envelope_seals_complete():
+    ev = ee.seal(
+        execution=ee.ExecutionJoin(runtime_execution_id=_RUNTIME_ID),
+        outcome=_outcome(),
+        created_at="2026-09-29T00:00:00Z",
+        policy_decisions=[_policy_decision()],
+    )
+    assert ev.completeness == ee.COMPLETE
+    assert ev.gaps == ()
+    assert ev.execution.primary_execution_ref == ("runtime", _RUNTIME_ID)
+
+
+def test_seal_raises_when_both_identities_are_blank_and_ungapped():
+    with pytest.raises(ee.ExecutionEvidenceError, match="execution"):
+        ee.seal(
+            execution=ee.ExecutionJoin(),
+            outcome=_outcome(),
+            created_at="2026-09-29T00:00:00Z",
+            policy_decisions=[_policy_decision()],
+        )
+
+
+def test_seal_succeeds_when_that_absence_carries_a_required_gap():
+    ev = ee.seal(
+        execution=ee.ExecutionJoin(),
+        outcome=_outcome(),
+        created_at="2026-09-29T00:00:00Z",
+        policy_decisions=[_policy_decision()],
+        gaps=[ee.Gap(block="execution", code="not_produced", required=True)],
+    )
+    assert ev.completeness == ee.INCOMPLETE
+    assert ev.execution.primary_execution_ref == ("", "")
+
+
+def test_blank_runtime_identity_is_hash_neutral():
+    with_explicit_blank = _seal(execution=_execution(runtime_execution_id=""))
+    without_the_field = _seal(execution=_execution())
+    assert with_explicit_blank.content_hash == without_the_field.content_hash
+    assert with_explicit_blank.evidence_id == without_the_field.evidence_id
+    # And against a hand-built payload whose execution block omits the key
+    # entirely -- the T2 idiom at test_execution_evidence.py:155.
+    manual_payload = {
+        "api_version": ee.API_VERSION,
+        "kind": ee.KIND,
+        "execution": {
+            "execution_id": without_the_field.execution.execution_id,
+            "work_item_id": without_the_field.execution.work_item_id,
+            "trace_id": without_the_field.execution.trace_id,
+        },
+        "outcome": without_the_field.outcome.to_dict(),
+        "policy_decisions": [p.to_dict() for p in without_the_field.policy_decisions],
+    }
+    assert ee.hash_bytes(ee.canonical_json(manual_payload)) == without_the_field.content_hash
+
+
+def test_adding_a_runtime_identity_changes_the_hash():
+    without = _seal(execution=_execution())
+    with_runtime = _seal(execution=_execution(runtime_execution_id=_RUNTIME_ID))
+    assert without.content_hash != with_runtime.content_hash
+    assert without.evidence_id != with_runtime.evidence_id
+
+
+@pytest.mark.parametrize(
+    "execution",
+    (
+        _execution(),  # we_ only
+        ee.ExecutionJoin(runtime_execution_id=_RUNTIME_ID),  # ex- only
+        _execution(runtime_execution_id=_RUNTIME_ID),  # both
+    ),
+    ids=("work-only", "runtime-only", "both"),
+)
+def test_recompute_content_hash_agrees_for_all_three_join_shapes(execution):
+    ev = _seal(execution=execution)
+    assert ee.recompute_content_hash(ev) == ev.content_hash
+
+
+def test_redaction_round_trip_covers_runtime_execution_id():
+    # Extends T5's per-block redaction parametrization: the credential must
+    # be planted in runtime_execution_id specifically, not just trace_id.
+    evidence = _seal(execution=_execution(runtime_execution_id=_CREDENTIAL))
+    assert _CREDENTIAL not in json.dumps(evidence.to_dict())
+    assert evidence.execution.runtime_execution_id == ""
+    matching = [g for g in evidence.gaps if g.block == "execution" and g.code == "redacted_out"]
+    assert len(matching) == 1, evidence.gaps
+    assert ee.recompute_content_hash(evidence) == evidence.content_hash
+
+
+@pytest.mark.parametrize(
+    "execution_id,runtime_execution_id,expected",
+    (
+        ("we_test0000000000000000000000", "", ("work", "we_test0000000000000000000000")),
+        ("we_test0000000000000000000000", _RUNTIME_ID, ("work", "we_test0000000000000000000000")),
+        ("", _RUNTIME_ID, ("runtime", _RUNTIME_ID)),
+        ("", "", ("", "")),
+    ),
+)
+def test_primary_execution_ref_precedence(execution_id, runtime_execution_id, expected):
+    join = ee.ExecutionJoin(execution_id=execution_id, runtime_execution_id=runtime_execution_id)
+    assert join.primary_execution_ref == expected
+    assert join.primary_execution_ref[0] in ee.EXECUTION_REF_KINDS | {""}
+
+
+def test_primary_execution_ref_is_not_an_init_parameter():
+    with pytest.raises(TypeError):
+        ee.ExecutionJoin(execution_id="we_x", primary_execution_ref=("work", "we_x"))
+
+
+def test_primary_execution_ref_is_rejected_as_a_from_dict_key():
+    doc = _seal().to_dict()
+    doc["execution"]["primary_execution_ref"] = ["work", "we_x"]
+    with pytest.raises(ee.ExecutionEvidenceError, match="unknown key"):
+        ee.ExecutionEvidence.from_dict(doc)

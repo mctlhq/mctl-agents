@@ -1,7 +1,20 @@
 """`ExecutionEvidence` — the versioned, hashed, tamper-evident envelope that
 joins the canonical governance records of one governed execution (mctlhq/
 mctl-agents#520, parent #199, ADR 018:
-docs/adr/018-execution-evidence-envelope-contract.md).
+docs/adr/018-execution-evidence-envelope-contract.md, amended by
+mctlhq/mctl-agents#539 to add a second typed execution identity).
+
+`ExecutionJoin` carries two distinct, typed identities rather than one
+overloaded field: `execution_id` (`we_`, the #196 work execution mctl-api
+mints) and `runtime_execution_id` (`ex-`, the ADR 011
+`ExecutionContext.context_id` every governed mutation is stamped with).
+Each is validated to belong to its own namespace and never the other's;
+`ExecutionJoin.primary_execution_ref` derives a single typed `(kind, id)`
+retrieval pair from whichever is set, `work` taking precedence when both
+are. Three golden fixtures under `tests/fixtures/evidence/` pin the three
+join shapes: `investigator-evidence.json` (`we_` only, unchanged),
+`implementer-evidence.json` (`ex-` only) and `shepherd-evidence.json`
+(both). See ADR 018 Amendment 1 for the full rationale.
 
 mctl-agents already has five sealed, canonical governance contracts, each
 owned by exactly one store: execution identity (`we_`,
@@ -94,6 +107,17 @@ SNAPSHOT_ID_PREFIXES = (SNAPSHOT_ID_PREFIX, SNAPSHOT_LOCAL_ID_PREFIX)
 REQUEST_ID_PREFIX = "xr_"
 #: orchestrator/action_approvals.py:47 ID_PREFIX
 APPROVAL_ID_PREFIX = "aar_"
+#: orchestrator/execution_identity.py's CONTEXT_ID_PREFIX — the ADR 011
+#: ExecutionContext.context_id prefix every governed mutation (policy
+#: decisions, aar_ approvals, implementer/shepherd runs) is stamped with,
+#: never the #196 work execution's we_.
+RUNTIME_EXECUTION_ID_PREFIX = "ex-"
+#: The exact shape execution_identity.seal() derives: "ex-" + 16 lowercase
+#: hex characters (content_hash[7:23]). A prefix-only check would let
+#: arbitrary text through into to_dict(); execution_id keeps a prefix-only
+#: check instead because we_ ids are ULIDs minted by mctl-api whose body
+#: shape this repository does not own.
+_RUNTIME_EXECUTION_ID_PATTERN = re.compile(r"ex-[0-9a-f]{16}")
 
 #: orchestrator/work_context/execution_requests.py KINDS
 EXECUTION_REQUEST_KINDS = frozenset({"start", "resume"})
@@ -109,6 +133,9 @@ USAGE_DEVLOOP_STAGES = frozenset({"investigator", "implementer", "reviewer", "sh
 # resolved open questions).
 OUTCOME_CODES = frozenset({"succeeded", "failed", "refused", "abandoned", "superseded"})
 GAP_CODES = frozenset({"not_produced", "store_unavailable", "not_applicable", "redacted_out", "undecided"})
+#: Which identity ExecutionJoin.primary_execution_ref is retrieved by:
+#: "work" for execution_id (we_), "runtime" for runtime_execution_id (ex-).
+EXECUTION_REF_KINDS = frozenset({"work", "runtime"})
 BLOCK_NAMES = frozenset({
     "execution", "outcome", "policy_decisions", "snapshot_refs",
     "execution_request", "usage", "approvals", "artifacts",
@@ -162,9 +189,16 @@ _DROPPED = object()
 #: a leaf redacted before hashing at `seal()` time hashes identically when
 #: `recompute_content_hash()` later rebuilds the payload from the
 #: reconstructed, already-redacted dataclass via its `to_dict()` (which
-#: always emits every key). Omitting the key outright — the alternative —
-#: would make every redacted envelope's `content_hash` unreproducible,
-#: because `to_dict()` cannot omit a key.
+#: always emits every key -- with one deliberate exception:
+#: `ExecutionJoin.to_dict()`'s `runtime_execution_id`, mctlhq/
+#: mctl-agents#539. `seal()`'s hash-neutral prune, above, already pops that
+#: key from the payload whenever it is blank or redacted before
+#: reconstruction; `to_dict()` mirrors the same omission so a rebuilt
+#: payload stays byte-identical to the pruned one. Every other block, and
+#: every other field of this one, still always emits every key). Omitting
+#: a key outright is otherwise unsafe -- it would make a redacted
+#: envelope's `content_hash` unreproducible -- which is exactly why this
+#: exception is narrow and this comment calls it out by name.
 _REDACTED_LEAF = ""
 
 
@@ -244,21 +278,53 @@ def _require_sha256(value: Any, *, where: str) -> str:
 
 @dataclass(frozen=True)
 class ExecutionJoin:
-    """Joins this envelope to the canonical execution the #196 identity
-    contract mints (`we_...`). A reference only: no execution state, no
-    `ExecutionContext` field, is copied here."""
+    """Joins this envelope to the canonical execution(s) it is evidence for
+    — two distinct, typed identities, never one overloaded field (ADR 018
+    Amendment 1, mctlhq/mctl-agents#539): `execution_id` is the #196
+    identity contract's `we_...` work execution; `runtime_execution_id` is
+    the ADR 011 `ExecutionContext.context_id` (`ex-...`) every governed
+    mutation — implementer/shepherd runs, policy decisions, `aar_`
+    approvals — is stamped with. A reference only: no execution state, no
+    `ExecutionContext` field, is copied here. Either may be blank; `seal()`
+    requires at least one. Use `primary_execution_ref` for the single typed
+    retrieval identity this join implies."""
 
-    execution_id: str
+    execution_id: str = ""
     work_item_id: str = ""
     trace_id: str = ""
+    runtime_execution_id: str = ""
+
+    @property
+    def primary_execution_ref(self) -> tuple[str, str]:
+        """`(kind, id)` with `kind` in `EXECUTION_REF_KINDS`, or `("", "")`
+        when neither identity is set. `work` wins when both are present.
+        Derived, never stored, never hashed, never accepted by `from_dict`
+        or `__init__` as a field — the same rule `ExecutionEvidence.
+        completeness` follows."""
+        if self.execution_id:
+            return ("work", self.execution_id)
+        if self.runtime_execution_id:
+            return ("runtime", self.runtime_execution_id)
+        return ("", "")
 
     def to_dict(self) -> dict[str, Any]:
-        return {"execution_id": self.execution_id, "work_item_id": self.work_item_id, "trace_id": self.trace_id}
+        result: dict[str, Any] = {
+            "execution_id": self.execution_id,
+            "work_item_id": self.work_item_id,
+            "trace_id": self.trace_id,
+        }
+        if self.runtime_execution_id:
+            result["runtime_execution_id"] = self.runtime_execution_id
+        return result
 
     @classmethod
     def from_dict(cls, data: Any) -> ExecutionJoin:
         mapping = _require_mapping(data, where="execution")
-        _reject_unknown_keys(mapping, frozenset({"execution_id", "work_item_id", "trace_id"}), where="execution")
+        _reject_unknown_keys(
+            mapping,
+            frozenset({"execution_id", "work_item_id", "trace_id", "runtime_execution_id"}),
+            where="execution",
+        )
         return cls(
             execution_id=_require_str(
                 mapping.get("execution_id", ""), where="execution.execution_id", allow_empty=True
@@ -267,6 +333,9 @@ class ExecutionJoin:
                 mapping.get("work_item_id", ""), where="execution.work_item_id", allow_empty=True
             ),
             trace_id=_require_str(mapping.get("trace_id", ""), where="execution.trace_id", allow_empty=True),
+            runtime_execution_id=_require_str(
+                mapping.get("runtime_execution_id", ""), where="execution.runtime_execution_id", allow_empty=True
+            ),
         )
 
 
@@ -850,6 +919,7 @@ class ExecutionEvidence:
             "content_hash": self.content_hash,
             "completeness": self.completeness,
             "outcome_code": self.outcome.code,
+            "primary_execution_kind": self.execution.primary_execution_ref[0],
             "policy_decision_count": len(self.policy_decisions),
             "snapshot_ref_count": len(self.snapshot_refs),
             "approval_count": len(self.approvals),
@@ -867,10 +937,31 @@ def _check_created_at(created_at: str) -> None:
 
 
 def _check_execution_join(join: ExecutionJoin) -> None:
-    if join.execution_id and not join.execution_id.startswith(EXECUTION_ID_PREFIX):
-        raise ExecutionEvidenceError(
-            f"execution.execution_id must start with {EXECUTION_ID_PREFIX!r}, got {join.execution_id!r}"
-        )
+    """Symmetric and cross-rejecting (ADR 018 Amendment 1): each identity
+    must belong to its own namespace and must never carry the other's
+    shape, so `we_` and `ex-` can never silently merge into one untagged
+    field the way `usage_ledger.execution_id` already has."""
+    if join.execution_id:
+        if join.execution_id.startswith(RUNTIME_EXECUTION_ID_PREFIX):
+            raise ExecutionEvidenceError(
+                f"execution.execution_id {join.execution_id!r} carries a runtime ExecutionContext id "
+                f"({RUNTIME_EXECUTION_ID_PREFIX!r}); put it in execution.runtime_execution_id instead"
+            )
+        if not join.execution_id.startswith(EXECUTION_ID_PREFIX):
+            raise ExecutionEvidenceError(
+                f"execution.execution_id must start with {EXECUTION_ID_PREFIX!r}, got {join.execution_id!r}"
+            )
+    if join.runtime_execution_id:
+        if join.runtime_execution_id.startswith(EXECUTION_ID_PREFIX):
+            raise ExecutionEvidenceError(
+                f"execution.runtime_execution_id {join.runtime_execution_id!r} carries a work execution id "
+                f"({EXECUTION_ID_PREFIX!r}); put it in execution.execution_id instead"
+            )
+        if not _RUNTIME_EXECUTION_ID_PATTERN.fullmatch(join.runtime_execution_id):
+            raise ExecutionEvidenceError(
+                f"execution.runtime_execution_id must be {RUNTIME_EXECUTION_ID_PREFIX!r} followed by 16 "
+                f"lowercase hex characters, got {join.runtime_execution_id!r}"
+            )
 
 
 def _check_outcome(outcome: Outcome) -> None:
@@ -1038,7 +1129,7 @@ def _check_required_blocks(
                 f"block {block!r} is required but absent and its Gap is not marked required"
             )
 
-    _check("execution", True, not execution.execution_id)
+    _check("execution", True, not (execution.execution_id or execution.runtime_execution_id))
     _check("outcome", True, not outcome.code)
     _check("policy_decisions", requirements.policy_decisions, len(policy_decisions) == 0)
     _check("snapshot_refs", requirements.snapshot_refs, len(snapshot_refs) == 0)
@@ -1086,6 +1177,19 @@ def seal(
     )
     safe_payload, redaction_gaps = _safe(raw_payload, requirements=requirements)
     all_gaps = tuple(gaps) + redaction_gaps
+
+    # Hash-neutral prune (ADR 018 Amendment 1): _safe() rewrites a dropped
+    # leaf to _REDACTED_LEAF ("") rather than omitting it, and ExecutionJoin
+    # itself is constructed from this same safe_payload below, so a blank
+    # runtime_execution_id — never supplied, or dropped by redaction — must
+    # be pruned here before clean_execution/hashing, mirroring
+    # _content_payload's block-level absent-when-empty rule. Without this,
+    # a we_-only join would hash a
+    # {"execution_id": ..., "runtime_execution_id": "", ...} block instead
+    # of the byte-identical block every already-sealed we_-only envelope
+    # (including the investigator fixture) was hashed with.
+    if not safe_payload["execution"].get("runtime_execution_id"):
+        safe_payload["execution"].pop("runtime_execution_id", None)
 
     clean_execution = ExecutionJoin.from_dict(safe_payload["execution"])
     clean_outcome = Outcome.from_dict(safe_payload["outcome"])
@@ -1178,6 +1282,7 @@ __all__ = [
     "DEFAULT_REQUIREMENTS",
     "EVIDENCE_ID_PREFIX",
     "EXECUTION_ID_PREFIX",
+    "EXECUTION_REF_KINDS",
     "EXECUTION_REQUEST_KINDS",
     "EXECUTION_REQUEST_STATES",
     "GAP_CODES",
@@ -1185,6 +1290,7 @@ __all__ = [
     "KIND",
     "OUTCOME_CODES",
     "REQUEST_ID_PREFIX",
+    "RUNTIME_EXECUTION_ID_PREFIX",
     "SNAPSHOT_ID_PREFIX",
     "SNAPSHOT_ID_PREFIXES",
     "SNAPSHOT_LOCAL_ID_PREFIX",

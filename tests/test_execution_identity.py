@@ -125,6 +125,15 @@ def test_context_id_is_derived_from_content_hash():
     assert context.context_id == "ex-" + context.content_hash[7:23]
 
 
+def test_context_id_prefix_constant_is_ex_and_a_sealed_context_starts_with_it():
+    # mctlhq/mctl-agents#539 extracts CONTEXT_ID_PREFIX so
+    # orchestrator/execution_evidence.py's RUNTIME_EXECUTION_ID_PREFIX can be
+    # pinned equal to it by a prefix-drift test.
+    assert ei.CONTEXT_ID_PREFIX == "ex-"
+    context = _context()
+    assert context.context_id.startswith(ei.CONTEXT_ID_PREFIX)
+
+
 def test_seal_is_deterministic_across_issued_at():
     a = _context(issued_at="2026-01-01T00:00:00Z")
     b = _context(issued_at="2026-12-31T23:59:59Z")

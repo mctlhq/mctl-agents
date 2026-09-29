@@ -76,7 +76,7 @@ rejects unknown keys, and bounded string lengths. Implemented in
 | `evidence_id` | str | `seal()` | `"ev-" + content_hash[7:23]`, derived not random |
 | `content_hash` | str | `seal()` | `"sha256:..."` over every other field except `created_at` |
 | `created_at` | str (ISO-8601) | caller | sealing time; excluded from the hash |
-| `execution` | `ExecutionJoin` | caller | the `we_` execution this evidence is for — required |
+| `execution` | `ExecutionJoin` | caller | the execution this evidence is for — required (at least one of `execution_id`/`runtime_execution_id`, Amendment 1) |
 | `outcome` | `Outcome` | caller | the final outcome — required, exactly one |
 | `policy_decisions` | `PolicyDecisionRef[]` | caller | every policy decision this execution's actions produced — required by default |
 | `snapshot_refs` | `SnapshotRef[]` (optional) | caller | `ContextSnapshot`s this execution sealed or consulted; absent when empty |
@@ -87,7 +87,8 @@ rejects unknown keys, and bounded string lengths. Implemented in
 | `gaps` | `Gap[]` | `_safe()` + caller | every block known to be missing, and why |
 
 **`ExecutionJoin`** — `execution_id` (`we_`-validated), `work_item_id`,
-`trace_id`.
+`trace_id`, `runtime_execution_id` (`ex-`-validated, Amendment 1: two typed
+identities, never one overloaded field).
 
 **`SnapshotRef`** — `snapshot_id` (`cs_` or `cs-`), `content_hash`
 (`sha256:`). No source, selector, locator or body — `EvidenceRef` already
@@ -194,7 +195,7 @@ envelope.
 
 | Concern | Owner | What `ExecutionEvidence` may record | What it must never do |
 | --- | --- | --- | --- |
-| Execution identity (#196) | `orchestrator/work_context/`, ADR 011 | `execution_id`, `work_item_id`, `trace_id` (`ExecutionJoin`) — a reference only | Copy any `ExecutionContext` field beyond the join keys |
+| Execution identity (#196, ADR 011) | `orchestrator/work_context/` (`we_`), `orchestrator/execution_identity.py` (`ex-`) | `execution_id`, `work_item_id`, `trace_id`, `runtime_execution_id` (`ExecutionJoin`) — a reference only, two typed identities never merged into one (Amendment 1) | Copy any `ExecutionContext` field beyond the join keys; overload `execution_id`/`runtime_execution_id` into one column |
 | Context (#264, ADR 009) | `orchestrator/context_snapshot.py` | `snapshot_id` + `content_hash` (`SnapshotRef`) only | Carry a source, selector, locator or body |
 | Execution requests (mctl-api#368) | `orchestrator/work_context/execution_requests.py` | `request_id`, `kind`, `state` | Carry request provenance beyond those three fields |
 | Model usage (#199 parent scope, ADR 012) | `orchestrator/usage_ledger.py` | `session_id`, `result_uuid`, `model_key`, `devloop_stage` — join keys only | Carry a token count, a cost figure, or any ledger row content |
@@ -348,3 +349,183 @@ redaction-before-hash rule (sec. 3); the derived-`completeness` and
 required-block-gap rules (sec. 4); or the boundary table, including that
 persistence and retrieval are Tier B owned by mctl-api and that
 mctlhq/mctl-agents#483's gitops-persistence design stays superseded (sec. 5).
+
+**Amendment 1** (mctlhq/mctl-agents#539) additionally changed only:
+
+```
+docs/adr/018-execution-evidence-envelope-contract.md    # this amendment; sec. 1/5 edited in place
+orchestrator/execution_identity.py                      # CONTEXT_ID_PREFIX extracted, literal-to-constant only
+orchestrator/execution_evidence.py                      # ExecutionJoin gains runtime_execution_id
+tests/test_execution_evidence.py                        # T15 + extensions to T3, T11, T13
+tests/test_execution_identity.py                        # CONTEXT_ID_PREFIX drift assertion
+tests/fixtures/evidence/implementer-evidence.json       # new fixture (ex- only)
+tests/fixtures/evidence/shepherd-evidence.json          # new fixture (both identities)
+```
+
+`investigator-evidence.json` is unchanged, byte-for-byte.
+
+## Amendment 1 — the execution join: `we_` and `ex-` as two typed fields (mctlhq/mctl-agents#539)
+
+> **Status:** accepted
+
+### Model (B): two typed fields, not a canonical resolution
+
+Only `run_issue_investigator.py` ever attaches a `we_` — mctl-api mints one
+per `(work_item_id, engine, engine_ref)` triple
+(`orchestrator/work_context/executions.py:4-15`), reached through
+`resolve_identity`/`attach_execution`. Every governed *mutation* — every
+`ActionRequest`/`Decision` a policy checkpoint produces
+(`policy_checkpoint.py:641`, `:678-682`), every `aar_` approval `intent_hash`
+is bound to (`action_approvals.py:98-148`, `:416-419`) — carries only the
+ADR 011 `ExecutionContext.context_id` (`ex-`), never a `we_`. Before this
+amendment, `ExecutionJoin.execution_id` demanded `we_` unconditionally, so no
+valid envelope could ever be sealed for an implementer run, a shepherd run
+(including the #519/#524 gated merge), a policy decision or an approval —
+exactly the executions #199 most needs to cover.
+
+Two models were considered:
+
+- **Model (A) — resolve every governed run to a canonical `we_`.** Rejected.
+  It requires mctl-agents to either start minting `we_` locally (a second
+  execution authority, which the issue forbids) or make every governed
+  mutation depend on a network round trip to mctl-api and a work item that
+  may not exist (an incident-responder sweep, a reconcile pass, a local
+  run). It also does not remove the need for the `ex-` field: policy
+  decisions and `aar_` intents are hash-bound to the runtime id regardless,
+  so dropping it would break the deterministic linkage this amendment
+  requires.
+- **Model (B) — two distinct, typed fields, no overloading in either
+  direction.** Chosen. `execution_id` stays `we_`-only; a new
+  `runtime_execution_id` is `ex-`-only. Neither is derived from, copied
+  from, or reconciled with the other — the producer supplies whichever it
+  has, and the contract validates shape only. Model (A) remains available
+  later as a purely additive *producer* enhancement: attaching a `we_` to an
+  implementer/shepherd run costs nothing on this contract, the envelope
+  simply carries both fields (the `shepherd-evidence.json` fixture below
+  pins that exact shape).
+
+This is exactly the defect `orchestrator/usage_ledger.py:59-66` and
+`model_usage_records.execution_id` already carry: one untagged field, two
+identifier shapes, indistinguishable to any consumer except by regex
+guessing. This amendment refuses to add a second instance of it.
+
+### The four-field `ExecutionJoin`
+
+| Field | Type | Validation | Meaning |
+| --- | --- | --- | --- |
+| `execution_id` | str, optional | must start with `we_` (`EXECUTION_ID_PREFIX`); must NOT start with `ex-` | the #196 work execution mctl-api mints, when one was attached |
+| `work_item_id` | str, optional | unvalidated (unchanged) | the work item `execution_id` was attached to |
+| `trace_id` | str, optional | unvalidated (unchanged; a tightening to ADR 011's 32-lowercase-hex shape is a named follow-up, not made here — see requirements.md open question 3) | a correlation id, historically a Temporal workflow id |
+| `runtime_execution_id` | str, optional | must fullmatch `ex-[0-9a-f]{16}` (`RUNTIME_EXECUTION_ID_PREFIX` + the exact shape `execution_identity.seal()` derives); must NOT start with `we_` | the ADR 011 `ExecutionContext.context_id` every governed mutation is stamped with |
+
+Both identity fields are now optional at the dataclass level (`seal()`, not
+`__init__`, enforces requiredness — sec. 4 below). Validation is symmetric
+and cross-rejecting: an `ex-` value in `execution_id` and a `we_` value in
+`runtime_execution_id` both raise `ExecutionEvidenceError`, naming the field
+the value belongs in, so the two namespaces can never silently merge.
+
+### Primary retrieval identity — derived, never stored, never the only lookup key
+
+`evidence_id` remains the envelope's own content-derived key (sec. 2,
+unchanged). For *execution-scoped* retrieval — "find the evidence for this
+execution" — `ExecutionJoin` gains a derived, typed property:
+
+```python
+@property
+def primary_execution_ref(self) -> tuple[str, str]:
+    """(kind, id), kind in EXECUTION_REF_KINDS = {"work", "runtime"}."""
+```
+
+`work` wins when both are present; `("runtime", runtime_execution_id)` when
+only that is set; `("", "")` when neither is. It is a `@property`, never a
+field: not in `__init__`, not accepted by `from_dict`, never entering
+`_content_payload` or the hash. `to_log_dict()` gains
+`primary_execution_kind` (the kind only, per ADR 018's "counts and codes,
+never ids or lists" trace surface) — the id is deliberately not exported to
+telemetry.
+
+**Tier B (mctl-api#409) must store and index `execution_id` and
+`runtime_execution_id` as two separate typed columns, each independently
+queryable — never one untagged column, and never indexed by
+`primary_execution_ref` alone.** A both-identities envelope's primary is its
+`we_`, but it must still be reachable by its `ex-`: that is precisely how
+evidence is reached from a `POLICY_DECISION` or an `aar_` approval, which
+carry only the runtime id. Indexing only the primary pair would make those
+envelopes unreachable by the very identifier the deterministic-linkage rule
+below binds them to.
+
+### Deterministic linkage
+
+Every `POLICY_DECISION` a policy checkpoint produces carries
+`ctx.context_id` as its `execution_id` (`policy_checkpoint.py:641`,
+`decision_record()` at `:551-552`); every `aar_` approval's `intent_hash` is
+bound to that same runtime id via `ActionIntent.execution_id`
+(`action_approvals.py:140-148`, redemption check at `:416-419`). This
+amendment states the rule those two facts imply: **a `PolicyDecisionRef` or
+`ApprovalRef` inside an `ExecutionEvidence` envelope is reachable from its
+originating `POLICY_DECISION`/`aar_` record only through the envelope's
+`execution.runtime_execution_id`**, never through `execution_id`. A work
+execution (`we_`) is the linkage a `SnapshotRef` or an `ExecutionRequestRef`
+resolves through instead. No cryptographic proof ties a `we_` and an `ex-`
+inside the same envelope to the same real-world run — that linkage lives in
+the work-item layer that attaches both, not in this payload-free contract;
+the producer owns pair consistency, this contract validates shape only.
+
+### Completeness for a runtime-only run
+
+`seal()`'s required-block check for `execution` becomes: present iff
+`execution_id` **or** `runtime_execution_id` is non-blank. An implementer or
+shepherd run carrying only an `ex-`, an outcome and at least one policy
+decision now seals `COMPLETE` with no gap — the `implementer-evidence.json`
+fixture below is exactly that shape. An envelope with neither identity still
+raises `ExecutionEvidenceError` unless a `Gap(block="execution",
+code="not_produced", required=True)` accounts for the absence.
+
+### Hash neutrality — why `v1alpha1` stays enough
+
+A blank `runtime_execution_id` never enters the hashed `execution` block:
+`ExecutionJoin.to_dict()` emits the key only when non-blank, and `seal()`
+additionally prunes it from the redacted payload before hashing (covering
+the one path where a blank can reappear post-redaction — `_safe()` rewrites
+a dropped leaf to `""` rather than omitting it). Together these make the
+hashed `execution` block a pure function of the two identity fields in every
+path, so every `we_`-only envelope sealed before this amendment — including
+`investigator-evidence.json` — keeps its exact `content_hash` and
+`evidence_id`. Because nothing is persisted yet (Tier B is unbuilt) and the
+change is provably hash-neutral, `api_version` stays
+`evidence.mctl.ai/v1alpha1` and `SUPPORTED_API_VERSIONS` gains no second
+entry — bumping would force Tier B to support two document shapes and two
+conformance suites on day one for a contract with no data to migrate.
+
+### Golden vectors
+
+Three committed fixtures under `tests/fixtures/evidence/`, each asserted for
+literal `content_hash`, literal `evidence_id`, `to_dict()` round-trip and
+`recompute_content_hash()` agreement:
+
+| Fixture | Join | `primary_execution_ref` |
+| --- | --- | --- |
+| `investigator-evidence.json` (unchanged) | `we_` only | `("work", "we_...")` |
+| `implementer-evidence.json` (new) | `ex-` only, with `policy_decisions` and an `approvals` entry bound to it | `("runtime", "ex-...")` |
+| `shepherd-evidence.json` (new) | both | `("work", "we_...")` |
+
+### Named follow-ups (not built here)
+
+1. The #199 evidence producer: seal an envelope at the end of a governed
+   implementer/shepherd workflow, populating `runtime_execution_id` from
+   `execution_identity.load_from_environment()` and `execution_id` from
+   `work_context.executions.resolve_identity()` when one exists.
+2. De-overload `usage_ledger.execution_id` (`:59-66`, `:176`) and mctl-api's
+   `model_usage_records.execution_id` into the same two typed fields, so the
+   ledger stops being the counter-example this amendment cites.
+3. Optionally attach a `we_` to implementer and shepherd runs (model (A) as
+   a purely additive producer-side enhancement; no contract change
+   required — `shepherd-evidence.json` already pins the resulting shape).
+4. Tighten `ExecutionJoin.trace_id` to ADR 011's 32-lowercase-hex shape. Held
+   back because the existing golden fixture uses a Temporal workflow id
+   there, and tightening it now would move a hash this amendment promises
+   not to move.
+
+This amendment reopens nothing else sec. 1–5 fixed: the hash rule, the
+redaction-before-hash rule, the derived-`completeness` rule's mechanism, and
+every other boundary row are unchanged.
