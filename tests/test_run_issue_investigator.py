@@ -4148,6 +4148,124 @@ def test_context_eval_on_still_prints_observe_candidate_record_when_the_live_rec
     assert any(line.startswith("warn: context evaluation failed") for line in lines)
 
 
+def _sealed_snapshot_for_emit_context_eval(*, work_context=None):
+    """Shared fixture builder for the `_emit_context_eval` `execution_ref`
+    tests below. Reuses the exact `seal()` pattern from
+    `test_write_status_yaml_with_a_snapshot_is_additive_and_agrees`; only
+    `work_context` varies between callers."""
+    from orchestrator import context_snapshot as cs
+
+    execution = cs.ExecutionCorrelation(
+        agent="issue-investigator",
+        environment="production",
+        temporal_workflow_id="dev-loop-mctlhq-mctl-agents-528",
+        target_repository_sha="a" * 40,
+        definition_version="legacy",
+        definition_content_hash="sha256:" + "1a" * 32,
+        profile_version="legacy",
+        profile_content_hash="sha256:" + "2b" * 32,
+        release_revision=0,
+    )
+    return cs.seal(
+        execution=execution,
+        strategy=cs.ContextStrategy(name="deterministic-fixed-order", version="1.0.0"),
+        budget=cs.ContextBudget(
+            max_sources=12, max_bytes=120000, max_bytes_per_source=50000, used_sources=0, used_bytes=0,
+        ),
+        retention=cs.RetentionPolicy(class_="execution-record", expires_after_days=180),
+        created_at="2026-09-19T00:00:00Z",
+        work_context=work_context,
+    )
+
+
+def _run_emit_context_eval_for_candidate(monkeypatch, capsys, *, candidate_work_context):
+    """Directly calls `_emit_context_eval` with a hand-built `AssemblyResult`
+    whose `observe_candidate` carries `candidate_work_context`, and returns
+    the parsed JSON of the SECOND (observe-candidate) `context_eval=` line."""
+    from orchestrator import context_assembly
+
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_EVAL", "on")
+
+    live_snapshot = _sealed_snapshot_for_emit_context_eval()
+    candidate_snapshot = _sealed_snapshot_for_emit_context_eval(work_context=candidate_work_context)
+
+    metrics = context_assembly.AssemblyMetrics(
+        mode="shadow",
+        candidates_by_kind={},
+        included_by_kind={},
+        candidates_total=0,
+        candidates_dropped_pre_budget=0,
+        dropped_stale=0,
+        dropped_duplicate=0,
+        excluded_budget=0,
+        truncated_sources=0,
+        used_sources=0,
+        used_bytes=0,
+        assembly_latency_ms=0.0,
+        collector_calls=0,
+        strategy_name="deterministic-fixed-order",
+        strategy_version="1.0.0",
+        snapshot=live_snapshot,
+    )
+    result = context_assembly.AssemblyResult(
+        mode="shadow",
+        snapshot=live_snapshot,
+        rendered={},
+        metrics=metrics,
+        observe_candidate=candidate_snapshot,
+    )
+
+    run_issue_investigator._emit_context_eval(result)
+
+    lines = capsys.readouterr().out.splitlines()
+    context_eval_lines = [line for line in lines if line.startswith("[context] context_eval=")]
+    assert len(context_eval_lines) == 2
+    return json.loads(context_eval_lines[1].split("=", 1)[1])
+
+
+def test_emit_context_eval_populates_execution_ref_for_a_store_backed_candidate(monkeypatch, capsys):
+    """mctlhq/mctl-agents#528 P2 codex finding (unchanged across three review
+    rounds, most recently b9c54cb): the `execution_ref` populate/omit branch
+    in `_emit_context_eval` was the one piece of #528's evidence pipeline
+    that nothing pinned — every existing end-to-end test of `_emit_context_
+    eval` builds a candidate with no `work_context` at all, so only the
+    "omit because work_context is None" sub-case was ever (implicitly)
+    exercised. This test calls `_emit_context_eval` directly with a
+    `work_context` whose `execution_id` IS store-backed (`we_`-prefixed,
+    `is_store_execution`) and pins that the observe-candidate record's
+    `execution_ref` is populated from it."""
+    from orchestrator import context_snapshot as cs
+
+    work_context = cs.WorkContextRef(
+        work_item_id="wi-77",
+        work_item_revision="1",
+        execution_id="we_abc123",
+        execution_sequence=1,
+    )
+    candidate_payload = _run_emit_context_eval_for_candidate(monkeypatch, capsys, candidate_work_context=work_context)
+    assert candidate_payload["execution_ref"] == {"work_item_id": "wi-77", "execution_id": "we_abc123"}
+
+
+def test_emit_context_eval_omits_execution_ref_for_a_non_store_backed_candidate(monkeypatch, capsys):
+    """Companion to `test_emit_context_eval_populates_execution_ref_for_a_
+    store_backed_candidate` (mctlhq/mctl-agents#528 P2 codex finding): when
+    the candidate's `work_context.execution_id` is NOT store-backed (no
+    `we_` prefix), `_emit_context_eval` must build no `ExecutionRef` at all,
+    so the observe-candidate record's `to_log_dict()` carries no
+    `execution_ref` key whatsoever (not merely `None` — `EvalRecord.to_log_
+    dict()` only adds the key when it is not `None`)."""
+    from orchestrator import context_snapshot as cs
+
+    work_context = cs.WorkContextRef(
+        work_item_id="wi-77",
+        work_item_revision="1",
+        execution_id="local-abc",
+        execution_sequence=1,
+    )
+    candidate_payload = _run_emit_context_eval_for_candidate(monkeypatch, capsys, candidate_work_context=work_context)
+    assert "execution_ref" not in candidate_payload
+
+
 def test_context_eval_on_carries_the_strategy_catalog_identity(tmp_path, monkeypatch, capsys):
     """Regression for the catalog-identity fix in commit 61d2d79
     (mctlhq/mctl-agents#526): before that fix, `_emit_context_eval` never
