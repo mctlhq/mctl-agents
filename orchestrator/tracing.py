@@ -490,6 +490,19 @@ def current_traceparent() -> str | None:
         return None
 
 
+def trace_ids(traceparent: str | None) -> tuple[str, str] | None:
+    """The (trace_id, span_id) hex pair of a W3C traceparent, or None."""
+    if not valid_traceparent(traceparent):
+        return None
+    match = _TRACEPARENT_RE.match((traceparent or "").strip())
+    return (match.group(1), match.group(2)) if match else None
+
+
+def current_trace_ids() -> tuple[str, str] | None:
+    """The (trace_id, span_id) of the current span, or None when there is none."""
+    return trace_ids(current_traceparent())
+
+
 def context_from_traceparent(value: str | None) -> Any:
     """An OpenTelemetry Context whose remote parent is `value`, or None when
     tracing is off or the value is not a valid traceparent. Invalid input is
@@ -851,11 +864,15 @@ class AgentRunObserver:
             self._last_ns[None] = time.time_ns()
 
     def observe(self, message: Any) -> None:
-        if self._usage is not None:
-            self._usage.observe(message)  # never raises
-        if not self._root.recording:
-            return
+        # The whole body is one try/except: that is the guarantee that observing
+        # never breaks the stream it observes, structural here rather than
+        # borrowed from UsageRecorder.observe (which guards itself too, but a
+        # caller must not have to rely on that).
         try:
+            if self._usage is not None:
+                self._usage.observe(message)
+            if not self._root.recording:
+                return
             kind = type(message).__name__
             if kind == "AssistantMessage":
                 self._assistant(message)
@@ -863,7 +880,7 @@ class AgentRunObserver:
                 self._user(message)
             elif kind == "ResultMessage":
                 self._result(message)
-        except Exception as exc:  # noqa: BLE001 — observing must never break the stream it observes
+        except Exception as exc:  # noqa: BLE001
             _warn_once("observe", "could not trace an SDK message (%s)", type(exc).__name__)
 
     def close(self, error: BaseException | None = None) -> None:
@@ -1010,26 +1027,36 @@ class agent_run:
 
     Either way the observer also feeds the model-usage producer
     (orchestrator/usage_ledger.py, mctlhq/.github#50): this is the one place
-    every driver already hands its whole SDK stream to."""
+    every driver already hands its whole SDK stream to. The recorder is
+    built when the span opens (`__enter__`, not `__init__`), so it can carry
+    the `invoke_agent` span's trace and span ids."""
 
     def __init__(self, agent: str, model: str | None) -> None:
         self._agent = agent
         self._model = model
         self._span_cm: Any = None
         self._usage: Any = None
+        self._observer: AgentRunObserver = _NoopObserver(None)
+
+    def _build_recorder(self) -> Any:
         # Guarded like everything else here: usage recording must not fail
         # the run it records (rule 2 above). Deferred: usage_ledger imports
         # httpx, and this module keeps its top level to the standard library.
         try:
             from orchestrator import usage_ledger
 
-            self._usage = usage_ledger.UsageRecorder.from_env(agent)
+            ids = current_trace_ids()
+            if ids is not None:
+                return usage_ledger.UsageRecorder.from_env(self._agent, trace_id=ids[0], span_id=ids[1])
+            return usage_ledger.UsageRecorder.from_env(self._agent)
         except Exception as exc:  # noqa: BLE001
             _warn_once("usage", "usage recording unavailable for this run (%s)", type(exc).__name__)
-        self._observer: AgentRunObserver = _NoopObserver(self._usage)
+            return None
 
     def __enter__(self) -> AgentRunObserver:
         if not _state.enabled:
+            self._usage = self._build_recorder()  # tracing is off: no ids to carry
+            self._observer = _NoopObserver(self._usage)
             return self._observer
         attributes: dict[str, Any] = {
             "gen_ai.operation.name": "invoke_agent",
@@ -1041,6 +1068,7 @@ class agent_run:
             attributes["gen_ai.request.model"] = self._model
         self._span_cm = span(f"invoke_agent {self._agent}", attributes, kind="client")
         handle = self._span_cm.__enter__()
+        self._usage = self._build_recorder()  # the invoke_agent span is current here
         self._observer = AgentRunObserver(handle, self._model, self._usage)
         return self._observer
 

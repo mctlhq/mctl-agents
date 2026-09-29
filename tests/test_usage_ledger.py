@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ import anyio
 import httpx
 import pytest
 from claude_agent_sdk import ResultMessage
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from orchestrator import options, run_shepherd, tracing, usage_ledger
 from tests.test_tracing_agents import (
@@ -153,7 +155,7 @@ def test_an_error_result_is_recorded_as_an_error_with_its_status():
     assert record["api_error_status"] == "429"
 
 
-def test_correlation_comes_from_the_runner_pod_environment():
+def test_correlation_comes_from_the_runner_pod_environment(monkeypatch):
     env = {
         usage_ledger.TOKEN_ENV: TOKEN,
         "MCTL_TOKEN": ADMIN_TOKEN,
@@ -162,8 +164,12 @@ def test_correlation_comes_from_the_runner_pod_environment():
         "WORKFLOW_NAME": "mctl-agents-investigate-abcde",
         "WORKFLOW_WORK_ITEM_ID": "wi_123",
     }
+    api = FakeApi()
+    monkeypatch.setattr(usage_ledger, "_default_post", api)
     rec = usage_ledger.UsageRecorder.from_env("issue-investigator", env)
-    (record,) = rec.records_for(_result("u1", {OPUS: _usage(1, 2)}))
+    rec.observe(_result("u1", {OPUS: _usage(1, 2)}))
+    assert usage_ledger.flush(5)
+    (record,) = api.records
     assert record["agent"] == "investigator"
     assert record["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-api-7"
     assert record["temporal_run_id"] == "run-abc-123"
@@ -172,7 +178,7 @@ def test_correlation_comes_from_the_runner_pod_environment():
     assert rec._token == TOKEN
 
 
-def test_correlation_omits_temporal_run_id_when_the_env_var_is_absent():
+def test_correlation_omits_temporal_run_id_when_the_env_var_is_absent(monkeypatch):
     """mctlhq/mctl-agents#505: a pod without WORKFLOW_TEMPORAL_RUN_ID (every
     runner outside a DevLoop, and every DevLoop pod before mctl-gitops#1408
     deploys) must keep recording usage exactly as before -- no warning, no
@@ -184,8 +190,12 @@ def test_correlation_omits_temporal_run_id_when_the_env_var_is_absent():
         "WORKFLOW_NAME": "mctl-agents-implement-abcde",
         "WORKFLOW_WORK_ITEM_ID": "wi_123",
     }
+    api = FakeApi()
+    monkeypatch.setattr(usage_ledger, "_default_post", api)
     rec = usage_ledger.UsageRecorder.from_env("implementer", env)
-    (record,) = rec.records_for(_result("u1", {OPUS: _usage(1, 2)}))
+    rec.observe(_result("u1", {OPUS: _usage(1, 2)}))
+    assert usage_ledger.flush(5)
+    (record,) = api.records
     assert record["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-api-7"
     assert "temporal_run_id" not in record
     assert rec._token == TOKEN
@@ -213,6 +223,92 @@ def test_messages_other_than_results_are_ignored():
     rec.observe(_result("u1", None))  # no per-model usage: nothing attributable
     rec.observe(_result("u2", {OPUS: _usage(1, 2)}, session=""))
     assert api.calls == []
+
+
+def test_the_usage_recorder_class_has_no_pure_planning_helper_left():
+    """Review P3 on #494: `records_for` read delivery-thread-only state
+    (`_seen`, `_baseline`) from the caller's thread and could mutate
+    `_warned`, despite being documented as pure. Deleted; nothing calls it."""
+    assert not hasattr(usage_ledger.UsageRecorder, "records_for")
+
+
+# ---------------------------------------------------------------------------
+# recorded_at is turn time (review P3 on #494)
+# ---------------------------------------------------------------------------
+
+
+def test_recorded_at_is_captured_before_a_slow_delivery_completes():
+    """`observe` stamps `recorded_at` on the caller's thread before queuing
+    the job; a slow POST on the delivery thread must not shift it."""
+    release = threading.Event()
+    api = FakeApi()
+
+    def slow_post(url: str, body: dict, headers: dict) -> httpx.Response:
+        release.wait(10)
+        return api(url, body, headers)
+
+    rec = usage_ledger.UsageRecorder("implementer", token=TOKEN, post=slow_post, sleep=lambda _s: None)
+    before = datetime.now(UTC)
+    rec.observe(_result("u1", {OPUS: _usage(1, 2)}))
+    # The job is queued and observe() has already returned: recorded_at is
+    # fixed now, seconds before the delivery thread's POST is even allowed
+    # to complete.
+    after_observe = datetime.now(UTC)
+    release.set()
+    assert usage_ledger.flush(5)
+    recorded_at = datetime.fromisoformat(api.records[0]["recorded_at"].replace("Z", "+00:00"))
+    assert before <= recorded_at <= after_observe
+
+
+def test_a_retried_batch_keeps_the_timestamp_of_its_turn():
+    api = FakeApi(503)
+    _recorder(api).observe(_result("u1", {OPUS: _usage(1, 2)}))
+    first, retry = (body["records"][0]["recorded_at"] for _, body, _ in api.calls)
+    assert first == retry
+
+
+def test_recorded_at_stays_an_iso_utc_z_timestamp():
+    api = FakeApi()
+    _recorder(api).observe(_result("u1", {OPUS: _usage(1, 2)}))
+    (record,) = api.records
+    recorded_at = record["recorded_at"]
+    assert recorded_at.endswith("Z")
+    datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))  # a real ISO UTC timestamp, still
+
+
+# ---------------------------------------------------------------------------
+# Trace correlation (review P3 on #494)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def traced() -> InMemorySpanExporter:
+    """Tracing on, synchronously, into memory: what `agent_run` needs so its
+    `invoke_agent` span has real ids to carry into the usage record."""
+    tracing._reset_for_tests()
+    exporter = InMemorySpanExporter()
+    assert tracing.init_tracing("test-pod", exporter=exporter, synchronous=True, set_global=False)
+    yield exporter
+    tracing._reset_for_tests()
+
+
+def test_the_trace_and_span_ids_of_the_run_reach_the_record(ledger, traced):
+    with tracing.agent_run("implementer", None) as obs:
+        obs.observe(_result("u1", {OPUS: _usage(1, 2)}))
+    assert usage_ledger.flush(5)
+    (span,) = [s for s in traced.get_finished_spans() if s.name == "invoke_agent implementer"]
+    (record,) = ledger.records
+    assert record["trace_id"] == f"{span.context.trace_id:032x}"
+    assert record["span_id"] == f"{span.context.span_id:016x}"
+
+
+def test_no_trace_ids_are_sent_when_tracing_is_off(ledger):
+    assert tracing.enabled() is False
+    with tracing.agent_run("implementer", None) as obs:
+        obs.observe(_result("u1", {OPUS: _usage(1, 2)}))
+    assert usage_ledger.flush(5)
+    (record,) = ledger.records
+    assert "trace_id" not in record and "span_id" not in record
 
 
 # ---------------------------------------------------------------------------

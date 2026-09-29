@@ -44,6 +44,8 @@ state. A blocking POST there would stall the loop and push back every anyio
 deadline the drivers rely on (`fail_after`, the #366 drain). Whatever is
 still queued when the interpreter exits is flushed by an `atexit` hook,
 bounded by FLUSH_TIMEOUT_SECONDS; by then the anyio loop has returned.
+`recorded_at` is stamped in `observe`, on the caller's thread, before the job
+is queued: it names the turn, not whenever the delivery thread got to it.
 
 Correlation (mctlhq/mctl-agents#499). Each record says which piece of work
 spent it:
@@ -306,6 +308,10 @@ def _default_post(url: str, body: dict[str, Any], headers: dict[str, str]) -> ht
     return httpx.post(url, json=body, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
 class _Worker:
     """The one delivery thread of this process: jobs run in order."""
 
@@ -430,8 +436,10 @@ class UsageRecorder:
     def observe(self, message: Any) -> None:
         """Queue `message` for recording if it is a ResultMessage.
 
-        Returns at once and never raises: the work happens on the delivery
-        thread.
+        Captures the observation time on the caller's thread, before the job
+        is queued, so queue delay and delivery retries cannot shift
+        `recorded_at`. Returns at once and never raises: the rest of the
+        work happens on the delivery thread.
         """
         if type(message).__name__ != "ResultMessage":
             return
@@ -440,34 +448,28 @@ class UsageRecorder:
                 "disabled", "usage recording is off (%s): this run records no model usage", self._off_reason
             )
             return
+        observed_at = _utc_now_iso()
         try:
-            self._submit(lambda: self._record(message))
+            self._submit(lambda: self._record(message, observed_at))
         except Exception as exc:  # noqa: BLE001 — recording must never break the run it records
             self._warn_once("submit", "could not queue model usage (%s: %s)", type(exc).__name__, exc)
 
-    def _record(self, message: Any) -> None:
+    def _record(self, message: Any, recorded_at: str) -> None:
         try:
-            planned = self._plan(message)
+            planned = self._plan(message, recorded_at)
             if planned and self._deliver([record for _, _, _, record in planned]):
                 self._commit(planned)
         except Exception as exc:  # noqa: BLE001 — recording must never break the run it records
             self._warn_once("observe", "could not record model usage (%s: %s)", type(exc).__name__, exc)
-
-    def records_for(self, message: Any) -> list[dict[str, Any]]:
-        """The records one ResultMessage adds, without delivering them.
-
-        Empty for a message already handled, and for one with no session or
-        no per-model usage (nothing it reports can be attributed). Pure: it
-        neither delivers nor marks anything as handled.
-        """
-        return [record for _, _, _, record in self._plan(message)]
 
     def _commit(self, planned: list[tuple[Any, Any, dict[str, int], dict[str, Any]]]) -> None:
         for seen_key, baseline_key, cumulative, _ in planned:
             self._seen.add(seen_key)
             self._baseline[baseline_key] = cumulative
 
-    def _plan(self, message: Any) -> list[tuple[Any, Any, dict[str, int], dict[str, Any]]]:
+    def _plan(
+        self, message: Any, recorded_at: str | None = None
+    ) -> list[tuple[Any, Any, dict[str, int], dict[str, Any]]]:
         session_id = str(getattr(message, "session_id", "") or "").strip()
         model_usage = getattr(message, "model_usage", None)
         if not session_id or not isinstance(model_usage, Mapping) or not model_usage:
@@ -487,7 +489,7 @@ class UsageRecorder:
             "session_id": session_id,
             "agent": self.agent,
             "outcome": outcome,
-            "recorded_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "recorded_at": recorded_at or _utc_now_iso(),
             **self._correlation,
         }
         if result_uuid:

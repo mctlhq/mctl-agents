@@ -410,6 +410,27 @@ guessing one.
 collector cannot drift, but no path in this repo emits it: it is written by
 the review collector (mctlhq/.github#126), not by `UsageRecorder`.
 
+**`recorded_at` is turn time.** It is captured in `UsageRecorder.observe`, on
+the driver's own thread, before the job is queued for the delivery thread —
+not later, when the delivery thread gets to planning or delivering it. Queue
+delay and a delivery retry therefore cannot shift it. This is deliberately
+not mctl-api's ingest time, which is a separate, server-side fact about when
+the row was stored; a delta record's tokens may include usage first observed
+one turn earlier, when a batch was carried forward after a delivery that
+certainly failed (see "Two consequences for delivery" above), and
+`recorded_at` names the turn that carried them, not the turn whose delta they
+originated in.
+
+**Trace correlation.** The record carries `trace_id` and `span_id` from the
+W3C traceparent of the `invoke_agent` span, read at the moment
+`tracing.agent_run` opens that span — so a single run's records join its own
+trace. Both are omitted entirely, never written empty or all-zero, when
+tracing is off or there is no recording span to read ids from. These are the
+OpenTelemetry ids of that span, and are distinct from `orchestrator/
+execution_identity.py`'s same-named `trace_id` field: that one names a chain
+of execution contexts (ADR 011), minted locally when there is no OTel span at
+all, and is not the value carried here.
+
 ## Amendment 2026-09-26 — the collector (mctlhq/mctl-agents#506)
 
 **The reviewer stage reaches the ledger through a puller, not a pusher.**

@@ -9,6 +9,7 @@ with the suite's `FakeMcpClient`.
 """
 from __future__ import annotations
 
+import logging
 import subprocess
 
 import anyio
@@ -16,7 +17,7 @@ import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolResultBlock, ToolUseBlock, UserMessage
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from orchestrator import policy_checkpoint, run_implementer, run_issue_investigator, tracing
+from orchestrator import policy_checkpoint, run_implementer, run_issue_investigator, tracing, usage_ledger
 from tests.conftest import fake_mcp_client_factory
 
 MODEL = "claude-opus-5"
@@ -262,6 +263,44 @@ def test_an_observer_that_breaks_never_breaks_the_agent_loop(exported, tmp_path,
 def test_agent_run_is_inert_when_tracing_is_off(tmp_path, monkeypatch):
     _run_investigator_agent(tmp_path, monkeypatch, _stream())  # no exporter at all: must just run
     assert tracing.enabled() is False
+
+
+class _BoomUsage:
+    """A usage recorder whose `observe` always raises — review P3 on #494:
+    `AgentRunObserver.observe` must not let it break the stream it observes,
+    structurally (the whole body is one try/except), not because
+    UsageRecorder happens to guard itself."""
+
+    def observe(self, message: object) -> None:
+        raise RuntimeError("usage recorder bug")
+
+
+def _boom_usage_recorder(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        usage_ledger.UsageRecorder, "from_env", classmethod(lambda cls, *_a, **_k: _BoomUsage())
+    )
+
+
+def _trace_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records
+        if r.name == "orchestrator.tracing" and "could not trace an SDK message" in r.getMessage()
+    ]
+
+
+def test_a_raising_usage_recorder_does_not_break_the_stream_with_tracing_off(tmp_path, monkeypatch, caplog):
+    _boom_usage_recorder(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="orchestrator.tracing"):
+        _run_investigator_agent(tmp_path, monkeypatch, _stream())  # must not raise
+    assert len(_trace_warnings(caplog)) == 1
+
+
+def test_a_raising_usage_recorder_does_not_break_the_stream_with_tracing_on(exported, tmp_path, monkeypatch, caplog):
+    _boom_usage_recorder(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="orchestrator.tracing"):
+        _run_investigator_agent(tmp_path, monkeypatch, _stream())  # must not raise
+    assert "invoke_agent issue-investigator" in _spans(exported)
+    assert len(_trace_warnings(caplog)) == 1
 
 
 # ---------------------------------------------------------------------------
