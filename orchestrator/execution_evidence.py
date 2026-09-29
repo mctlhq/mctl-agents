@@ -189,9 +189,16 @@ _DROPPED = object()
 #: a leaf redacted before hashing at `seal()` time hashes identically when
 #: `recompute_content_hash()` later rebuilds the payload from the
 #: reconstructed, already-redacted dataclass via its `to_dict()` (which
-#: always emits every key). Omitting the key outright — the alternative —
-#: would make every redacted envelope's `content_hash` unreproducible,
-#: because `to_dict()` cannot omit a key.
+#: always emits every key -- with one deliberate exception:
+#: `ExecutionJoin.to_dict()`'s `runtime_execution_id`, mctlhq/
+#: mctl-agents#539. `seal()`'s hash-neutral prune, above, already pops that
+#: key from the payload whenever it is blank or redacted before
+#: reconstruction; `to_dict()` mirrors the same omission so a rebuilt
+#: payload stays byte-identical to the pruned one. Every other block, and
+#: every other field of this one, still always emits every key). Omitting
+#: a key outright is otherwise unsafe -- it would make a redacted
+#: envelope's `content_hash` unreproducible -- which is exactly why this
+#: exception is narrow and this comment calls it out by name.
 _REDACTED_LEAF = ""
 
 

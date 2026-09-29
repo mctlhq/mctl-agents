@@ -554,6 +554,20 @@ def test_prefixes_agree_with_their_owning_modules():
     assert ee.RUNTIME_EXECUTION_ID_PREFIX == ei.CONTEXT_ID_PREFIX == "ex-"
 
 
+def test_runtime_execution_id_pattern_matches_a_real_sealed_context_id():
+    # mctlhq/mctl-agents#539 P2 follow-up: the T11 check above only pins the
+    # "ex-" prefix, never the 16-hex *body* shape _RUNTIME_EXECUTION_ID_PATTERN
+    # asserts. Seal a real ExecutionContext through execution_identity.seal()
+    # (CONTEXT_ID_PREFIX + content_hash[7:23]) and confirm it fully matches the
+    # pattern, so a change to that slice (a different length, a different
+    # derivation) fails this test instead of silently making
+    # _check_execution_join reject every legitimate runtime_execution_id.
+    from tests.test_execution_identity import _context
+
+    context = _context()
+    assert ee._RUNTIME_EXECUTION_ID_PATTERN.fullmatch(context.context_id)
+
+
 def test_execution_request_vocabularies_agree_with_their_owning_module():
     assert ee.EXECUTION_REQUEST_KINDS == xr.KINDS
     assert ee.EXECUTION_REQUEST_STATES == xr.STATES
