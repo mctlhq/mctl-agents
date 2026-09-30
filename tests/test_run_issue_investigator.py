@@ -412,6 +412,12 @@ def test_investigate_skips_proposal_past_proposed(tmp_path, monkeypatch):
     assert result.skipped_reason is not None
     assert "in-flight" in result.skipped_reason
     assert result.error is None
+    # mctlhq/mctl-agents#542: a non-resume skip still carries the typed
+    # outcome, so a caller can tell it apart from a real investigation
+    # without parsing `skipped_reason` prose.
+    assert result.outcome_code == "refused"
+    assert result.outcome_reason == "proposal-terminal"
+    assert result.context_only is False
 
 
 def test_investigate_dry_run_does_not_skip_fresh_issue(tmp_path, monkeypatch):
@@ -5243,3 +5249,506 @@ def _raising_connector_for_tests():
         yield  # pragma: no cover — unreachable, only shapes the generator
 
     return _connect
+
+
+# ---------------------------------------------------------------------------
+# Context-only resume onto a closed loop (mctlhq/mctl-agents#542)
+# ---------------------------------------------------------------------------
+def test_is_dispatched_resume_covers_the_four_input_combinations():
+    is_dispatched = run_issue_investigator._is_dispatched_resume
+
+    # An explicit --resume-from-execution-id is always a dispatched resume.
+    assert is_dispatched(
+        resume_from_execution_id="e1", execution_id=None, execution_request_id=None
+    ) is True
+    # A store we_ id plus the execution-request that named it.
+    assert is_dispatched(
+        resume_from_execution_id=None, execution_id="we_abc", execution_request_id="xr-1"
+    ) is True
+    # A store we_ id with no execution-request is correlation only, not a
+    # dispatched resume — the CWFT always sends both together.
+    assert is_dispatched(
+        resume_from_execution_id=None, execution_id="we_abc", execution_request_id=None
+    ) is False
+    # An execution-request id beside a non-store execution id (or none) is
+    # not a dispatched resume either.
+    assert is_dispatched(
+        resume_from_execution_id=None, execution_id=None, execution_request_id="xr-1"
+    ) is False
+    assert is_dispatched(
+        resume_from_execution_id=None, execution_id=None, execution_request_id=None
+    ) is False
+
+
+def _dispatched_resume_env(monkeypatch, *, context_mode):
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.OBSERVE)
+    monkeypatch.delenv(_work_context_rollout.REQUIRED_ENV_VAR, raising=False)
+    # No token: WorkItemClient._request raises WorkItemUnavailable, caught by
+    # seal_snapshot and returned as an unfavourable-but-non-raising
+    # SnapshotAnswer — at `observe` that is logged, never fatal, so this
+    # exercises the context-only path without a live mctl-api.
+    monkeypatch.delenv("MCTL_TOKEN", raising=False)
+    if context_mode is None:
+        monkeypatch.delenv("ISSUE_INVESTIGATOR_CONTEXT_MODE", raising=False)
+    else:
+        monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_MODE", context_mode)
+
+
+def _stub_successful_persist(monkeypatch):
+    """`_dispatched_resume_env` deletes `MCTL_TOKEN`, so every `persist()`
+    call in that fixture answers unfavourably without raising (a real
+    `WorkItemUnavailable` caught and turned into a non-`stored`
+    `SnapshotAnswer`). Tests that need a snapshot to genuinely reach the
+    store — as opposed to exercising the no-token fallback — call this to
+    make `persist()` answer as mctl-api would on a real write."""
+    from orchestrator.work_context import snapshots as ws
+
+    def _persist(snapshot, client):
+        return ws.SnapshotAnswer(
+            ws.SNAPSHOT_SEALED, snapshot_id="cs_test0000000000000000000000000000", content_hash="deadbeef"
+        )
+
+    monkeypatch.setattr(ws, "persist", _persist)
+
+
+def _stub_dispatched_work_item(monkeypatch, *, execution_id="we_dispatch", state="in-progress"):
+    from orchestrator.work_context.contract import (
+        WORK_ITEM_FOUND,
+        ExecutionRef,
+        WorkItem,
+        WorkItemAnswer,
+    )
+
+    item = WorkItem(
+        work_item_id="wi-542",
+        revision="r1",
+        state=state,
+        service="mctl-telegram",
+        slug="issue-542-x",
+        executions=(ExecutionRef(execution_id=execution_id, sequence=3),),
+    )
+    monkeypatch.setattr(
+        "orchestrator.work_context.client.WorkItemClient.get",
+        lambda self, work_item_id: WorkItemAnswer(verdict=WORK_ITEM_FOUND, item=item),
+    )
+    return item
+
+
+def _dispatched_resume_issue(monkeypatch, *, number=542, title="Fix work context resume"):
+    issue = IssueData(
+        ref=IssueRef(
+            owner="mctlhq", repo="mctl-telegram", number=number,
+            url=f"https://github.com/mctlhq/mctl-telegram/issues/{number}",
+        ),
+        title=title,
+        body="Body text",
+        state="OPEN",
+    )
+    monkeypatch.setattr(run_issue_investigator, "gh_issue_view", lambda url: issue)
+    monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "a" * 40)
+
+    def _forbidden_agent(repo_dir, prompt, proposal_dir):
+        raise AssertionError("the SDK agent must never run on the context-only path")
+
+    monkeypatch.setattr(run_issue_investigator, "_run_agent", _forbidden_agent)
+    return issue
+
+
+def _spy_clone(monkeypatch, tmp_path):
+    cloned: list[str] = []
+    clone_dir = tmp_path / "clone"
+    (clone_dir / "repo").mkdir(parents=True, exist_ok=True)
+
+    def _clone(full_repo, slug):
+        cloned.append(full_repo)
+        return clone_dir
+
+    monkeypatch.setattr(run_issue_investigator, "_clone_repo", _clone)
+    return cloned
+
+
+@pytest.mark.parametrize("existing_status", ["accepted", "implemented", "merged"])
+def test_dispatched_resume_onto_terminal_proposal_seals_context_only_snapshot(
+    tmp_path, monkeypatch, capsys, existing_status
+):
+    """T1/T2: a dispatched resume onto a proposal whose .status.yaml is past
+    `proposed` clones and seals a ContextSnapshot instead of the silent
+    no-op skip #542 reports, and the proposal directory is left
+    byte-identical. The snapshot must actually reach the work-item store
+    (`_stub_successful_persist`) for this to count as `succeeded` — see
+    `test_dispatched_resume_context_not_persisted_is_reported_as_refused`
+    for the case where it does not."""
+    _dispatched_resume_env(monkeypatch, context_mode="shadow")
+    _stub_dispatched_work_item(monkeypatch)
+    _stub_successful_persist(monkeypatch)
+    issue = _dispatched_resume_issue(monkeypatch)
+    cloned = _spy_clone(monkeypatch, tmp_path)
+
+    slug = build_slug(542, "Fix work context resume")
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / slug
+    write_status_yaml(proposal_dir, issue)
+    (proposal_dir / ".status.yaml").write_text(yaml.safe_dump({"status": existing_status}))
+    before = {p: p.read_bytes() for p in proposal_dir.rglob("*") if p.is_file()}
+
+    result = investigate(
+        issue.ref.url,
+        state_dir=tmp_path,
+        work_item_id="wi-542",
+        execution_id="we_dispatch",
+        execution_request_id="xr-1",
+        resume_from_execution_id="we_prior",
+    )
+
+    assert cloned == ["mctlhq/mctl-telegram"]
+    assert result.error is None
+    assert result.context_only is True
+    assert result.outcome_code == "succeeded"
+    assert result.outcome_reason == "proposal-terminal"
+
+    after = {p: p.read_bytes() for p in proposal_dir.rglob("*") if p.is_file()}
+    assert after == before
+
+    out = capsys.readouterr().out
+    assert "[outcome] code=succeeded reason=proposal-terminal context_only=true" in out
+    assert "work_item_id=wi-542" in out
+    assert "execution_id=we_dispatch" in out
+
+
+@pytest.mark.parametrize(
+    ("required", "want_code"),
+    [("false", "refused"), ("true", "failed"), (None, "failed")],
+)
+def test_dispatched_resume_context_not_persisted_follows_work_context_required(
+    tmp_path, monkeypatch, capsys, required, want_code
+):
+    """Codex P2 follow-up (#545 review on #542): a context-only resume
+    whose snapshot seals locally but never actually reaches the
+    work-item store must not be reported `succeeded` — that recreates
+    the exact silent no-op #542 exists to remove, just hidden behind a
+    Succeeded ledger entry. `_dispatched_resume_env` deletes
+    `MCTL_TOKEN`, so `persist()` answers unfavourably (not `stored`)
+    without raising, and `AssemblyResult.store_ref` stays `None`.
+
+    Codex review follow-up: with the entry gate requiring `observe`,
+    this is reachable only when the store itself could not decide
+    (unreachable, or it refused the snapshot) — an infrastructure
+    condition, not a run defect, so it must not hard-fail the CWFT.
+    `outcome_code="refused"` and a `skipped_reason` (no `error`) keep
+    `main()` from calling `sys.exit(1)`.
+
+    Which of the two applies is WORK_CONTEXT_REQUIRED's call (owner
+    decision on #545). When required, which is also the unset default, the
+    run fails explicitly (`failed`, `error` set, so the CWFT fails). When
+    `false`, it fails open (`refused`, no `error`). Neither ever reports
+    `succeeded`, and the terminal proposal is never rewritten."""
+    _dispatched_resume_env(monkeypatch, context_mode="shadow")
+    if required is not None:
+        monkeypatch.setenv(_work_context_rollout.REQUIRED_ENV_VAR, required)
+    _stub_dispatched_work_item(monkeypatch)
+    issue = _dispatched_resume_issue(monkeypatch, number=548)
+    _spy_clone(monkeypatch, tmp_path)
+
+    slug = build_slug(548, "Fix work context resume")
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / slug
+    write_status_yaml(proposal_dir, issue)
+    (proposal_dir / ".status.yaml").write_text(yaml.safe_dump({"status": "merged"}))
+    before = {p.name: p.read_bytes() for p in proposal_dir.iterdir()}
+
+    result = investigate(
+        issue.ref.url,
+        state_dir=tmp_path,
+        work_item_id="wi-542",
+        execution_id="we_dispatch",
+        execution_request_id="xr-1",
+        resume_from_execution_id="we_prior",
+    )
+
+    assert result.context_only is True
+    assert result.outcome_code == want_code
+    assert result.outcome_reason == "context-not-persisted"
+    if want_code == "failed":
+        assert result.error is not None
+    else:
+        assert result.error is None
+        assert result.skipped_reason is not None
+    assert {p.name: p.read_bytes() for p in proposal_dir.iterdir()} == before
+
+    out = capsys.readouterr().out
+    assert f"[outcome] code={want_code} reason=context-not-persisted context_only=true" in out
+    assert "code=succeeded" not in out
+
+
+def test_dispatched_resume_at_rollout_off_keeps_the_unchanged_skip(tmp_path, monkeypatch):
+    """Codex review follow-up on #542: with `WORK_CONTEXT_ROLLOUT_MODE` at
+    its default `off`, `work_context_ref` can never become non-`None` no
+    matter what `ISSUE_INVESTIGATOR_CONTEXT_MODE` is set to — the
+    work-context block below the entry gate never contacts the store. A
+    dispatched resume onto a terminal proposal must therefore take the same
+    no-clone skip as `_context_mode() == "off"` (T4), not enter the
+    context-only path only to seal a snapshot that can never be persisted
+    and always report `outcome_code="failed"`."""
+    _dispatched_resume_env(monkeypatch, context_mode="shadow")
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.OFF)
+    _stub_dispatched_work_item(monkeypatch)
+    issue = _dispatched_resume_issue(monkeypatch, number=549)
+    cloned = _spy_clone(monkeypatch, tmp_path)
+
+    slug = build_slug(549, "Fix work context resume")
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / slug
+    write_status_yaml(proposal_dir, issue)
+    (proposal_dir / ".status.yaml").write_text(yaml.safe_dump({"status": "merged"}))
+
+    result = investigate(
+        issue.ref.url,
+        state_dir=tmp_path,
+        work_item_id="wi-542",
+        execution_id="we_dispatch",
+        execution_request_id="xr-1",
+        resume_from_execution_id="we_prior",
+    )
+
+    assert cloned == []
+    assert result.error is None
+    assert result.context_only is False
+    assert result.outcome_code == "refused"
+    assert result.outcome_reason == "proposal-terminal"
+
+
+def test_dispatched_resume_context_carries_work_context_provenance(tmp_path, monkeypatch):
+    """T3: the sealed snapshot's work_context names this run's store
+    execution and the prior one it resumed from — #431 acceptance items 3
+    and 4, on the context-only path."""
+    _dispatched_resume_env(monkeypatch, context_mode="shadow")
+    _stub_dispatched_work_item(monkeypatch)
+    issue = _dispatched_resume_issue(monkeypatch, number=543)
+    _spy_clone(monkeypatch, tmp_path)
+
+    slug = build_slug(543, "Fix work context resume")
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / slug
+    write_status_yaml(proposal_dir, issue)
+    (proposal_dir / ".status.yaml").write_text(yaml.safe_dump({"status": "merged"}))
+
+    captured: dict[str, object] = {}
+    real_entry = run_issue_investigator.context_assembly.assemble_investigator_context
+
+    def capturing_entry(**kwargs):
+        captured["work_context"] = kwargs.get("work_context")
+        return real_entry(**kwargs)
+
+    monkeypatch.setattr(
+        run_issue_investigator.context_assembly, "assemble_investigator_context", capturing_entry
+    )
+
+    result = investigate(
+        "https://github.com/mctlhq/mctl-telegram/issues/543",
+        state_dir=tmp_path,
+        work_item_id="wi-542",
+        execution_id="we_dispatch",
+        execution_request_id="xr-1",
+        resume_from_execution_id="we_prior",
+    )
+
+    assert result.context_only is True
+    wc = captured["work_context"]
+    assert wc is not None
+    assert wc.work_item_id == "wi-542"
+    assert wc.execution_id == "we_dispatch"
+    assert "we_prior" in wc.prior_execution_ids
+
+
+def test_dispatched_resume_at_context_mode_off_keeps_the_unchanged_skip(tmp_path, monkeypatch):
+    """T4: with assembly off there is nothing to seal, so a dispatched
+    resume onto a terminal proposal still takes today's skip — no clone —
+    but the typed outcome distinguishes it from a real run."""
+    _dispatched_resume_env(monkeypatch, context_mode="off")
+    _stub_dispatched_work_item(monkeypatch)
+    issue = _dispatched_resume_issue(monkeypatch, number=544)
+    cloned = _spy_clone(monkeypatch, tmp_path)
+
+    slug = build_slug(544, "Fix work context resume")
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / slug
+    write_status_yaml(proposal_dir, issue)
+    (proposal_dir / ".status.yaml").write_text(yaml.safe_dump({"status": "merged"}))
+
+    result = investigate(
+        issue.ref.url,
+        state_dir=tmp_path,
+        work_item_id="wi-542",
+        execution_id="we_dispatch",
+        execution_request_id="xr-1",
+    )
+
+    assert cloned == []
+    assert result.context_only is False
+    assert result.outcome_code == "refused"
+    assert result.outcome_reason == "proposal-terminal"
+
+
+def test_non_resume_run_onto_merged_proposal_is_unchanged(tmp_path, monkeypatch):
+    """T5: a plain (non-resume) investigation of a merged proposal — no
+    work item at all — behaves exactly as before: no clone, no assembly."""
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_MODE", "shadow")
+    issue = _dispatched_resume_issue(monkeypatch, number=545)
+    cloned = _spy_clone(monkeypatch, tmp_path)
+
+    slug = build_slug(545, "Fix work context resume")
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / slug
+    write_status_yaml(proposal_dir, issue)
+    (proposal_dir / ".status.yaml").write_text(yaml.safe_dump({"status": "merged"}))
+
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert cloned == []
+    assert result.context_only is False
+    assert result.outcome_code == "refused"
+    assert result.outcome_reason == "proposal-terminal"
+
+
+def test_context_only_path_forces_shadow_and_never_builds_a_prompt(tmp_path, monkeypatch):
+    """T6: ISSUE_INVESTIGATOR_CONTEXT_MODE=on still assembles the
+    context-only snapshot under `shadow` semantics — no prompt is ever
+    built on this path, so `on` semantics (which would propagate a failure
+    as if a prompt had been built) do not apply."""
+    _dispatched_resume_env(monkeypatch, context_mode="on")
+    _stub_dispatched_work_item(monkeypatch)
+    issue = _dispatched_resume_issue(monkeypatch, number=546)
+    _spy_clone(monkeypatch, tmp_path)
+
+    seen_modes: list[str] = []
+    real_entry = run_issue_investigator.context_assembly.assemble_investigator_context
+
+    def capturing_entry(**kwargs):
+        seen_modes.append(kwargs.get("mode"))
+        return real_entry(**kwargs)
+
+    monkeypatch.setattr(
+        run_issue_investigator.context_assembly, "assemble_investigator_context", capturing_entry
+    )
+
+    def _forbidden_build_prompt(*args, **kwargs):
+        raise AssertionError("no prompt is ever built on the context-only path")
+
+    monkeypatch.setattr(run_issue_investigator, "_build_prompt", _forbidden_build_prompt)
+
+    slug = build_slug(546, "Fix work context resume")
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / slug
+    write_status_yaml(proposal_dir, issue)
+    (proposal_dir / ".status.yaml").write_text(yaml.safe_dump({"status": "accepted"}))
+
+    result = investigate(
+        issue.ref.url,
+        state_dir=tmp_path,
+        work_item_id="wi-542",
+        execution_id="we_dispatch",
+        execution_request_id="xr-1",
+    )
+
+    assert result.context_only is True
+    assert seen_modes == ["shadow"]
+
+
+def test_context_only_assembly_failure_is_reported_not_swallowed(tmp_path, monkeypatch):
+    """T7: an exception assembling context on the context-only path must
+    surface as an explicit failure — a resume that could not seal C2 is
+    never reported as a success."""
+    _dispatched_resume_env(monkeypatch, context_mode="shadow")
+    _stub_dispatched_work_item(monkeypatch)
+    issue = _dispatched_resume_issue(monkeypatch, number=547)
+    _spy_clone(monkeypatch, tmp_path)
+
+    def _boom(**kwargs):
+        raise RuntimeError("collector exploded")
+
+    monkeypatch.setattr(
+        run_issue_investigator.context_assembly, "assemble_investigator_context", _boom
+    )
+
+    slug = build_slug(547, "Fix work context resume")
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / slug
+    write_status_yaml(proposal_dir, issue)
+    (proposal_dir / ".status.yaml").write_text(yaml.safe_dump({"status": "accepted"}))
+
+    result = investigate(
+        issue.ref.url,
+        state_dir=tmp_path,
+        work_item_id="wi-542",
+        execution_id="we_dispatch",
+        execution_request_id="xr-1",
+    )
+
+    assert result.error is not None
+    assert "collector exploded" in result.error
+    assert result.outcome_code == "failed"
+    assert result.outcome_reason == "context-assembly-failed"
+
+
+def test_own_execution_finish_keys_on_outcome_code_not_skipped_reason():
+    """T8: a context-only result carries a skipped_reason (the proposal was
+    never rewritten) but ends the execution Succeeded — it did everything
+    it was permitted to do. A refused result still ends Failed."""
+    from orchestrator.work_context import executions as ex
+
+    own = run_issue_investigator._OwnExecution()
+    calls: list[str] = []
+
+    class _Client:
+        def attach_execution(self, work_item_id, run, phase):
+            calls.append(phase)
+            return ex.ExecutionAnswer(ex.EXECUTION_EXISTING, execution_id="we_x", attempt=1, phase=phase)
+
+    own.hold(_Client(), "wi-1", ex.EngineRun(engine="argo", engine_ref="wf-1"))
+
+    context_only = run_issue_investigator.InvestigateResult(
+        "mctl-telegram", "issue-1-x", Path("/tmp/x"),
+        skipped_reason="proposal already merged — sealed a context-only snapshot instead",
+        outcome_code="succeeded", outcome_reason="proposal-terminal", context_only=True,
+    )
+    own.finish(context_only)
+    assert calls == [ex.PHASE_SUCCEEDED]
+
+    calls.clear()
+    own.hold(_Client(), "wi-1", ex.EngineRun(engine="argo", engine_ref="wf-1"))
+    refused = run_issue_investigator.InvestigateResult(
+        "mctl-telegram", "issue-1-x", Path("/tmp/x"),
+        skipped_reason="proposal already accepted", outcome_code="refused", outcome_reason="proposal-terminal",
+    )
+    own.finish(refused)
+    assert calls == [ex.PHASE_FAILED]
+
+
+def test_investigate_result_rejects_an_unknown_outcome_code():
+    with pytest.raises(ValueError, match="outcome_code"):
+        run_issue_investigator.InvestigateResult(
+            "mctl-telegram", "issue-1-x", Path("/tmp/x"), outcome_code="bogus",
+        )
+
+
+def test_investigate_result_rejects_a_malformed_outcome_reason():
+    with pytest.raises(ValueError, match="outcome_reason"):
+        run_issue_investigator.InvestigateResult(
+            "mctl-telegram", "issue-1-x", Path("/tmp/x"),
+            outcome_code="failed", outcome_reason="Not A Slug!",
+        )
+
+
+def test_main_prints_ctx_verdict_for_a_context_only_run(tmp_path, monkeypatch, capsys):
+    """T8/task 8: main()'s human summary reads `ctx`, not `skip`, for a
+    context-only result — the old word would read as the silent no-op this
+    change exists to stop being."""
+    fake_result = run_issue_investigator.InvestigateResult(
+        "mctl-telegram", "issue-1-x", tmp_path,
+        skipped_reason="sealed a context-only snapshot instead of rewriting it",
+        outcome_code="succeeded", outcome_reason="proposal-terminal", context_only=True,
+    )
+    monkeypatch.setattr(run_issue_investigator, "investigate", lambda **kwargs: fake_result)
+    monkeypatch.setattr(run_issue_investigator, "_work_context_from_args", lambda args: None)
+    monkeypatch.setattr(
+        "orchestrator.auth.ensure_auth_for_sdk", lambda: None,
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_issue_investigator.py", "--issue-url", "https://github.com/mctlhq/mctl-telegram/issues/1"],
+    )
+    run_issue_investigator.main()
+    out = capsys.readouterr().out
+    assert "  ctx  mctl-telegram/issue-1-x:" in out

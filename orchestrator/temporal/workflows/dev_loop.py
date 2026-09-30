@@ -106,7 +106,7 @@ with workflow.unsafe.imports_passed_through():
         lifecycle_ownership,
     )
     from orchestrator.temporal.activities.pr_state import PRState, get_pr_state
-    from orchestrator.temporal.activities.proposals import find_proposal_slug
+    from orchestrator.temporal.activities.proposals import find_proposal_slug, read_proposal_status
     from orchestrator.temporal.activities.registry import ResolvedRelease, resolve_agent_release
     from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
     from orchestrator.temporal.constants import (
@@ -345,6 +345,28 @@ ISSUE_KEYED_DISPATCH_PATCH = "issue-keyed-dispatch"
 DISPATCHED_NOT_RUN_FAILS_PATCH = "dispatched-not-run-fails"
 #: The error type of that failure, for whoever reads why the run ended.
 DISPATCHED_NOT_RUN_ERROR_TYPE = "DispatchedRequestNotRun"
+#: Guards ending the loop right after a dispatched resume's investigate step
+#: when the proposal it targeted was past `proposed` and so was never
+#: rewritten (mctlhq/mctl-agents#542, ADR 011 §8): the investigator sealed a
+#: context-only ContextSnapshot instead (mctl-agents#542's own change to
+#: `orchestrator/run_issue_investigator.py`), and there is no new proposal
+#: revision for this loop to wait on approval for. Not
+#: PROPOSAL_TERMINAL_PATCH — that name is already taken by the unrelated
+#: merge-watch "end on the proposal's own terminal status" branch; the
+#: collision here would be textual only, but a shared name for two different
+#: `workflow.patched` decisions is exactly the kind of thing that makes a
+#: replay bug quiet. An execution whose history predates this patch takes
+#: its old command sequence — proceeding into the human-input/approval wait
+#: on a proposal that will never move — exactly as it always has.
+CONTEXT_ONLY_RESUME_PATCH = "context-only-resume"
+#: `ended` reason this branch returns, named once so the workflow and its
+#: tests agree on the exact string.
+CONTEXT_ONLY_RESUME_ENDED_REASON = "investigate context-only: proposal-terminal"
+#: The proposal statuses a resumed investigate leaves REWRITABLE — mirrors
+#: `run_issue_investigator._OVERWRITABLE_STATUSES` (that module's own status
+#: word is never imported here: it drags in anyio/claude_agent_sdk and the
+#: rest of a non-workflow-safe module tree into the sandbox).
+_OVERWRITABLE_PROPOSAL_STATUSES = {"proposed"}
 #: Guards the correlation params added to the implement and shepherd submits
 #: (mctlhq/mctl-agents#505, owner decision 4 on mctlhq/.github#50). Depends on
 #: mctl-gitops#1408 declaring `temporal_workflow_id` / `temporal_run_id` /
@@ -2868,6 +2890,47 @@ class DevLoopWorkflow:
                 implement=None,
                 ended=f"investigate ended {investigate_result.phase}",
             )
+
+        if dispatched is not None and workflow.patched(CONTEXT_ONLY_RESUME_PATCH):
+            # mctlhq/mctl-agents#542: the investigate CWFT that just
+            # succeeded may have taken the context-only path — a dispatched
+            # resume onto a proposal already past `proposed`, which the
+            # investigator refuses to rewrite and instead seals a
+            # context-only ContextSnapshot for
+            # (`orchestrator/run_issue_investigator.py`'s own change).
+            # There is no new proposal revision for this loop to wait on
+            # approval for, so it ends here rather than parking.
+            #
+            # Learned from the proposal's own status — the same source
+            # `find_proposal_slug`'s multi-match disambiguation already
+            # reads below — rather than a new CWFT output channel: an
+            # ordinary investigate always (re)writes `.status.yaml` to
+            # `proposed`, while a context-only run leaves it exactly as it
+            # found it.
+            issue_number_for_status = parse_issue_url(issue.issue_url).number
+            status_slug = await workflow.execute_activity(
+                find_proposal_slug,
+                args=[target_repo, issue_number_for_status],
+                start_to_close_timeout=SLUG_LOOKUP_TIMEOUT,
+                retry_policy=SLUG_LOOKUP_RETRY_POLICY,
+            )
+            if status_slug:
+                proposal_status = await workflow.execute_activity(
+                    read_proposal_status,
+                    args=[target_repo, status_slug],
+                    start_to_close_timeout=SLUG_LOOKUP_TIMEOUT,
+                    retry_policy=SLUG_LOOKUP_RETRY_POLICY,
+                )
+                # None (unreadable) is never treated as "definitely not
+                # proposed" — "could not observe is never observed absent"
+                # — so an unreadable status falls through to the ordinary
+                # path below, exactly as it always has.
+                if proposal_status is not None and proposal_status not in _OVERWRITABLE_PROPOSAL_STATUSES:
+                    return DevLoopResult(
+                        investigate=investigate_result,
+                        implement=None,
+                        ended=CONTEXT_ONLY_RESUME_ENDED_REASON,
+                    )
 
         # Durable clarification (mctlhq/mctl-agents#333, ADR 013), gated so
         # an in-flight history recorded before this change takes its old

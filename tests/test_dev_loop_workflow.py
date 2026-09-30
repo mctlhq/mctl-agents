@@ -211,6 +211,13 @@ def _fake_activities(
     *,
     released: bool,
     investigate_phase: str = "Succeeded",
+    # mctlhq/mctl-agents#542: `read_proposal_status` is only ever scheduled
+    # for a DISPATCHED execution (`dispatched is not None`), so this default
+    # is inert for every pre-existing, non-dispatched test in this module.
+    # "proposed" is the answer an ORDINARY investigate leaves behind, so a
+    # dispatch test that does not override this proceeds exactly as before
+    # #542 — past the new branch, into the human-input/approval path.
+    proposal_status: str | None = "proposed",
     # mctl-agents#410: defaults to "open" so every pre-existing test in this
     # module (none of which cares about the stale-issue gate) reaches
     # find_proposal_slug/approve exactly as before.
@@ -634,11 +641,16 @@ def _fake_activities(
             return gate_results.pop(0) if len(gate_results) > 1 else gate_results[0]
         return GatedActionResult(code="merge_gate_disabled")
 
+    @activity.defn(name="read_proposal_status")
+    async def fake_read_proposal_status(service: str, slug: str) -> str | None:
+        return proposal_status
+
     activities = [
         fake_resolve_agent_release,
         fake_submit_and_wait,
         fake_record_execution,
         _fake_find_proposal_slug,
+        fake_read_proposal_status,
         fake_find_human_input_request,
         fake_get_issue_state,
         fake_get_pr_state,
@@ -4852,6 +4864,59 @@ class TestLaunchCorrelation:
 
         assert implement_log[0]["work_item_id"] == "wi-505"
         assert shepherd_log[0]["work_item_id"] == "wi-505"
+
+    async def test_dispatched_resume_onto_terminal_proposal_ends_before_implement_and_approval(
+        self, env
+    ):
+        """Codex P2 follow-up (#545 review on #542): the context-only
+        early-end branch (`CONTEXT_ONLY_RESUME_ENDED_REASON`) had no
+        coverage -- every existing dispatch test's `read_proposal_status`
+        fake defaults to "proposed", which the branch's own
+        `_OVERWRITABLE_PROPOSAL_STATUSES` check reads as "keep going", so
+        nothing ever reached it. A dispatched loop whose proposal is
+        already "accepted" must end right there: no approve/implement CWFT
+        submitted, and no approval wait entered (an unresolved wait would
+        hang `handle.result()` below past the `fail_after` deadline instead
+        of returning)."""
+        activities, calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, proposal_status="accepted",
+        )
+
+        @activity.defn(name="bind_dispatched_execution")
+        async def fake_bind_dispatched_execution(input):
+            from orchestrator.temporal.activities.execution_requests import (
+                BOUND,
+                BoundExecution,
+            )
+
+            return BoundExecution(BOUND, execution_id="we_ctx_test", sequence=1)
+
+        @activity.defn(name="advance_dispatched_execution")
+        async def fake_advance_dispatched_execution(input) -> str:
+            return "ok"
+
+        activities = [*activities, fake_bind_dispatched_execution, fake_advance_dispatched_execution]
+
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(
+                    issue_url="https://github.com/mctlhq/mctl-telegram/issues/548",
+                    work_item_id="wi-548",
+                    execution_request_id="xr-548",
+                ),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                result = await handle.result()
+
+        assert result.implement is None
+        assert result.ended == dev_loop.CONTEXT_ONLY_RESUME_ENDED_REASON
+        # Neither approve nor implement were ever submitted to Argo.
+        assert calls == ["mctl-agents-investigate"]
 
     async def test_undispatched_loop_omits_work_item_id_entirely(self, env):
         """T3 (undispatched half): an issue-url-only loop, where

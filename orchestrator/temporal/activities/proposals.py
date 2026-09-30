@@ -183,6 +183,40 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
         raise ProposalListingError(f"listing {url} failed: {exc}") from exc
 
 
+@activity.defn
+async def read_proposal_status(service: str, slug: str) -> str | None:
+    """The ``status:`` a known proposal slug's ``.status.yaml`` currently
+    carries (mctlhq/mctl-agents#542).
+
+    Unlike ``find_proposal_slug``, this never resolves a slug on its own —
+    the caller already has one (from ``find_proposal_slug`` or its own
+    deterministic derivation). ``None`` means the status could not be read
+    (missing file, non-dict YAML, or a ``status`` that is not a string) —
+    the same "could not be read" the multi-match branch of
+    ``find_proposal_slug`` already treats as "never retire on missing
+    evidence" (``proposal_identity.select_proposal_slug``). A caller that
+    needs to tell "definitely still not `proposed`" apart from "unreadable"
+    must keep that distinction — ``None`` is never read as a status.
+
+    Transport and non-404 HTTP failures raise (retryable), the same
+    contract as ``find_proposal_slug``: an outage must not be read as a
+    missing or unreadable status.
+    """
+    token = await asyncio.to_thread(_resolve_token)
+    if not token:
+        raise ProposalListingError(
+            "no GitHub token available (GITHUB_TOKEN_FILE unreadable and "
+            "GITHUB_TOKEN unset); refusing an unauthenticated lookup (a "
+            "private repo would 404 and masquerade as a missing proposal)"
+        )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+    }
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        return await _read_proposal_status(client, headers, service, slug)
+
+
 def _raise_first(results: list[str | BaseException | None]) -> list[str | None]:
     """Re-raise the first failed status read; otherwise narrow the list.
 

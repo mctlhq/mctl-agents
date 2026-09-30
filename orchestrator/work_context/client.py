@@ -59,7 +59,11 @@ ROUTES = {
     # GET lists the ledger; POST attaches an execution or advances its
     # phase, idempotent on (engine, engine_ref) (mctlhq/mctl-agents#455).
     "list_executions": "/api/v1/work-items/{id}/executions",
-    # Sealed ContextSnapshots (mctl-api#362, mctlhq/mctl-agents#431).
+    # Sealed ContextSnapshots (mctl-api#362, mctlhq/mctl-agents#431). Only a
+    # singular, per-execution route — there is no plural `/snapshots` LIST
+    # route in this repo. The `/snapshots` listing mctlhq/mctl-agents#542
+    # quotes is an mctl-api-side surface; nothing in this client depends on
+    # a client-side listing (mctl-agents#542 tasks.md item 11).
     "execution_snapshot": "/api/v1/work-items/{id}/executions/{execution_id}/snapshot",
     # Execution requests (mctl-api#368, mctlhq/mctl-agents#461). Claim,
     # fulfil and reject are the service principal's alone.
