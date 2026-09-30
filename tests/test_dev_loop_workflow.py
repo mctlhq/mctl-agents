@@ -211,6 +211,13 @@ def _fake_activities(
     *,
     released: bool,
     investigate_phase: str = "Succeeded",
+    # mctlhq/mctl-agents#542: `read_proposal_status` is only ever scheduled
+    # for a DISPATCHED execution (`dispatched is not None`), so this default
+    # is inert for every pre-existing, non-dispatched test in this module.
+    # "proposed" is the answer an ORDINARY investigate leaves behind, so a
+    # dispatch test that does not override this proceeds exactly as before
+    # #542 — past the new branch, into the human-input/approval path.
+    proposal_status: str | None = "proposed",
     # mctl-agents#410: defaults to "open" so every pre-existing test in this
     # module (none of which cares about the stale-issue gate) reaches
     # find_proposal_slug/approve exactly as before.
@@ -634,11 +641,16 @@ def _fake_activities(
             return gate_results.pop(0) if len(gate_results) > 1 else gate_results[0]
         return GatedActionResult(code="merge_gate_disabled")
 
+    @activity.defn(name="read_proposal_status")
+    async def fake_read_proposal_status(service: str, slug: str) -> str | None:
+        return proposal_status
+
     activities = [
         fake_resolve_agent_release,
         fake_submit_and_wait,
         fake_record_execution,
         _fake_find_proposal_slug,
+        fake_read_proposal_status,
         fake_find_human_input_request,
         fake_get_issue_state,
         fake_get_pr_state,

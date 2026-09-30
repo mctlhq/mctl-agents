@@ -14,6 +14,11 @@ Pipeline for one issue:
        `proposed` (accepted / in-progress / implemented / merged / ...),
        skip — an implementation is already in flight and must not be
        clobbered. A missing file or `proposed` status is overwritable.
+       Exception (mctlhq/mctl-agents#542): a dispatched `resume` onto that
+       terminal proposal, with context assembly enabled, still clones and
+       seals a context-only `ContextSnapshot` (step 5 and half of step 6,
+       under `shadow` semantics) before returning — the proposal itself is
+       still never rewritten.
     5. `gh repo clone mctlhq/<service>` (read-only) so the agent can ground
        the design in real code.
     6. Run the Claude Agent SDK against a STAGING directory: the agent reads
@@ -275,6 +280,31 @@ def _capability_discovery_prompt_block() -> str:
 # (re-)investigated. Anything past that means the implementer/shepherd has
 # taken ownership — re-running the investigator would clobber in-flight work.
 _OVERWRITABLE_STATUSES = {"proposed"}
+
+
+def _is_dispatched_resume(
+    *,
+    resume_from_execution_id: str | None,
+    execution_id: str | None,
+    execution_request_id: str | None,
+) -> bool:
+    """True when this run serves a work-item `resume` the dispatcher
+    fulfilled (mctlhq/mctl-agents#542, ADR 011 §8) — as opposed to an
+    intake-label investigation, a `@MCTL reinvestigate` directive, or a
+    direct CLI call with no work item at all.
+
+    Either an explicit `--resume-from-execution-id`, or a store `we_`
+    `--execution-id` delivered together with the `--execution-request-id`
+    that names the dispatched request it serves. Imported lazily, inside
+    the function body, matching this module's import discipline (see
+    tests/test_worker_isolation.py)."""
+    if resume_from_execution_id:
+        return True
+    if not execution_request_id:
+        return False
+    from orchestrator.work_context.snapshots import is_store_execution
+
+    return is_store_execution(execution_id)
 
 # https://github.com/<owner>/<repo>/issues/<n>
 _ISSUE_URL_RE = re.compile(
@@ -1923,6 +1953,29 @@ async def _run_agent(
                 print(f"warn: {ledger.describe()}")
 
 
+def _validate_outcome(outcome_code: str, outcome_reason: str) -> None:
+    """Checks `outcome_code`/`outcome_reason` against the vocabulary
+    `orchestrator/execution_evidence.py` (ADR 018) already defines, instead
+    of inventing a second one for this module (mctlhq/mctl-agents#542).
+    Imported lazily, matching this module's import discipline (see
+    tests/test_worker_isolation.py)."""
+    from orchestrator.execution_evidence import (
+        _SLUG_PATTERN,
+        MAX_SLUG_LENGTH,
+        OUTCOME_CODES,
+    )
+
+    if outcome_code not in OUTCOME_CODES:
+        raise ValueError(f"outcome_code {outcome_code!r} is not one of {sorted(OUTCOME_CODES)!r}")
+    if not outcome_reason:
+        return
+    if len(outcome_reason) > MAX_SLUG_LENGTH or not _SLUG_PATTERN.match(outcome_reason):
+        raise ValueError(
+            f"outcome_reason must be a 1..{MAX_SLUG_LENGTH} character code of "
+            f"[a-z0-9][a-z0-9._-]*, got {outcome_reason!r}"
+        )
+
+
 @dataclass
 class InvestigateResult:
     service: str
@@ -1938,6 +1991,26 @@ class InvestigateResult:
     # in-process and so no longer reads this field; kept for whatever still
     # calls investigate() synchronously (the legacy/direct trigger path).
     rate_limited: bool = False
+    # mctlhq/mctl-agents#542: an explicit, typed outcome carried beside the
+    # free-text `skipped_reason`/`error` fields above, drawn from
+    # `execution_evidence.OUTCOME_CODES` (ADR 018) rather than a vocabulary
+    # invented here. Defaulted so every pre-#542 construction of this
+    # dataclass — in this module and in tests/ — compiles unchanged and
+    # reads as an ordinary success.
+    outcome_code: str = "succeeded"
+    # A machine-readable slug (execution_evidence's `_SLUG_PATTERN`), never
+    # prose. "" only when `outcome_code == "succeeded"` and nothing more
+    # specific applies — the ordinary, fully-successful run.
+    outcome_reason: str = ""
+    # True only for the context-only path (mctlhq/mctl-agents#542): a
+    # dispatched resume onto a proposal `_OVERWRITABLE_STATUSES` refuses to
+    # rewrite, which still clones and seals a `ContextSnapshot` under
+    # `shadow` semantics instead of returning the silent no-op skip of
+    # before. The proposal directory is left byte-identical either way.
+    context_only: bool = False
+
+    def __post_init__(self) -> None:
+        _validate_outcome(self.outcome_code, self.outcome_reason)
 
 
 def _assemble_context(
@@ -1952,6 +2025,7 @@ def _assemble_context(
     temporal_workflow_id: str | None = None,
     temporal_run_id: str | None = None,
     argo_workflow_name: str | None = None,
+    fatal: bool = False,
 ) -> context_assembly.AssemblyResult | None:
     """Assembles and seals this investigation's `ContextSnapshot`
     (mctlhq/mctl-agents#265). Returns `None` in `off` mode without doing any
@@ -1966,6 +2040,12 @@ def _assemble_context(
     — a telemetry feature must not be able to fail an investigation. In
     `on`, it propagates: a sealed snapshot must never describe a prompt that
     was not actually built.
+
+    `fatal=True` (mctlhq/mctl-agents#542's context-only resume path) inverts
+    that policy for `shadow` too: on that path no prompt is EVER built, so
+    the snapshot is not telemetry beside the real deliverable — it IS the
+    deliverable, and a failure to seal it must propagate rather than warn
+    and pretend the run succeeded at nothing.
     """
     if mode == "off":
         return None
@@ -2007,7 +2087,7 @@ def _assemble_context(
             argo_workflow_name=argo_workflow_name,
         )
     except Exception as exc:
-        if mode == "on":
+        if mode == "on" or fatal:
             raise
         print(f"warn: context assembly failed: {type(exc).__name__}: {exc}")
         return None
@@ -2383,7 +2463,16 @@ class _OwnExecution:
             return
         from orchestrator.work_context import executions as _executions
 
-        succeeded = result is not None and result.error is None and result.skipped_reason is None
+        # mctlhq/mctl-agents#542: keyed on the typed outcome, not on
+        # `skipped_reason is None`. A context-only result HAS a
+        # skipped_reason (the proposal was never rewritten) but did
+        # everything it was permitted to do, so it must still end
+        # Succeeded — the same condition `DevLoopWorkflow`'s own
+        # `advance_phase` now agrees with for a dispatched resume. A
+        # `refused` result (today's silent skip, still reachable at
+        # ISSUE_INVESTIGATOR_CONTEXT_MODE=off or for a non-resume run) keeps
+        # ending Failed, same as before this change.
+        succeeded = result is not None and result.error is None and result.outcome_code == "succeeded"
         where = f"{self.run.engine}/{self.run.engine_ref} of {self.work_item_id}"
         if not succeeded and not _executions.final_attempt():
             print(
@@ -2565,16 +2654,46 @@ def _investigate(
     proposal_dir = proposals_dir / slug
     status_path = proposal_dir / ".status.yaml"
 
-    # Idempotency guard — never clobber a proposal an implementer owns.
+    # Idempotency guard — never clobber a proposal an implementer or
+    # shepherd owns. Split into two independent questions (mctlhq/
+    # mctl-agents#542): whether this run may REWRITE the proposal (the
+    # original rule, unchanged) and — only when it may not — whether it
+    # should still seal a context-only ContextSnapshot instead of returning
+    # today's silent no-op skip. `rewrite_allowed=False` stays true all the
+    # way through this function; nothing below ever writes into
+    # `proposal_dir` on that path.
     existing = _load_status(status_path)
     existing_status = existing.get("status")
-    if existing and existing_status not in _OVERWRITABLE_STATUSES:
+    rewrite_allowed = not existing or existing_status in _OVERWRITABLE_STATUSES
+    context_only_pending = False
+    if not rewrite_allowed:
         reason = (
             f"proposal {service}/{slug} already at status "
             f"'{existing_status}' — refusing to overwrite in-flight work"
         )
-        print(f"warn: {reason}")
-        return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
+        dispatched_resume = _is_dispatched_resume(
+            resume_from_execution_id=resume_from_execution_id,
+            execution_id=execution_id,
+            execution_request_id=execution_request_id,
+        )
+        if not dispatched_resume or _context_mode() == "off":
+            # The ordinary case (an intake-label re-investigation, a `@MCTL
+            # reinvestigate` directive, or a direct CLI call): unchanged —
+            # no clone, no assembly, nothing sealed. Also the escape hatch
+            # for a dispatched resume when context assembly is off: with
+            # nothing to seal, cloning would buy nothing.
+            print(f"warn: {reason}")
+            return InvestigateResult(
+                service, slug, proposal_dir, skipped_reason=reason,
+                outcome_code="refused", outcome_reason="proposal-terminal",
+            )
+        # A dispatched resume onto a terminal proposal, with context
+        # assembly enabled: fall through — past the work-context block
+        # below, whose WorkContextRef is what makes the seal meaningful —
+        # into the context-only path inside the `try`. The proposal itself
+        # is still never rewritten.
+        print(f"info: {reason} (dispatched resume — sealing a context-only snapshot instead)")
+        context_only_pending = True
 
     # Work-context seam (mctlhq/mctl-agents#267): resolve the WorkItem and
     # reconstruct canonical state, but only when a caller actually supplied
@@ -2628,7 +2747,10 @@ def _investigate(
                     )
                     if _work_context_rollout.new_answer_may_veto():
                         print(f"warn: {reason}")
-                        return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
+                        return InvestigateResult(
+                            service, slug, proposal_dir, skipped_reason=reason,
+                            outcome_code="refused", outcome_reason="work-item-mismatch",
+                        )
                     print(f"warn: {reason} (observe mode — proceeding without work context)")
                     work_context_ref = None
                     canonical = None
@@ -2648,7 +2770,10 @@ def _investigate(
                             f"{canonical.state!r} — refusing to re-investigate"
                         )
                         print(f"warn: {reason}")
-                        return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
+                        return InvestigateResult(
+                            service, slug, proposal_dir, skipped_reason=reason,
+                            outcome_code="refused", outcome_reason="work-item-terminal",
+                        )
                     work_context_ref, refusal = _resolve_work_context_ref(
                         client=client,
                         canonical=canonical,
@@ -2662,7 +2787,10 @@ def _investigate(
                         own_execution=own_execution,
                     )
                     if refusal:
-                        return InvestigateResult(service, slug, proposal_dir, skipped_reason=refusal)
+                        return InvestigateResult(
+                            service, slug, proposal_dir, skipped_reason=refusal,
+                            outcome_code="refused", outcome_reason="work-context-refused",
+                        )
                     if work_context_ref is not None:
                         tracing.annotate(
                             execution_id=work_context_ref.execution_id,
@@ -2671,7 +2799,10 @@ def _investigate(
             elif _work_context_rollout.blocks_on_unknown():
                 reason = f"work item {work_item_id!r} could not be resolved: {answer.reason}"
                 print(f"warn: {reason}")
-                return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
+                return InvestigateResult(
+                    service, slug, proposal_dir, skipped_reason=reason,
+                    outcome_code="refused", outcome_reason="work-item-unresolved",
+                )
 
     if issue.state == "CLOSED":
         print(f"warn: issue {issue.ref.full_repo}#{issue.ref.number} is CLOSED — investigating anyway.")
@@ -2682,7 +2813,10 @@ def _investigate(
             f"          service={service} slug={slug}\n"
             f"          proposal_dir={proposal_dir}"
         )
-        return InvestigateResult(service, slug, proposal_dir, skipped_reason="dry-run")
+        return InvestigateResult(
+            service, slug, proposal_dir, skipped_reason="dry-run",
+            outcome_code="refused", outcome_reason="dry-run",
+        )
 
     # Whether the proposal dir already existed (a re-investigation of a
     # `proposed` proposal). If it did NOT, a failure path must roll it back
@@ -2704,6 +2838,59 @@ def _investigate(
     try:
         # 1. Read-only clone so the agent can ground the design in real code.
         clone = _clone_repo(issue.ref.full_repo, slug)
+
+        # 1b. The context-only path (mctlhq/mctl-agents#542): a dispatched
+        #     resume onto a proposal the idempotency guard above refuses to
+        #     rewrite. Clone and assemble — nothing else. No staging
+        #     directory is created, the SDK is never invoked, and the
+        #     `finally` below still drops the clone unconditionally, so this
+        #     branch leaves no residue beyond the sealed snapshot itself.
+        if context_only_pending:
+            outcome_work_item_id = (
+                work_context_ref.work_item_id if work_context_ref is not None else (work_item_id or "-")
+            )
+            outcome_execution_id = (
+                work_context_ref.execution_id if work_context_ref is not None else (execution_id or "-")
+            )
+            try:
+                context = _assemble_context(
+                    mode="shadow",
+                    issue=issue,
+                    repo_dir=clone / "repo",
+                    proposal_dir=proposal_dir,
+                    service=service,
+                    slug=slug,
+                    work_context=work_context_ref,
+                    temporal_workflow_id=temporal_workflow_id,
+                    temporal_run_id=temporal_run_id,
+                    argo_workflow_name=execution_context.correlation.argo_workflow_name,
+                    fatal=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — surfaces as a typed result, not a crash
+                print(
+                    "[outcome] code=failed reason=context-assembly-failed context_only=true "
+                    f"snapshot_id=- execution_id={outcome_execution_id} work_item_id={outcome_work_item_id}"
+                )
+                return InvestigateResult(
+                    service, slug, proposal_dir,
+                    error=f"context assembly failed: {type(exc).__name__}: {exc}",
+                    outcome_code="failed", outcome_reason="context-assembly-failed",
+                    context_only=True,
+                )
+            snapshot_id = context.snapshot.snapshot_id if context is not None else "-"
+            print(
+                "[outcome] code=succeeded reason=proposal-terminal context_only=true "
+                f"snapshot_id={snapshot_id} execution_id={outcome_execution_id} work_item_id={outcome_work_item_id}"
+            )
+            return InvestigateResult(
+                service, slug, proposal_dir,
+                skipped_reason=(
+                    f"proposal {service}/{slug} already at status "
+                    f"'{existing_status}' — sealed a context-only snapshot instead of rewriting it"
+                ),
+                outcome_code="succeeded", outcome_reason="proposal-terminal",
+                context_only=True,
+            )
 
         # 2. The agent writes into STAGING, never into the live proposal.
         #    Everything downstream follows from that: the existing
@@ -2876,7 +3063,10 @@ def _investigate(
                 detail += (
                     f" (present but not a regular file: {', '.join(wrong_type)})"
                 )
-            return InvestigateResult(service, slug, proposal_dir, error=detail)
+            return InvestigateResult(
+                service, slug, proposal_dir, error=detail,
+                outcome_code="failed", outcome_reason="agent-output-missing",
+            )
 
         # 5. Write .status.yaml into STAGING as well, so a failure there
         #    publishes nothing at all rather than leaving the new
@@ -3208,9 +3398,15 @@ def _investigate(
 
     except subprocess.CalledProcessError as e:
         msg = f"shell step failed: {' '.join(e.cmd)}\nstdout: {e.stdout}\nstderr: {e.stderr}"
-        return InvestigateResult(service, slug, proposal_dir, error=msg)
+        return InvestigateResult(
+            service, slug, proposal_dir, error=msg,
+            outcome_code="failed", outcome_reason="shell-step-failed",
+        )
     except _StagingReplaced as e:
-        return InvestigateResult(service, slug, proposal_dir, error=str(e))
+        return InvestigateResult(
+            service, slug, proposal_dir, error=str(e),
+            outcome_code="failed", outcome_reason="staging-replaced",
+        )
     except _ProposalAdvanced as e:
         # The rollback already put the proposal back; this is an ordinary
         # refusal, not a crash.
@@ -3220,9 +3416,13 @@ def _investigate(
                 f"proposal advanced to '{e.status}' while the agent was "
                 "running — refusing to overwrite it"
             ),
+            outcome_code="failed", outcome_reason="proposal-advanced",
         )
     except SystemExit as e:
-        return InvestigateResult(service, slug, proposal_dir, error=f"SystemExit: {e}")
+        return InvestigateResult(
+            service, slug, proposal_dir, error=f"SystemExit: {e}",
+            outcome_code="failed", outcome_reason="system-exit",
+        )
     except InvestigatorOrphanedSubagent as e:
         # Caught explicitly, ahead of the generic branch below, so the result
         # message names a platform handoff we lost rather than reading as "the
@@ -3251,6 +3451,7 @@ def _investigate(
                 f"harness failure — the run ended with a delegated sub-agent "
                 f"still live, so its work was discarded: {e}"
             ),
+            outcome_code="failed", outcome_reason="orphaned-subagent",
         )
     except RateLimitExhaustedError as e:
         # Must be caught before the generic Exception branch below — same
@@ -3258,10 +3459,14 @@ def _investigate(
         # `rate_limited=True` for whatever's driving this call to tell "this
         # account is out of quota" apart from any other agent failure.
         return InvestigateResult(
-            service, slug, proposal_dir, error=str(e), rate_limited=True
+            service, slug, proposal_dir, error=str(e), rate_limited=True,
+            outcome_code="failed", outcome_reason="rate-limit-exhausted",
         )
     except Exception as e:  # pragma: no cover — defensive  # noqa: BLE001 — surfaces as a result, not a crash
-        return InvestigateResult(service, slug, proposal_dir, error=f"{type(e).__name__}: {e}")
+        return InvestigateResult(
+            service, slug, proposal_dir, error=f"{type(e).__name__}: {e}",
+            outcome_code="failed", outcome_reason="unexpected-error",
+        )
     finally:
         # Drop the staging directory. Whatever the agent left there is
         # this run's work and either landed in the swap or is being
@@ -3521,7 +3726,11 @@ def main() -> None:
         print(f"  fail {result.service}/{result.slug}: {result.error}")
         sys.exit(1)
     if result.skipped_reason:
-        print(f"  skip {result.service}/{result.slug}: {result.skipped_reason}")
+        # mctlhq/mctl-agents#542: a context-only resume sealed a real
+        # ContextSnapshot before returning — "skip" alone would read as the
+        # old silent no-op this change exists to stop being.
+        verdict = "ctx " if result.context_only else "skip"
+        print(f"  {verdict} {result.service}/{result.slug}: {result.skipped_reason}")
         return
     print(f"  ok   {result.service}/{result.slug} -> {result.proposal_dir}")
     print(f"    {_gitops_tree_url(result.service, result.slug)}")

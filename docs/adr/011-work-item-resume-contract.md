@@ -404,6 +404,41 @@ the shepherd's liveness check, the orphan sweep) sees the dispatched loop
 too; the `dev-loop-xr_*` alias those callers used to consult (#477, the
 #474 memo) is gone.
 
+**A dispatched `resume` onto a loop whose proposal is past `proposed`
+(mctlhq/mctl-agents#542).** §8's "a `resume` of a finished loop is exactly a
+new run of it" holds even when the proposal that loop produced has already
+reached `accepted`/`implemented`/`merged`: `_OVERWRITABLE_STATUSES` in
+`run_issue_investigator.py` still refuses to rewrite it (never relaxed by
+this change), but a dispatched resume no longer exits having sealed
+nothing. The investigator clones the target repo and assembles a
+context-only `ContextSnapshot` under `shadow` semantics — no prompt is ever
+built on this path, so `on`'s "propagate on failure" rule is reused rather
+than `shadow`'s ordinary "warn and continue": a resume that could not seal
+this snapshot is reported `outcome_code="failed"`,
+`outcome_reason="context-assembly-failed"`, never as a silent success. A
+successful context-only run carries `outcome_code="succeeded"`,
+`outcome_reason="proposal-terminal"` (mctlhq/mctl-agents#431 acceptance
+items 3, 4, 7 provable on it), and `DevLoopWorkflow` ends the run right
+after, `ended="investigate context-only: proposal-terminal"`, rather than
+entering the approval wait for a proposal revision that does not exist —
+gated by `workflow.patched("context-only-resume")`, which reads the
+proposal's own `.status.yaml` (via the new `read_proposal_status` activity,
+beside `find_proposal_slug`) rather than a new CWFT output channel.
+
+The outcome is carried BESIDE the phase, never as a new one:
+`executions.PHASE_*` is mctl-api's own closed set
+(`Running`/`Succeeded`/`Failed`), and `_OwnExecution.finish` now keys
+Succeeded/Failed on `outcome_code == "succeeded"` rather than on
+`skipped_reason is None` — a context-only result carries a `skipped_reason`
+(the proposal was never rewritten) but did everything it was permitted to
+do, so it ends `Succeeded` on both the self-attached and the dispatched
+path, closing the inconsistency the two used to have for the same
+condition. With `ISSUE_INVESTIGATOR_CONTEXT_MODE=off` the dispatched resume
+still takes the original silent skip — nothing to seal, so cloning buys
+nothing — but the returned outcome is `refused`/`proposal-terminal` even
+there, so the run is distinguishable from a real one in the ledger either
+way.
+
 ## Alternatives
 
 1. **Reuse `StepRef` for cross-execution chaining.** Rejected: it would

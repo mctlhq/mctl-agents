@@ -65,7 +65,7 @@ from orchestrator.temporal.activities.lifecycle_reconcile import (
 from orchestrator.temporal.activities.orphans import detect_orphans
 from orchestrator.temporal.activities.pr_merge import merge_pull_request_gated
 from orchestrator.temporal.activities.pr_state import get_pr_state
-from orchestrator.temporal.activities.proposals import find_proposal_slug
+from orchestrator.temporal.activities.proposals import find_proposal_slug, read_proposal_status
 from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import record_execution
 from orchestrator.temporal.activities.stranded import find_stranded_accepted
@@ -540,6 +540,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         # one — nothing here waits on a mutex or an Argo run.
         reconcile_lifecycle_ownership,
         find_proposal_slug,
+        read_proposal_status,
         find_human_input_request,
         get_pr_state,
         get_issue_state,

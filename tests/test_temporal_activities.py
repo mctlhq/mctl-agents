@@ -23,7 +23,11 @@ from orchestrator.temporal.activities.human_input import (
     find_human_input_request,
 )
 from orchestrator.temporal.activities.identity import MintRequest, mint_execution_context
-from orchestrator.temporal.activities.proposals import ProposalListingError, find_proposal_slug
+from orchestrator.temporal.activities.proposals import (
+    ProposalListingError,
+    find_proposal_slug,
+    read_proposal_status,
+)
 from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
 from orchestrator.temporal.implement_outcome import ImplementerObservation
@@ -1003,6 +1007,81 @@ class TestFindProposalSlug:
 
         assert await env.run(find_proposal_slug, "mctl-agents", "404") == self.V1
         assert seen == [self._LISTING]
+
+
+class TestReadProposalStatus:
+    """mctlhq/mctl-agents#542: DevLoopWorkflow's context-only-resume branch
+    reads a known slug's current status through this activity."""
+
+    def _content_response(self, status_yaml: str) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "encoding": "base64",
+                "content": base64.b64encode(status_yaml.encode()).decode(),
+            },
+        )
+
+    async def test_reads_the_status_field(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == (
+                "/repos/mctlhq/mctl-gitops/contents/"
+                "platform-gitops/agents-state/mctl-portal/proposals/"
+                "issue-80-x/.status.yaml"
+            )
+            return self._content_response("status: accepted\n")
+
+        _mock_async_client(monkeypatch, handler)
+        status = await env.run(read_proposal_status, "mctl-portal", "issue-80-x")
+        assert status == "accepted"
+
+    async def test_missing_status_file_is_none_not_error(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"message": "Not Found"})
+
+        _mock_async_client(monkeypatch, handler)
+        assert await env.run(read_proposal_status, "mctl-portal", "issue-80-x") is None
+
+    async def test_malformed_yaml_is_none_never_read_as_proposed(self, env, monkeypatch):
+        """A hand-edited or half-written status file is missing evidence,
+        never "definitely still proposed" — the caller (DevLoopWorkflow)
+        must treat this the same as an absent file, not as license to end
+        the loop OR to assume the ordinary path."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return self._content_response("{not: valid: yaml:")
+
+        _mock_async_client(monkeypatch, handler)
+        assert await env.run(read_proposal_status, "mctl-portal", "issue-80-x") is None
+
+    async def test_server_error_raises_for_retry(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(502, text="bad gateway")
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(ProposalListingError):
+            await env.run(read_proposal_status, "mctl-portal", "issue-80-x")
+
+    async def test_no_token_raises_instead_of_unauthenticated_404(self, env, monkeypatch):
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(str(request.url))
+            return httpx.Response(404)
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(ProposalListingError, match="no GitHub token available"):
+            await env.run(read_proposal_status, "mctl-portal", "issue-80-x")
+        assert requests_made == []
 
 
 class TestFindHumanInputRequest:
