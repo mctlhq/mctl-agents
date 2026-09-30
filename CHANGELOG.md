@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.62.1](https://github.com/mctlhq/mctl-agents/compare/1.62.0...1.62.1) (2026-09-30)
+
+
+### Bug Fixes
+
+* **deps:** bump claude-agent-sdk to 0.2.163 for the 5.5 models ([455a6e6](https://github.com/mctlhq/mctl-agents/commit/455a6e6e82848643b04131c4009fea78a8337fff))
+
 ## [1.62.0](https://github.com/mctlhq/mctl-agents/compare/1.61.0...1.62.0) (2026-09-30)
 
 
