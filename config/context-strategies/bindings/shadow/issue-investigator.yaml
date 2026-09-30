@@ -79,3 +79,15 @@ spec:
       kind: none
       ref: null
       evaluatorVersion: null
+  - revision: 7
+    strategy: deterministic-fixed-order
+    version: 1.0.0
+    contentHash: sha256:1e01a20d8c2afca7982b789a9d38ca2e7e3dc8a1abd6a3f8bdfbc9904475181b
+    implementationHash: sha256:078b4132be2df049445d1d6ece252ed7ea993adf3340f2078bd1a0407418e67e
+    promotedBy: mashkovd
+    promotedAt: '2026-09-30T21:20:23Z'
+    reason: 'republish pins after #542 work-item-intent source'
+    evidence:
+      kind: none
+      ref: null
+      evaluatorVersion: null
