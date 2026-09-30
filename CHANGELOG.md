@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.63.0](https://github.com/mctlhq/mctl-agents/compare/1.62.1...1.63.0) (2026-09-30)
+
+
+### Features
+
+* **work-context:** WorkItem intents as a ContextSnapshot source ([#542](https://github.com/mctlhq/mctl-agents/issues/542) tasks 12-17) ([1c208f1](https://github.com/mctlhq/mctl-agents/commit/1c208f1e74fac223407b0bf572b89d999aadcb09))
+
+
+### Bug Fixes
+
+* **work-context:** advance the intent mark only over intents seen ([60ec7b8](https://github.com/mctlhq/mctl-agents/commit/60ec7b89efc102c34e82219ccabe1b5964f7b59a))
+
 ## [1.62.1](https://github.com/mctlhq/mctl-agents/compare/1.62.0...1.62.1) (2026-09-30)
 
 
