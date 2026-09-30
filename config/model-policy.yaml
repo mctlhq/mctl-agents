@@ -6,7 +6,7 @@ profiles:
     model_env: CLAUDE_CHEAP_MODEL
 
   balanced:
-    model: claude-sonnet-5
+    model: claude-sonnet-5-5
     model_env: CLAUDE_BALANCED_MODEL
 
 tasks:

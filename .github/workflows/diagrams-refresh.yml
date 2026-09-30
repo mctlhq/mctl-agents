@@ -237,7 +237,7 @@ jobs:
           # the only commands it may run are the validator, the facts
           # regenerator and git read-only inspection of the release diffs.
           claude_args: >-
-            --model claude-sonnet-5
+            --model claude-sonnet-5-5
             --max-turns 60
             --allowedTools "Read,Glob,Grep,Edit(docs/diagrams/archify/**),Write(docs/diagrams/archify/**),Write(CHANGES.md),Bash(node _archify/archify/bin/archify.mjs validate:*),Bash(node _archify/archify/bin/archify.mjs brands:*),Bash(python3 tools/diagram_facts.py:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git -C _gitops log:*),Bash(git -C _gitops diff:*),Bash(git -C _api log:*),Bash(git -C _api diff:*)"
 

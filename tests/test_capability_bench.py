@@ -75,7 +75,7 @@ def _result(
         "session_id": session_id,
         "uuid": uuid,
         "model_usage": {
-            "claude-sonnet-5": {
+            "claude-sonnet-5-5": {
                 "inputTokens": input_tokens,
                 "outputTokens": output_tokens,
                 "cacheReadInputTokens": cache_read,

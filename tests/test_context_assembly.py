@@ -424,7 +424,7 @@ def test_build_execution_correlation_legacy_branch(tmp_path):
         resolver_mode="legacy",
         issue_url="https://github.com/mctlhq/mctl-agents/issues/265",
         target_repository_sha="a" * 40,
-        legacy_model="claude-sonnet-5",
+        legacy_model="claude-sonnet-5-5",
         legacy_allowed_tools=("Read", "Write"),
         legacy_budget_usd=8.0,
     )
@@ -442,7 +442,7 @@ def test_build_execution_correlation_legacy_hash_changes_with_inputs():
         resolver_mode="legacy",
         issue_url="https://github.com/mctlhq/mctl-agents/issues/265",
         target_repository_sha="a" * 40,
-        legacy_model="claude-sonnet-5",
+        legacy_model="claude-sonnet-5-5",
         legacy_allowed_tools=("Read",),
         legacy_budget_usd=8.0,
     )
@@ -519,7 +519,7 @@ def test_assemble_investigator_context_shadow_mode_seals_a_snapshot(tmp_path):
         slug="issue-265-x",
         prompt_template="PROMPT",
         resolver_mode="legacy",
-        legacy_model="claude-sonnet-5",
+        legacy_model="claude-sonnet-5-5",
         legacy_allowed_tools=("Read", "Write"),
         legacy_budget_usd=8.0,
     )
