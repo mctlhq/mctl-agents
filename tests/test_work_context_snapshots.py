@@ -134,7 +134,12 @@ def test_seal_body_carries_the_exact_canonical_document(tmp_path):
     assert json.loads(raw)["strategy"] == snap.strategy.to_dict()  # the version travels in the bytes
     assert (body["execution_sequence"], body["strategy"], body["strategy_version"]) == (
         2, snap.strategy.name, snap.strategy.version)
-    assert (body["prior_execution_id"], body["prior_snapshot_id"]) == (E1, "cs_prior")
+    # A resumed snapshot is named alone: the store resolves its execution,
+    # which may be older than the latest prior one (mctl-agents#542).
+    assert body["prior_snapshot_id"] == "cs_prior" and "prior_execution_id" not in body
+    # Without one, the latest prior store execution is named.
+    plain = ws.seal_body(snap, _work_context())
+    assert plain["prior_execution_id"] == E1 and "prior_snapshot_id" not in plain
     # Local correlation ids are never sent as store references.
     other = ws.seal_body(snap, _work_context(prior_execution_ids=("sha-local",), resumed_from_snapshot_id="sha256:x"))
     assert "prior_execution_id" not in other and "prior_snapshot_id" not in other
