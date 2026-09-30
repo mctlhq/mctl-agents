@@ -5376,7 +5376,7 @@ def test_dispatched_resume_onto_terminal_proposal_seals_context_only_snapshot(
     no-op skip #542 reports, and the proposal directory is left
     byte-identical. The snapshot must actually reach the work-item store
     (`_stub_successful_persist`) for this to count as `succeeded` — see
-    `test_dispatched_resume_context_not_persisted_is_reported_as_failure`
+    `test_dispatched_resume_context_not_persisted_is_reported_as_refused`
     for the case where it does not."""
     _dispatched_resume_env(monkeypatch, context_mode="shadow")
     _stub_dispatched_work_item(monkeypatch)
@@ -5414,14 +5414,21 @@ def test_dispatched_resume_onto_terminal_proposal_seals_context_only_snapshot(
     assert "execution_id=we_dispatch" in out
 
 
-def test_dispatched_resume_context_not_persisted_is_reported_as_failure(tmp_path, monkeypatch, capsys):
+def test_dispatched_resume_context_not_persisted_is_reported_as_refused(tmp_path, monkeypatch, capsys):
     """Codex P2 follow-up (#545 review on #542): a context-only resume
     whose snapshot seals locally but never actually reaches the
     work-item store must not be reported `succeeded` — that recreates
     the exact silent no-op #542 exists to remove, just hidden behind a
     Succeeded ledger entry. `_dispatched_resume_env` deletes
     `MCTL_TOKEN`, so `persist()` answers unfavourably (not `stored`)
-    without raising, and `AssemblyResult.store_ref` stays `None`."""
+    without raising, and `AssemblyResult.store_ref` stays `None`.
+
+    Codex review follow-up: with the entry gate requiring `observe`,
+    this is reachable only when the store itself could not decide
+    (unreachable, or it refused the snapshot) — an infrastructure
+    condition, not a run defect, so it must not hard-fail the CWFT.
+    `outcome_code="refused"` and a `skipped_reason` (no `error`) keep
+    `main()` from calling `sys.exit(1)`."""
     _dispatched_resume_env(monkeypatch, context_mode="shadow")
     _stub_dispatched_work_item(monkeypatch)
     issue = _dispatched_resume_issue(monkeypatch, number=548)
@@ -5442,12 +5449,13 @@ def test_dispatched_resume_context_not_persisted_is_reported_as_failure(tmp_path
     )
 
     assert result.context_only is True
-    assert result.outcome_code == "failed"
+    assert result.outcome_code == "refused"
     assert result.outcome_reason == "context-not-persisted"
-    assert result.error is not None
+    assert result.error is None
+    assert result.skipped_reason is not None
 
     out = capsys.readouterr().out
-    assert "[outcome] code=failed reason=context-not-persisted context_only=true" in out
+    assert "[outcome] code=refused reason=context-not-persisted context_only=true" in out
 
 
 def test_dispatched_resume_at_rollout_off_keeps_the_unchanged_skip(tmp_path, monkeypatch):

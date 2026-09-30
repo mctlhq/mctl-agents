@@ -2896,33 +2896,41 @@ def _investigate(
             # landing in the work-item store. `_assemble_context(fatal=True)`
             # only turns an *exception* into a typed failure — it says
             # nothing about a non-raising, unfavourable persist. That is a
-            # reachable, non-exceptional outcome: no work context at all
-            # (`work_context_ref is None`, e.g. no `work_item_id` was
-            # supplied, or the store answered "unknown" at `observe`, where
-            # `blocks_on_unknown()` does not hold — the rollout-below-
-            # `observe` case is excluded before this path is even entered,
-            # see the entry gate above), or a `SnapshotAnswer` that never
-            # reached `stored` (`context_assembly._persist_to_work_item_store`
-            # only raises at `enforce`+ or on a vetoing divergence; at
-            # `observe` it logs and returns). `AssemblyResult.store_ref` is
-            # `None` in exactly those cases (`snapshots.store_ref_from`), so
-            # it is the one signal
-            # that distinguishes "sealed and stored" from "sealed and
+            # reachable, non-exceptional outcome: with the entry gate above
+            # now requiring `rollout.computes_new_answer()` (>= `observe`),
+            # the only ways left to reach it are the store itself failing to
+            # answer — `WorkItemClient.get()` degrading to `WORK_ITEM_UNKNOWN`
+            # on a transport error instead of raising, so `work_context_ref`
+            # stays `None` — or `context_assembly._persist_to_work_item_store`
+            # logging a non-`stored` answer instead of raising, which only
+            # happens at `observe` (it raises at `enforce`+ or on a vetoing
+            # divergence). `AssemblyResult.store_ref` is `None` in exactly
+            # those cases (`snapshots.store_ref_from`), so it is the one
+            # signal that distinguishes "sealed and stored" from "sealed and
             # thrown away" — reporting `succeeded` on the latter would
             # recreate the silent no-op this path exists to remove, just
             # hidden behind a Succeeded ledger entry.
+            #
+            # Codex review follow-up on #542: both remaining causes are the
+            # store failing to decide, not a defect in this run, and this
+            # rollout stage's contract is that the store being unable to
+            # decide must never hard-fail the CWFT. `refused` (not `failed`)
+            # and `skipped_reason` (not `error`) keep that distinction —
+            # `main()` only calls `sys.exit(1)` when `error` is set — while
+            # still refusing to claim `succeeded` on a snapshot that never
+            # reached the store.
             if context is None or context.store_ref is None:
                 print(
-                    "[outcome] code=failed reason=context-not-persisted context_only=true "
+                    "[outcome] code=refused reason=context-not-persisted context_only=true "
                     f"snapshot_id={snapshot_id} execution_id={outcome_execution_id} work_item_id={outcome_work_item_id}"
                 )
                 return InvestigateResult(
                     service, slug, proposal_dir,
-                    error=(
+                    skipped_reason=(
                         f"context-only resume sealed snapshot {snapshot_id!r} but it never reached "
-                        "the work-item store"
+                        "the work-item store — the store could not decide, not a run defect"
                     ),
-                    outcome_code="failed", outcome_reason="context-not-persisted",
+                    outcome_code="refused", outcome_reason="context-not-persisted",
                     context_only=True,
                 )
             print(
