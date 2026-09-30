@@ -152,20 +152,20 @@ wheels = [
 
 [[package]]
 name = "claude-agent-sdk"
-version = "0.2.136"
+version = "0.2.163"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
+    { name = "jsonschema" },
     { name = "mcp" },
     { name = "sniffio" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/67/ef/ecd4cc717d0af9b29c0202b2b69284582f1463e7429dc4e9f00c3c5c5771/claude_agent_sdk-0.2.136.tar.gz", hash = "sha256:a45bff05f629dc753992d960a944737c61de9efab4d5a798b0c4e83d21386bc3", size = 312189, upload-time = "2026-08-11T20:09:34.835Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9b/74/635d38e2ef813a2d1ba4ff7f3de736c35ee3bce9ebf4a5b7e89f3293604f/claude_agent_sdk-0.2.163.tar.gz", hash = "sha256:269821ad5acff5967522ff15f444b0598840fd9bdc45c645de569a5478061a53", size = 365180, upload-time = "2026-09-30T19:46:37.125Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c2/38/06ef7686e0de2ef66257f22f055ff4e79d63f20d0cbd822eeea70ac346e2/claude_agent_sdk-0.2.136-py3-none-macosx_11_0_arm64.whl", hash = "sha256:40c74bf4d75d35991bc006c24b4ab6c0cecd8d5467dd1d9520b02d27507e59f3", size = 83253479, upload-time = "2026-08-11T20:09:41.119Z" },
-    { url = "https://files.pythonhosted.org/packages/8a/cf/744bbf0f612e28d771da748f3bfeab9800fc8be753e8677473cba1d16961/claude_agent_sdk-0.2.136-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:bcd90b2960b463141a84a0c7fcf6c957555cf96169e6cfedee430498dc40b775", size = 88598004, upload-time = "2026-08-11T20:09:48.209Z" },
-    { url = "https://files.pythonhosted.org/packages/5f/44/c654a8af1c3505f15332c6d7e32adbb8b800acfa9901cfaccab1c851f822/claude_agent_sdk-0.2.136-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:12f0b97f49d429b9e06a62a1f56ec10fc8b4435bff6e83207837d47a7871a9a6", size = 93319413, upload-time = "2026-08-11T20:09:55.157Z" },
-    { url = "https://files.pythonhosted.org/packages/98/67/1a9018e2cfe0a790b905977f0c48894014bfd1cf616f230d1f1499b0d8e5/claude_agent_sdk-0.2.136-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:a07d17456b8759fac35ed9ae6cdfdc065bc690669b0a8cc80bd7d9c8d4f1623f", size = 94452952, upload-time = "2026-08-11T20:10:02.885Z" },
-    { url = "https://files.pythonhosted.org/packages/c7/14/b0488725da3341c7aa4e44920e59ca1fa5183645e7a8e7ef8a3924ef1626/claude_agent_sdk-0.2.136-py3-none-win_amd64.whl", hash = "sha256:e4cc387b68c8fee5e32bdcf7f38c249cd2f0ebf4bc3ae04a459a83785e541d89", size = 93503605, upload-time = "2026-08-11T20:10:09.949Z" },
+    { url = "https://files.pythonhosted.org/packages/c7/48/bd56b852692a99939384c25ae6bbcbd6e9017ce5becf28c1e00d8ce83c24/claude_agent_sdk-0.2.163-py3-none-macosx_11_0_arm64.whl", hash = "sha256:b025dcc3f9c52779bcd9e9c088b1a587d96afbffb8355b5d3053850796735ede", size = 93359293, upload-time = "2026-09-30T19:46:40.568Z" },
+    { url = "https://files.pythonhosted.org/packages/ba/c0/73f36a7435037ae06541be0fd6fdfe4f3270e6fd958a4523ee1c90e2737d/claude_agent_sdk-0.2.163-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:e10d48657f01cc53801cdd8ec3d0a6c8c680b82da083da42493f82feb99d04e6", size = 97793458, upload-time = "2026-09-30T19:46:44.773Z" },
+    { url = "https://files.pythonhosted.org/packages/13/c7/d8fbc84fa75b79f5a57af1595a79b0a392844fcb192aad09ef8c646b6c85/claude_agent_sdk-0.2.163-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:e3be00eeb9fc156a3308a2e8fb58390768fdcb2ff16683fac385b4d98e99233c", size = 102851414, upload-time = "2026-09-30T19:46:48.947Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/ea/fc2a0a4e27c8ccfdbc77344298842adcbb6de03d4cdbae5793ff659b00e0/claude_agent_sdk-0.2.163-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:260cb955d237b7e1897f1dbf9ee5efbf815d8622d0c7459a05409c56432d8501", size = 103197060, upload-time = "2026-09-30T19:46:53.144Z" },
 ]
 
 [[package]]
@@ -403,7 +403,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anyio", specifier = "==4.14.2" },
-    { name = "claude-agent-sdk", specifier = "==0.2.136" },
+    { name = "claude-agent-sdk", specifier = "==0.2.163" },
     { name = "httpx", specifier = "==0.28.1" },
     { name = "mcp", specifier = "==1.29.0" },
     { name = "opentelemetry-api", specifier = "==1.44.0" },
