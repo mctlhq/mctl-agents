@@ -11,5 +11,13 @@ profiles:
 
 tasks:
   service_agent: balanced
-  mentor_digest: cheap
-  review_findings_normalize: cheap
+  # Both left `cheap` (Haiku) on 2026-10-01. review_findings_normalize is the
+  # shepherd's reading of review comments into severity-tagged findings, and
+  # the shepherd merges on that reading -- a P2 read as P3 is an unattended
+  # merge. Haiku had already failed judgement work here twice (the reviewer's
+  # low tier approving a diff with a real P2, gitops#1058; the incident
+  # responder's guessed root causes). mentor_digest runs weekly, so the
+  # stronger model costs next to nothing there. `cheap` stays defined for
+  # purely mechanical tasks.
+  mentor_digest: balanced
+  review_findings_normalize: balanced
