@@ -772,12 +772,44 @@ def test_switch_on_with_no_intents_records_mark_zero_and_off_records_none(tmp_pa
     assert "intent_high_water" not in off["work_context"]
 
 
-def test_recorded_mark_and_source_mark_combine():
+def test_recorded_mark_is_authoritative_over_the_sources():
+    """The recorded mark saw what `sources` cannot (ceiling cuts), so a
+    carried source above it never raises it; without a recorded mark the
+    sources are the fallback."""
     doc = {"work_context": {"intent_high_water": 40}, "sources": [_sealed(12)]}
     assert ca.prior_intent_high_water(doc) == 40
     doc2 = {"work_context": {"intent_high_water": 40}, "sources": [_sealed(55)]}
-    assert ca.prior_intent_high_water(doc2) == 55
+    assert ca.prior_intent_high_water(doc2) == 40
+    assert ca.prior_intent_high_water({"work_context": {}, "sources": [_sealed(55)]}) == 55
     assert ca.prior_intent_high_water({"work_context": {"intent_high_water": "40"}, "sources": []}) is None
+
+
+def test_ceiling_cut_intents_hold_the_mark_below_a_carried_pinned_intent(tmp_path):
+    """The candidate ceiling cuts the ranked intents (collected last) before
+    anything is sealed, so they leave no source behind. A carried pinned
+    resume intent with a higher id must not lift the mark past them: the
+    next snapshot offers them again."""
+    ranked_ids = range(1, 21)
+    intents = _parsed(*ranked_ids, 30)
+    config = ca.AssemblyConfig(max_candidates=10, max_sources=50, max_bytes=1_000_000)
+    doc = _seal_doc(tmp_path, (intents, intents[-1], None), config=config)
+    sealed = {x["selector"]["intent_id"]: x["selection"]["included"]
+              for x in doc["sources"] if x["kind"] == "work-item-intent"}
+    assert sealed[30] is True  # the pinned intent was carried
+    cut = [i for i in ranked_ids if i not in sealed]
+    assert cut  # ... and the ceiling cut ranked intents without a trace
+    mark = doc["work_context"]["intent_high_water"]
+    assert mark == min(cut) - 1
+    assert ca.prior_intent_high_water(doc) == mark
+    _, reoffered, _ = ca.select_work_item_intents(intents, prior_high_water=mark, resume_intent=None)
+    assert set(cut) <= {i.intent_id for i in reoffered}
+
+
+def test_all_offered_intents_seen_lets_the_pinned_intent_set_the_mark(tmp_path):
+    intents = _parsed(1, 2, 30)
+    config = ca.AssemblyConfig(max_sources=50)
+    doc = _seal_doc(tmp_path, (intents, intents[-1], None), config=config)
+    assert doc["work_context"]["intent_high_water"] == 30
 
 
 def test_work_context_intent_high_water_is_validated():

@@ -955,24 +955,28 @@ def select_work_item_intents(
 
 
 def prior_intent_high_water(prior_document: Mapping[str, Any] | None) -> int | None:
-    """The intent high-water mark a stored snapshot document leaves: the
-    larger of the mark it recorded (`work_context.intent_high_water`) and the
+    """The intent high-water mark a stored snapshot document leaves: the mark
+    it recorded (`work_context.intent_high_water`) when it has one, else the
     mark its own intent sources imply (`intent_mark_from_sources`). None when
     it has neither, as for every snapshot sealed before the intent source
     existed or with the switch off, so every intent qualifies up to the cap.
 
-    The recorded mark is what survives a quiet execution: one that selected
-    no intent still records the mark it inherited."""
+    The recorded mark is authoritative. It was computed from the intents
+    offered to the pipeline (`_next_intent_high_water`), which sees what
+    `sources` cannot: intents the candidate ceiling cut before sealing. So it
+    is never raised by the sources, which would jump past those intents. It
+    also survives a quiet execution: one that selected no intent still
+    records the mark it inherited."""
     if not isinstance(prior_document, Mapping):
         return None
     work_context = prior_document.get("work_context")
     recorded = work_context.get("intent_high_water") if isinstance(work_context, Mapping) else None
     if not isinstance(recorded, int) or isinstance(recorded, bool) or recorded < 0:
         recorded = None
+    if recorded is not None:
+        return recorded
     sources = prior_document.get("sources")
-    derived = intent_mark_from_sources(sources) if isinstance(sources, list) else None
-    marks = [m for m in (recorded, derived) if m is not None]
-    return max(marks) if marks else None
+    return intent_mark_from_sources(sources) if isinstance(sources, list) else None
 
 
 def intent_mark_from_sources(sources: Sequence[Any]) -> int | None:
@@ -1008,13 +1012,39 @@ def intent_mark_from_sources(sources: Sequence[Any]) -> int | None:
 
 
 def _next_intent_high_water(assembly_input: AssemblyInput, sources: Sequence[ContextSource]) -> int:
-    """The mark this snapshot records for the next execution: its own
-    sources' mark, never below the one it inherited (the listing started
-    there, so every intent it saw is above it). Intents the cap cut are
-    below the kept ones and stay behind the mark: they are counted in
-    `candidates_dropped_pre_budget`, not offered again."""
-    derived = intent_mark_from_sources([s.to_dict() for s in sources])
-    return max(assembly_input.prior_intent_high_water or 0, derived or 0)
+    """The mark this snapshot records for the next execution, never below
+    the one it inherited (the listing started there).
+
+    It is computed from the ranked intents OFFERED to the pipeline, not from
+    `sources`: the candidate ceiling cuts candidates before anything is
+    sealed, and the ranked intents are collected last, so a cut intent
+    leaves no trace in `sources`. A ranked intent counts as seen only when
+    its source is included or excluded as `duplicate-content` (its bytes
+    reached the prompt under another id). If any offered intent was not
+    seen, the mark stops just below the lowest such id, whatever else was
+    carried, so the pinned resume intent never lifts it past an unseen one.
+    Otherwise it is the highest seen id, the pinned intent included.
+
+    Intents the cap cut are older than every kept one and stay behind the
+    mark: they are counted in `candidates_dropped_pre_budget`, not offered
+    again."""
+    _, ranked, _ = select_work_item_intents(
+        assembly_input.work_item_intents,
+        prior_high_water=assembly_input.prior_intent_high_water,
+        resume_intent=assembly_input.resume_intent,
+    )
+    seen: set[int] = set()
+    for source in sources:
+        if source.kind != "work-item-intent":
+            continue
+        value = source.selector.get("intent_id")
+        if not isinstance(value, int) or isinstance(value, bool):
+            continue
+        if source.selection.included or source.selection.reason_code == "duplicate-content":
+            seen.add(value)
+    unseen = [i.intent_id for i in ranked if i.intent_id not in seen]
+    derived = min(unseen) - 1 if unseen else max(seen, default=0)
+    return max(assembly_input.prior_intent_high_water or 0, derived)
 
 
 def _with_intent_high_water(
@@ -1686,16 +1716,15 @@ def assemble(
             for collector in _collectors_for(shadow_input):
                 shadow_candidates.extend(collector(shadow_input))
             shadow_outcome = run_pipeline(shadow_candidates, shadow_config, assembly_input.now)
+            shadow_sources = tuple(_to_context_source(c) for c in shadow_outcome.candidates)
             shadow_snapshot = seal(
                 execution=execution,
                 strategy=shadow_outcome.strategy,
                 budget=shadow_outcome.budget,
                 retention=retention,
                 created_at=_iso(assembly_input.now),
-                work_context=_with_intent_high_water(
-                    work_context, shadow_input, tuple(_to_context_source(c) for c in shadow_outcome.candidates)
-                ),
-                sources=tuple(_to_context_source(c) for c in shadow_outcome.candidates),
+                work_context=_with_intent_high_water(work_context, shadow_input, shadow_sources),
+                sources=shadow_sources,
                 evidence_refs=(),
                 conflicts=shadow_outcome.conflicts,
             )
