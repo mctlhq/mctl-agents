@@ -2911,15 +2911,35 @@ def _investigate(
             # recreate the silent no-op this path exists to remove, just
             # hidden behind a Succeeded ledger entry.
             #
-            # Codex review follow-up on #542: both remaining causes are the
-            # store failing to decide, not a defect in this run, and this
-            # rollout stage's contract is that the store being unable to
-            # decide must never hard-fail the CWFT. `refused` (not `failed`)
-            # and `skipped_reason` (not `error`) keep that distinction —
-            # `main()` only calls `sys.exit(1)` when `error` is set — while
-            # still refusing to claim `succeeded` on a snapshot that never
-            # reached the store.
+            # WORK_CONTEXT_REQUIRED decides which way an unpersisted C2
+            # fails, the same contract as `rollout.work_context_required()`
+            # everywhere else. When it is required (the default), the run
+            # fails explicitly: `failed` with `error` set, so `main()` exits
+            # 1 and the CWFT fails rather than pretend context continuity
+            # held. When it is not (`WORK_CONTEXT_REQUIRED=false`, the
+            # break-glass for a work-item store outage), the run fails open:
+            # `refused` with a `skipped_reason` and no `error`, so the CWFT
+            # does not fail. Either way it never claims `succeeded` for a
+            # snapshot that never reached the store, and the proposal is
+            # never rewritten.
             if context is None or context.store_ref is None:
+                from orchestrator.work_context import rollout as _work_context_rollout
+
+                if _work_context_rollout.work_context_required():
+                    print(
+                        "[outcome] code=failed reason=context-not-persisted context_only=true "
+                        f"snapshot_id={snapshot_id} execution_id={outcome_execution_id} "
+                        f"work_item_id={outcome_work_item_id}"
+                    )
+                    return InvestigateResult(
+                        service, slug, proposal_dir,
+                        error=(
+                            f"context-only resume sealed snapshot {snapshot_id!r} but it never reached "
+                            "the work-item store, and WORK_CONTEXT_REQUIRED is set"
+                        ),
+                        outcome_code="failed", outcome_reason="context-not-persisted",
+                        context_only=True,
+                    )
                 print(
                     "[outcome] code=refused reason=context-not-persisted context_only=true "
                     f"snapshot_id={snapshot_id} execution_id={outcome_execution_id} work_item_id={outcome_work_item_id}"

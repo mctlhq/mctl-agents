@@ -5414,7 +5414,13 @@ def test_dispatched_resume_onto_terminal_proposal_seals_context_only_snapshot(
     assert "execution_id=we_dispatch" in out
 
 
-def test_dispatched_resume_context_not_persisted_is_reported_as_refused(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize(
+    ("required", "want_code"),
+    [("false", "refused"), ("true", "failed"), (None, "failed")],
+)
+def test_dispatched_resume_context_not_persisted_follows_work_context_required(
+    tmp_path, monkeypatch, capsys, required, want_code
+):
     """Codex P2 follow-up (#545 review on #542): a context-only resume
     whose snapshot seals locally but never actually reaches the
     work-item store must not be reported `succeeded` — that recreates
@@ -5428,8 +5434,16 @@ def test_dispatched_resume_context_not_persisted_is_reported_as_refused(tmp_path
     (unreachable, or it refused the snapshot) — an infrastructure
     condition, not a run defect, so it must not hard-fail the CWFT.
     `outcome_code="refused"` and a `skipped_reason` (no `error`) keep
-    `main()` from calling `sys.exit(1)`."""
+    `main()` from calling `sys.exit(1)`.
+
+    Which of the two applies is WORK_CONTEXT_REQUIRED's call (owner
+    decision on #545). When required, which is also the unset default, the
+    run fails explicitly (`failed`, `error` set, so the CWFT fails). When
+    `false`, it fails open (`refused`, no `error`). Neither ever reports
+    `succeeded`, and the terminal proposal is never rewritten."""
     _dispatched_resume_env(monkeypatch, context_mode="shadow")
+    if required is not None:
+        monkeypatch.setenv(_work_context_rollout.REQUIRED_ENV_VAR, required)
     _stub_dispatched_work_item(monkeypatch)
     issue = _dispatched_resume_issue(monkeypatch, number=548)
     _spy_clone(monkeypatch, tmp_path)
@@ -5438,6 +5452,7 @@ def test_dispatched_resume_context_not_persisted_is_reported_as_refused(tmp_path
     proposal_dir = tmp_path / "mctl-telegram" / "proposals" / slug
     write_status_yaml(proposal_dir, issue)
     (proposal_dir / ".status.yaml").write_text(yaml.safe_dump({"status": "merged"}))
+    before = {p.name: p.read_bytes() for p in proposal_dir.iterdir()}
 
     result = investigate(
         issue.ref.url,
@@ -5449,13 +5464,18 @@ def test_dispatched_resume_context_not_persisted_is_reported_as_refused(tmp_path
     )
 
     assert result.context_only is True
-    assert result.outcome_code == "refused"
+    assert result.outcome_code == want_code
     assert result.outcome_reason == "context-not-persisted"
-    assert result.error is None
-    assert result.skipped_reason is not None
+    if want_code == "failed":
+        assert result.error is not None
+    else:
+        assert result.error is None
+        assert result.skipped_reason is not None
+    assert {p.name: p.read_bytes() for p in proposal_dir.iterdir()} == before
 
     out = capsys.readouterr().out
-    assert "[outcome] code=refused reason=context-not-persisted context_only=true" in out
+    assert f"[outcome] code={want_code} reason=context-not-persisted context_only=true" in out
+    assert "code=succeeded" not in out
 
 
 def test_dispatched_resume_at_rollout_off_keeps_the_unchanged_skip(tmp_path, monkeypatch):
