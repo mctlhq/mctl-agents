@@ -2676,11 +2676,25 @@ def _investigate(
             execution_id=execution_id,
             execution_request_id=execution_request_id,
         )
-        if not dispatched_resume or _context_mode() == "off":
+        # Codex review follow-up on #542: `_context_mode() != "off"` alone is
+        # not enough to make this path worth entering.
+        # `work_context_ref` below (and therefore `AssemblyResult.store_ref`)
+        # can only become non-`None` once `WORK_CONTEXT_ROLLOUT_MODE` is at
+        # least `observe` (`rollout.computes_new_answer()`) — at the default
+        # `off` rollout, the work-context block never contacts the store, so
+        # the context-only path would always seal a snapshot, always find
+        # `store_ref is None`, and always report `outcome_code="failed"` for
+        # a run that was never able to persist anything in the first place.
+        # Treat rollout-off the same as context-mode-off: nothing to seal (or
+        # nowhere for it to land), so cloning would buy nothing.
+        from orchestrator.work_context import rollout as _work_context_rollout
+
+        if not dispatched_resume or _context_mode() == "off" or not _work_context_rollout.computes_new_answer():
             # The ordinary case (an intake-label re-investigation, a `@MCTL
             # reinvestigate` directive, or a direct CLI call): unchanged —
             # no clone, no assembly, nothing sealed. Also the escape hatch
-            # for a dispatched resume when context assembly is off: with
+            # for a dispatched resume when context assembly is off, or the
+            # work-context rollout has not reached `observe` yet: with
             # nothing to seal, cloning would buy nothing.
             print(f"warn: {reason}")
             return InvestigateResult(
@@ -2883,12 +2897,16 @@ def _investigate(
             # only turns an *exception* into a typed failure — it says
             # nothing about a non-raising, unfavourable persist. That is a
             # reachable, non-exceptional outcome: no work context at all
-            # (`work_context_ref is None`, e.g. the rollout gate below
-            # `observe`), or a `SnapshotAnswer` that never reached `stored`
-            # (`context_assembly._persist_to_work_item_store` only raises at
-            # `enforce`+ or on a vetoing divergence; at `observe` it logs and
-            # returns). `AssemblyResult.store_ref` is `None` in exactly those
-            # cases (`snapshots.store_ref_from`), so it is the one signal
+            # (`work_context_ref is None`, e.g. no `work_item_id` was
+            # supplied, or the store answered "unknown" at `observe`, where
+            # `blocks_on_unknown()` does not hold — the rollout-below-
+            # `observe` case is excluded before this path is even entered,
+            # see the entry gate above), or a `SnapshotAnswer` that never
+            # reached `stored` (`context_assembly._persist_to_work_item_store`
+            # only raises at `enforce`+ or on a vetoing divergence; at
+            # `observe` it logs and returns). `AssemblyResult.store_ref` is
+            # `None` in exactly those cases (`snapshots.store_ref_from`), so
+            # it is the one signal
             # that distinguishes "sealed and stored" from "sealed and
             # thrown away" — reporting `succeeded` on the latter would
             # recreate the silent no-op this path exists to remove, just

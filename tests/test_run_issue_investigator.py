@@ -5450,6 +5450,42 @@ def test_dispatched_resume_context_not_persisted_is_reported_as_failure(tmp_path
     assert "[outcome] code=failed reason=context-not-persisted context_only=true" in out
 
 
+def test_dispatched_resume_at_rollout_off_keeps_the_unchanged_skip(tmp_path, monkeypatch):
+    """Codex review follow-up on #542: with `WORK_CONTEXT_ROLLOUT_MODE` at
+    its default `off`, `work_context_ref` can never become non-`None` no
+    matter what `ISSUE_INVESTIGATOR_CONTEXT_MODE` is set to — the
+    work-context block below the entry gate never contacts the store. A
+    dispatched resume onto a terminal proposal must therefore take the same
+    no-clone skip as `_context_mode() == "off"` (T4), not enter the
+    context-only path only to seal a snapshot that can never be persisted
+    and always report `outcome_code="failed"`."""
+    _dispatched_resume_env(monkeypatch, context_mode="shadow")
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.OFF)
+    _stub_dispatched_work_item(monkeypatch)
+    issue = _dispatched_resume_issue(monkeypatch, number=549)
+    cloned = _spy_clone(monkeypatch, tmp_path)
+
+    slug = build_slug(549, "Fix work context resume")
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / slug
+    write_status_yaml(proposal_dir, issue)
+    (proposal_dir / ".status.yaml").write_text(yaml.safe_dump({"status": "merged"}))
+
+    result = investigate(
+        issue.ref.url,
+        state_dir=tmp_path,
+        work_item_id="wi-542",
+        execution_id="we_dispatch",
+        execution_request_id="xr-1",
+        resume_from_execution_id="we_prior",
+    )
+
+    assert cloned == []
+    assert result.error is None
+    assert result.context_only is False
+    assert result.outcome_code == "refused"
+    assert result.outcome_reason == "proposal-terminal"
+
+
 def test_dispatched_resume_context_carries_work_context_provenance(tmp_path, monkeypatch):
     """T3: the sealed snapshot's work_context names this run's store
     execution and the prior one it resumed from — #431 acceptance items 3
