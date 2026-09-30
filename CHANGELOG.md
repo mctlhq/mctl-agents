@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.62.0](https://github.com/mctlhq/mctl-agents/compare/1.61.0...1.62.0) (2026-09-30)
+
+
+### Features
+
+* **agents:** issue-494-usage-producer-residual-review-p3s-from ([1bcbcec](https://github.com/mctlhq/mctl-agents/commit/1bcbcec8643c61694e85bee9c0504c8ac9c3f8d0))
+* **agents:** issue-528-feat-context-platform-472-slice-c-produc ([a38e8c2](https://github.com/mctlhq/mctl-agents/commit/a38e8c24015641b32e4654d139c3fa9a665f5729))
+* **agents:** issue-539-feat-evidence-define-the-execution-join ([9fe775f](https://github.com/mctlhq/mctl-agents/commit/9fe775fee8db4e9fe2efa93e23cdecccc889de4a))
+* **agents:** issue-539-feat-evidence-define-the-execution-join ([f4a4d24](https://github.com/mctlhq/mctl-agents/commit/f4a4d245550fc148e08dfecc2ae2fafbd6df5a3d))
+* **agents:** issue-542-fix-work-context-a-resume-onto-a-closed ([df0c27d](https://github.com/mctlhq/mctl-agents/commit/df0c27d65fae58c0a78d22e8621b833d1d2ea48d))
+* **context-assembly:** add evaluator reference to the compare line ([d4202db](https://github.com/mctlhq/mctl-agents/commit/d4202dbafb20af03e348c7b8cd48df23eb0de2eb))
+* **context-eval:** add execution-observed provenance and record round-trip ([308ec98](https://github.com/mctlhq/mctl-agents/commit/308ec981b569e608e7b2077e8eb52aa9236b37e5))
+* **context-release:** add --evidence-file to the promote CLI ([60d3b5d](https://github.com/mctlhq/mctl-agents/commit/60d3b5d7fa2bddfa1137be8119ef3180543f01b5))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-528-feat-context-platform-472-slice-c-produc ([6172430](https://github.com/mctlhq/mctl-agents/commit/61724303e867e7361c828c0eea3672d0b999093e))
+* **agents:** address P1/P2 codex findings on issue-528-feat-context-platform-472-slice-c-produc ([b9c54cb](https://github.com/mctlhq/mctl-agents/commit/b9c54cbea1748cecc047d2e759daff8bc97e94a6))
+* **agents:** address P1/P2 codex findings on issue-528-feat-context-platform-472-slice-c-produc ([b4ce95a](https://github.com/mctlhq/mctl-agents/commit/b4ce95acf2c516914f3e86e100d09140490ac698))
+* **agents:** address P1/P2 codex findings on issue-528-feat-context-platform-472-slice-c-produc ([428de51](https://github.com/mctlhq/mctl-agents/commit/428de51cd4bc55e7f639fe75961c54132da56ac8))
+* **agents:** address P1/P2 codex findings on issue-539-feat-evidence-define-the-execution-join ([401de4f](https://github.com/mctlhq/mctl-agents/commit/401de4f1b5d96b97577034bfdbb6fc20ebcf1fdd))
+* **agents:** address P1/P2 codex findings on issue-542-fix-work-context-a-resume-onto-a-closed ([bc95dae](https://github.com/mctlhq/mctl-agents/commit/bc95daedd328d9af249bebefb01c444356e99b35))
+* **agents:** address P1/P2 codex findings on issue-542-fix-work-context-a-resume-onto-a-closed ([f931669](https://github.com/mctlhq/mctl-agents/commit/f931669667ca3f718e6179b657c18bef79438846))
+* **agents:** address P1/P2 codex findings on issue-542-fix-work-context-a-resume-onto-a-closed ([200fe9d](https://github.com/mctlhq/mctl-agents/commit/200fe9d14d0f655499417d077af620ac35241219))
+* **agents:** seal a context-only snapshot on a dispatched resume onto a closed loop ([997a8ff](https://github.com/mctlhq/mctl-agents/commit/997a8ff00f30ebb4398e6c60b43299f178ef22cc))
+* **deps:** bump pyjwt to 2.15.1 for CVE-2026-102268 ([3f62794](https://github.com/mctlhq/mctl-agents/commit/3f6279471222dd84a5989a0a65053e5f7e8293ea))
+* **deps:** bump pyjwt to 2.15.1 for CVE-2026-102268 ([9048256](https://github.com/mctlhq/mctl-agents/commit/9048256334b6b8c42f4be62634636f0226c8ef96))
+* **investigator:** an unpersisted C2 follows WORK_CONTEXT_REQUIRED ([c7345b0](https://github.com/mctlhq/mctl-agents/commit/c7345b0c96df1d8bfd81d34a50b433540fbc4cd1))
+* **orchestrator:** usage producer residual review P3s from [#494](https://github.com/mctlhq/mctl-agents/issues/494) ([5ec1063](https://github.com/mctlhq/mctl-agents/commit/5ec1063820abe1f49ab7af81e66ab5e657a93083))
+
 ## [1.61.0](https://github.com/mctlhq/mctl-agents/compare/1.60.0...1.61.0) (2026-09-28)
 
 
