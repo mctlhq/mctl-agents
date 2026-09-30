@@ -1856,9 +1856,16 @@ def assemble_investigator_context(
     # One client for the one conversation with the store, and only when
     # the rollout and the execution id say there is one.
     client = _client(work_item_client) if _work_context_active(work_context) else None
-    work_context, prior_answer = _link_prior_snapshot_with_answer(work_context, client)
+    request_answer = _read_execution_request(work_context, client, execution_request_id)
+    work_context, prior_answer = _link_prior_snapshot_with_answer(
+        work_context, client, requested_execution_id=_requested_resume_execution(work_context, request_answer)
+    )
     reading = _resolve_work_item_intents(
-        work_context, client, execution_request_id=execution_request_id, prior_answer=prior_answer
+        work_context,
+        client,
+        execution_request_id=execution_request_id,
+        prior_answer=prior_answer,
+        request_answer=request_answer,
     )
     if reading is not None:
         intents, resume_intent, high_water = reading
@@ -1893,6 +1900,7 @@ def _resolve_work_item_intents(
     *,
     execution_request_id: str | None,
     prior_answer: Any | None,
+    request_answer: Any | None = None,
 ) -> tuple[tuple[Intent, ...], Intent | None, int | None] | None:
     """`(intents, resume_intent, prior_high_water)` for a WorkItem-backed
     assembly, or None when there is none to read: no store execution (no
@@ -1915,7 +1923,8 @@ def _resolve_work_item_intents(
     wid = work_context.work_item_id
     resume_intent: Intent | None = None
     if execution_request_id:
-        request_answer = client.execution_request(wid, execution_request_id)
+        if request_answer is None:
+            request_answer = client.execution_request(wid, execution_request_id)
         request = request_answer.request
         if request_answer.verdict != xr.FOUND or request is None:
             raise IntentUnresolved(
@@ -1992,19 +2001,48 @@ def _client(work_item_client: Any | None) -> Any:
     return WorkItemClient()
 
 
+def _read_execution_request(
+    work_context: WorkContextRef | None, client: Any | None, execution_request_id: str | None
+) -> Any | None:
+    """The one read of the execution request this run fulfils, shared by the
+    resume pointer and the intent source, or None when there is no request
+    or no store conversation. The answer is returned whatever its verdict:
+    each reader decides what a failed read means for it."""
+    if work_context is None or client is None or not execution_request_id:
+        return None
+    return client.execution_request(work_context.work_item_id, execution_request_id)
+
+
+def _requested_resume_execution(work_context: WorkContextRef | None, request_answer: Any | None) -> str:
+    """The execution the request says this run resumes from, or "" when the
+    request could not be read, belongs to another item, or names none. Only
+    a hint for the convenience pointer: `resumed_from` still uses it only
+    when it is one of this execution's prior store executions."""
+    from orchestrator.work_context import execution_requests as xr
+
+    if work_context is None or request_answer is None or request_answer.verdict != xr.FOUND:
+        return ""
+    request = request_answer.request
+    if request is None or request.work_item_id != work_context.work_item_id:
+        return ""
+    return request.resumed_from_execution_id
+
+
 def _link_prior_snapshot_with_answer(
-    work_context: WorkContextRef | None, client: Any | None
+    work_context: WorkContextRef | None, client: Any | None, *, requested_execution_id: str = ""
 ) -> tuple[WorkContextRef | None, Any | None]:
-    """Point `resumed_from_snapshot_id` at the prior execution's sealed
-    snapshot before this execution's is sealed. A convenience pointer
-    (ADR 011): a failed lookup is logged and never blocks, and a retry that
-    gets a different answer is not a divergence (`snapshots.differing_fields`
-    ignores the pointer)."""
+    """Point `resumed_from_snapshot_id` at the resumed execution's sealed
+    snapshot before this execution's is sealed: the execution the request
+    names, else the latest prior one that sealed a snapshot
+    (`snapshots.resumed_from`). A convenience pointer (ADR 011): a failed
+    lookup is logged and never blocks, and a retry that gets a different
+    answer is not a divergence (`snapshots.differing_fields` ignores the
+    pointer)."""
     if work_context is None or client is None:
         return work_context, None
     from orchestrator.work_context.snapshots import SNAPSHOT_SKIPPED, resumed_from
 
-    linked, answer = resumed_from(work_context, client)
+    linked, answer = resumed_from(work_context, client, requested_execution_id=requested_execution_id)
     if answer.verdict != SNAPSHOT_SKIPPED:
         _emit_snapshot_answer("resumed_from", answer)
     return linked, answer

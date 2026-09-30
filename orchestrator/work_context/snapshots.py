@@ -188,12 +188,17 @@ def seal_body(snapshot: ContextSnapshot, work_context: WorkContextRef) -> dict[s
         "strategy": snapshot.strategy.name,
         "strategy_version": snapshot.strategy.version,
     }
-    prior = _latest_store_prior(work_context)
-    if prior:
-        body["prior_execution_id"] = prior
     resumed = work_context.resumed_from_snapshot_id
     if isinstance(resumed, str) and resumed.startswith(SNAPSHOT_ID_PREFIX):
+        # The store resolves the prior execution through the snapshot and
+        # refuses a pair that disagrees (mctl-api `checkPrior`). The snapshot
+        # may belong to an execution older than the latest prior one
+        # (`resumed_from`), so name it alone rather than risk that refusal.
         body["prior_snapshot_id"] = resumed
+    else:
+        prior = _latest_store_prior(work_context)
+        if prior:
+            body["prior_execution_id"] = prior
     return body
 
 
@@ -356,17 +361,68 @@ def _stored_document(snap: dict[str, Any]) -> dict[str, Any] | None:
     return doc if isinstance(doc, dict) else None
 
 
-def resumed_from(work_context: WorkContextRef, client: Any) -> tuple[WorkContextRef, SnapshotAnswer]:
+#: How many prior store executions `resumed_from` asks about before it gives
+#: up. The prior list is short in practice; the cap bounds the reads.
+MAX_RESUME_LOOKUPS = 20
+
+
+def resumed_from(
+    work_context: WorkContextRef, client: Any, *, requested_execution_id: str = ""
+) -> tuple[WorkContextRef, SnapshotAnswer]:
     """`work_context` with `resumed_from_snapshot_id` naming the snapshot the
-    latest prior store execution sealed. Unchanged unless that snapshot is
-    found; the answer says why."""
-    prior = _latest_store_prior(work_context)
-    if not is_store_execution(work_context.execution_id) or not prior:
+    resumed execution sealed. Unchanged unless that snapshot is found; the
+    answer says why.
+
+    The resumed execution is `requested_execution_id` when the execution
+    request named one and it is a prior store execution of this item: that
+    execution's snapshot, and no other, is the answer. Otherwise the prior
+    store executions are asked newest first, and the first that sealed a
+    snapshot answers. A prior execution that ran but sealed nothing (a run
+    that exited before assembly) is skipped only on the store's documented
+    absence (SNAPSHOT_ABSENT): any other answer, a failed or unreadable read
+    among them, stops the walk and is returned as is, because a snapshot the
+    lookup could not see is not a snapshot that does not exist."""
+    priors = [p for p in work_context.prior_execution_ids if is_store_execution(p)]
+    if not is_store_execution(work_context.execution_id) or not priors:
         return work_context, SnapshotAnswer(SNAPSHOT_SKIPPED, reason="no prior store execution")
-    answer = client.execution_snapshot(work_context.work_item_id, prior)
-    if answer.verdict != SNAPSHOT_REPLAYED:
-        return work_context, answer
-    return replace(work_context, resumed_from_snapshot_id=answer.snapshot_id), answer
+    if requested_execution_id and requested_execution_id in priors:
+        candidates = [requested_execution_id]
+        how = f"requested execution {requested_execution_id}"
+    else:
+        candidates = list(reversed(priors))[:MAX_RESUME_LOOKUPS]
+        how = "latest prior execution that sealed a snapshot"
+    answer = SnapshotAnswer(SNAPSHOT_SKIPPED, reason="no prior store execution")
+    ledger: frozenset[str] | None = None
+    for position, execution_id in enumerate(candidates):
+        answer = client.execution_snapshot(work_context.work_item_id, execution_id)
+        if answer.verdict == SNAPSHOT_REPLAYED:
+            answer = replace(answer, reason=f"{how}: {execution_id}")
+            return replace(work_context, resumed_from_snapshot_id=answer.snapshot_id), answer
+        if answer.verdict != SNAPSHOT_ABSENT or position == len(candidates) - 1:
+            return work_context, answer
+        # The store answers `snapshot_not_found` for an execution it never
+        # recorded as well as for one that sealed nothing. Only the second
+        # may be walked past: an unrecorded prior (a `--resume-from` id the
+        # store does not know) must stay the latest prior, so the seal names
+        # it and the store checks it.
+        if ledger is None:
+            ledger = _recorded_executions(client, work_context.work_item_id)
+        if not ledger or execution_id not in ledger:
+            return work_context, replace(
+                answer, reason=f"{answer.reason}; {execution_id} is not a recorded execution, not walked past"
+            )
+    return work_context, answer
+
+
+def _recorded_executions(client: Any, work_item_id: str) -> frozenset[str]:
+    """The executions the store's ledger records for the item, or an empty
+    set when the item could not be read: an unread ledger confirms nothing."""
+    from orchestrator.work_context.contract import WORK_ITEM_FOUND
+
+    read = client.get(work_item_id)
+    if read.verdict != WORK_ITEM_FOUND or read.item is None:
+        return frozenset()
+    return frozenset(e.execution_id for e in read.item.executions if e.execution_id)
 
 
 def persist(snapshot: ContextSnapshot, client: Any) -> SnapshotAnswer:

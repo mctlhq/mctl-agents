@@ -91,3 +91,16 @@ spec:
       kind: none
       ref: null
       evaluatorVersion: null
+  - revision: 8
+    strategy: deterministic-fixed-order
+    version: 1.0.0
+    contentHash: sha256:73fb0be129309d3b34809d0cc83b14b226d11721c569b65c8c33508e8a4812b8
+    implementationHash: sha256:7e748f9fab5db244c9899b3a0d9df8f8f1bd69a61e00b83093140877efdb628f
+    promotedBy: mashkovd
+    promotedAt: '2026-09-30T23:25:56Z'
+    reason: 'republish pins after the #542 resume-pointer fix (resumed_from walks
+      to the requested or latest sealed prior)'
+    evidence:
+      kind: none
+      ref: null
+      evaluatorVersion: null
