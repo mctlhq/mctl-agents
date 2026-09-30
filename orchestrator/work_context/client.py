@@ -120,6 +120,11 @@ class _HTTPResult:
         self.status_path = status_path
 
 
+def quote_path_segment(value: str) -> str:
+    """One URL path segment, quoted exactly as the client quotes it."""
+    return _q(value)
+
+
 class WorkItemClient:
     """Synchronous client. Safe in Argo pods and CLI entry points."""
 
@@ -131,6 +136,11 @@ class WorkItemClient:
         self._token = token if token is not None else os.environ.get("MCTL_TOKEN", "").strip()
         self._timeout = timeout
         self._opener = _no_redirect_opener()
+
+    @property
+    def base_url(self) -> str:
+        """The base URL every request of this client goes to."""
+        return self._base
 
     # -- transport ------------------------------------------------------
 
@@ -298,15 +308,15 @@ class WorkItemClient:
 
     # -- canonical intents (mctlhq/mctl-api#430, mctlhq/mctl-agents#542) --
 
-    def list_intents(self, work_item_id: str) -> wi.IntentsAnswer:
-        """Every intent of the item, ascending by id. LISTED only when every
-        page was read: a truncated page whose continuation fails, or a
-        listing longer than `intents.MAX_PAGES` pages, is UNKNOWN, never a
-        shorter list. ABSENT only for the documented item 404 on the first
-        page; an item that vanishes mid-listing is UNKNOWN."""
+    def list_intents(self, work_item_id: str, *, after_id: int = 0) -> wi.IntentsAnswer:
+        """Every intent of the item with an id above `after_id`, ascending.
+        LISTED only when every page was read: a truncated page whose
+        continuation fails, or a listing longer than `intents.MAX_PAGES`
+        pages, is UNKNOWN, never a shorter list. ABSENT only for the
+        documented item 404 on the first page; an item that vanishes
+        mid-listing is UNKNOWN."""
         base = ROUTES["list_intents"].format(id=_q(work_item_id))
         collected: list[wi.Intent] = []
-        after_id = 0
         for page_no in range(wi.MAX_PAGES):
             path = f"{base}?after_id={after_id}&limit={wi.PAGE_LIMIT}"
             try:
@@ -317,6 +327,8 @@ class WorkItemClient:
             if terminal is not None or page is None:
                 if terminal is None:
                     return wi.IntentsAnswer(wi.INTENTS_UNKNOWN, reason="listing page could not be classified")
+                # The caller treats both as unresolved today; the split keeps
+                # "the item is gone" distinguishable from "a page failed".
                 if page_no > 0 and terminal.verdict == wi.INTENT_ABSENT:
                     return wi.IntentsAnswer(wi.INTENTS_UNKNOWN, reason=f"page {page_no + 1}: {terminal.reason}")
                 return terminal

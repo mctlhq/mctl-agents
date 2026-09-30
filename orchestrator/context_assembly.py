@@ -278,6 +278,9 @@ class AssemblyInput:
     #: The highest `work-item-intent` id among the prior snapshot's (C1's)
     #: sources, or None when there is no C1 or it carries none.
     prior_intent_high_water: int | None = None
+    #: The base URL of the client that read the intents, so a sealed
+    #: locator names the URL actually read. Empty = `api_base()`.
+    work_item_api_base: str = ""
 
 
 @dataclass
@@ -477,11 +480,26 @@ def apply_budget(candidates: Sequence[CandidateSource], config: AssemblyConfig) 
     higher-ranked (later) included candidate `included=False,
     reason_code="budget-exhausted"`. Stopping at the first miss, rather than
     opportunistically fitting a smaller later source, keeps the rule one
-    sentence long and reproducible."""
+    sentence long and reproducible.
+
+    The one exemption is a candidate marked `pinned` — only ever the resume
+    intent (mctlhq/mctl-agents#542): it is budgeted first, so it is never
+    dropped for sources ranked ahead of it. If it alone exceeds `max_bytes`
+    it is cut to fit, the same way `truncate_to_per_source_limit` cuts."""
     used_sources = 0
     used_bytes = 0
     budget_hit = False
-    for candidate in sorted((c for c in candidates if c.included), key=lambda c: c.rank):
+    for candidate in sorted((c for c in candidates if c.included and c.pinned), key=lambda c: c.rank):
+        if used_sources + 1 > config.max_sources or used_bytes >= config.max_bytes:
+            candidate.included = False
+            candidate.reason_code = "budget-exhausted"
+            budget_hit = True
+            continue
+        if used_bytes + candidate.byte_count > config.max_bytes:
+            truncate_to_per_source_limit(candidate, config.max_bytes - used_bytes)
+        used_sources += 1
+        used_bytes += candidate.byte_count
+    for candidate in sorted((c for c in candidates if c.included and not c.pinned), key=lambda c: c.rank):
         if budget_hit:
             candidate.included = False
             candidate.reason_code = "budget-exhausted"
@@ -912,13 +930,14 @@ def select_work_item_intents(
     prior_high_water: int | None,
     resume_intent: Intent | None,
     cap: int = MAX_WORK_ITEM_INTENTS,
-) -> tuple[Intent | None, tuple[Intent, ...]]:
-    """`(pinned, ranked)`: the pinned resume intent, and the intents newer
-    than the prior snapshot's highest one, ascending by id, at most `cap`
-    of them (mctlhq/mctl-agents#542). With no prior high-water mark every
-    intent qualifies, up to the cap. The resume intent is never repeated in
-    `ranked`. A pure function of its arguments, so the same inputs select
-    the same intents in the same order."""
+) -> tuple[Intent | None, tuple[Intent, ...], int]:
+    """`(pinned, ranked, over_cap)`: the pinned resume intent; the newest
+    `cap` intents above the prior snapshot's highest carried one, emitted
+    ascending by id (mctlhq/mctl-agents#542); and how many qualifying
+    intents the cap cut, so a truncated selection is counted, never silent.
+    With no prior high-water mark every intent qualifies. The resume intent
+    is never repeated in `ranked`. A pure function of its arguments, so the
+    same inputs select the same intents in the same order."""
     pinned_id = resume_intent.intent_id if resume_intent is not None else None
     newer = sorted(
         (
@@ -927,27 +946,44 @@ def select_work_item_intents(
         ),
         key=lambda i: i.intent_id,
     )
-    return resume_intent, tuple(newer[:cap])
+    kept = newer[-cap:] if cap > 0 else []
+    return resume_intent, tuple(kept), len(newer) - len(kept)
 
 
 def prior_intent_high_water(prior_document: Mapping[str, Any] | None) -> int | None:
-    """The highest `work-item-intent` id among a stored snapshot document's
-    sources, or None when there is no document or it carries none (every
-    snapshot sealed before this kind existed)."""
+    """The intent id below which a stored snapshot document shows every
+    ranked intent as carried, or None when there is no document or it holds
+    no intent (every snapshot sealed before this kind existed).
+
+    Only `selection.included` sources were seen by the model. A ranked
+    intent sealed as excluded (budget, duplicate) was not, so the mark stops
+    just below the lowest such id and it is offered again, even when higher
+    ids were carried: re-offering a carried intent is a superset, dropping
+    an unseen one is not. The pinned resume intent (`strategy_step:
+    primary`) may be older than the mark and never lowers it."""
     if not isinstance(prior_document, Mapping):
         return None
     sources = prior_document.get("sources")
     if not isinstance(sources, list):
         return None
-    ids: list[int] = []
+    carried: list[int] = []
+    unseen: list[int] = []
     for source in sources:
         if not isinstance(source, Mapping) or source.get("kind") != "work-item-intent":
             continue
         selector = source.get("selector")
         value = selector.get("intent_id") if isinstance(selector, Mapping) else None
-        if isinstance(value, int) and not isinstance(value, bool):
-            ids.append(value)
-    return max(ids) if ids else None
+        if not isinstance(value, int) or isinstance(value, bool):
+            continue
+        selection = source.get("selection")
+        selection = selection if isinstance(selection, Mapping) else {}
+        if selection.get("included") is True:
+            carried.append(value)
+        elif selection.get("strategy_step") != "primary":
+            unseen.append(value)
+    if unseen:
+        return min(unseen) - 1
+    return max(carried) if carried else None
 
 
 def _intent_candidate(assembly_input: AssemblyInput, intent: Intent, *, pinned: bool) -> CandidateSource:
@@ -956,9 +992,12 @@ def _intent_candidate(assembly_input: AssemblyInput, intent: Intent, *, pinned: 
     retention removed the text) lives in the selector. `text_redacted` is
     recorded explicitly, so an empty text there reads as "removed", never as
     an empty intent."""
-    from orchestrator.work_context.client import ROUTES, api_base
+    from orchestrator.work_context.client import ROUTES, api_base, quote_path_segment
 
-    route = ROUTES["work_item_intent"].format(id=intent.work_item_id, intent_id=intent.intent_id)
+    route = ROUTES["work_item_intent"].format(
+        id=quote_path_segment(intent.work_item_id), intent_id=quote_path_segment(str(intent.intent_id))
+    )
+    base = assembly_input.work_item_api_base or api_base()
     payload = {"text": intent.text, "params": intent.params}
     header = (
         f"WorkItem intent {intent.intent_id} by {intent.actor_principal}"
@@ -968,7 +1007,7 @@ def _intent_candidate(assembly_input: AssemblyInput, intent: Intent, *, pinned: 
     return CandidateSource(
         source_id=f"work-item-intent:{intent.work_item_id}:{intent.intent_id}",
         kind="work-item-intent",
-        locator=f"{api_base()}{route}",
+        locator=f"{base}{route}",
         selector={
             "work_item_id": intent.work_item_id,
             "intent_id": intent.intent_id,
@@ -997,7 +1036,7 @@ def collect_work_item_intents(assembly_input: AssemblyInput) -> list[CandidateSo
     resume intent first, then the selected newer intents in ascending id
     order. Reads nothing itself; the intents were read from mctl-api before
     assembly, so this stays a pure collector like the others."""
-    pinned, ranked = select_work_item_intents(
+    pinned, ranked, _ = select_work_item_intents(
         assembly_input.work_item_intents,
         prior_high_water=assembly_input.prior_intent_high_water,
         resume_intent=assembly_input.resume_intent,
@@ -1005,6 +1044,16 @@ def collect_work_item_intents(assembly_input: AssemblyInput) -> list[CandidateSo
     out = [_intent_candidate(assembly_input, pinned, pinned=True)] if pinned is not None else []
     out.extend(_intent_candidate(assembly_input, i, pinned=False) for i in ranked)
     return out
+
+
+def _work_item_intents_over_cap(assembly_input: AssemblyInput) -> int:
+    if not assembly_input.work_item_intents:
+        return 0
+    return select_work_item_intents(
+        assembly_input.work_item_intents,
+        prior_high_water=assembly_input.prior_intent_high_water,
+        resume_intent=assembly_input.resume_intent,
+    )[2]
 
 
 def _collect_pinned_work_item_intent(assembly_input: AssemblyInput) -> list[CandidateSource]:
@@ -1537,6 +1586,7 @@ def assemble(
     candidates_dropped_pre_budget = (
         max(0, len(assembly_input.issue.comments) - config.max_comments)
         + outcome.counters.excluded_candidate_ceiling
+        + _work_item_intents_over_cap(assembly_input)
     )
 
     sources = tuple(_to_context_source(c) for c in outcome.candidates)
@@ -1743,6 +1793,7 @@ def assemble_investigator_context(
             work_item_intents=intents,
             resume_intent=resume_intent,
             prior_intent_high_water=high_water,
+            work_item_api_base=str(getattr(client, "base_url", "") or ""),
         )
     result = assemble(assembly_input, mode=mode, execution=execution, work_context=work_context)
     answer = _persist_to_work_item_store(result.snapshot, client)
@@ -1798,6 +1849,10 @@ def _resolve_work_item_intents(
             raise IntentUnresolved(
                 f"execution request {execution_request_id} belongs to {request.work_item_id}, not {wid}"
             )
+        if request.intent_id_malformed:
+            raise IntentUnresolved(
+                f"execution request {execution_request_id} of {wid} carries a malformed intent_id"
+            )
         if request.intent_id is not None:
             read = client.work_item_intent(wid, request.intent_id)
             if read.verdict != wi.INTENT_FOUND or read.intent is None:
@@ -1805,15 +1860,17 @@ def _resolve_work_item_intents(
                     f"resume intent {request.intent_id} of {wid} is unresolved ({read.verdict}): {read.reason}"
                 )
             resume_intent = read.intent
-    listing = client.list_intents(wid)
-    if listing.verdict != wi.INTENTS_LISTED:
-        raise IntentUnresolved(f"intents of {wid} could not be listed ({listing.verdict}): {listing.reason}")
     prior_document = (
         prior_answer.stored_document
         if prior_answer is not None and prior_answer.verdict == SNAPSHOT_REPLAYED
         else None
     )
     high_water = prior_intent_high_water(prior_document)
+    # Only intents above the mark can be selected, so the listing starts
+    # there; the pinned intent was read by id above.
+    listing = client.list_intents(wid, after_id=high_water or 0)
+    if listing.verdict != wi.INTENTS_LISTED:
+        raise IntentUnresolved(f"intents of {wid} could not be listed ({listing.verdict}): {listing.reason}")
     print(
         "[context] work-item-intent source=on "
         f"listed={len(listing.intents)} "
@@ -1857,11 +1914,6 @@ def _client(work_item_client: Any | None) -> Any:
     from orchestrator.work_context.client import WorkItemClient
 
     return WorkItemClient()
-
-
-def _link_prior_snapshot(work_context: WorkContextRef | None, client: Any | None) -> WorkContextRef | None:
-    """`_link_prior_snapshot_with_answer`, without the prior snapshot's read."""
-    return _link_prior_snapshot_with_answer(work_context, client)[0]
 
 
 def _link_prior_snapshot_with_answer(

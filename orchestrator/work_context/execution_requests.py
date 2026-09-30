@@ -149,6 +149,10 @@ class ExecutionRequest:
     #: `intent_id`), or None when the request names none
     #: (mctlhq/mctl-agents#542).
     intent_id: int | None = None
+    #: `intent_id` was present with a value that is not an integer id. The
+    #: request still parses (claiming, fulfilling and rejecting never read
+    #: it); only the intent source refuses it, and only when it is on.
+    intent_id_malformed: bool = False
 
     @staticmethod
     def from_payload(data: Any) -> ExecutionRequest | None:
@@ -166,11 +170,20 @@ class ExecutionRequest:
         version = data.get("expected_state_version", 0)
         if not isinstance(version, int) or isinstance(version, bool):
             return None
-        # Absent (mctl-api omits it) or null is "no intent". Present but not
-        # a positive integer is a malformed request, never "no intent".
-        intent_id = data.get("intent_id")
-        if intent_id is not None and (not isinstance(intent_id, int) or isinstance(intent_id, bool) or intent_id <= 0):
-            return None
+        # Absent (mctl-api omits it), null or 0 (a Go zero value) is "no
+        # intent". Anything else that is not a positive integer is recorded
+        # as malformed rather than failing the whole request: this parser
+        # also backs claim/fulfil/reject, which never read the field.
+        raw_intent_id = data.get("intent_id")
+        intent_id: int | None = None
+        intent_id_malformed = False
+        if isinstance(raw_intent_id, int) and not isinstance(raw_intent_id, bool):
+            if raw_intent_id > 0:
+                intent_id = raw_intent_id
+            elif raw_intent_id < 0:
+                intent_id_malformed = True
+        elif raw_intent_id is not None:
+            intent_id_malformed = True
         return ExecutionRequest(
             request_id=rid,
             work_item_id=wid,
@@ -184,6 +197,7 @@ class ExecutionRequest:
             reason=_str(data.get("reason")),
             claim_expires_at=_str(data.get("claim_expires_at")),
             intent_id=intent_id,
+            intent_id_malformed=intent_id_malformed,
         )
 
 

@@ -192,6 +192,8 @@ def test_t12_context_only_resume_carries_the_intent_and_leaves_the_proposal_byte
 ):
     _env(monkeypatch, switch="on")
     store = _install(monkeypatch, _FakeStore(intents=[_intent(3), _intent(7, text="ship the digest")], intent_id=7))
+    # The sealed locator names the base of the client that read the intent.
+    monkeypatch.setattr(wc_client.WorkItemClient, "base_url", property(lambda self: "https://api.read"))
     _stub_dispatched_work_item(monkeypatch)
     persisted = _record_persist(monkeypatch)
     captured = _capture_assembly(monkeypatch)
@@ -218,7 +220,7 @@ def test_t12_context_only_resume_carries_the_intent_and_leaves_the_proposal_byte
     assert pinned["content_hash"] == cs.hash_bytes(want)
     assert pinned["trust"]["tier"] == "reported"
     assert pinned["selection"]["reason_code"] == "resume-intent"
-    assert pinned["locator"] == f"https://api.mctl.ai/api/v1/work-items/{WID}/intents/7"
+    assert pinned["locator"] == f"https://api.read/api/v1/work-items/{WID}/intents/7"
     # The older intent is there too, as an ordinary (unpinned) source.
     assert sources[f"work-item-intent:{WID}:3"]["selection"]["reason_code"] == "work-item-intent"
     assert f"/api/v1/work-items/{WID}/intents/7" in store.paths
@@ -334,6 +336,9 @@ def test_main_exits_nonzero_on_intent_unresolved(monkeypatch):
         )
 
     monkeypatch.setattr(run_issue_investigator, "investigate", _unresolved)
+    # Hermetic: no Claude credentials are needed to map a failed result to
+    # an exit code (the same stub the other main() tests use).
+    monkeypatch.setattr("orchestrator.auth.ensure_auth_for_sdk", lambda: None)
     monkeypatch.setattr(
         "sys.argv", ["run_issue_investigator", "--issue-url", "https://github.com/mctlhq/mctl-telegram/issues/1"]
     )
@@ -449,20 +454,68 @@ def test_t15_same_intents_seal_the_same_snapshot(tmp_path):
     assert _seal(tuple(reversed(intents))) == first
 
 
-def test_select_takes_newer_than_high_water_ascending_capped_plus_pinned():
+def test_select_keeps_the_newest_above_the_mark_ascending_plus_pinned():
     intents = _parsed(*range(1, 41))
-    pinned, ranked = ca.select_work_item_intents(
+    pinned, ranked, over_cap = ca.select_work_item_intents(
         tuple(reversed(intents)), prior_high_water=10, resume_intent=intents[4]
     )
     assert pinned is intents[4]
-    assert [i.intent_id for i in ranked] == list(range(11, 11 + ca.MAX_WORK_ITEM_INTENTS))
+    # 30 qualify (11..40): the newest 20 are kept, emitted ascending.
+    assert [i.intent_id for i in ranked] == list(range(21, 41))
+    assert over_cap == 10
     # The pinned intent is never repeated among the ranked ones.
-    _, ranked2 = ca.select_work_item_intents(intents, prior_high_water=None, resume_intent=intents[0])
-    assert 1 not in [i.intent_id for i in ranked2]
-    assert [i.intent_id for i in ranked2] == list(range(2, 2 + ca.MAX_WORK_ITEM_INTENTS))
+    _, ranked2, over2 = ca.select_work_item_intents(intents, prior_high_water=None, resume_intent=intents[39])
+    assert 40 not in [i.intent_id for i in ranked2]
+    assert [i.intent_id for i in ranked2] == list(range(20, 40))
+    assert over2 == 19
+    _, ranked3, over3 = ca.select_work_item_intents(intents[:5], prior_high_water=None, resume_intent=None)
+    assert [i.intent_id for i in ranked3] == [1, 2, 3, 4, 5]
+    assert over3 == 0
 
 
-def test_pinned_intent_survives_a_budget_that_drops_the_ranked_ones(tmp_path):
+def test_intents_cut_by_the_cap_are_counted_pre_budget(tmp_path):
+    (tmp_path / "repo").mkdir()
+    base = ca.assemble(_assembly_input(tmp_path), mode="shadow", execution=_execution())
+    inp = _assembly_input(tmp_path, work_item_intents=_parsed(*range(1, 26)))
+    result = ca.assemble(inp, mode="shadow", execution=_execution())
+    assert result.metrics.candidates_dropped_pre_budget == base.metrics.candidates_dropped_pre_budget + 5
+    carried = [s.selector["intent_id"] for s in result.snapshot.sources if s.kind == "work-item-intent"]
+    assert carried == list(range(6, 26))
+
+
+@pytest.mark.parametrize("strategy", sorted(ca.STRATEGIES))
+@pytest.mark.parametrize("limit", ["max_sources", "max_bytes"])
+def test_pinned_resume_intent_survives_a_budget_that_drops_everything_else(tmp_path, strategy, limit):
+    """Task 15 DoD: the resume intent survives a budget that drops every
+    other ranked source, the github-issue included; older intents do not
+    share the exemption."""
+    (tmp_path / "repo").mkdir()
+    intents = _parsed(1, 2, 3)
+    tiny = {"max_sources": 1} if limit == "max_sources" else {"max_bytes": 8}
+    config = ca.AssemblyConfig(strategy=strategy, **tiny)
+    inp = _assembly_input(tmp_path, work_item_intents=intents, resume_intent=intents[2], config=config)
+    result = ca.assemble(inp, mode="shadow", execution=_execution())
+    included = {s.source_id: s.selection.included for s in result.snapshot.sources}
+    assert [k for k, v in included.items() if v] == [f"work-item-intent:{WID}:3"]
+    assert included[f"work-item-intent:{WID}:1"] is False
+    kinds_excluded = {s.kind for s in result.snapshot.sources if not s.selection.included}
+    assert "github-issue" in kinds_excluded
+    # The budget still holds: an oversize pinned intent is cut to fit.
+    budget = result.snapshot.budget
+    assert budget.used_sources <= budget.max_sources and budget.used_bytes <= budget.max_bytes
+
+
+def test_budget_without_a_pinned_intent_is_unchanged(tmp_path):
+    """No resume intent: the rank-order budget is exactly today's."""
+    (tmp_path / "repo").mkdir()
+    config = ca.AssemblyConfig(max_sources=1)
+    inp = _assembly_input(tmp_path, work_item_intents=_parsed(1, 2), config=config)
+    result = ca.assemble(inp, mode="shadow", execution=_execution())
+    included = [s.kind for s in result.snapshot.sources if s.selection.included]
+    assert "work-item-intent" not in included and len(included) == 1
+
+
+def test_pinned_intent_is_collected_right_after_the_issue(tmp_path):
     (tmp_path / "repo").mkdir()
     intents = _parsed(1, 2, 3)
     inp = _assembly_input(tmp_path, work_item_intents=intents, resume_intent=intents[2])
@@ -582,18 +635,95 @@ def test_t18_prior_snapshot_without_the_kind_selects_every_intent_up_to_the_cap(
     assert ca.prior_intent_high_water(doc) is None
     assert ca.prior_intent_high_water(None) is None
     intents = _parsed(*range(1, 31))
-    _, ranked = ca.select_work_item_intents(intents, prior_high_water=ca.prior_intent_high_water(doc),
-                                            resume_intent=None)
-    assert [i.intent_id for i in ranked] == list(range(1, 1 + ca.MAX_WORK_ITEM_INTENTS))
+    _, ranked, over_cap = ca.select_work_item_intents(
+        intents, prior_high_water=ca.prior_intent_high_water(doc), resume_intent=None
+    )
+    assert [i.intent_id for i in ranked] == list(range(11, 31))
+    assert over_cap == 10
+
+
+def _sealed(iid: int, *, included: bool = True, step: str = "secondary", kind: str = "work-item-intent"):
+    return {"kind": kind, "selector": {"intent_id": iid},
+            "selection": {"included": included, "strategy_step": step}}
 
 
 def test_prior_snapshot_with_the_kind_sets_the_high_water_mark():
-    doc = {"sources": [
-        {"kind": "work-item-intent", "selector": {"intent_id": 4}},
-        {"kind": "work-item-intent", "selector": {"intent_id": 9}},
-        {"kind": "issue-comment", "selector": {"intent_id": 99}},
-    ]}
+    doc = {"sources": [_sealed(4), _sealed(9), _sealed(99, kind="issue-comment")]}
     assert ca.prior_intent_high_water(doc) == 9
+
+
+def test_high_water_ignores_intents_c1_sealed_as_excluded():
+    """C1 carried 1..5 and 21..25 but sealed 6..20 excluded (budget): the
+    model never saw 6..20, so C2 offers them again."""
+    doc = {"sources": [_sealed(i, included=not 6 <= i <= 20) for i in range(1, 26)]}
+    mark = ca.prior_intent_high_water(doc)
+    assert mark == 5
+    _, ranked, _ = ca.select_work_item_intents(_parsed(*range(1, 26)), prior_high_water=mark, resume_intent=None)
+    assert [i.intent_id for i in ranked] == list(range(6, 26))
+    # Only excluded: nothing carried, the mark stops below the lowest.
+    assert ca.prior_intent_high_water({"sources": [_sealed(7, included=False)]}) == 6
+
+
+def test_high_water_is_not_lowered_by_an_old_pinned_intent():
+    doc = {"sources": [_sealed(2, included=False, step="primary"), _sealed(9)]}
+    assert ca.prior_intent_high_water(doc) == 9
+    doc2 = {"sources": [_sealed(2, step="primary"), _sealed(30)]}
+    assert ca.prior_intent_high_water(doc2) == 30
+
+
+def _work_context() -> Any:
+    import types
+
+    return types.SimpleNamespace(work_item_id=WID)
+
+
+def _replayed(doc: dict[str, Any]) -> ws.SnapshotAnswer:
+    return ws.SnapshotAnswer(ws.SNAPSHOT_REPLAYED, snapshot_id="cs_c1", content_hash="x", stored_document=doc)
+
+
+def test_listing_starts_at_the_high_water_mark(monkeypatch):
+    """An item with many old intents below the mark reads only the tail."""
+    monkeypatch.setenv(wi.SWITCH_ENV_VAR, "on")
+    store = _install(monkeypatch, _FakeStore(intents=[_intent(i) for i in range(1, 451)], intent_id=3))
+    doc = {"sources": [_sealed(440)]}
+    intents, resume, mark = ca._resolve_work_item_intents(
+        _work_context(), wc_client.WorkItemClient(), execution_request_id=REQUEST_ID, prior_answer=_replayed(doc)
+    )
+    assert mark == 440
+    assert [i.intent_id for i in intents] == list(range(441, 451))
+    assert resume is not None and resume.intent_id == 3
+    assert [p for p in store.intent_paths() if "?" in p] == [
+        f"/api/v1/work-items/{WID}/intents?after_id=440&limit=100"
+    ]
+
+
+def test_listing_from_the_mark_keeps_truncated_continuation_semantics(monkeypatch):
+    monkeypatch.setenv(wi.SWITCH_ENV_VAR, "on")
+    store = _FakeStore(intents=[_intent(i) for i in range(1, 400)], intent_id=None)
+    real = store.handle
+
+    def _flaky(method, path):
+        if "after_id=300" in path:
+            return wc_client._HTTPResult(503, {})
+        return real(method, path)
+
+    store.handle = _flaky  # type: ignore[method-assign]
+    _install(monkeypatch, store)
+    with pytest.raises(ca.IntentUnresolved):
+        ca._resolve_work_item_intents(
+            _work_context(), wc_client.WorkItemClient(), execution_request_id=REQUEST_ID,
+            prior_answer=_replayed({"sources": [_sealed(200)]}),
+        )
+
+
+def test_sealed_locator_uses_the_reading_clients_base_and_quotes_the_route(monkeypatch):
+    monkeypatch.setenv("MCTL_API_BASE_URL", "https://wrong.example")
+    intent = wi.Intent.from_payload(_intent(7, wid="wi/542 x"))
+    assert intent is not None
+    inp = _assembly_input(Path("/tmp"), work_item_api_base="https://api.test")
+    candidate = ca._intent_candidate(inp, intent, pinned=True)
+    assert candidate.locator == "https://api.test/api/v1/work-items/wi%2F542%20x/intents/7"
+    assert wc_client.WorkItemClient(base_url="https://api.test/").base_url == "https://api.test"
 
 
 @pytest.mark.parametrize(
@@ -725,19 +855,53 @@ def test_routes_are_declared():
 
 
 @pytest.mark.parametrize(
-    ("value", "parses", "want"),
-    [("absent", True, None), (None, True, None), (7, True, 7), (0, False, None), (-1, False, None),
-     ("7", False, None), (True, False, None), (7.0, False, None)],
+    ("value", "malformed", "want"),
+    [("absent", False, None), (None, False, None), (0, False, None), (7, False, 7), (-1, True, None),
+     ("7", True, None), (True, True, None), (False, True, None), (7.0, True, None)],
 )
-def test_execution_request_intent_id(value, parses, want):
+def test_execution_request_intent_id_never_breaks_the_request(value, malformed, want):
+    """The parser also backs claim/fulfil/reject: no intent_id value makes
+    the request unparseable. 0 / null / absent are "no intent"; anything
+    else that is not a positive integer is flagged, never fatal here."""
     data: dict[str, Any] = {"id": REQUEST_ID, "work_item_id": WID, "kind": "resume", "state": xr.STATE_CLAIMED}
     if value != "absent":
         data["intent_id"] = value
     request = xr.ExecutionRequest.from_payload(data)
-    if not parses:
-        assert request is None
+    assert request is not None
+    assert request.intent_id == want
+    assert request.intent_id_malformed is malformed
+    claim = xr.answer_from_claim(200, {"schema_version": wi.SCHEMA_VERSION, "execution_request": data,
+                                       "claim_token": "tok"})
+    assert claim.verdict == xr.CLAIMED
+
+
+@pytest.mark.parametrize("value", [0, "7"])
+@pytest.mark.parametrize("switch", ["off", "on"])
+def test_request_intent_id_zero_or_malformed_by_switch(monkeypatch, switch, value):
+    """With the switch off nothing reads intent_id. On, 0 pins nothing and a
+    malformed value is unresolved (it cannot be told apart from an intent)."""
+    monkeypatch.setenv(wi.SWITCH_ENV_VAR, switch)
+    store = _FakeStore(intents=[_intent(1)])
+    store.request_answer = (200, {"schema_version": wi.SCHEMA_VERSION, "execution_request": {
+        "id": REQUEST_ID, "work_item_id": WID, "kind": "resume", "state": xr.STATE_CLAIMED, "intent_id": value}})
+    _install(monkeypatch, store)
+    client = wc_client.WorkItemClient()
+    assert client.execution_request(WID, REQUEST_ID).verdict == xr.FOUND
+
+    def _resolve():
+        return ca._resolve_work_item_intents(
+            _work_context(), client, execution_request_id=REQUEST_ID, prior_answer=None
+        )
+
+    if switch == "off":
+        assert _resolve() == ((), None, None)
+        assert store.intent_paths() == []
+    elif value == 0:
+        intents, resume, _ = _resolve()
+        assert resume is None and [i.intent_id for i in intents] == [1]
     else:
-        assert request is not None and request.intent_id == want
+        with pytest.raises(ca.IntentUnresolved):
+            _resolve()
 
 
 def test_intent_from_payload_requires_text_redacted():
