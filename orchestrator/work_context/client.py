@@ -24,6 +24,7 @@ from typing import Any
 from urllib.parse import quote
 
 from orchestrator.work_context import execution_requests as xr
+from orchestrator.work_context import intents as wi
 from orchestrator.work_context.contract import (
     WORK_ITEM_FOUND,
     WORK_ITEM_UNKNOWN,
@@ -71,6 +72,11 @@ ROUTES = {
     "claim_execution_request": "/api/v1/execution-requests/claim",
     "fulfil_execution_request": "/api/v1/execution-requests/{request_id}/fulfil",
     "reject_execution_request": "/api/v1/execution-requests/{request_id}/reject",
+    # Canonical WorkItem intents (mctlhq/mctl-api#430), read as a
+    # ContextSnapshot source (mctlhq/mctl-agents#542). Ascending id order,
+    # paginated with `after_id`/`limit`.
+    "list_intents": "/api/v1/work-items/{id}/intents",
+    "work_item_intent": "/api/v1/work-items/{id}/intents/{intent_id}",
 }
 
 
@@ -289,6 +295,45 @@ class WorkItemClient:
             res.status, res.payload, work_item_id=work_item_id,
             content_hash=str(body.get("content_hash", "")), execution_id=execution_id,
         )
+
+    # -- canonical intents (mctlhq/mctl-api#430, mctlhq/mctl-agents#542) --
+
+    def list_intents(self, work_item_id: str) -> wi.IntentsAnswer:
+        """Every intent of the item, ascending by id. LISTED only when every
+        page was read: a truncated page whose continuation fails, or a
+        listing longer than `intents.MAX_PAGES` pages, is UNKNOWN, never a
+        shorter list. ABSENT only for the documented item 404 on the first
+        page; an item that vanishes mid-listing is UNKNOWN."""
+        base = ROUTES["list_intents"].format(id=_q(work_item_id))
+        collected: list[wi.Intent] = []
+        after_id = 0
+        for page_no in range(wi.MAX_PAGES):
+            path = f"{base}?after_id={after_id}&limit={wi.PAGE_LIMIT}"
+            try:
+                res = self._request("GET", path)
+            except WorkItemUnavailable as exc:
+                return wi.IntentsAnswer(wi.INTENTS_UNKNOWN, reason=str(exc))
+            page, terminal = wi.page_from(res.status, res.payload, work_item_id=work_item_id, after_id=after_id)
+            if terminal is not None or page is None:
+                if terminal is None:
+                    return wi.IntentsAnswer(wi.INTENTS_UNKNOWN, reason="listing page could not be classified")
+                if page_no > 0 and terminal.verdict == wi.INTENT_ABSENT:
+                    return wi.IntentsAnswer(wi.INTENTS_UNKNOWN, reason=f"page {page_no + 1}: {terminal.reason}")
+                return terminal
+            collected.extend(page.intents)
+            if not page.truncated:
+                return wi.IntentsAnswer(wi.INTENTS_LISTED, intents=tuple(collected))
+            after_id = page.intents[-1].intent_id
+        return wi.IntentsAnswer(wi.INTENTS_UNKNOWN, reason=f"listing is longer than {wi.MAX_PAGES} pages")
+
+    def work_item_intent(self, work_item_id: str, intent_id: int) -> wi.IntentsAnswer:
+        """One intent of the item: FOUND, ABSENT (documented 404) or UNKNOWN."""
+        path = ROUTES["work_item_intent"].format(id=_q(work_item_id), intent_id=_q(str(intent_id)))
+        try:
+            res = self._request("GET", path)
+        except WorkItemUnavailable as exc:
+            return wi.IntentsAnswer(wi.INTENTS_UNKNOWN, reason=str(exc))
+        return wi.answer_from_read(res.status, res.payload, work_item_id=work_item_id, intent_id=intent_id)
 
     # -- this run's own execution (mctlhq/mctl-agents#455) ---------------
 

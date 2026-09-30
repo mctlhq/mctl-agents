@@ -67,6 +67,7 @@ from orchestrator.temporal.issue_ref import loop_workflow_id
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a runtime cycle
     from orchestrator.run_issue_investigator import IssueData
+    from orchestrator.work_context.intents import Intent
     from orchestrator.work_context.snapshots import SnapshotAnswer, StoreRef
 
 STRATEGY_NAME = "deterministic-fixed-order"
@@ -116,7 +117,9 @@ _LEGACY_DEFINITION_PATH = (
 # Content-addressed kinds are pinned by something other than a wall-clock
 # staleness window (a git SHA, an in-process hash) — they classify `fresh`
 # explicitly rather than falling into the `unknown` fail-safe (ADR 009 sec. 6).
-_CONTENT_ADDRESSED_KINDS = frozenset({"target-repo", "inline-template"})
+# A WorkItem intent is an immutable record (mctlhq/mctl-agents#542): its
+# bytes never change once appended, so it is content-addressed too.
+_CONTENT_ADDRESSED_KINDS = frozenset({"target-repo", "inline-template", "work-item-intent"})
 
 # Per-kind freshness table (requirements.md "Freshness, deduplication,
 # truncation, budget"): None means content-addressed, handled above.
@@ -126,7 +129,13 @@ _DEFAULT_FRESHNESS_TABLE: dict[str, int | None] = {
     "proposal-dir": 86400,
     "target-repo": None,
     "inline-template": None,
+    "work-item-intent": None,
 }
+
+# How many WorkItem intents newer than the prior snapshot's enter one
+# assembly (mctlhq/mctl-agents#542). The pinned resume intent is added on
+# top of these, never counted against them.
+MAX_WORK_ITEM_INTENTS = 20
 
 # requirements.md's "Comment ceiling" open question: a deterministic ceiling
 # of the 20 most recent comments, counted in metrics as a pre-budget drop.
@@ -195,6 +204,10 @@ class CandidateSource:
     byte_count: int = 0
     freshness_staleness: str = "unknown"
     truncated: bool = False
+    #: Kept first like a `_PINNED_KINDS` source, for this one candidate
+    #: only. Set for the resume intent (mctlhq/mctl-agents#542), whose kind
+    #: is not pinned as a whole: older intents stay ranked and droppable.
+    pinned: bool = False
 
 
 Collector = Callable[["AssemblyInput"], list[CandidateSource]]
@@ -255,6 +268,16 @@ class AssemblyInput:
     prompt_template: str
     now: datetime
     config: AssemblyConfig
+    #: Canonical WorkItem intents already read from mctl-api
+    #: (mctlhq/mctl-agents#542), ascending by id. Empty whenever the
+    #: `WORK_ITEM_INTENT_SOURCE` switch is off or the run is not
+    #: WorkItem-backed, in which case no intent collector runs at all.
+    work_item_intents: tuple[Intent, ...] = ()
+    #: The intent the dispatched resume's execution request names, pinned.
+    resume_intent: Intent | None = None
+    #: The highest `work-item-intent` id among the prior snapshot's (C1's)
+    #: sources, or None when there is no C1 or it carries none.
+    prior_intent_high_water: int | None = None
 
 
 @dataclass
@@ -502,13 +525,17 @@ def _recency(candidate: CandidateSource) -> float | None:
     return _epoch(candidate.content_time)
 
 
+def _is_pinned(candidate: CandidateSource) -> bool:
+    return candidate.kind in _PINNED_KINDS or candidate.pinned
+
+
 def ranking_score(candidate: CandidateSource) -> float:
     """The score recorded in `Selection.score`: pinned kinds outrank
     everything; otherwise ten points per trust step and one per freshness
     step, so trust always dominates freshness — the same precedence the
     sort key in `rank_candidates` applies (recency only breaks ties, and so
     is not part of the score)."""
-    if candidate.kind in _PINNED_KINDS:
+    if _is_pinned(candidate):
         return _PINNED_SCORE
     trust = len(_TRUST_ORDER) - 1 - _TRUST_ORDER[candidate.trust_tier]
     freshness = len(_FRESHNESS_ORDER) - 1 - _FRESHNESS_ORDER[candidate.freshness_staleness]
@@ -525,7 +552,7 @@ def rank_candidates(candidates: Sequence[CandidateSource]) -> list[CandidateSour
     collector order — a total order, so the result is deterministic. Must
     run after `classify_freshness`."""
     indexed = list(enumerate(candidates))
-    pinned = [c for _, c in indexed if c.kind in _PINNED_KINDS]
+    pinned = [c for _, c in indexed if _is_pinned(c)]
 
     def key(item: tuple[int, CandidateSource]) -> tuple[int, int, float, int]:
         index, candidate = item
@@ -537,7 +564,7 @@ def rank_candidates(candidates: Sequence[CandidateSource]) -> list[CandidateSour
             index,
         )
 
-    rest = [c for _, c in sorted((i for i in indexed if i[1].kind not in _PINNED_KINDS), key=key)]
+    rest = [c for _, c in sorted((i for i in indexed if not _is_pinned(i[1])), key=key)]
     ordered = pinned + rest
     for rank, candidate in enumerate(ordered, start=1):
         candidate.rank = rank
@@ -879,6 +906,115 @@ def collect_prior_proposal(assembly_input: AssemblyInput) -> list[CandidateSourc
     return candidates
 
 
+def select_work_item_intents(
+    intents: Sequence[Intent],
+    *,
+    prior_high_water: int | None,
+    resume_intent: Intent | None,
+    cap: int = MAX_WORK_ITEM_INTENTS,
+) -> tuple[Intent | None, tuple[Intent, ...]]:
+    """`(pinned, ranked)`: the pinned resume intent, and the intents newer
+    than the prior snapshot's highest one, ascending by id, at most `cap`
+    of them (mctlhq/mctl-agents#542). With no prior high-water mark every
+    intent qualifies, up to the cap. The resume intent is never repeated in
+    `ranked`. A pure function of its arguments, so the same inputs select
+    the same intents in the same order."""
+    pinned_id = resume_intent.intent_id if resume_intent is not None else None
+    newer = sorted(
+        (
+            i for i in intents
+            if (prior_high_water is None or i.intent_id > prior_high_water) and i.intent_id != pinned_id
+        ),
+        key=lambda i: i.intent_id,
+    )
+    return resume_intent, tuple(newer[:cap])
+
+
+def prior_intent_high_water(prior_document: Mapping[str, Any] | None) -> int | None:
+    """The highest `work-item-intent` id among a stored snapshot document's
+    sources, or None when there is no document or it carries none (every
+    snapshot sealed before this kind existed)."""
+    if not isinstance(prior_document, Mapping):
+        return None
+    sources = prior_document.get("sources")
+    if not isinstance(sources, list):
+        return None
+    ids: list[int] = []
+    for source in sources:
+        if not isinstance(source, Mapping) or source.get("kind") != "work-item-intent":
+            continue
+        selector = source.get("selector")
+        value = selector.get("intent_id") if isinstance(selector, Mapping) else None
+        if isinstance(value, int) and not isinstance(value, bool):
+            ids.append(value)
+    return max(ids) if ids else None
+
+
+def _intent_candidate(assembly_input: AssemblyInput, intent: Intent, *, pinned: bool) -> CandidateSource:
+    """One intent as a source. The hashed content is the canonical JSON of
+    `{text, params}`; the provenance (who, from where, when, and whether
+    retention removed the text) lives in the selector. `text_redacted` is
+    recorded explicitly, so an empty text there reads as "removed", never as
+    an empty intent."""
+    from orchestrator.work_context.client import ROUTES, api_base
+
+    route = ROUTES["work_item_intent"].format(id=intent.work_item_id, intent_id=intent.intent_id)
+    payload = {"text": intent.text, "params": intent.params}
+    header = (
+        f"WorkItem intent {intent.intent_id} by {intent.actor_principal}"
+        f"{' via ' + intent.surface if intent.surface else ''} at {intent.created_at}"
+    )
+    body = "[text removed by retention]" if intent.text_redacted else intent.text
+    return CandidateSource(
+        source_id=f"work-item-intent:{intent.work_item_id}:{intent.intent_id}",
+        kind="work-item-intent",
+        locator=f"{api_base()}{route}",
+        selector={
+            "work_item_id": intent.work_item_id,
+            "intent_id": intent.intent_id,
+            "actor_principal": intent.actor_principal,
+            "surface": intent.surface,
+            "created_at": intent.created_at,
+            "text_redacted": intent.text_redacted,
+            "fields": "text,params",
+        },
+        raw=canonical_json(payload),
+        observed_at=intent.created_at,
+        max_age_seconds=assembly_input.config.freshness_table.get("work-item-intent"),
+        trust_tier="reported",
+        trust_rationale="work-item-intent-recorded-by-mctl-api",
+        reason_code="resume-intent" if pinned else "work-item-intent",
+        strategy_step="primary" if pinned else "secondary",
+        render_text=f"{header}:\n{body}",
+        content_time=intent.created_at,
+        retrieved_at=_iso(assembly_input.now),
+        pinned=pinned,
+    )
+
+
+def collect_work_item_intents(assembly_input: AssemblyInput) -> list[CandidateSource]:
+    """The canonical WorkItem intents (mctlhq/mctl-agents#542): the pinned
+    resume intent first, then the selected newer intents in ascending id
+    order. Reads nothing itself; the intents were read from mctl-api before
+    assembly, so this stays a pure collector like the others."""
+    pinned, ranked = select_work_item_intents(
+        assembly_input.work_item_intents,
+        prior_high_water=assembly_input.prior_intent_high_water,
+        resume_intent=assembly_input.resume_intent,
+    )
+    out = [_intent_candidate(assembly_input, pinned, pinned=True)] if pinned is not None else []
+    out.extend(_intent_candidate(assembly_input, i, pinned=False) for i in ranked)
+    return out
+
+
+def _collect_pinned_work_item_intent(assembly_input: AssemblyInput) -> list[CandidateSource]:
+    return [c for c in collect_work_item_intents(assembly_input) if c.pinned]
+
+
+def _collect_ranked_work_item_intents(assembly_input: AssemblyInput) -> list[CandidateSource]:
+    return [c for c in collect_work_item_intents(assembly_input) if not c.pinned]
+
+
 _COLLECTOR_ORDER: tuple[Collector, ...] = (
     collect_inline_template,
     collect_github_issue,
@@ -886,6 +1022,27 @@ _COLLECTOR_ORDER: tuple[Collector, ...] = (
     collect_target_repo,
     collect_prior_proposal,
 )
+
+# The same order with the WorkItem intents in it (mctlhq/mctl-agents#542):
+# the pinned resume intent right after the issue, so the default strategy's
+# rank-order budget reaches it before any comment, and the other intents
+# after everything else. Used only when intents were read; otherwise
+# `_COLLECTOR_ORDER` runs unchanged and the snapshot keeps today's bytes.
+_COLLECTOR_ORDER_WITH_INTENTS: tuple[Collector, ...] = (
+    collect_inline_template,
+    collect_github_issue,
+    _collect_pinned_work_item_intent,
+    collect_issue_comments,
+    collect_target_repo,
+    collect_prior_proposal,
+    _collect_ranked_work_item_intents,
+)
+
+
+def _collectors_for(assembly_input: AssemblyInput) -> tuple[Collector, ...]:
+    if assembly_input.work_item_intents or assembly_input.resume_intent is not None:
+        return _COLLECTOR_ORDER_WITH_INTENTS
+    return _COLLECTOR_ORDER
 
 
 # ---------------------------------------------------------------------------
@@ -1369,7 +1526,7 @@ def assemble(
 
     candidates: list[CandidateSource] = []
     collector_calls = 0
-    for collector in _COLLECTOR_ORDER:
+    for collector in _collectors_for(assembly_input):
         candidates.extend(collector(assembly_input))
         collector_calls += 1
 
@@ -1434,7 +1591,7 @@ def assemble(
             shadow_config = replace(config, strategy=resolution.bound_strategy)
             shadow_input = replace(assembly_input, config=shadow_config)
             shadow_candidates: list[CandidateSource] = []
-            for collector in _COLLECTOR_ORDER:
+            for collector in _collectors_for(shadow_input):
                 shadow_candidates.extend(collector(shadow_input))
             shadow_outcome = run_pipeline(shadow_candidates, shadow_config, assembly_input.now)
             shadow_snapshot = seal(
@@ -1529,6 +1686,7 @@ def assemble_investigator_context(
     now: datetime | None = None,
     work_context: WorkContextRef | None = None,
     work_item_client: Any | None = None,
+    execution_request_id: str | None = None,
 ) -> AssemblyResult | None:
     """The feature-gated entry point `run_issue_investigator.investigate()`
     calls. Returns `None` when `mode == "off"` — no collector runs, no
@@ -1536,7 +1694,13 @@ def assemble_investigator_context(
 
     With the work-context rollout at `observe` or above and a store
     execution (`we_...`), the sealed snapshot is also persisted to mctl-api
-    (mctlhq/mctl-agents#431, `_persist_to_work_item_store`)."""
+    (mctlhq/mctl-agents#431, `_persist_to_work_item_store`).
+
+    With `WORK_ITEM_INTENT_SOURCE=on` and that same store execution, the
+    item's canonical intents are read from mctl-api first and become sources
+    (mctlhq/mctl-agents#542); the intent `execution_request_id`'s request
+    names is pinned. An intent that must be carried but cannot be read
+    raises `IntentUnresolved`, and nothing is sealed or persisted."""
     if mode == "off":
         return None
 
@@ -1569,7 +1733,17 @@ def assemble_investigator_context(
     # One client for the one conversation with the store, and only when
     # the rollout and the execution id say there is one.
     client = _client(work_item_client) if _work_context_active(work_context) else None
-    work_context = _link_prior_snapshot(work_context, client)
+    work_context, prior_answer = _link_prior_snapshot_with_answer(work_context, client)
+    intents, resume_intent, high_water = _resolve_work_item_intents(
+        work_context, client, execution_request_id=execution_request_id, prior_answer=prior_answer
+    )
+    if intents or resume_intent is not None:
+        assembly_input = replace(
+            assembly_input,
+            work_item_intents=intents,
+            resume_intent=resume_intent,
+            prior_intent_high_water=high_water,
+        )
     result = assemble(assembly_input, mode=mode, execution=execution, work_context=work_context)
     answer = _persist_to_work_item_store(result.snapshot, client)
     if answer is not None:
@@ -1577,6 +1751,77 @@ def assemble_investigator_context(
 
         return replace(result, store_ref=store_ref_from(result.snapshot, answer))
     return result
+
+
+class IntentUnresolved(RuntimeError):
+    """A WorkItem intent this assembly must carry could not be read
+    (mctlhq/mctl-agents#542): the resume intent the execution request names,
+    the request itself, or the item's intent listing. The run fails as
+    `failed` / `intent-unresolved` and seals nothing: a C2 that silently
+    lacks the intent would claim a completeness it does not have."""
+
+
+def _resolve_work_item_intents(
+    work_context: WorkContextRef | None,
+    client: Any | None,
+    *,
+    execution_request_id: str | None,
+    prior_answer: Any | None,
+) -> tuple[tuple[Intent, ...], Intent | None, int | None]:
+    """`(intents, resume_intent, prior_high_water)` for a WorkItem-backed
+    assembly, or `((), None, None)` when there is none to read: no store
+    execution (no client), or the `WORK_ITEM_INTENT_SOURCE` switch is off.
+
+    Every read that fails is `IntentUnresolved`, never "no intent": the
+    execution request (whose `intent_id` decides what is pinned), the pinned
+    intent itself, and the listing. Only a request that names no intent pins
+    nothing."""
+    if work_context is None or client is None:
+        return (), None, None
+    from orchestrator.work_context import execution_requests as xr
+    from orchestrator.work_context import intents as wi
+    from orchestrator.work_context.snapshots import SNAPSHOT_REPLAYED
+
+    if wi.switch() != wi.SWITCH_ON:
+        print("[context] work-item-intent source=off", flush=True)
+        return (), None, None
+    wid = work_context.work_item_id
+    resume_intent: Intent | None = None
+    if execution_request_id:
+        request_answer = client.execution_request(wid, execution_request_id)
+        request = request_answer.request
+        if request_answer.verdict != xr.FOUND or request is None:
+            raise IntentUnresolved(
+                f"execution request {execution_request_id} of {wid} could not be read: {request_answer.reason}"
+            )
+        if request.work_item_id != wid:
+            raise IntentUnresolved(
+                f"execution request {execution_request_id} belongs to {request.work_item_id}, not {wid}"
+            )
+        if request.intent_id is not None:
+            read = client.work_item_intent(wid, request.intent_id)
+            if read.verdict != wi.INTENT_FOUND or read.intent is None:
+                raise IntentUnresolved(
+                    f"resume intent {request.intent_id} of {wid} is unresolved ({read.verdict}): {read.reason}"
+                )
+            resume_intent = read.intent
+    listing = client.list_intents(wid)
+    if listing.verdict != wi.INTENTS_LISTED:
+        raise IntentUnresolved(f"intents of {wid} could not be listed ({listing.verdict}): {listing.reason}")
+    prior_document = (
+        prior_answer.stored_document
+        if prior_answer is not None and prior_answer.verdict == SNAPSHOT_REPLAYED
+        else None
+    )
+    high_water = prior_intent_high_water(prior_document)
+    print(
+        "[context] work-item-intent source=on "
+        f"listed={len(listing.intents)} "
+        f"resume_intent_id={resume_intent.intent_id if resume_intent is not None else '-'} "
+        f"prior_high_water={high_water if high_water is not None else '-'}",
+        flush=True,
+    )
+    return listing.intents, resume_intent, high_water
 
 
 class SnapshotNotPersisted(RuntimeError):
@@ -1615,19 +1860,26 @@ def _client(work_item_client: Any | None) -> Any:
 
 
 def _link_prior_snapshot(work_context: WorkContextRef | None, client: Any | None) -> WorkContextRef | None:
+    """`_link_prior_snapshot_with_answer`, without the prior snapshot's read."""
+    return _link_prior_snapshot_with_answer(work_context, client)[0]
+
+
+def _link_prior_snapshot_with_answer(
+    work_context: WorkContextRef | None, client: Any | None
+) -> tuple[WorkContextRef | None, Any | None]:
     """Point `resumed_from_snapshot_id` at the prior execution's sealed
     snapshot before this execution's is sealed. A convenience pointer
     (ADR 011): a failed lookup is logged and never blocks, and a retry that
     gets a different answer is not a divergence (`snapshots.differing_fields`
     ignores the pointer)."""
     if work_context is None or client is None:
-        return work_context
+        return work_context, None
     from orchestrator.work_context.snapshots import SNAPSHOT_SKIPPED, resumed_from
 
     linked, answer = resumed_from(work_context, client)
     if answer.verdict != SNAPSHOT_SKIPPED:
         _emit_snapshot_answer("resumed_from", answer)
-    return linked
+    return linked, answer
 
 
 def _persist_to_work_item_store(snapshot: ContextSnapshot, client: Any | None) -> SnapshotAnswer | None:

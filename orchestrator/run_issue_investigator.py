@@ -2013,6 +2013,31 @@ class InvestigateResult:
         _validate_outcome(self.outcome_code, self.outcome_reason)
 
 
+def _intent_unresolved(
+    service: str,
+    slug: str,
+    proposal_dir: Path,
+    exc: Exception,
+    *,
+    execution_id: str,
+    work_item_id: str,
+    context_only: bool,
+) -> InvestigateResult:
+    """The typed failure for a WorkItem intent that could not be read
+    (mctlhq/mctl-agents#542): `failed` / `intent-unresolved` with `error`
+    set, so `main()` exits non-zero and nothing was sealed or persisted."""
+    print(
+        f"[outcome] code=failed reason=intent-unresolved context_only={str(context_only).lower()} "
+        f"snapshot_id=- execution_id={execution_id} work_item_id={work_item_id}"
+    )
+    return InvestigateResult(
+        service, slug, proposal_dir,
+        error=f"WorkItem intent unresolved: {exc}",
+        outcome_code="failed", outcome_reason="intent-unresolved",
+        context_only=context_only,
+    )
+
+
 def _assemble_context(
     *,
     mode: str,
@@ -2026,6 +2051,7 @@ def _assemble_context(
     temporal_run_id: str | None = None,
     argo_workflow_name: str | None = None,
     fatal: bool = False,
+    execution_request_id: str | None = None,
 ) -> context_assembly.AssemblyResult | None:
     """Assembles and seals this investigation's `ContextSnapshot`
     (mctlhq/mctl-agents#265). Returns `None` in `off` mode without doing any
@@ -2046,6 +2072,11 @@ def _assemble_context(
     the snapshot is not telemetry beside the real deliverable — it IS the
     deliverable, and a failure to seal it must propagate rather than warn
     and pretend the run succeeded at nothing.
+
+    `context_assembly.IntentUnresolved` (mctlhq/mctl-agents#542) always
+    propagates, in every mode: a WorkItem intent the run must carry could
+    not be read, and warning past it would run on a context that silently
+    lacks it.
     """
     if mode == "off":
         return None
@@ -2085,9 +2116,10 @@ def _assemble_context(
             temporal_workflow_id=temporal_workflow_id,
             temporal_run_id=temporal_run_id,
             argo_workflow_name=argo_workflow_name,
+            execution_request_id=execution_request_id,
         )
     except Exception as exc:
-        if mode == "on" or fatal:
+        if mode == "on" or fatal or isinstance(exc, context_assembly.IntentUnresolved):
             raise
         print(f"warn: context assembly failed: {type(exc).__name__}: {exc}")
         return None
@@ -2879,6 +2911,12 @@ def _investigate(
                     temporal_run_id=temporal_run_id,
                     argo_workflow_name=execution_context.correlation.argo_workflow_name,
                     fatal=True,
+                    execution_request_id=execution_request_id,
+                )
+            except context_assembly.IntentUnresolved as exc:
+                return _intent_unresolved(
+                    service, slug, proposal_dir, exc,
+                    execution_id=outcome_execution_id, work_item_id=outcome_work_item_id, context_only=True,
                 )
             except Exception as exc:  # noqa: BLE001 — surfaces as a typed result, not a crash
                 print(
@@ -2982,21 +3020,30 @@ def _investigate(
         # 2b. Assemble this investigation's ContextSnapshot
         #     (mctlhq/mctl-agents#265) — off by default; see _assemble_context's
         #     docstring for the shadow/on failure policy.
-        context = _assemble_context(
-            mode=_context_mode(),
-            issue=issue,
-            repo_dir=clone / "repo",
-            proposal_dir=proposal_dir,
-            service=service,
-            slug=slug,
-            work_context=work_context_ref,
-            temporal_workflow_id=temporal_workflow_id,
-            temporal_run_id=temporal_run_id,
-            # The same source _run_agent's correlation uses below, so the
-            # ContextSnapshot and the CapabilitySet sealed for one execution
-            # agree on it.
-            argo_workflow_name=execution_context.correlation.argo_workflow_name,
-        )
+        try:
+            context = _assemble_context(
+                mode=_context_mode(),
+                issue=issue,
+                repo_dir=clone / "repo",
+                proposal_dir=proposal_dir,
+                service=service,
+                slug=slug,
+                work_context=work_context_ref,
+                temporal_workflow_id=temporal_workflow_id,
+                temporal_run_id=temporal_run_id,
+                # The same source _run_agent's correlation uses below, so the
+                # ContextSnapshot and the CapabilitySet sealed for one
+                # execution agree on it.
+                argo_workflow_name=execution_context.correlation.argo_workflow_name,
+                execution_request_id=execution_request_id,
+            )
+        except context_assembly.IntentUnresolved as exc:
+            return _intent_unresolved(
+                service, slug, proposal_dir, exc,
+                execution_id=work_context_ref.execution_id if work_context_ref is not None else (execution_id or "-"),
+                work_item_id=work_context_ref.work_item_id if work_context_ref is not None else (work_item_id or "-"),
+                context_only=False,
+            )
 
         # 2c. Resolve this investigation's ServiceSkillBundle
         #     (mctlhq/mctl-agents#305) — empty unless resolver_mode is

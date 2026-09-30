@@ -145,6 +145,10 @@ class ExecutionRequest:
     execution_id: str = ""
     reason: str = ""
     claim_expires_at: str = ""
+    #: The WorkItem intent this request resumes with (mctl-api#368's
+    #: `intent_id`), or None when the request names none
+    #: (mctlhq/mctl-agents#542).
+    intent_id: int | None = None
 
     @staticmethod
     def from_payload(data: Any) -> ExecutionRequest | None:
@@ -162,6 +166,11 @@ class ExecutionRequest:
         version = data.get("expected_state_version", 0)
         if not isinstance(version, int) or isinstance(version, bool):
             return None
+        # Absent (mctl-api omits it) or null is "no intent". Present but not
+        # a positive integer is a malformed request, never "no intent".
+        intent_id = data.get("intent_id")
+        if intent_id is not None and (not isinstance(intent_id, int) or isinstance(intent_id, bool) or intent_id <= 0):
+            return None
         return ExecutionRequest(
             request_id=rid,
             work_item_id=wid,
@@ -174,6 +183,7 @@ class ExecutionRequest:
             execution_id=_str(data.get("execution_id")),
             reason=_str(data.get("reason")),
             claim_expires_at=_str(data.get("claim_expires_at")),
+            intent_id=intent_id,
         )
 
 

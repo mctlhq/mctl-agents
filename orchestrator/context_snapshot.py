@@ -64,6 +64,13 @@ SOURCE_KINDS = frozenset({
     # context.mctl.ai/v1alpha1 — no field change, from_dict still rejects
     # unknown keys.
     "human-input-response",
+    # A canonical WorkItem intent read from mctl-api's intents API
+    # (mctlhq/mctl-api#430), recorded at trust.tier="reported" like
+    # human-input-response. mctlhq/mctl-agents#542 (correction 2026-09-30):
+    # a resume intent is canonical WorkItem state, not a GitHub comment, and
+    # mctlhq/mctl-agents#431's acceptance needs it in C2 with provenance.
+    # Additive within context.mctl.ai/v1alpha1, as above.
+    "work-item-intent",
 })
 RETENTION_CLASSES = frozenset({"telemetry", "execution-record", "gitops"})
 
