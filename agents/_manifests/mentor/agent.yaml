@@ -31,7 +31,7 @@ spec:
       - Edit
       - "mcp__mctl__*"
   execution:
-    budgetUsd: 2.00          # MENTOR_BUDGET_USD default
+    budgetUsd: 10.00         # MENTOR_BUDGET_USD default
     sandbox:
       backend: argo
       clusterWorkflowTemplate: mctl-agents-daily

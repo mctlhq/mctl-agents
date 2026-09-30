@@ -318,7 +318,7 @@ agents:
       - inline: orchestrator/run_mentor.py:build_prompt
       - file: agents/_mentor/CLAUDE.md
     modelPolicyTask: mentor_digest
-    budgetEnv: MENTOR_BUDGET_USD               # default 2.00
+    budgetEnv: MENTOR_BUDGET_USD               # default 10.00
     sandbox:
       backend: argo
       clusterWorkflowTemplate: mctl-agents-daily

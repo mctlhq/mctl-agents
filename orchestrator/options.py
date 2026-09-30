@@ -198,7 +198,10 @@ def _positive_seconds(name: str, *, default: float) -> float:
 
 
 SERVICE_AGENT_BUDGET_USD = float(os.getenv("SERVICE_AGENT_BUDGET_USD", "5.00"))
-MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
+# Matches the deployed value (cwft-mctl-agents-run.yaml sets 10.00). The old
+# 2.00 default was sized for Haiku; with mentor_digest on the balanced
+# profile it would have truncated local digests mid-run.
+MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "10.00"))
 # Tier 2 implementer budget — soft cap per single proposal implementation.
 # A proposal touching one or two files usually finishes well under this.
 # No hard kill: the SDK stops sampling once the cap is exceeded but the
