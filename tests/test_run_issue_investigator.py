@@ -5294,6 +5294,23 @@ def _dispatched_resume_env(monkeypatch, *, context_mode):
         monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_MODE", context_mode)
 
 
+def _stub_successful_persist(monkeypatch):
+    """`_dispatched_resume_env` deletes `MCTL_TOKEN`, so every `persist()`
+    call in that fixture answers unfavourably without raising (a real
+    `WorkItemUnavailable` caught and turned into a non-`stored`
+    `SnapshotAnswer`). Tests that need a snapshot to genuinely reach the
+    store — as opposed to exercising the no-token fallback — call this to
+    make `persist()` answer as mctl-api would on a real write."""
+    from orchestrator.work_context import snapshots as ws
+
+    def _persist(snapshot, client):
+        return ws.SnapshotAnswer(
+            ws.SNAPSHOT_SEALED, snapshot_id="cs_test0000000000000000000000000000", content_hash="deadbeef"
+        )
+
+    monkeypatch.setattr(ws, "persist", _persist)
+
+
 def _stub_dispatched_work_item(monkeypatch, *, execution_id="we_dispatch", state="in-progress"):
     from orchestrator.work_context.contract import (
         WORK_ITEM_FOUND,
@@ -5357,9 +5374,13 @@ def test_dispatched_resume_onto_terminal_proposal_seals_context_only_snapshot(
     """T1/T2: a dispatched resume onto a proposal whose .status.yaml is past
     `proposed` clones and seals a ContextSnapshot instead of the silent
     no-op skip #542 reports, and the proposal directory is left
-    byte-identical."""
+    byte-identical. The snapshot must actually reach the work-item store
+    (`_stub_successful_persist`) for this to count as `succeeded` — see
+    `test_dispatched_resume_context_not_persisted_is_reported_as_failure`
+    for the case where it does not."""
     _dispatched_resume_env(monkeypatch, context_mode="shadow")
     _stub_dispatched_work_item(monkeypatch)
+    _stub_successful_persist(monkeypatch)
     issue = _dispatched_resume_issue(monkeypatch)
     cloned = _spy_clone(monkeypatch, tmp_path)
 
@@ -5391,6 +5412,42 @@ def test_dispatched_resume_onto_terminal_proposal_seals_context_only_snapshot(
     assert "[outcome] code=succeeded reason=proposal-terminal context_only=true" in out
     assert "work_item_id=wi-542" in out
     assert "execution_id=we_dispatch" in out
+
+
+def test_dispatched_resume_context_not_persisted_is_reported_as_failure(tmp_path, monkeypatch, capsys):
+    """Codex P2 follow-up (#545 review on #542): a context-only resume
+    whose snapshot seals locally but never actually reaches the
+    work-item store must not be reported `succeeded` — that recreates
+    the exact silent no-op #542 exists to remove, just hidden behind a
+    Succeeded ledger entry. `_dispatched_resume_env` deletes
+    `MCTL_TOKEN`, so `persist()` answers unfavourably (not `stored`)
+    without raising, and `AssemblyResult.store_ref` stays `None`."""
+    _dispatched_resume_env(monkeypatch, context_mode="shadow")
+    _stub_dispatched_work_item(monkeypatch)
+    issue = _dispatched_resume_issue(monkeypatch, number=548)
+    _spy_clone(monkeypatch, tmp_path)
+
+    slug = build_slug(548, "Fix work context resume")
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / slug
+    write_status_yaml(proposal_dir, issue)
+    (proposal_dir / ".status.yaml").write_text(yaml.safe_dump({"status": "merged"}))
+
+    result = investigate(
+        issue.ref.url,
+        state_dir=tmp_path,
+        work_item_id="wi-542",
+        execution_id="we_dispatch",
+        execution_request_id="xr-1",
+        resume_from_execution_id="we_prior",
+    )
+
+    assert result.context_only is True
+    assert result.outcome_code == "failed"
+    assert result.outcome_reason == "context-not-persisted"
+    assert result.error is not None
+
+    out = capsys.readouterr().out
+    assert "[outcome] code=failed reason=context-not-persisted context_only=true" in out
 
 
 def test_dispatched_resume_context_carries_work_context_provenance(tmp_path, monkeypatch):

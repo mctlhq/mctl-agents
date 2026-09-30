@@ -4865,6 +4865,59 @@ class TestLaunchCorrelation:
         assert implement_log[0]["work_item_id"] == "wi-505"
         assert shepherd_log[0]["work_item_id"] == "wi-505"
 
+    async def test_dispatched_resume_onto_terminal_proposal_ends_before_implement_and_approval(
+        self, env
+    ):
+        """Codex P2 follow-up (#545 review on #542): the context-only
+        early-end branch (`CONTEXT_ONLY_RESUME_ENDED_REASON`) had no
+        coverage -- every existing dispatch test's `read_proposal_status`
+        fake defaults to "proposed", which the branch's own
+        `_OVERWRITABLE_PROPOSAL_STATUSES` check reads as "keep going", so
+        nothing ever reached it. A dispatched loop whose proposal is
+        already "accepted" must end right there: no approve/implement CWFT
+        submitted, and no approval wait entered (an unresolved wait would
+        hang `handle.result()` below past the `fail_after` deadline instead
+        of returning)."""
+        activities, calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, proposal_status="accepted",
+        )
+
+        @activity.defn(name="bind_dispatched_execution")
+        async def fake_bind_dispatched_execution(input):
+            from orchestrator.temporal.activities.execution_requests import (
+                BOUND,
+                BoundExecution,
+            )
+
+            return BoundExecution(BOUND, execution_id="we_ctx_test", sequence=1)
+
+        @activity.defn(name="advance_dispatched_execution")
+        async def fake_advance_dispatched_execution(input) -> str:
+            return "ok"
+
+        activities = [*activities, fake_bind_dispatched_execution, fake_advance_dispatched_execution]
+
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(
+                    issue_url="https://github.com/mctlhq/mctl-telegram/issues/548",
+                    work_item_id="wi-548",
+                    execution_request_id="xr-548",
+                ),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                result = await handle.result()
+
+        assert result.implement is None
+        assert result.ended == dev_loop.CONTEXT_ONLY_RESUME_ENDED_REASON
+        # Neither approve nor implement were ever submitted to Argo.
+        assert calls == ["mctl-agents-investigate"]
+
     async def test_undispatched_loop_omits_work_item_id_entirely(self, env):
         """T3 (undispatched half): an issue-url-only loop, where
         `self._work_item_id` is `""`, omits the key entirely rather than

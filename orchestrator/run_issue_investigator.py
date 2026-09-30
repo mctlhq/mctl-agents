@@ -2878,6 +2878,35 @@ def _investigate(
                     context_only=True,
                 )
             snapshot_id = context.snapshot.snapshot_id if context is not None else "-"
+            # A context-only run's entire deliverable is the sealed snapshot
+            # landing in the work-item store. `_assemble_context(fatal=True)`
+            # only turns an *exception* into a typed failure — it says
+            # nothing about a non-raising, unfavourable persist. That is a
+            # reachable, non-exceptional outcome: no work context at all
+            # (`work_context_ref is None`, e.g. the rollout gate below
+            # `observe`), or a `SnapshotAnswer` that never reached `stored`
+            # (`context_assembly._persist_to_work_item_store` only raises at
+            # `enforce`+ or on a vetoing divergence; at `observe` it logs and
+            # returns). `AssemblyResult.store_ref` is `None` in exactly those
+            # cases (`snapshots.store_ref_from`), so it is the one signal
+            # that distinguishes "sealed and stored" from "sealed and
+            # thrown away" — reporting `succeeded` on the latter would
+            # recreate the silent no-op this path exists to remove, just
+            # hidden behind a Succeeded ledger entry.
+            if context is None or context.store_ref is None:
+                print(
+                    "[outcome] code=failed reason=context-not-persisted context_only=true "
+                    f"snapshot_id={snapshot_id} execution_id={outcome_execution_id} work_item_id={outcome_work_item_id}"
+                )
+                return InvestigateResult(
+                    service, slug, proposal_dir,
+                    error=(
+                        f"context-only resume sealed snapshot {snapshot_id!r} but it never reached "
+                        "the work-item store"
+                    ),
+                    outcome_code="failed", outcome_reason="context-not-persisted",
+                    context_only=True,
+                )
             print(
                 "[outcome] code=succeeded reason=proposal-terminal context_only=true "
                 f"snapshot_id={snapshot_id} execution_id={outcome_execution_id} work_item_id={outcome_work_item_id}"
