@@ -38,7 +38,7 @@ def _assemble_kwargs(tmp_path, work_context, client):
         mode="shadow", issue=issue, issue_url=issue.ref.url, full_repo="mctlhq/mctl-agents",
         repo_dir=tmp_path / "repo", target_repo_sha="a" * 40, proposal_dir=tmp_path / "proposal",
         service="mctl-agents", slug="issue-431-x", prompt_template="PROMPT", resolver_mode="legacy",
-        legacy_model="claude-sonnet-5", legacy_allowed_tools=("Read",), legacy_budget_usd=8.0,
+        legacy_model="claude-sonnet-5-5", legacy_allowed_tools=("Read",), legacy_budget_usd=8.0,
         work_context=work_context, work_item_client=client,
     )
 

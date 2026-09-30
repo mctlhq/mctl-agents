@@ -763,7 +763,7 @@ def test_real_issue_investigator_definition_resolves_against_the_catalog():
     # The values that only exist because this is the real catalog: the
     # corrected model-policy task (#277 / gitops#1002) and the renamed
     # policy (gitops#981).
-    assert plan.model == "claude-sonnet-5"
+    assert plan.model == "claude-sonnet-5-5"
     assert plan.policy_ref == "scoped-proposal-authoring"
     assert plan.binding_source == "compatibility-fixture"
     # The legacy env override the catalog could not express until

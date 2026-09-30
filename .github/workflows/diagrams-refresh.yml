@@ -196,7 +196,7 @@ jobs:
 
       - name: Agent edits the diagram sources
         id: agent
-        uses: anthropics/claude-code-action@6b082c41935b4c8a3b8b0ef85ba4ba4d9eeb8975 # v1.0.189 (CLI 2.1.226)
+        uses: anthropics/claude-code-action@12dd8d74c712f5f3669365b2369b558c495b1104 # v1.0.238 (CLI 2.1.286)
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ steps.app-token.outputs.token }}
@@ -237,7 +237,7 @@ jobs:
           # the only commands it may run are the validator, the facts
           # regenerator and git read-only inspection of the release diffs.
           claude_args: >-
-            --model claude-sonnet-5
+            --model claude-sonnet-5-5
             --max-turns 60
             --allowedTools "Read,Glob,Grep,Edit(docs/diagrams/archify/**),Write(docs/diagrams/archify/**),Write(CHANGES.md),Bash(node _archify/archify/bin/archify.mjs validate:*),Bash(node _archify/archify/bin/archify.mjs brands:*),Bash(python3 tools/diagram_facts.py:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git -C _gitops log:*),Bash(git -C _gitops diff:*),Bash(git -C _api log:*),Bash(git -C _api diff:*)"
 
