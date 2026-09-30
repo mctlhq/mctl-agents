@@ -600,9 +600,19 @@ class WorkContextRef:
     actor_kind: str = ""
     actor_id: str = ""
     surface_transition: bool = False
+    #: The WorkItem intent high-water mark this snapshot leaves for the next
+    #: execution (mctlhq/mctl-agents#542): every intent id at or below it
+    #: was either carried or deliberately cut. Recorded on every snapshot
+    #: assembled with `WORK_ITEM_INTENT_SOURCE=on`, including one that
+    #: selected no intent, so a quiet execution never erases the mark.
+    #: Omitted from the document when None (every snapshot sealed with the
+    #: switch off, or before the field existed), so those bytes are
+    #: unchanged. Additive within context.mctl.ai/v1alpha1, like the
+    #: "work-item-intent" source kind.
+    intent_high_water: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "work_item_id": self.work_item_id,
             "work_item_revision": self.work_item_revision,
             "execution_id": self.execution_id,
@@ -615,6 +625,9 @@ class WorkContextRef:
             "actor_id": self.actor_id,
             "surface_transition": self.surface_transition,
         }
+        if self.intent_high_water is not None:
+            data["intent_high_water"] = self.intent_high_water
+        return data
 
     @classmethod
     def from_dict(cls, data: Any) -> WorkContextRef:
@@ -624,10 +637,13 @@ class WorkContextRef:
             frozenset({
                 "work_item_id", "work_item_revision", "execution_id", "execution_sequence",
                 "prior_execution_ids", "resumed_from_snapshot_id", "origin_surface",
-                "current_surface", "actor_kind", "actor_id", "surface_transition",
+                "current_surface", "actor_kind", "actor_id", "surface_transition", "intent_high_water",
             }),
             where="work_context",
         )
+        intent_high_water = _optional_int(mapping.get("intent_high_water"), where="work_context.intent_high_water")
+        if intent_high_water is not None and intent_high_water < 0:
+            raise ContextSnapshotError("work_context.intent_high_water must be >= 0")
         prior_raw = mapping.get("prior_execution_ids", [])
         if not isinstance(prior_raw, list) or not all(isinstance(p, str) for p in prior_raw):
             raise ContextSnapshotError("work_context.prior_execution_ids must be a list of strings")
@@ -655,6 +671,7 @@ class WorkContextRef:
             surface_transition=_require_bool(
                 mapping.get("surface_transition", False), where="work_context.surface_transition"
             ),
+            intent_high_water=intent_high_water,
         )
 
 

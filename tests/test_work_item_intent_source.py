@@ -505,6 +505,20 @@ def test_pinned_resume_intent_survives_a_budget_that_drops_everything_else(tmp_p
     assert budget.used_sources <= budget.max_sources and budget.used_bytes <= budget.max_bytes
 
 
+def test_budget_cut_pinned_intent_counts_as_a_truncated_source(tmp_path):
+    (tmp_path / "repo").mkdir()
+    intents = _parsed(1, 2, 3)
+    roomy = ca.assemble(_assembly_input(tmp_path, work_item_intents=intents, resume_intent=intents[2]),
+                        mode="shadow", execution=_execution())
+    assert roomy.metrics.truncated_sources == 0
+    config = ca.AssemblyConfig(max_bytes=8)
+    inp = _assembly_input(tmp_path, work_item_intents=intents, resume_intent=intents[2], config=config)
+    tight = ca.assemble(inp, mode="shadow", execution=_execution())
+    (pinned,) = [s for s in tight.snapshot.sources if s.selection.included]
+    assert pinned.byte_count == 8
+    assert tight.metrics.truncated_sources == 1
+
+
 def test_budget_without_a_pinned_intent_is_unchanged(tmp_path):
     """No resume intent: the rank-order budget is exactly today's."""
     (tmp_path / "repo").mkdir()
@@ -610,9 +624,10 @@ def test_t18_switch_off_unset_or_bogus_makes_no_intent_request_and_keeps_bytes(
     if switch == "bogus":
         assert f"warn: {wi.SWITCH_ENV_VAR}='bogus'" in out
     assert b"work-item-intent" not in got
+    assert b"intent_high_water" not in got
 
     # Byte-identical to the same run with the intent code path removed.
-    monkeypatch.setattr(ca, "_resolve_work_item_intents", lambda *a, **k: ((), None, None))
+    monkeypatch.setattr(ca, "_resolve_work_item_intents", lambda *a, **k: None)
     baseline, _, _ = _run("on")
     assert got == baseline
 
@@ -669,6 +684,125 @@ def test_high_water_is_not_lowered_by_an_old_pinned_intent():
     assert ca.prior_intent_high_water(doc) == 9
     doc2 = {"sources": [_sealed(2, step="primary"), _sealed(30)]}
     assert ca.prior_intent_high_water(doc2) == 30
+
+
+_WC = cs.WorkContextRef(work_item_id=WID, work_item_revision="r1", execution_id="we_1", execution_sequence=1)
+
+
+def _seal_doc(tmp_path: Path, reading: tuple[tuple[wi.Intent, ...], wi.Intent | None, int | None] | None,
+              **overrides: Any) -> dict[str, Any]:
+    """Seal one WorkItem-backed snapshot the way the entry point does for a
+    given resolver answer (None = switch off)."""
+    (tmp_path / "repo").mkdir(exist_ok=True)
+    fields: dict[str, Any] = dict(overrides)
+    if reading is not None:
+        intents, resume, mark = reading
+        fields.update(work_item_intents=intents, resume_intent=resume, prior_intent_high_water=mark,
+                      record_intent_high_water=True)
+    inp = _assembly_input(tmp_path, **fields)
+    return ca.assemble(inp, mode="shadow", execution=_execution(), work_context=_WC).snapshot.to_dict()
+
+
+def test_mark_survives_a_quiet_snapshot(tmp_path, monkeypatch):
+    """C1 carries intents up to 100; C2 finds nothing new and selects no
+    intent, yet still records 100; C3 lists from after_id=100, not 0."""
+    monkeypatch.setenv(wi.SWITCH_ENV_VAR, "on")
+    store = _install(monkeypatch, _FakeStore(intents=[_intent(i) for i in range(1, 101)]))
+    client = wc_client.WorkItemClient()
+
+    def _resolve(prior_doc):
+        store.paths.clear()
+        return ca._resolve_work_item_intents(
+            _work_context(), client, execution_request_id=None,
+            prior_answer=_replayed(prior_doc) if prior_doc is not None else None,
+        )
+
+    roomy = ca.AssemblyConfig(max_sources=50)
+    c1 = _seal_doc(tmp_path, _resolve(None), config=roomy)
+    # The cap kept 81..100, all carried; 1..80 stay behind the mark.
+    assert c1["work_context"]["intent_high_water"] == 100
+    reading2 = _resolve(c1)
+    assert reading2 == ((), None, 100)
+    c2 = _seal_doc(tmp_path, reading2, config=roomy)
+    assert not [x for x in c2["sources"] if x["kind"] == "work-item-intent"]
+    assert c2["work_context"]["intent_high_water"] == 100
+    assert _resolve(c2) == ((), None, 100)
+    assert [p for p in store.intent_paths() if "?" in p] == [
+        f"/api/v1/work-items/{WID}/intents?after_id=100&limit=100"
+    ]
+    # Round-trips through the strict reader.
+    assert cs.WorkContextRef.from_dict(c2["work_context"]).intent_high_water == 100
+
+
+def test_budget_excluded_intents_in_c1_hold_the_recorded_mark_back(tmp_path):
+    """With the default budget C1 cannot carry all 20: the recorded mark
+    stops below the first one it dropped, so those are offered again."""
+    doc = _seal_doc(tmp_path, (_parsed(*range(81, 101)), None, 80))
+    dropped = [x["selector"]["intent_id"] for x in doc["sources"]
+               if x["kind"] == "work-item-intent" and not x["selection"]["included"]]
+    assert dropped
+    assert doc["work_context"]["intent_high_water"] == min(dropped) - 1
+
+
+@pytest.mark.parametrize(("switch", "want"), [("on", 0), ("off", None)])
+def test_quiet_run_records_the_mark_end_to_end(tmp_path, monkeypatch, switch, want):
+    """Through `investigate()`: an item with no intents and a request that
+    names none still seals `intent_high_water` when the switch is on, and
+    never when it is off."""
+    _env(monkeypatch, switch=switch)
+    _install(monkeypatch, _FakeStore(intents=[], intent_id=None))
+    _stub_dispatched_work_item(monkeypatch)
+    persisted = _record_persist(monkeypatch)
+    issue = _dispatched_resume_issue(monkeypatch, number=567)
+    _spy_clone(monkeypatch, tmp_path)
+    _terminal_proposal(tmp_path, issue, 567, "merged")
+
+    result = _run_resume(tmp_path, issue)
+
+    assert result.outcome_code == "succeeded"
+    (snapshot,) = persisted
+    assert not _intent_sources(snapshot)
+    assert snapshot.to_dict()["work_context"].get("intent_high_water") == want
+
+
+def test_switch_on_with_no_intents_records_mark_zero_and_off_records_none(tmp_path):
+    on = _seal_doc(tmp_path, ((), None, None))
+    assert on["work_context"]["intent_high_water"] == 0
+    off = _seal_doc(tmp_path, None)
+    assert "intent_high_water" not in off["work_context"]
+
+
+def test_recorded_mark_and_source_mark_combine():
+    doc = {"work_context": {"intent_high_water": 40}, "sources": [_sealed(12)]}
+    assert ca.prior_intent_high_water(doc) == 40
+    doc2 = {"work_context": {"intent_high_water": 40}, "sources": [_sealed(55)]}
+    assert ca.prior_intent_high_water(doc2) == 55
+    assert ca.prior_intent_high_water({"work_context": {"intent_high_water": "40"}, "sources": []}) is None
+
+
+def test_work_context_intent_high_water_is_validated():
+    base = _WC.to_dict()
+    assert "intent_high_water" not in base
+    with pytest.raises(cs.ContextSnapshotError):
+        cs.WorkContextRef.from_dict({**base, "intent_high_water": -1})
+    with pytest.raises(cs.ContextSnapshotError):
+        cs.WorkContextRef.from_dict({**base, "intent_high_water": True})
+    assert cs.WorkContextRef.from_dict({**base, "intent_high_water": 7}).intent_high_water == 7
+
+
+def test_duplicate_content_counts_as_seen(tmp_path):
+    """Two intents with identical {text, params}: one is included, the other
+    excluded as duplicate-content, and its bytes still reached the prompt.
+    The mark advances past both."""
+    twins = tuple(wi.Intent.from_payload(_intent(i, text="same", params={"k": 1})) for i in (1, 2))
+    assert all(twins)
+    doc = _seal_doc(tmp_path, (twins, None, None))  # type: ignore[arg-type]
+    reasons = sorted(x["selection"]["reason_code"] for x in doc["sources"] if x["kind"] == "work-item-intent")
+    assert "duplicate-content" in reasons
+    assert doc["work_context"]["intent_high_water"] == 2
+    assert ca.prior_intent_high_water(doc) == 2
+    assert ca.intent_mark_from_sources([_sealed(3, included=False) | {"selection": {
+        "included": False, "reason_code": "duplicate-content", "strategy_step": "secondary"}}]) == 3
 
 
 def _work_context() -> Any:
@@ -894,7 +1028,7 @@ def test_request_intent_id_zero_or_malformed_by_switch(monkeypatch, switch, valu
         )
 
     if switch == "off":
-        assert _resolve() == ((), None, None)
+        assert _resolve() is None
         assert store.intent_paths() == []
     elif value == 0:
         intents, resume, _ = _resolve()

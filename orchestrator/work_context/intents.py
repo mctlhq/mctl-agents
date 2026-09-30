@@ -12,8 +12,13 @@ Every classifier keeps "could not observe" apart from "observed absent"
   the item asked about, or a truncated page whose continuation cannot be
   read is UNKNOWN;
 - only mctl-api's documented absence signals are ABSENT: a 404 with
-  `intent_not_found` for one intent, a 404 with `work_item_not_found` for
-  the item, and a 200 whose `intents` list is empty for a listing.
+  `intent_not_found` for one intent, and a 404 with `work_item_not_found`
+  for the item;
+- a 200 listing whose `intents` list is empty is neither: it is LISTED with
+  no intents. The item exists and was read completely; it simply has no
+  intents yet. That is a successful observation the run proceeds on (and
+  records its high-water mark from), whereas ABSENT and UNKNOWN both mean
+  the intents could not be established and fail the run as unresolved.
 
 A retention-swept intent reads back with `text: ""` and
 `text_redacted: true`. That is "the text is gone", never "the text was

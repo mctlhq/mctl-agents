@@ -281,6 +281,10 @@ class AssemblyInput:
     #: The base URL of the client that read the intents, so a sealed
     #: locator names the URL actually read. Empty = `api_base()`.
     work_item_api_base: str = ""
+    #: True when the intent source was on and read for this assembly, even
+    #: if it selected nothing: the snapshot then records its intent
+    #: high-water mark (`WorkContextRef.intent_high_water`).
+    record_intent_high_water: bool = False
 
 
 @dataclass
@@ -951,22 +955,39 @@ def select_work_item_intents(
 
 
 def prior_intent_high_water(prior_document: Mapping[str, Any] | None) -> int | None:
-    """The intent id below which a stored snapshot document shows every
-    ranked intent as carried, or None when there is no document or it holds
-    no intent (every snapshot sealed before this kind existed).
+    """The intent high-water mark a stored snapshot document leaves: the
+    larger of the mark it recorded (`work_context.intent_high_water`) and the
+    mark its own intent sources imply (`intent_mark_from_sources`). None when
+    it has neither, as for every snapshot sealed before the intent source
+    existed or with the switch off, so every intent qualifies up to the cap.
 
-    Only `selection.included` sources were seen by the model. A ranked
-    intent sealed as excluded (budget, duplicate) was not, so the mark stops
-    just below the lowest such id and it is offered again, even when higher
-    ids were carried: re-offering a carried intent is a superset, dropping
-    an unseen one is not. The pinned resume intent (`strategy_step:
-    primary`) may be older than the mark and never lowers it."""
+    The recorded mark is what survives a quiet execution: one that selected
+    no intent still records the mark it inherited."""
     if not isinstance(prior_document, Mapping):
         return None
+    work_context = prior_document.get("work_context")
+    recorded = work_context.get("intent_high_water") if isinstance(work_context, Mapping) else None
+    if not isinstance(recorded, int) or isinstance(recorded, bool) or recorded < 0:
+        recorded = None
     sources = prior_document.get("sources")
-    if not isinstance(sources, list):
-        return None
-    carried: list[int] = []
+    derived = intent_mark_from_sources(sources) if isinstance(sources, list) else None
+    marks = [m for m in (recorded, derived) if m is not None]
+    return max(marks) if marks else None
+
+
+def intent_mark_from_sources(sources: Sequence[Any]) -> int | None:
+    """The intent id below which a snapshot's sources show every ranked
+    intent as seen, or None when they hold no intent.
+
+    Seen means `selection.included`, or excluded as `duplicate-content`
+    (identical bytes reached the prompt under another source id). A ranked
+    intent excluded for any other reason (budget, candidate ceiling) was not
+    seen, so the mark stops just below the lowest such id and it is offered
+    again, even when higher ids were carried: re-offering a seen intent is a
+    superset, dropping an unseen one is not. The pinned resume intent
+    (`strategy_step: primary`) may be older than the mark and never lowers
+    it."""
+    seen: list[int] = []
     unseen: list[int] = []
     for source in sources:
         if not isinstance(source, Mapping) or source.get("kind") != "work-item-intent":
@@ -977,13 +998,31 @@ def prior_intent_high_water(prior_document: Mapping[str, Any] | None) -> int | N
             continue
         selection = source.get("selection")
         selection = selection if isinstance(selection, Mapping) else {}
-        if selection.get("included") is True:
-            carried.append(value)
+        if selection.get("included") is True or selection.get("reason_code") == "duplicate-content":
+            seen.append(value)
         elif selection.get("strategy_step") != "primary":
             unseen.append(value)
     if unseen:
         return min(unseen) - 1
-    return max(carried) if carried else None
+    return max(seen) if seen else None
+
+
+def _next_intent_high_water(assembly_input: AssemblyInput, sources: Sequence[ContextSource]) -> int:
+    """The mark this snapshot records for the next execution: its own
+    sources' mark, never below the one it inherited (the listing started
+    there, so every intent it saw is above it). Intents the cap cut are
+    below the kept ones and stay behind the mark: they are counted in
+    `candidates_dropped_pre_budget`, not offered again."""
+    derived = intent_mark_from_sources([s.to_dict() for s in sources])
+    return max(assembly_input.prior_intent_high_water or 0, derived or 0)
+
+
+def _with_intent_high_water(
+    work_context: WorkContextRef | None, assembly_input: AssemblyInput, sources: Sequence[ContextSource]
+) -> WorkContextRef | None:
+    if work_context is None or not assembly_input.record_intent_high_water:
+        return work_context
+    return replace(work_context, intent_high_water=_next_intent_high_water(assembly_input, sources))
 
 
 def _intent_candidate(assembly_input: AssemblyInput, intent: Intent, *, pinned: bool) -> CandidateSource:
@@ -1291,7 +1330,10 @@ def run_pipeline(candidates: list[CandidateSource], config: AssemblyConfig, now:
         if candidate.included and truncate_to_per_source_limit(candidate, config.max_bytes_per_source):
             truncated_sources += 1
 
+    truncated_before_budget = {id(c) for c in candidates if c.truncated}
     budget = apply_budget(candidates, config)
+    # A pinned resume intent the budget cut to fit is a truncated source too.
+    truncated_sources += sum(1 for c in candidates if c.truncated and id(c) not in truncated_before_budget)
     excluded_budget = sum(1 for c in candidates if c.reason_code == "budget-exhausted")
     # Counted after deduplication and the budget, which may overwrite a
     # `stale-demoted` reason: the metric reports what the snapshot shows.
@@ -1597,7 +1639,7 @@ def assemble(
         budget=outcome.budget,
         retention=retention,
         created_at=_iso(assembly_input.now),
-        work_context=work_context,
+        work_context=_with_intent_high_water(work_context, assembly_input, sources),
         sources=sources,
         evidence_refs=(),
         conflicts=outcome.conflicts,
@@ -1650,7 +1692,9 @@ def assemble(
                 budget=shadow_outcome.budget,
                 retention=retention,
                 created_at=_iso(assembly_input.now),
-                work_context=work_context,
+                work_context=_with_intent_high_water(
+                    work_context, shadow_input, tuple(_to_context_source(c) for c in shadow_outcome.candidates)
+                ),
                 sources=tuple(_to_context_source(c) for c in shadow_outcome.candidates),
                 evidence_refs=(),
                 conflicts=shadow_outcome.conflicts,
@@ -1784,16 +1828,18 @@ def assemble_investigator_context(
     # the rollout and the execution id say there is one.
     client = _client(work_item_client) if _work_context_active(work_context) else None
     work_context, prior_answer = _link_prior_snapshot_with_answer(work_context, client)
-    intents, resume_intent, high_water = _resolve_work_item_intents(
+    reading = _resolve_work_item_intents(
         work_context, client, execution_request_id=execution_request_id, prior_answer=prior_answer
     )
-    if intents or resume_intent is not None:
+    if reading is not None:
+        intents, resume_intent, high_water = reading
         assembly_input = replace(
             assembly_input,
             work_item_intents=intents,
             resume_intent=resume_intent,
             prior_intent_high_water=high_water,
             work_item_api_base=str(getattr(client, "base_url", "") or ""),
+            record_intent_high_water=True,
         )
     result = assemble(assembly_input, mode=mode, execution=execution, work_context=work_context)
     answer = _persist_to_work_item_store(result.snapshot, client)
@@ -1818,24 +1864,25 @@ def _resolve_work_item_intents(
     *,
     execution_request_id: str | None,
     prior_answer: Any | None,
-) -> tuple[tuple[Intent, ...], Intent | None, int | None]:
+) -> tuple[tuple[Intent, ...], Intent | None, int | None] | None:
     """`(intents, resume_intent, prior_high_water)` for a WorkItem-backed
-    assembly, or `((), None, None)` when there is none to read: no store
-    execution (no client), or the `WORK_ITEM_INTENT_SOURCE` switch is off.
+    assembly, or None when there is none to read: no store execution (no
+    client), or the `WORK_ITEM_INTENT_SOURCE` switch is off. A tuple, even
+    an empty one, means the source was on and read.
 
     Every read that fails is `IntentUnresolved`, never "no intent": the
     execution request (whose `intent_id` decides what is pinned), the pinned
     intent itself, and the listing. Only a request that names no intent pins
     nothing."""
     if work_context is None or client is None:
-        return (), None, None
+        return None
     from orchestrator.work_context import execution_requests as xr
     from orchestrator.work_context import intents as wi
     from orchestrator.work_context.snapshots import SNAPSHOT_REPLAYED
 
     if wi.switch() != wi.SWITCH_ON:
         print("[context] work-item-intent source=off", flush=True)
-        return (), None, None
+        return None
     wid = work_context.work_item_id
     resume_intent: Intent | None = None
     if execution_request_id:
