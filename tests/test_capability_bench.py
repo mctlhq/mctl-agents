@@ -105,6 +105,23 @@ def test_totals_for_transcript_takes_deltas_of_cumulative_usage_within_a_session
     assert totals["duration_api_ms"] == 800
 
 
+def test_totals_for_transcript_keeps_turns_of_a_metadata_only_final_result():
+    """claude P2 / Copilot on #554: a final ResultMessage whose model counters
+    did not move is skipped by the ledger (no record), but its cumulative
+    num_turns and duration_api_ms still count for the session."""
+    messages = [
+        _result(session_id="s1", uuid="r1", input_tokens=100, output_tokens=20, num_turns=2, duration_api_ms=500),
+        _result(session_id="s1", uuid="r2", input_tokens=100, output_tokens=20, num_turns=4, duration_api_ms=900),
+    ]
+
+    totals = cb._totals_for_transcript(messages)
+
+    assert totals["input_tokens"] == 100
+    assert totals["output_tokens"] == 20
+    assert totals["num_turns"] == 4
+    assert totals["duration_api_ms"] == 900
+
+
 def test_totals_for_transcript_sums_across_sessions():
     messages = [
         _result(session_id="s1", uuid="r1", input_tokens=100, output_tokens=50, num_turns=2, duration_api_ms=500),
