@@ -328,6 +328,9 @@ the endpoint shape belongs to `usage-ledger`.
 10. Every producer record carries a `devloop_stage` vocabulary value or none.
 11. A review-feedback run's records carry `agent=implementer` and
     `devloop_stage=shepherd`.
+12. A result whose present measured deltas are all 0 for a model, with no
+    `provider_reported_cost`, produces no record for that model; a bucket
+    with no measured counter present is still recorded.
 
 ## Amendment 2026-09-24 — the producer (mctlhq/.github#50)
 
@@ -470,6 +473,47 @@ mctl-api's insert-or-ignore on the derived id makes a second delivery add no
 row — so "re-read one artifact" and "re-run the whole sweep" are the same
 operation, and a wider `--lookback-days` backfill (up to the 90-day artifact
 retention) is a safe redundant read, never a double count.
+
+## Amendment 2026-10-01 — a result with no new usage is not emitted (mctlhq/.github#50)
+
+**The rule.** For each model bucket of a `ResultMessage`, the producer emits
+no `ModelUsageRecord` when every measured counter delta that is present
+(tokens and web-search requests) is 0 and `provider_reported_cost` is absent. A result whose every bucket is like
+that emits nothing at all — not an empty batch, no call.
+
+**Why.** Because `model_usage` is cumulative per session (amendment
+2026-09-24), a metadata-only or duplicate cumulative `ResultMessage` — the
+drain's second result of a session, reporting the totals already recorded —
+yields an all-zero delta. Such a result is **not a separate usage
+invocation**: no model call was spent between it and the previous result for
+that model. Recording it put zero-token rows into the ledger (observed on the
+shepherd's rows in the #50 rollout) that attribute nothing, inflate
+invocation counts and read like real calls. Example, one session and one
+model:
+
+| Result | cumulative input/output | emitted |
+|---|---|---|
+| 1 | 100 / 20 | 100 / 20 |
+| 2 | 100 / 20 | nothing |
+| 3 | 120 / 25 | 20 / 5 |
+
+**Absent is not zero.** Only counters the SDK actually reported are
+compared. An absent counter is never written as 0 and never read as a zero
+delta; a bucket that reports no measured counter at all is still recorded,
+because absence alone says nothing about whether usage happened.
+`provider_reported_cost` stays null under the subscription decision, so
+today the cost clause never fires; it is part of the rule so that an
+invoice-grade figure, once a provider supplies one, is never dropped.
+
+**State still advances.** A skipped bucket advances its `(session, model)`
+baseline, and a fully skipped result is committed to the producer's seen-set
+without a delivery, so a later result's delta is computed from the right
+baseline and a replay of the skipped result stays a no-op.
+
+**What does not change.** Rows already in the ledger stay; this is a
+producer rule, not a migration. Dedupe stays by `(session_id, result_uuid,
+model_key)` as described in "Idempotency and dedupe". The rows of a session
+still sum to its reported total, since a skipped row contributed 0.
 
 ## Non-goals
 

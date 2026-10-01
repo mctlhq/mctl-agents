@@ -52,7 +52,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from orchestrator.context_snapshot import canonical_json  # noqa: E402
-from orchestrator.usage_ledger import UsageRecorder  # noqa: E402
+from orchestrator.usage_ledger import UsageRecorder, _int  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # schema-bytes — pure computation
@@ -188,13 +188,16 @@ def _totals_for_transcript(messages: Sequence[Mapping[str, Any]]) -> dict[str, i
         message = SimpleNamespace(**raw)
         planned = recorder._plan(message)
         recorder._commit(planned)
-        records = [record for _, _, _, record in planned]
-        if records:
-            session = per_session.setdefault(str(records[0].get("session_id", "")), {})
+        if planned:
+            # Per-message fields come off the ResultMessage itself, so a
+            # result whose every bucket was skipped as zero-delta (planned
+            # record None) still carries its cumulative turns and duration.
+            session = per_session.setdefault(str(raw.get("session_id", "")).strip(), {})
             for field, _ in _PER_MESSAGE_FIELDS:
-                value = records[0].get(field)
-                if isinstance(value, int):
+                value = _int(raw.get(field))
+                if value is not None:
                     session[field] = max(session.get(field, 0), value)
+        records = [record for _, _, _, record in planned if record is not None]
         for record in records:
             for field, _ in _TOKEN_FIELDS:
                 value = record.get(field)

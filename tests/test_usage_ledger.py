@@ -379,6 +379,73 @@ def test_the_same_result_observed_twice_is_sent_once_and_does_not_move_the_basel
     assert api.records[1]["output_tokens"] == 15
 
 
+def test_a_result_with_no_new_usage_is_not_a_usage_invocation():
+    """Owner decision on .github#50: 100/20 emits 100/20, a second 100/20
+    (metadata-only or duplicate cumulative result) emits nothing, and 120/25
+    still emits 20/5 against the right baseline."""
+    api = FakeApi()
+    rec = _recorder(api)
+    rec.observe(_result("u1", {OPUS: _usage(100, 20)}))
+    rec.observe(_result("u2", {OPUS: _usage(100, 20)}))
+    rec.observe(_result("u3", {OPUS: _usage(120, 25)}))
+    got = [(r["result_uuid"], r["input_tokens"], r["output_tokens"]) for r in api.records]
+    assert got == [("u1", 100, 20), ("u3", 20, 5)]
+    # Not an empty POST either: the zero result made no call at all.
+    assert len(api.calls) == 2
+
+
+def test_a_skipped_zero_result_is_committed_and_stays_a_no_op_on_replay():
+    api = FakeApi()
+    rec = _recorder(api)
+    rec.observe(_result("u1", {OPUS: _usage(100, 20)}))
+    zero = _result("u2", {OPUS: _usage(100, 20)})
+    rec.observe(zero)
+    assert ("session-1", "u2") in rec._seen
+    rec.observe(zero)
+    assert [r["result_uuid"] for r in api.records] == ["u1"]
+
+
+def test_only_the_non_zero_bucket_of_a_two_model_result_is_sent():
+    api = FakeApi()
+    rec = _recorder(api)
+    rec.observe(_result("u1", {OPUS: _usage(100, 20), HAIKU: _usage(50, 5)}))
+    rec.observe(_result("u2", {OPUS: _usage(130, 26), HAIKU: _usage(50, 5)}))
+    rec.observe(_result("u3", {OPUS: _usage(130, 26), HAIKU: _usage(70, 9)}))
+    got = [(r["result_uuid"], r["model_key"], r["input_tokens"], r["output_tokens"]) for r in api.records]
+    assert got == [
+        ("u1", OPUS, 100, 20), ("u1", HAIKU, 50, 5),
+        ("u2", OPUS, 30, 6),
+        ("u3", HAIKU, 20, 4),
+    ]
+
+
+def test_absent_counters_stay_absent_and_do_not_cause_a_skip_on_their_own():
+    """Absent is unknown, not 0: it is neither written as 0 nor read as a
+    zero delta. A bucket that reports no counter at all is still sent."""
+    api = FakeApi()
+    rec = _recorder(api)
+    rec.observe(_result("u1", {OPUS: {"inputTokens": 100, "costUSD": 0.01}}))
+    rec.observe(_result("u2", {OPUS: {"inputTokens": 130}}))
+    rec.observe(_result("u3", {HAIKU: {"costUSD": 0.01, "contextWindow": 200000}}))
+    first, second, bare = api.records
+    assert (first["input_tokens"], second["input_tokens"]) == (100, 30)
+    measured = ("output_tokens", "cache_read_tokens", "cache_write_tokens", "web_search_requests")
+    for record in (first, second):
+        assert not any(field in record for field in measured)
+    assert bare["model_key"] == HAIKU
+    assert not any(field in bare for field in ("input_tokens", *measured))
+
+
+def test_a_zero_delta_bucket_with_a_provider_reported_cost_is_still_sent():
+    """The SDK gives no provider-reported cost today (ADR-012 keeps it null),
+    so the rule is checked on the record the planner built."""
+    zero = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0}
+    assert not usage_ledger._carries_usage(zero)
+    assert usage_ledger._carries_usage({**zero, "provider_reported_cost": 0.42})
+    assert usage_ledger._carries_usage({**zero, "provider_reported_cost": 0})
+    assert not usage_ledger._carries_usage({**zero, "provider_reported_cost": None})
+
+
 def test_a_redelivered_batch_is_byte_for_byte_the_same_identity():
     """What makes a retry safe server-side: the retry carries the same
     session/result/model, so it lands on the same row id."""

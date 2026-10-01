@@ -24,6 +24,13 @@ each ResultMessage were recorded as-is. So each record carries what THIS
 turn added for that model: its cumulative counters minus the ones last seen
 for the same (session, model). The rows of a session sum to its total.
 
+No empty rows. A ResultMessage whose cumulative counters did not move for a
+model (a metadata-only or duplicate result: the drain's second result of a
+session reports the same totals) is not a usage invocation, so that model's
+bucket is not sent; a result whose every bucket is like that sends nothing.
+Its baseline and turn key still advance. Only counters the SDK reported are
+compared: an absent counter stays absent, it is never read as 0.
+
 Idempotency. mctl-api derives the row id from (session_id, result_uuid,
 model_key) and ignores a second insert of it, so a re-sent batch counts once.
 In the process, the same key is remembered too: observing one ResultMessage
@@ -298,6 +305,20 @@ def agent_env_without_writer_token(env: Mapping[str, str]) -> dict[str, str]:
     return {**env, TOKEN_ENV: ""}
 
 
+def _carries_usage(record: Mapping[str, Any]) -> bool:
+    """False when every measured counter present in `record` is 0 and no
+    provider-reported cost is set: a bucket like that is not a usage
+    invocation and is not sent (ADR-012, amendment 2026-10-01).
+
+    Only present counters count. A record with none present at all is kept:
+    an absent counter is unknown, not 0, and must not cause a skip on its own.
+    """
+    if record.get("provider_reported_cost") is not None:
+        return True
+    present = [record[field] for _, field in _COUNTERS if field in record]
+    return not present or any(n != 0 for n in present)
+
+
 def _int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
@@ -457,19 +478,24 @@ class UsageRecorder:
     def _record(self, message: Any, recorded_at: str) -> None:
         try:
             planned = self._plan(message, recorded_at)
-            if planned and self._deliver([record for _, _, _, record in planned]):
+            records = [record for _, _, _, record in planned if record is not None]
+            # Nothing to send (every bucket was empty) is nothing that could
+            # fail to land: commit at once, so a replay stays a no-op.
+            if planned and (not records or self._deliver(records)):
                 self._commit(planned)
         except Exception as exc:  # noqa: BLE001 — recording must never break the run it records
             self._warn_once("observe", "could not record model usage (%s: %s)", type(exc).__name__, exc)
 
-    def _commit(self, planned: list[tuple[Any, Any, dict[str, int], dict[str, Any]]]) -> None:
+    def _commit(self, planned: list[tuple[Any, Any, dict[str, int], dict[str, Any] | None]]) -> None:
         for seen_key, baseline_key, cumulative, _ in planned:
             self._seen.add(seen_key)
             self._baseline[baseline_key] = cumulative
 
     def _plan(
         self, message: Any, recorded_at: str | None = None
-    ) -> list[tuple[Any, Any, dict[str, int], dict[str, Any]]]:
+    ) -> list[tuple[Any, Any, dict[str, int], dict[str, Any] | None]]:
+        """One entry per model bucket; its record is None when the bucket
+        carries no new usage and must not be sent (see `_carries_usage`)."""
         session_id = str(getattr(message, "session_id", "") or "").strip()
         model_usage = getattr(message, "model_usage", None)
         if not session_id or not isinstance(model_usage, Mapping) or not model_usage:
@@ -506,7 +532,7 @@ class UsageRecorder:
             if isinstance(value, str) and value:
                 common[attr] = value
 
-        planned: list[tuple[Any, Any, dict[str, int], dict[str, Any]]] = []
+        planned: list[tuple[Any, Any, dict[str, int], dict[str, Any] | None]] = []
         for model_key, usage in model_usage.items():
             if not isinstance(usage, Mapping):
                 continue
@@ -533,7 +559,12 @@ class UsageRecorder:
             provider = usage.get("provider")
             if isinstance(provider, str) and provider:
                 record["provider"] = provider
-            planned.append((seen_key, (session_id, str(model_key)), {**previous, **current}, record))
+            planned.append((
+                seen_key,
+                (session_id, str(model_key)),
+                {**previous, **current},
+                record if _carries_usage(record) else None,
+            ))
         return planned
 
     def _deliver(self, records: list[dict[str, Any]]) -> bool:
