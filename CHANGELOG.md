@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.64.0](https://github.com/mctlhq/mctl-agents/compare/1.63.0...1.64.0) (2026-09-30)
+
+
+### Features
+
+* **model-policy:** move mentor and shepherd to the balanced profile ([3ee0f7f](https://github.com/mctlhq/mctl-agents/commit/3ee0f7fe10553e846a9974d1d63198cbeee63a5b))
+* **model-policy:** move mentor and shepherd to the balanced profile ([32f672c](https://github.com/mctlhq/mctl-agents/commit/32f672cdbe986deaceb6b56230d0b820ad9cfac5))
+
+
+### Bug Fixes
+
+* **mentor:** align the MENTOR_BUDGET_USD default with the deployed 10.00 ([911ec5a](https://github.com/mctlhq/mctl-agents/commit/911ec5a395ab79066d66ae336f14dea59e75d945))
+* **work-context:** point a resume at the execution it resumes from ([df15c69](https://github.com/mctlhq/mctl-agents/commit/df15c69588fda55351c45434a200d9b8a9c24a86))
+* **work-context:** point a resume at the execution it resumes from ([ba7d02c](https://github.com/mctlhq/mctl-agents/commit/ba7d02c9a5454e445f32b6588df4be3b97c0365a))
+
 ## [1.63.0](https://github.com/mctlhq/mctl-agents/compare/1.62.1...1.63.0) (2026-09-30)
 
 
