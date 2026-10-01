@@ -477,8 +477,8 @@ retention) is a safe redundant read, never a double count.
 ## Amendment 2026-10-01 — a result with no new usage is not emitted (mctlhq/.github#50)
 
 **The rule.** For each model bucket of a `ResultMessage`, the producer emits
-no `ModelUsageRecord` when every measured token delta that is present is 0
-and `provider_reported_cost` is absent. A result whose every bucket is like
+no `ModelUsageRecord` when every measured counter delta that is present
+(tokens and web-search requests) is 0 and `provider_reported_cost` is absent. A result whose every bucket is like
 that emits nothing at all — not an empty batch, no call.
 
 **Why.** Because `model_usage` is cumulative per session (amendment

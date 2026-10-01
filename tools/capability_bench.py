@@ -188,7 +188,7 @@ def _totals_for_transcript(messages: Sequence[Mapping[str, Any]]) -> dict[str, i
         message = SimpleNamespace(**raw)
         planned = recorder._plan(message)
         recorder._commit(planned)
-        records = [record for _, _, _, record in planned]
+        records = [record for _, _, _, record in planned if record is not None]
         if records:
             session = per_session.setdefault(str(records[0].get("session_id", "")), {})
             for field, _ in _PER_MESSAGE_FIELDS:
