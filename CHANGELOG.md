@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.64.1](https://github.com/mctlhq/mctl-agents/compare/1.64.0...1.64.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* **usage:** drop skipped buckets in the capability bench ([459130a](https://github.com/mctlhq/mctl-agents/commit/459130ac14c3c18f4871e6b43ccfb8c2a9f0de9c))
+* **usage:** keep bench turns for metadata-only results ([f92d14e](https://github.com/mctlhq/mctl-agents/commit/f92d14e61d94c0cb61a58ac8c82511d8419bd6a8))
+* **usage:** skip model buckets with no new usage ([c764757](https://github.com/mctlhq/mctl-agents/commit/c764757449e53e16ef31020fb047d27c36099d75))
+* **usage:** skip model buckets with no new usage ([7a47160](https://github.com/mctlhq/mctl-agents/commit/7a47160a0423d4b28716bc3a7569de61974b43f9))
+
 ## [1.64.0](https://github.com/mctlhq/mctl-agents/compare/1.63.0...1.64.0) (2026-09-30)
 
 
