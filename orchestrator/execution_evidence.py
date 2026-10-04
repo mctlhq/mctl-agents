@@ -1896,6 +1896,12 @@ class CurrentEvidence:
     evidence: ExecutionEvidence | None = None
 
 
+def _content_key(evidence: ExecutionEvidence) -> bytes:
+    """Canonical bytes of everything but `created_at` — the same exclusion
+    `content_hash` makes, so two seals of one content compare equal."""
+    return canonical_json({k: v for k, v in evidence.to_dict().items() if k != "created_at"})
+
+
 def _observed_at_key(observed_at: str) -> str:
     """A lexically comparable form of a `_CREATED_AT_PATTERN` timestamp:
     the fraction is padded to six digits, so `...:00Z` sorts before
@@ -1938,8 +1944,10 @@ def resolve_current(
        (`AUTHORITY_RANK`: observed > derived > asserted), then by
        `observed_at` (later wins). A newer assertion never displaces an
        older observation.
-    5. More than one distinct envelope sharing the top rank -> `ambiguous`
-       (fail closed, never an arbitrary pick); exactly one -> `current`.
+    5. More than one distinct envelope sharing the top rank, or two
+       different contents claiming one `evidence_id` anywhere in the pool
+       (a forgery `from_dict` cannot detect) -> `ambiguous` (fail closed,
+       never an order-dependent pick); exactly one -> `current`.
 
     `kind`/`repository`/`ref`/`revision` are validated with the same rules
     as a sealed `subject` (a blank `revision` excepted); a malformed one
@@ -1966,7 +1974,20 @@ def resolve_current(
         and not any(g.block == "subject" and g.code == "redacted_out" for g in e.gaps)
     ]
     pool = [e for e in same_subject if e.subject is not None and e.subject.revision == revision]
-    by_id = {e.evidence_id: e for e in pool}
+    # from_dict does not recompute content_hash, so two different envelopes
+    # can claim one evidence_id. Any such collision makes every id-keyed
+    # step below (supersession, winners) order-dependent: fail closed before
+    # it. The same envelope listed twice, even re-sealed at another
+    # created_at, is not a collision and is deduplicated.
+    contents_by_id: dict[str, set[bytes]] = {}
+    for e in pool:
+        contents_by_id.setdefault(e.evidence_id, set()).add(_content_key(e))
+    if any(len(contents) > 1 for contents in contents_by_id.values()):
+        return CurrentEvidence(state="ambiguous")
+    by_id: dict[str, ExecutionEvidence] = {}
+    for e in pool:
+        by_id.setdefault(e.evidence_id, e)
+    pool = list(by_id.values())
 
     def authority_rank(e: ExecutionEvidence) -> int:
         return AUTHORITY_RANK.get(e.provenance.authority, 0) if e.provenance is not None else 0
@@ -2003,15 +2024,8 @@ def resolve_current(
         return (authority_rank(e), _observed_at_key(e.provenance.observed_at))
 
     top = max(rank(e) for e in live)
-    # Distinct by content, not by id: from_dict does not recompute
-    # content_hash, so two different envelopes can claim one evidence_id. The
-    # same envelope listed twice (even re-sealed at another created_at) is
-    # one winner, and two contents under one id is a tie, never a pick.
-    winners: dict[bytes, ExecutionEvidence] = {}
-    for e in live:
-        if rank(e) == top:
-            content = {k: v for k, v in e.to_dict().items() if k != "created_at"}
-            winners.setdefault(canonical_json(content), e)
+    # Keyed by id: the collision check above makes ids unique per content.
+    winners = {e.evidence_id: e for e in live if rank(e) == top}
     if len(winners) != 1:
         return CurrentEvidence(state="ambiguous")
     return CurrentEvidence(state="current", evidence=next(iter(winners.values())))

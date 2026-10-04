@@ -1651,8 +1651,7 @@ def test_validate_rejects_a_non_string_leaf_as_an_evidence_error(block, override
         forged.validate()
 
 
-
-# -- review round 9 (PR #575) -----------------------------------------------
+# -- PR #575 review: forged evidence_id collisions, read-only AUTHORITY_RANK -
 
 
 def test_resolve_current_treats_two_contents_under_one_id_as_ambiguous():
@@ -1661,9 +1660,22 @@ def test_resolve_current_treats_two_contents_under_one_id_as_ambiguous():
     assert forged.evidence_id == a.evidence_id
     assert _resolve([a, forged]).state == "ambiguous"
     assert _resolve([forged, a]).state == "ambiguous"
-    # The same envelope re-sealed at another created_at is still one winner.
+    # The same envelope re-sealed at another created_at is the same evidence
+    # by contract (created_at is outside content_hash): one winner, not a tie.
     resealed = dataclasses.replace(a, created_at="2030-01-01T00:00:00Z")
-    assert _resolve([a, resealed]).evidence == a
+    assert _resolve([a, resealed]).state == "current"
+    assert _resolve([resealed, a]).state == "current"
+
+
+@pytest.mark.parametrize("order", ((0, 1, 2), (1, 0, 2), (2, 1, 0), (0, 2, 1)))
+def test_a_forged_id_collision_never_lets_list_order_pick_through_supersession(order):
+    obs = _pr_evidence(authority="observed", observed_at="2026-10-04T10:00:00Z")
+    ass = dataclasses.replace(obs, provenance=_provenance(authority="asserted"))  # forged: same id
+    y = _pr_evidence(authority="asserted", observed_at="2026-10-04T11:00:00Z", supersedes=obs.evidence_id)
+    members = (obs, ass, y)
+    result = _resolve([members[i] for i in order])
+    assert result.state == "ambiguous"
+    assert result.evidence is None
 
 
 def test_authority_rank_is_read_only():
