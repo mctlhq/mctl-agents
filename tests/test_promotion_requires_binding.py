@@ -195,6 +195,37 @@ def test_no_binding_refuses_promotion(registry):
     assert not outcome.fails_release
 
 
+def test_every_unbound_agent_names_a_real_manifest():
+    """A typo or rename would silently void the allowance."""
+    real = {p.parent.name for p in _MANIFESTS.glob("*/agent.yaml")}
+    assert publish_agent_release.UNBOUND_AGENTS <= real
+
+
+def test_every_refusal_points_at_the_runbook(registry):
+    outcome = _publish("mentor", _gitops({}))
+    assert gate.RUNBOOK in outcome.detail
+
+
+def test_an_injected_transport_survives_the_retries(registry):
+    """Closing a client closes its transport: an injected transport must
+    stay open across the retries and across the binding and profile reads."""
+    closed: list[bool] = []
+    responder, seen = _flaky([lambda r: httpx.Response(502)] * 2, _binding(_V2))
+    inner = _gitops({_V2: responder})
+
+    class Tracking(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            assert not closed, "request sent through a closed transport"
+            return inner.handle_request(request)
+
+        def close(self) -> None:
+            closed.append(True)
+
+    outcome = _publish(_V2, Tracking())
+    assert outcome.state == publish_agent_release.PROMOTED
+    assert len(seen) == gate.FETCH_ATTEMPTS
+
+
 def test_a_vanished_binding_for_a_bound_agent_fails_the_release(registry):
     """claude P2 on #574: a 404 is quiet only for the agents known to be
     unbound. shepherd has a binding today; if it disappears, production must

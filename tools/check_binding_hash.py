@@ -129,21 +129,29 @@ def _fetch(url: str, transport: httpx.BaseTransport | None) -> bytes:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     response: httpx.Response | None = None
-    for attempt in range(1, FETCH_ATTEMPTS + 1):
-        try:
-            with httpx.Client(transport=transport, timeout=TIMEOUT_S, follow_redirects=True) as client:
+    # One client for every attempt. Closing a client closes its transport,
+    # so an injected transport belongs to the caller and is never closed
+    # here: the binding read and the profile read share it, and a client per
+    # attempt would hand it back closed to the next one (claude P3 on #574).
+    client = httpx.Client(transport=transport, timeout=TIMEOUT_S, follow_redirects=True)
+    try:
+        for attempt in range(1, FETCH_ATTEMPTS + 1):
+            try:
                 response = client.get(url, params={"ref": GITOPS_REF}, headers=headers)
-        except httpx.TransportError as exc:
-            if attempt == FETCH_ATTEMPTS:
-                raise BindingUnobservable(
-                    f"could not fetch {url} after {attempt} attempts: {exc!r}"
-                ) from exc
-        except httpx.HTTPError as exc:
-            raise BindingUnobservable(f"could not fetch {url}: {exc!r}") from exc
-        else:
-            if response.status_code < 500 or attempt == FETCH_ATTEMPTS:
-                break
-        time.sleep(RETRY_BACKOFF_S * attempt)
+            except httpx.TransportError as exc:
+                if attempt == FETCH_ATTEMPTS:
+                    raise BindingUnobservable(
+                        f"could not fetch {url} after {attempt} attempts: {exc!r}"
+                    ) from exc
+            except httpx.HTTPError as exc:
+                raise BindingUnobservable(f"could not fetch {url}: {exc!r}") from exc
+            else:
+                if response.status_code < 500 or attempt == FETCH_ATTEMPTS:
+                    break
+            time.sleep(RETRY_BACKOFF_S * attempt)
+    finally:
+        if transport is None:
+            client.close()
     if response is None:  # unreachable: every attempt without one raised
         raise BindingUnobservable(f"could not fetch {url}: no response")
     # 404 is the contents API's documented "no such path on this ref". Every
@@ -341,7 +349,9 @@ def evaluate_promotion(
     local_hash = resolver.definition_content_hash(raw_definition)
 
     def refuse(status: str, reason: str) -> PromotionVerdict:
-        return PromotionVerdict(agent, status, reason)
+        # Every refusal names the runbook: it is the one place that lists the
+        # remedies (re-pin, add the binding, or list the agent as unbound).
+        return PromotionVerdict(agent, status, f"{reason}; see {RUNBOOK}")
 
     try:
         binding = parse_binding(fetch_binding(transport, agent=agent), agent=agent)

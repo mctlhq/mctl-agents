@@ -38,8 +38,9 @@ match. A refusal for an absent binding (HTTP 404, the contents API's
 documented absence signal) is a warning, not a failure, ONLY for the agents
 listed in UNBOUND_AGENTS: it is the expected state of an agent nobody has
 bound yet, and a release that is red every time is one nobody reads. A 404
-for any other agent means its binding disappeared, and fails the step. Every agent's outcome is printed, and written to
-$GITHUB_STEP_SUMMARY when it is set.
+for any other agent means its binding disappeared, and fails the step.
+Every agent's outcome is printed, and written to $GITHUB_STEP_SUMMARY when
+it is set.
 
 ## prompt_hash
 
@@ -105,7 +106,9 @@ class PublishError(RuntimeError):
 # 404 means a binding that existed was deleted or renamed, and that fails the
 # step. Shrink this set in the same change that adds a binding (claude P2 on
 # #574) — an agent left here after it is bound only loses the loud failure
-# for a later deletion, never its gate.
+# for a later deletion, never its gate. A test pins every name to a real
+# manifest directory; the other half — that none of these is bound — needs
+# mctl-gitops and is checked by nothing offline.
 UNBOUND_AGENTS = frozenset({"incident-responder", "mentor", "service-agent"})
 
 PROMOTED = "promoted"
