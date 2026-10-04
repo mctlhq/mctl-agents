@@ -204,7 +204,8 @@ MAX_TOOL_CALLS = 256
 MAX_RELEASE_REVISION = 2**63 - 1
 
 #: `resolve_current` result states. `unknown_revision` and `ambiguous` are
-#: unknowns, never a substitute for `no_evidence`; `stale_revision` means
+#: unknowns, never a substitute for `no_evidence`: `ambiguous` covers both a
+#: top-rank tie and a fully superseded pool. `stale_revision` means
 #: evidence exists for the subject, only at other revisions.
 CURRENT_STATES = frozenset({"current", "no_evidence", "stale_revision", "unknown_revision", "ambiguous"})
 
@@ -1490,8 +1491,22 @@ def _check_bounded(value: str, pattern: re.Pattern[str], max_length: int, *, whe
         raise ExecutionEvidenceError(f"{where} must match {pattern.pattern!r} within {max_length} characters")
 
 
+def _check_string_fields(block: Any, names: Sequence[str], *, where: str) -> None:
+    for name in names:
+        if not isinstance(getattr(block, name), str):
+            raise ExecutionEvidenceError(f"{where}.{name} must be a string")
+
+
 def _check_versions(pins: VersionPins) -> None:
     """Shape only: requiredness is `_check_required_leaves`'s job."""
+    _check_string_fields(pins, (
+        "agent", "environment", "definition_version", "definition_content_hash",
+        "profile_name", "profile_version", "profile_content_hash",
+    ), where="versions")
+    if pins.release_revision is not None and (
+        not isinstance(pins.release_revision, int) or isinstance(pins.release_revision, bool)
+    ):
+        raise ExecutionEvidenceError("versions.release_revision must be an int or null")
     for name in ("agent", "environment", "profile_name"):
         value = getattr(pins, name)
         if value:
@@ -1523,9 +1538,7 @@ def _check_repository(repository: str) -> None:
 
 def _check_subject(subject: SubjectRef) -> None:
     """Shape only: requiredness is `_check_required_leaves`'s job."""
-    for field_name in ("kind", "repository", "ref", "revision"):
-        if not isinstance(getattr(subject, field_name), str):
-            raise ExecutionEvidenceError(f"subject.{field_name} must be a string")
+    _check_string_fields(subject, ("kind", "repository", "ref", "revision"), where="subject")
     if subject.kind and subject.kind not in SUBJECT_KINDS:
         raise ExecutionEvidenceError(f"subject.kind {subject.kind!r} is not one of {sorted(SUBJECT_KINDS)!r}")
     if subject.ref:
@@ -1553,6 +1566,7 @@ def _check_subject(subject: SubjectRef) -> None:
 
 def _check_tool_call(call: ToolCallRef) -> None:
     """Shape only: requiredness is `_check_required_leaves`'s job."""
+    _check_string_fields(call, ("kind", "name", "action_digest", "status"), where="tool_call")
     if call.kind and call.kind not in TOOL_CALL_KINDS:
         raise ExecutionEvidenceError(f"tool_call.kind {call.kind!r} is not one of {sorted(TOOL_CALL_KINDS)!r}")
     if call.name:
@@ -1570,6 +1584,7 @@ def _check_tool_call(call: ToolCallRef) -> None:
 
 def _check_provenance(provenance: Provenance, *, own_evidence_id: str) -> None:
     """Shape only: requiredness is `_check_required_leaves`'s job."""
+    _check_string_fields(provenance, ("authority", "observed_at", "supersedes"), where="provenance")
     if provenance.authority and provenance.authority not in AUTHORITY_RANK:
         raise ExecutionEvidenceError(
             f"provenance.authority {provenance.authority!r} is not one of {list(AUTHORITIES)!r}"
@@ -1908,8 +1923,11 @@ def resolve_current(
        `provenance.supersedes` with equal or stronger authority.
        Supersession only acts inside the pool, and never downward: an
        `asserted` envelope naming an `observed` one retires nothing.
-    4. Empty -> `stale_revision` when the subject key has (unredacted)
-       evidence at other revisions, else `no_evidence`. Otherwise rank by authority
+    4. Empty pool -> `stale_revision` when the subject key has
+       (unredacted) evidence at other revisions, else `no_evidence` — which
+       means no USABLE evidence, not that no run happened. A non-empty pool
+       whose every member is superseded (only a forged `supersedes` cycle)
+       -> `ambiguous`. Otherwise rank by authority
        (`AUTHORITY_RANK`: observed > derived > asserted), then by
        `observed_at` (later wins). A newer assertion never displaces an
        older observation.
@@ -1966,8 +1984,9 @@ def resolve_current(
         # "re-run for this SHA" and "the pipeline never ran" are different
         # decisions for the reader. no_evidence means no USABLE evidence: a
         # redacted-subject envelope is excluded above and answers it too.
-        other_revisions = any(e.subject is not None and e.subject.revision != revision for e in same_subject)
-        return CurrentEvidence(state="stale_revision" if other_revisions else "no_evidence")
+        # With the pool empty, every same-subject candidate is at another
+        # revision.
+        return CurrentEvidence(state="stale_revision" if same_subject else "no_evidence")
 
     def rank(e: ExecutionEvidence) -> tuple[int, str]:
         # validate() guarantees provenance on every subject-bound envelope;

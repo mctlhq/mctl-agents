@@ -1613,3 +1613,23 @@ def test_stale_revision_requires_evidence_at_another_revision():
 def test_an_unhashable_leaf_fails_as_an_evidence_error_not_a_type_error(overrides):
     with pytest.raises(ee.ExecutionEvidenceError, match="must be a string"):
         _seal(**overrides)
+
+
+
+@pytest.mark.parametrize(
+    "block,overrides",
+    (
+        ("versions", {"environment": ["shadow"]}),
+        ("versions", {"release_revision": "7"}),
+        ("tool_call", {"name": ["merge"]}),
+        ("provenance", {"supersedes": ["ev-0"]}),
+    ),
+)
+def test_validate_rejects_a_non_string_optional_leaf_as_an_evidence_error(block, overrides):
+    sealed = _seal(versions=_versions(), tool_calls=[_tool_call()], provenance=_provenance())
+    if block == "tool_call":
+        forged = dataclasses.replace(sealed, tool_calls=(dataclasses.replace(sealed.tool_calls[0], **overrides),))
+    else:
+        forged = dataclasses.replace(sealed, **{block: dataclasses.replace(getattr(sealed, block), **overrides)})
+    with pytest.raises(ee.ExecutionEvidenceError, match="must be"):
+        forged.validate()
