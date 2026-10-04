@@ -25,7 +25,11 @@ signal validates.
   question to its `ResponseSpec`. `validate()` recomputes all three on
   read; a tampered or carried-over value is rejected. `created_at` is
   deliberately NOT hash-covered: it is metadata, and the consumer bounds
-  every wait against its own clock rather than trusting it.
+  every wait against its own clock rather than trusting it. `expires_at`
+  IS hash-covered, so the producer anchors it to the next whole UTC hour
+  plus `DEFAULT_REQUEST_TTL_SECONDS` rather than to the sealing instant: a
+  retried step that re-seals the same draft within that hour gets the same
+  `request_id` (mctlhq/mctl-agents#563).
 - **Bounded waits.** `expires_at` must parse, exceed `created_at`, and stay
   within `MAX_REQUEST_TTL_SECONDS` of it — and the consumer additionally
   clamps the effective deadline to its own `now + MAX_REQUEST_TTL_SECONDS`
@@ -55,7 +59,11 @@ signal validates.
   round's `request.json` already published; it is what lets every later
   round's prompt pair each earlier answer with what was asked (an answer
   whose question cannot be read back renders as "question text
-  unavailable", never silently dropped). The marker never carries `value`. The same run drops
+  unavailable", never silently dropped). The stored `question` is bounded
+  at the render cap and written without ASCII escaping, so the marker stays
+  inside its reader's all-or-nothing 64 KiB read-back. Writing the marker
+  is best effort: a failure is a `warn:` line, never a lost proposal
+  (mctlhq/mctl-agents#563). The marker never carries `value`. The same run drops
   a carried-forward `request.json` whose `request_id` was answered. The
   consumer does not read the marker; it skips a resolved `question_hash`
   on its own. The marker exists for later executions and human readers of
