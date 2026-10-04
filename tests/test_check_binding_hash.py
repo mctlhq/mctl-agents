@@ -236,17 +236,44 @@ _UNOBSERVABLE_PROFILE = {
     "not a profile": {"profile": _yaml({**_PROFILE_DOC, "kind": "Something"})},
     "another profile": {"profile": _yaml({**_PROFILE_DOC, "metadata": {"name": "other"}})},
     "no spec.version": {"profile": _yaml({**_PROFILE_DOC, "spec": {}})},
+    "unsupported apiVersion": {"profile": _yaml({**_PROFILE_DOC, "apiVersion": "agents.mctl.ai/v9"})},
+    # Pinned by the binding too, so only the version's validity is at fault.
+    "unparseable spec.version": {"profile": _yaml({**_PROFILE_DOC, "spec": {"version": "1.5.1-rc1"}})},
 }
 
 
-@pytest.mark.parametrize("kwargs", list(_UNOBSERVABLE_PROFILE.values()), ids=list(_UNOBSERVABLE_PROFILE))
-def test_an_unobservable_profile_fails_closed(kwargs, capsys):
-    rc = check_binding_hash.check(_serving(_yaml(_binding_doc()), **kwargs))
+@pytest.mark.parametrize("case", list(_UNOBSERVABLE_PROFILE))
+def test_an_unobservable_profile_fails_closed(case, capsys):
+    binding = _binding_doc()
+    if case == "unparseable spec.version":
+        binding = _binding_doc(spec=_spec_with(profile={"version": "1.5.1-rc1"}))
+    rc = check_binding_hash.check(_serving(_yaml(binding), **_UNOBSERVABLE_PROFILE[case]))
 
     assert rc == check_binding_hash.EXIT_UNOBSERVED
     captured = capsys.readouterr()
     assert "ok:" not in captured.out
     assert "FAILED CLOSED" in captured.err
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        _binding_doc(content_hash="sha256:" + "0" * 64),
+        _binding_doc(spec=_spec_with(definition={"name": "issue-investigator-old"})),
+    ],
+    ids=["hash mismatch", "mirrored-field mismatch"],
+)
+def test_a_mismatch_is_reported_before_the_profile_is_read(binding):
+    """A mismatch fixable from agent.yaml or the binding must not be masked
+    by an outage on the profile read: exit 1 and exit 2 send the operator to
+    different procedures."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/profile.yaml"):
+            raise AssertionError("the profile must not be read before a mismatch is reported")
+        return httpx.Response(200, content=_yaml(binding))
+
+    assert check_binding_hash.check(httpx.MockTransport(handler)) == check_binding_hash.EXIT_MISMATCH
 
 
 def _seen_request(monkeypatch, **env: str) -> httpx.Request:

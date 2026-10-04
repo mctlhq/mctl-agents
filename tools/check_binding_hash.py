@@ -20,7 +20,9 @@ the local hash is `resolver.load_definition(...).content_hash`, the value
 `execute()` compares, the fetched binding goes through
 `resolver.parse_yaml_mapping` and `resolver.parse_release_binding`, and the
 remaining binding-vs-definition checks are `execute()`'s own
-`check_binding_against_definition` and `check_profile_compatibility`. A binding
+`check_binding_against_definition`, `check_binding_profile_version` and
+`check_profile_compatibility`, the last two against the execution profile
+read from the same mctl-gitops ref. A binding
 this accepts is one the resolver would accept, and the two cannot hash or
 parse differently.
 
@@ -136,6 +138,10 @@ def parse_profile_version(raw: bytes, name: str) -> str:
         raise BindingUnobservable(str(exc)) from exc
     metadata = document.get("metadata")
     spec = document.get("spec")
+    # apiVersion and kind are contracts between the two repositories, as
+    # load_profile enforces them; the rest of the profile's shape is not.
+    if document.get("apiVersion") != resolver.SUPPORTED_PROFILE_API_VERSION:
+        raise BindingUnobservable(f"{label}: unsupported profile apiVersion {document.get('apiVersion')!r}")
     if document.get("kind") != "ExecutionProfile" or not isinstance(metadata, dict) or not isinstance(spec, dict):
         raise BindingUnobservable(f"{label}: not an ExecutionProfile with metadata and spec")
     if metadata.get("name") != name:
@@ -143,6 +149,13 @@ def parse_profile_version(raw: bytes, name: str) -> str:
     version = spec.get("version")
     if not isinstance(version, str) or not version:
         raise BindingUnobservable(f"{label}: spec.version is required")
+    # An unparseable version is an invalid profile, not a mismatch with
+    # agent.yaml: without this it would surface from the compatibility check
+    # as exit 1, naming agent.yaml for a fault that lives in mctl-gitops.
+    try:
+        resolver._parse_version(version, path=label, field_path="spec.version")
+    except resolver.ResolverError as exc:
+        raise BindingUnobservable(str(exc)) from exc
     return version
 
 

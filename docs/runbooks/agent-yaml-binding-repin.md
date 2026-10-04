@@ -30,10 +30,13 @@ two places:
   is, when the run is about to cut a release. It checks `agent.yaml` at that PR's merge
   commit, which is the commit that gets tagged.
 
-Exit codes: `0` means the hashes match. `1` means they differ, or the local `agent.yaml`
-does not resolve. `2` means the binding could not be read or validated: a network error, a
-non-200 response, malformed YAML, or a missing or invalid `contentHash`. Code `2` is never
-treated as a match. Re-run it once the read works.
+Exit codes: `0` means the binding matches. `1` means it does not: the hashes differ, a
+mirrored field differs, the binding's `spec.profile.version` is not the catalog profile's,
+or the local `agent.yaml` does not resolve. `2` means the binding, or the execution profile
+it names, could not be read or validated: a network error, a non-200 response, malformed
+YAML, a missing or invalid `contentHash`, or a profile with the wrong `apiVersion`, `kind`
+or `metadata.name`, or a missing or unparseable `spec.version`. Code `2` is never treated as
+a match. Re-run it once the read works.
 
 ## Procedure for a legitimate change
 
@@ -122,9 +125,14 @@ exists.
   `autorelease: pending`, so the re-run cuts the release.
 - **If it was not intended:** revert the `agent.yaml` change on `main`. The next push
   re-runs the gate.
+- **If the error is `ambiguous version` (binding `spec.profile.version` vs the catalog
+  profile):** no `agent.yaml` change or hash re-pin clears it. The profile was versioned
+  without re-binding. Fix it in mctl-gitops by re-binding to the new version or reverting
+  the bump. Until then every mctl-agents release is blocked, which is correct: production
+  would fail the same way.
 - **On exit code 2** (unknown): read the error. A GitHub outage or rate limit just needs a
-  re-run. A malformed binding on mctl-gitops `main` needs fixing there first, because the
-  resolver would fail on it at run time too.
+  re-run. A malformed binding or execution profile on mctl-gitops `main` needs fixing there
+  first, because the resolver would fail on it at run time too.
 
 ## Paths this gate does not cover
 
