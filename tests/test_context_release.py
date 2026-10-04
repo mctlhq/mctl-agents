@@ -19,7 +19,7 @@ import json
 import re
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1252,8 +1252,9 @@ def _real_catalog_evidence_records() -> list[str]:
         strategy_implementation_hash=version.implementation_hash, evaluator_name=ce.EVALUATOR_NAME,
         evaluator_version=ce.EVALUATOR_VERSION, metrics_contract_version=ce.METRICS_CONTRACT_VERSION,
     )
-    from datetime import UTC, datetime, timedelta
-    now = datetime.now(UTC).replace(microsecond=0)
+    # Relative to now: the CLI gates on a 7-day freshness window against the
+    # real clock, so fixed dates turned this test red once they aged out.
+    now = datetime.now(UTC)
     isos = tuple((now - timedelta(days=d)).strftime("%Y-%m-%dT%H:%M:%SZ") for d in (1, 2, 3))
     records = [
         ce.EvalRecord(
