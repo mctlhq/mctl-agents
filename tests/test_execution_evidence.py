@@ -1649,3 +1649,25 @@ def test_validate_rejects_a_non_string_leaf_as_an_evidence_error(block, override
     # The type rejection specifically, never a downstream shape message.
     with pytest.raises(ee.ExecutionEvidenceError, match=r"must be a string|must be an int or null"):
         forged.validate()
+
+
+
+# -- review round 9 (PR #575) -----------------------------------------------
+
+
+def test_resolve_current_treats_two_contents_under_one_id_as_ambiguous():
+    a = _seal(subject=_subject(), provenance=_provenance(), outcome=_outcome(code="succeeded"))
+    forged = dataclasses.replace(a, outcome=_outcome(code="failed"))  # same id, different content
+    assert forged.evidence_id == a.evidence_id
+    assert _resolve([a, forged]).state == "ambiguous"
+    assert _resolve([forged, a]).state == "ambiguous"
+    # The same envelope re-sealed at another created_at is still one winner.
+    resealed = dataclasses.replace(a, created_at="2030-01-01T00:00:00Z")
+    assert _resolve([a, resealed]).evidence == a
+
+
+def test_authority_rank_is_read_only():
+    with pytest.raises(TypeError):
+        ee.AUTHORITY_RANK["asserted"] = 99  # type: ignore[index]
+    with pytest.raises(TypeError):
+        ee.AUTHORITY_RANK["self_reported"] = 4  # type: ignore[index]

@@ -72,6 +72,7 @@ from __future__ import annotations
 import re
 from collections.abc import Container, Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from orchestrator import policy_checkpoint as pc
@@ -188,7 +189,11 @@ NUMBERED_SUBJECT_KINDS = frozenset({"pull_request", "issue"})
 #: records. `asserted`: a model's or agent's own claim, not independently
 #: verified. Order is the precedence `resolve_current` applies.
 AUTHORITIES = ("observed", "derived", "asserted")
-AUTHORITY_RANK = {name: len(AUTHORITIES) - index for index, name in enumerate(AUTHORITIES)}
+#: Read-only, like every other vocabulary here: it is both the precedence
+#: resolve_current applies and the vocabulary _check_provenance validates.
+AUTHORITY_RANK: Mapping[str, int] = MappingProxyType(
+    {name: len(AUTHORITIES) - index for index, name in enumerate(AUTHORITIES)}
+)
 
 #: The consequential action classes a `ToolCallRef.kind` may name — the
 #: governed `ActionRequest.action_kind` values — `policy_checkpoint.
@@ -1998,7 +2003,15 @@ def resolve_current(
         return (authority_rank(e), _observed_at_key(e.provenance.observed_at))
 
     top = max(rank(e) for e in live)
-    winners = {e.evidence_id: e for e in live if rank(e) == top}
+    # Distinct by content, not by id: from_dict does not recompute
+    # content_hash, so two different envelopes can claim one evidence_id. The
+    # same envelope listed twice (even re-sealed at another created_at) is
+    # one winner, and two contents under one id is a tie, never a pick.
+    winners: dict[bytes, ExecutionEvidence] = {}
+    for e in live:
+        if rank(e) == top:
+            content = {k: v for k, v in e.to_dict().items() if k != "created_at"}
+            winners.setdefault(canonical_json(content), e)
     if len(winners) != 1:
         return CurrentEvidence(state="ambiguous")
     return CurrentEvidence(state="current", evidence=next(iter(winners.values())))
