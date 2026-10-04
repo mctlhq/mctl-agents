@@ -85,6 +85,10 @@ rejects unknown keys, and bounded string lengths. Implemented in
 | `approvals` | `ApprovalRef[]` (optional) | caller | `aar_` approvals this execution's actions relied on |
 | `artifacts` | `ArtifactRef[]` (optional) | caller | generated artifacts this execution produced |
 | `gaps` | `Gap[]` | `_safe()` + caller | every block known to be missing, and why |
+| `versions` | `VersionPins \| null` (optional, Amendment 2) | caller | the resolved ADR 007 release pins this execution ran under |
+| `subject` | `SubjectRef \| null` (optional, Amendment 2) | caller | what the evidence is about, bound to the exact revision observed |
+| `tool_calls` | `ToolCallRef[]` (optional, Amendment 2) | caller | consequential tool calls: kind, name, action digest, status |
+| `provenance` | `Provenance \| null` (optional, Amendment 2; required with `subject`) | caller | `authority`, `observed_at`, `supersedes` |
 
 **`ExecutionJoin`** — `execution_id` (`we_`-validated), `work_item_id`,
 `trace_id`, `runtime_execution_id` (`ex-`-validated, Amendment 1: two typed
@@ -364,6 +368,19 @@ tests/fixtures/evidence/shepherd-evidence.json          # new fixture (both iden
 
 `investigator-evidence.json` is unchanged, byte-for-byte.
 
+**Amendment 2** (mctlhq/mctl-agents#199) additionally changed only:
+
+```
+docs/adr/018-execution-evidence-envelope-contract.md    # this amendment; sec. 1 table rows added
+orchestrator/execution_evidence.py                      # four optional blocks, observation_failed, resolve_current
+tests/test_execution_evidence.py                        # T16 + extensions to T3, T5, T10
+tests/fixtures/evidence/shepherd-pr-evidence.json              # new fixture (all four blocks)
+tests/fixtures/evidence/shepherd-pr-superseding-evidence.json  # new fixture (supersedes the above)
+```
+
+All three pre-amendment fixtures are unchanged, byte-for-byte, and keep
+their literal `content_hash`/`evidence_id`.
+
 ## Amendment 1 — the execution join: `we_` and `ex-` as two typed fields (mctlhq/mctl-agents#539)
 
 > **Status:** accepted
@@ -529,3 +546,273 @@ literal `content_hash`, literal `evidence_id`, `to_dict()` round-trip and
 This amendment reopens nothing else sec. 1–5 fixed: the hash rule, the
 redaction-before-hash rule, the derived-`completeness` rule's mechanism, and
 every other boundary row are unchanged.
+
+## Amendment 2 — versions, subject binding, tool calls, authority and supersession (mctlhq/mctl-agents#199)
+
+> **Status:** accepted
+> **Date:** 2026-10-04
+> **Owner decision:** 2026-10-04 (the evidence #199 must carry, below)
+
+### Why
+
+The 2026-10-04 audit of #199 found the envelope could say *which execution*
+produced evidence but not *what the evidence was about*, *under which
+release*, *which consequential calls it made*, *how much to trust it* or
+*whether it is still current*. Concretely:
+
+- nothing pinned the `AgentDefinition` / `ExecutionProfile` / release
+  binding the run executed under, although ADR 007 sec. 5 already
+  materializes exactly those pins in `ExecutionPlan`;
+- consequential tool calls were visible only indirectly, as a
+  `PolicyDecisionRef.action_digest` — a call no checkpoint governed, or one
+  whose result was never observed, left no trace at all;
+- evidence about PR #524 at SHA1 and PR #524 at SHA2 were indistinguishable
+  — nothing in the hashed payload named the revision;
+- a model's own claim and an observation read from GitHub had the same
+  standing;
+- there was no way to say "this envelope replaces that one", and no rule
+  for which of several envelopes about the same thing is current;
+- "could not observe" was expressible only through gap codes whose
+  `required` flag the caller chose freely.
+
+The owner's rules for the fix: reuse Tier A/Tier B, never a second
+telemetry system; tracing (#195) is optional enrichment, not a dependency.
+
+### The four new optional blocks
+
+Each is optional at the envelope level, **enters the hashed payload only
+when present** (`None` / empty list = absent, the sec. 2 rule) and is
+**omitted from `to_dict()` when absent**, so a pre-amendment envelope both
+hashes and serializes byte-identically. Inside a present block every key is
+always emitted (blank as `""`, `release_revision` as `null`) — the rule
+every pre-amendment block already follows, which keeps redaction
+(`_REDACTED_LEAF`) reproducible.
+
+**`versions: VersionPins`** — the resolved release, field names copied from
+`context_snapshot.ExecutionCorrelation` / `resolver.ExecutionPlan`:
+
+| Field | Validation | Meaning |
+| --- | --- | --- |
+| `agent` | required; slug `[a-z0-9][a-z0-9._-]*`, ≤128 | the agent name |
+| `environment` | optional slug | the binding's environment |
+| `definition_version` | optional version token `[A-Za-z0-9][A-Za-z0-9._:+-]*`, ≤128 | registry version — names no bytes (ADR 007 sec. 4) |
+| `definition_content_hash` | **required**; `sha256:` + 64 hex | the pin that actually names the definition bytes (`spec.sourceManifest.contentHash`) |
+| `profile_name` | optional slug | the `ExecutionProfile` name |
+| `profile_version` | optional version token | the profile registry version |
+| `profile_content_hash` | optional `sha256:` + 64 hex | the profile bytes read |
+| `release_revision` | optional int ≥ 0 | the `ReleaseBinding` revision |
+
+**`subject: SubjectRef`** — what the evidence is about, bound to a version:
+
+| Field | Validation | Meaning |
+| --- | --- | --- |
+| `kind` | required; closed `SUBJECT_KINDS` = `pull_request`, `issue`, `branch`, `release`, `work_item` | subject class |
+| `repository` | `owner/name`; required for `pull_request`, `issue`, `branch`, `release` | the GitHub repository |
+| `ref` | required; the number for `pull_request`/`issue` (`[1-9][0-9]{0,9}`), otherwise `[A-Za-z0-9][A-Za-z0-9._/+-]*` ≤256 with no `..`, `//` or trailing `/` | PR/issue number, branch, tag or work item id |
+| `revision` | **required full lowercase git SHA (40 or 64 hex) for `SHA_BOUND_SUBJECT_KINDS` = `pull_request`, `branch`, `release`**; optional version token otherwise | the exact version observed |
+
+`revision` is in the hashed payload, so **PR@SHA1 and PR@SHA2 can never
+share a `content_hash` or `evidence_id`**. A moving pointer without its
+revision is rejected, not sealed: evidence about "PR #524" with no SHA is
+bound to nothing. If the producer could not read the SHA, it omits
+`subject` and records `Gap(block="subject", code="observation_failed",
+required=True)`. `SubjectRef.key` = `(kind, repository, ref)` is a derived
+property, never stored or hashed.
+
+**`tool_calls: ToolCallRef[]`** — consequential calls, in call order, at
+most `MAX_TOOL_CALLS` = 256:
+
+| Field | Validation | Meaning |
+| --- | --- | --- |
+| `kind` | required; closed `TOOL_CALL_KINDS` = every governed `policy_checkpoint` action kind (imported, not retyped; T16 asserts the two sets are equal) | the action class |
+| `name` | optional `[A-Za-z0-9][A-Za-z0-9_.:-]*` ≤128 | the tool / operation name (`ActionRequest.operation`) |
+| `action_digest` | required; `sha256:` + 64 hex | `ActionRequest.action_digest()` — the same value `PolicyDecisionRef.action_digest` and an `aar_` `intent_hash` bind, so the three join without carrying arguments |
+| `status` | required; closed `succeeded`, `failed`, `refused`, `unknown` | the observed result; `unknown` = the result could not be observed, never folded into `failed` |
+
+A tool call whose digest matches no `PolicyDecisionRef` is legal and is
+exactly what the evidence must reveal (an ungoverned call), so the
+contract does not cross-require the two.
+
+**`provenance: Provenance`** — required whenever `subject` is present:
+
+| Field | Validation | Meaning |
+| --- | --- | --- |
+| `authority` | required; closed `AUTHORITIES` = `observed` > `derived` > `asserted` | `observed`: read from the system of record by the producer itself; `derived`: computed deterministically from other records; `asserted`: a model's/agent's own claim |
+| `observed_at` | required; same shape as `created_at` | when the recorded state was observed. **Hashed**, unlike `created_at`: it is a fact about the evidence, not about sealing |
+| `supersedes` | optional; must fullmatch `ev-[0-9a-f]{16}` and must not be the envelope's own id | the earlier envelope this one explicitly replaces |
+
+The field name `authority` passes the sec. 5 no-authorization test (it
+contains no `allow`/`deny`/`permit`/`grant`/`authorized` token) and grants
+nothing: it ranks evidence, it never authorizes an action.
+
+### Unknown is not absence
+
+`GAP_CODES` gains `observation_failed`: the producer attempted to observe
+the referent and the read failed, was partial or was malformed. It is the
+only code in `UNKNOWN_GAP_CODES`, and **`validate()` rejects it unless
+`required=True`**, so an unknown can never leave an envelope `COMPLETE`.
+The legacy codes keep their caller-chosen flag — tightening
+`store_unavailable`/`undecided` retroactively could invalidate an envelope
+some caller already sealed. Vocabulary:
+
+| Situation | Express it as |
+| --- | --- |
+| Observed, and there is nothing (no tool calls, no approval) | leave the optional block absent; optionally `Gap(code="not_applicable", required=False)` |
+| Could not observe (API error, partial page, malformed body) | `Gap(code="observation_failed", required=True)` |
+| The execution did not produce it | `Gap(code="not_produced", ...)` (unchanged) |
+| A tool call ran but its result is unknown | `ToolCallRef(status="unknown")` |
+
+`Requirements` gains `versions`, `subject`, `tool_calls` and `provenance`
+flags, all `False` by default, so `DEFAULT_REQUIREMENTS` — and every
+envelope sealed under it — is unchanged.
+
+### Current vs historical — `resolve_current`
+
+One rule, implemented as the pure function
+`resolve_current(candidates, *, kind, repository, ref, revision)` in Tier A,
+which Tier B must reproduce and test against:
+
+1. `revision` (the subject's live revision, which the *reader* has just
+   observed) blank → `unknown_revision`. Never `no_evidence`.
+2. Pool = candidates with exactly this `subject.key` **and** this
+   `revision`. Everything at another revision is historical by definition.
+3. A pool member named by another pool member's `provenance.supersedes` is
+   dropped — but only when the superseding envelope's authority is equal
+   or stronger. A link to an envelope outside the pool removes nothing.
+4. Empty → `no_evidence`. Otherwise the highest `(authority rank,
+   observed_at)` wins: a newer assertion never displaces an older
+   observation; among equal authority the later observation wins
+   (`observed_at` compared with the fraction normalized, not as raw text).
+5. More than one distinct envelope at the top → `ambiguous`, never an
+   arbitrary pick. Exactly one → `current`.
+
+`candidates` must be the complete set for the subject key: a reader whose
+listing failed or was truncated has an unknown and must not call the rule
+(a short list would turn it into `no_evidence`).
+
+### Hash neutrality and version policy
+
+Nothing here changes `canonical_json`, `hash_bytes`, the redaction walk or
+the `evidence_id` derivation. Absent blocks never enter the payload, so the
+three pre-amendment fixtures keep their literal identities — proven by T3
+(literal `content_hash`/`evidence_id` per fixture, files untouched) and by
+T16's re-seal test (each legacy fixture re-sealed through the amended
+`seal()` reproduces its literal). As with Amendment 1, `api_version` stays
+`evidence.mctl.ai/v1alpha1`: the change is additive and hash-neutral, and
+no stored envelope can carry the new keys yet — Tier B's strict key check
+rejects them today (`evidenceEnvelopeKeys`), so there is nothing to
+migrate and no second conformance suite to keep.
+
+### Golden vectors
+
+| Fixture | Shape | `content_hash` |
+| --- | --- | --- |
+| `shepherd-pr-evidence.json` (new) | both identities; `subject` PR #524 @ a 40-hex SHA; `versions`; one `github.pull_request.merge` tool call; `provenance` `observed`; `COMPLETE` | `sha256:df6d015f8ddf64ac6f1955649883708402c7185618a09b1c07b7276fa32c7cc8` |
+| `shepherd-pr-superseding-evidence.json` (new) | same subject; `supersedes` the above; tool call `status: unknown`; `Gap(versions, observation_failed, required)`; `INCOMPLETE` | `sha256:5a7500c45dd74b8b0d46388115813a3b9576237c5523679d0f254e0994c4b282` |
+
+`resolve_current` over the pair at the fixture's SHA returns the
+superseding envelope (T16).
+
+### Acceptance criterion 1 of #199
+
+Reworded by owner decision 2026-10-04: evidence for an execution is
+reconstructed **from its canonical execution records** (the `we_`/`ex-`
+join plus the referenced `cs_`, `xr_`, `aar_`, policy-decision and usage
+records). Tracing (#195) is optional enrichment: `ExecutionJoin.trace_id`
+stays an optional join key, and no rule here depends on a trace existing.
+
+### Producer call points (mctlhq/mctl-agents#544 — not built here)
+
+The producer seals one envelope per governed run and posts it; it is never
+fatal to the run:
+
+- **Where:** at end-of-run of `run_issue_investigator.py`,
+  `run_implementer.py` and `run_shepherd.py`, in a `finally` path that runs
+  for success, failure and refusal alike (the `outcome` block carries
+  which).
+- **What:** `seal()` with `runtime_execution_id` from
+  `execution_identity.load_from_environment()`, `execution_id` from
+  `work_context.executions.resolve_identity()` when one exists, `versions`
+  from the run's `ExecutionPlan`, `subject` from the issue/PR the run acted
+  on with the revision the producer itself read (else an
+  `observation_failed` gap), one `ToolCallRef` per checkpointed action
+  (`policy_checkpoint` already computes the digest), and `provenance`
+  `observed` for facts the producer read itself, `asserted` for anything
+  that is only the model's claim. A re-run that corrects an earlier
+  envelope sets `supersedes`.
+- **How:** `POST /api/v1/evidence/records` with body
+  `{"envelope_b64": base64(<to_dict() JSON>)}` and
+  `Authorization: Bearer $MCTL_EVIDENCE_WRITER_TOKEN`. Any exception,
+  timeout, non-2xx or unset token is logged and counted, never raised:
+  evidence loss is reported, the run's result is not changed by it.
+- **Ordering:** the producer must not emit any Amendment 2 block until the
+  Tier B follow-up below is deployed — mctl-api answers `400
+  evidence_invalid` for unknown keys today. Until then it seals without
+  them (the pre-amendment shape, which stays valid).
+
+### Tier B follow-up (mctl-api) — checklist
+
+A follow-up mctl-api PR against `internal/evidence` must, before any
+producer emits the new blocks:
+
+1. **Accept the keys.** Add `versions`, `subject`, `tool_calls`,
+   `provenance` to `evidenceEnvelopeKeys` and to `optionalBlockKeys`
+   (absent when missing, `null` or `[]`; an object block that is present
+   always enters the payload — the existing `isEmptyBlock` rule). Reject
+   unknown keys inside each block, exactly as Tier A's `from_dict` does.
+   Canonicalization is otherwise unchanged.
+2. **Re-validate, never trust.** Mirror `_check_versions`,
+   `_check_subject` (SHA-bound kinds need a 40/64-hex `revision`),
+   `_check_tool_call`, `_check_provenance` (closed `authority`;
+   `observed_at` shape; `supersedes` = `^ev-[0-9a-f]{16}$` and ≠ own id),
+   "`subject` requires `provenance`", `MAX_TOOL_CALLS`, and
+   "`observation_failed` gaps must be `required: true`". Violations answer
+   `400 evidence_invalid`.
+3. **Conformance.** Copy `shepherd-pr-evidence.json` and
+   `shepherd-pr-superseding-evidence.json` into
+   `internal/evidence/testdata/` and assert their literal hashes; the
+   existing three vectors keep theirs.
+4. **Store (immutable columns, written once at ingest).** `ALTER TABLE
+   execution_evidence ADD COLUMN IF NOT EXISTS` (DDL, not an `UPDATE`, so
+   the immutability trigger is untouched; existing rows need no backfill —
+   none can carry the blocks):
+   `subject_kind`, `subject_repository`, `subject_ref`, `subject_revision`,
+   `authority`, `supersedes` (`TEXT NOT NULL DEFAULT ''`), `observed_at`
+   (`TIMESTAMPTZ NULL`). CHECK constraints: `authority IN ('', 'observed',
+   'derived', 'asserted')`; `supersedes = '' OR supersedes ~
+   '^ev-[0-9a-f]{16}$'`; `supersedes <> id`; `subject_kind = '' OR
+   (authority <> '' AND observed_at IS NOT NULL)`; `subject_kind NOT IN
+   ('pull_request','branch','release') OR subject_revision ~
+   '^[0-9a-f]{40}([0-9a-f]{24})?$'`. `versions` and `tool_calls` stay in the
+   verbatim envelope only — no columns, no second copy.
+5. **Index.** `(subject_kind, subject_repository, subject_ref,
+   subject_revision, observed_at DESC) WHERE subject_kind <> ''` and
+   `(supersedes) WHERE supersedes <> ''`.
+6. **Supersession at ingest.** When the named envelope exists, it must have
+   the same `(subject_kind, subject_repository, subject_ref,
+   subject_revision)` and an authority rank ≤ the new one, else `422
+   evidence_supersedes_invalid`. When it does not exist yet, accept (the
+   producer never blocks on ordering): the read rule only honours links
+   inside the pool, so a dangling link retires nothing.
+7. **Expose.** Serve `subject`, `authority`, `observed_at`, `supersedes`
+   and a read-time-derived `superseded_by` (valid links only) on every
+   evidence record; add `subject_kind`/`subject_repository`/`subject_ref`/
+   `subject_revision` filters to `GET /api/v1/evidence` and
+   `GET /api/v1/work-items/{id}/evidence`.
+8. **Current read.** `GET /api/v1/evidence/current?subject_kind=&repository=&ref=&revision=`
+   implementing `resolve_current` exactly, answering `{state, evidence}`
+   with `state` ∈ `current`, `no_evidence`, `unknown_revision`
+   (missing `revision`), `ambiguous`. It loads the complete pool; a pool
+   larger than the server cap, or any read error, is a `5xx`/typed error —
+   never a truncated `no_evidence`. Same authorization as `GET
+   /api/v1/evidence` (admin), plus the work-item-scoped variant through
+   `visibleWorkItem`.
+9. **Test both ways.** Each rule above green on a valid envelope and red on
+   a deliberate mutation (reverting it), per the workspace detector rule.
+
+### What this amendment does not change
+
+The hash rule, the redaction-before-hash rule, the derived `completeness`
+mechanism, the boundary table (evidence still grants nothing; persistence
+is still Tier B), Amendment 1's two typed identities, and every
+pre-amendment block's shape and validation.

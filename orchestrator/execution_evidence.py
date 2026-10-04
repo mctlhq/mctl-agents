@@ -16,6 +16,16 @@ join shapes: `investigator-evidence.json` (`we_` only, unchanged),
 `implementer-evidence.json` (`ex-` only) and `shepherd-evidence.json`
 (both). See ADR 018 Amendment 1 for the full rationale.
 
+ADR 018 Amendment 2 (mctlhq/mctl-agents#199) adds four optional blocks —
+`versions` (the resolved ADR 007 release pins), `subject` (what the
+evidence is about, bound to the exact revision observed, so PR@SHA1 and
+PR@SHA2 never share an identity), `tool_calls` (consequential calls by kind,
+name and action digest) and `provenance` (`authority`, `observed_at`,
+`supersedes`) — plus the `observation_failed` gap code and
+`resolve_current`, the one rule for telling current evidence from
+historical. Every new block is hash-neutral when absent: the three
+pre-amendment golden fixtures keep their exact `content_hash`.
+
 mctl-agents already has five sealed, canonical governance contracts, each
 owned by exactly one store: execution identity (`we_`,
 `orchestrator/work_context/`, `orchestrator/execution_identity.py`), context
@@ -64,6 +74,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from orchestrator import policy_checkpoint as pc
 from orchestrator.context_snapshot import canonical_json, hash_bytes
 from orchestrator.policy_checkpoint import UNDECIDED_CODES, VERDICTS
 from orchestrator.redaction import contains_credential, safe_scalar
@@ -132,14 +143,87 @@ USAGE_DEVLOOP_STAGES = frozenset({"investigator", "implementer", "reviewer", "sh
 # Closed vocabularies for this contract's own fields (requirements.md's
 # resolved open questions).
 OUTCOME_CODES = frozenset({"succeeded", "failed", "refused", "abandoned", "superseded"})
-GAP_CODES = frozenset({"not_produced", "store_unavailable", "not_applicable", "redacted_out", "undecided"})
+#: `observation_failed` (ADR 018 Amendment 2): the producer tried to observe
+#: the referent and the read failed, was partial or was malformed — an
+#: unknown, never an observed absence. Unlike the legacy codes it must always
+#: be `required=True` (see `_check_gap`), so an unknown can never leave an
+#: envelope `COMPLETE`.
+GAP_CODES = frozenset({
+    "not_produced", "store_unavailable", "not_applicable", "redacted_out", "undecided",
+    "observation_failed",
+})
+#: Gap codes that state "could not observe", which must therefore always be
+#: required. Only the Amendment 2 code: the legacy codes keep their
+#: caller-chosen flag so no already-sealed envelope is invalidated.
+UNKNOWN_GAP_CODES = frozenset({"observation_failed"})
 #: Which identity ExecutionJoin.primary_execution_ref is retrieved by:
 #: "work" for execution_id (we_), "runtime" for runtime_execution_id (ex-).
 EXECUTION_REF_KINDS = frozenset({"work", "runtime"})
 BLOCK_NAMES = frozenset({
     "execution", "outcome", "policy_decisions", "snapshot_refs",
     "execution_request", "usage", "approvals", "artifacts",
+    # ADR 018 Amendment 2 — every one optional and hash-neutral when absent.
+    "versions", "subject", "tool_calls", "provenance",
 })
+
+# ---------------------------------------------------------------------------
+# ADR 018 Amendment 2 vocabularies (mctlhq/mctl-agents#199).
+# ---------------------------------------------------------------------------
+
+#: What an envelope's evidence is about. `pull_request`, `branch` and
+#: `release` name a moving pointer, so their `revision` (the git SHA it
+#: pointed at when observed) is required: evidence for PR@SHA1 must never be
+#: read as evidence for PR@SHA2.
+SUBJECT_KINDS = frozenset({"pull_request", "issue", "branch", "release", "work_item"})
+#: Subject kinds whose `revision` is a required, full git object id.
+SHA_BOUND_SUBJECT_KINDS = frozenset({"pull_request", "branch", "release"})
+#: Subject kinds whose `repository` (`owner/name`) is required.
+REPOSITORY_SUBJECT_KINDS = frozenset({"pull_request", "issue", "branch", "release"})
+#: Subject kinds whose `ref` is a GitHub issue/PR number.
+NUMBERED_SUBJECT_KINDS = frozenset({"pull_request", "issue"})
+
+#: Who stands behind the envelope's statements, strongest first. `observed`:
+#: read from the system of record (GitHub API, mctl-api, the cluster) by the
+#: producer itself. `derived`: computed deterministically from other
+#: records. `asserted`: a model's or agent's own claim, not independently
+#: verified. Order is the precedence `resolve_current` applies.
+AUTHORITIES = ("observed", "derived", "asserted")
+AUTHORITY_RANK = {name: len(AUTHORITIES) - index for index, name in enumerate(AUTHORITIES)}
+
+#: The consequential action classes a `ToolCallRef.kind` may name — the
+#: governed `ActionRequest.action_kind` values `policy_checkpoint` declares,
+#: imported, not retyped (T16 asserts the set covers every one of them).
+TOOL_CALL_KINDS = frozenset({
+    pc.GITHUB_ISSUE_COMMENT,
+    pc.MCTL_OPERATION_EXECUTE,
+    pc.MCTL_WORK_ITEM_WRITE,
+    pc.MCP_TOOL_CALL,
+    pc.GITHUB_GIT_PUSH,
+    pc.GITHUB_PR_CREATE,
+    pc.GITHUB_PR_MERGE,
+    pc.GITHUB_PR_COMMENT,
+    pc.GITHUB_RUN_RERUN,
+    pc.GITHUB_ISSUE_LABEL,
+})
+#: A tool call's observed result. `unknown` is the explicit "the producer
+#: could not observe the result" state — never folded into `failed` or
+#: `succeeded`.
+TOOL_CALL_STATUSES = frozenset({"succeeded", "failed", "refused", "unknown"})
+MAX_TOOL_CALLS = 256
+
+#: `resolve_current` result states. `unknown_revision` and `ambiguous` are
+#: unknowns, never a substitute for `no_evidence`.
+CURRENT_STATES = frozenset({"current", "no_evidence", "unknown_revision", "ambiguous"})
+
+_REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
+_NUMBER_REF_PATTERN = re.compile(r"[1-9][0-9]{0,9}")
+MAX_SUBJECT_REF_LENGTH = 256
+_SUBJECT_REF_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+-]*")
+_GIT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+MAX_VERSION_LENGTH = 128
+_VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]*")
+MAX_TOOL_NAME_LENGTH = 128
+_TOOL_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*")
 
 COMPLETE = "COMPLETE"
 INCOMPLETE = "INCOMPLETE"
@@ -546,6 +630,163 @@ class Outcome:
         )
 
 
+# ---------------------------------------------------------------------------
+# ADR 018 Amendment 2 blocks (mctlhq/mctl-agents#199). Each is optional at
+# the envelope level and enters the hashed payload only when present, so an
+# envelope sealed without them hashes exactly as before this amendment.
+# Inside a present block every key is always emitted (blank as ""), the
+# rule every pre-amendment block follows.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VersionPins:
+    """The resolved release this execution ran under — ADR 007 sec. 4/5's
+    `ExecutionPlan` pins, copied field-for-field from the names
+    `context_snapshot.ExecutionCorrelation` already uses. References only:
+    which definition bytes, which profile, which binding revision, never
+    the definition or profile content. `definition_content_hash` is the
+    load-bearing pin (ADR 007: `definition_version` names no bytes), so it
+    is required whenever the block is present."""
+
+    agent: str = ""
+    environment: str = ""
+    definition_version: str = ""
+    definition_content_hash: str = ""
+    profile_name: str = ""
+    profile_version: str = ""
+    profile_content_hash: str = ""
+    release_revision: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "agent": self.agent,
+            "environment": self.environment,
+            "definition_version": self.definition_version,
+            "definition_content_hash": self.definition_content_hash,
+            "profile_name": self.profile_name,
+            "profile_version": self.profile_version,
+            "profile_content_hash": self.profile_content_hash,
+            "release_revision": self.release_revision,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> VersionPins:
+        mapping = _require_mapping(data, where="versions")
+        keys = (
+            "agent", "environment", "definition_version", "definition_content_hash",
+            "profile_name", "profile_version", "profile_content_hash",
+        )
+        _reject_unknown_keys(mapping, frozenset(keys) | {"release_revision"}, where="versions")
+        values = {
+            key: _require_str(mapping.get(key, ""), where=f"versions.{key}", allow_empty=True) for key in keys
+        }
+        revision_raw = mapping.get("release_revision")
+        release_revision = (
+            None if revision_raw is None else _require_int(revision_raw, where="versions.release_revision")
+        )
+        return cls(release_revision=release_revision, **values)
+
+
+@dataclass(frozen=True)
+class SubjectRef:
+    """What this evidence is about, bound to the exact version observed:
+    `kind` (closed `SUBJECT_KINDS`), `repository` (`owner/name`), `ref`
+    (the PR/issue number, branch, tag or work item id) and `revision` (the
+    git SHA the pointer resolved to, or a version token). `revision` is
+    part of the hashed payload, so PR@SHA1 and PR@SHA2 can never share an
+    `evidence_id`, and it is required for every `SHA_BOUND_SUBJECT_KINDS`
+    kind — evidence about a moving pointer without the version it pointed
+    at is not bound to anything."""
+
+    kind: str = ""
+    repository: str = ""
+    ref: str = ""
+    revision: str = ""
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        """`(kind, repository, ref)` — the version-independent identity
+        `resolve_current` groups by. Derived, never stored or hashed."""
+        return (self.kind, self.repository, self.ref)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "repository": self.repository, "ref": self.ref, "revision": self.revision}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> SubjectRef:
+        mapping = _require_mapping(data, where="subject")
+        _reject_unknown_keys(mapping, frozenset({"kind", "repository", "ref", "revision"}), where="subject")
+        return cls(
+            kind=_require_str(mapping.get("kind", ""), where="subject.kind", allow_empty=True),
+            repository=_require_str(mapping.get("repository", ""), where="subject.repository", allow_empty=True),
+            ref=_require_str(mapping.get("ref", ""), where="subject.ref", allow_empty=True),
+            revision=_require_str(mapping.get("revision", ""), where="subject.revision", allow_empty=True),
+        )
+
+
+@dataclass(frozen=True)
+class ToolCallRef:
+    """One consequential tool call this execution made: `kind` (a governed
+    `policy_checkpoint` action kind), the tool/operation `name`, the
+    `action_digest` that call's `ActionRequest` hashes to — the same value a
+    `PolicyDecisionRef.action_digest` and an `aar_` `intent_hash` bind, so
+    the three join without either carrying the arguments — and the observed
+    `status`. Never the arguments, the target text or the result."""
+
+    kind: str = ""
+    name: str = ""
+    action_digest: str = ""
+    status: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "name": self.name, "action_digest": self.action_digest, "status": self.status}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ToolCallRef:
+        mapping = _require_mapping(data, where="tool_call")
+        _reject_unknown_keys(mapping, frozenset({"kind", "name", "action_digest", "status"}), where="tool_call")
+        return cls(
+            kind=_require_str(mapping.get("kind", ""), where="tool_call.kind", allow_empty=True),
+            name=_require_str(mapping.get("name", ""), where="tool_call.name", allow_empty=True),
+            action_digest=_require_str(
+                mapping.get("action_digest", ""), where="tool_call.action_digest", allow_empty=True
+            ),
+            status=_require_str(mapping.get("status", ""), where="tool_call.status", allow_empty=True),
+        )
+
+
+@dataclass(frozen=True)
+class Provenance:
+    """Who stands behind this envelope and when it was true: `authority`
+    (closed `AUTHORITIES`, `observed` > `derived` > `asserted`),
+    `observed_at` (when the producer observed the state it records — part
+    of the hash, unlike `created_at`, because it is a fact about the
+    evidence rather than about sealing) and `supersedes` (the `ev-` id of
+    the earlier envelope this one explicitly replaces, blank when none).
+    Required whenever `subject` is present: `resolve_current` cannot rank
+    subject-bound evidence without it."""
+
+    authority: str = ""
+    observed_at: str = ""
+    supersedes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"authority": self.authority, "observed_at": self.observed_at, "supersedes": self.supersedes}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Provenance:
+        mapping = _require_mapping(data, where="provenance")
+        _reject_unknown_keys(mapping, frozenset({"authority", "observed_at", "supersedes"}), where="provenance")
+        return cls(
+            authority=_require_str(mapping.get("authority", ""), where="provenance.authority", allow_empty=True),
+            observed_at=_require_str(
+                mapping.get("observed_at", ""), where="provenance.observed_at", allow_empty=True
+            ),
+            supersedes=_require_str(mapping.get("supersedes", ""), where="provenance.supersedes", allow_empty=True),
+        )
+
+
 @dataclass(frozen=True)
 class Gap:
     """An explicit statement that a block of evidence is missing: `block`
@@ -589,6 +830,12 @@ class Requirements:
     usage: bool = False
     approvals: bool = False
     artifacts: bool = False
+    # ADR 018 Amendment 2: not required by default, so the default profile
+    # — and every envelope sealed under it — is unchanged.
+    versions: bool = False
+    subject: bool = False
+    tool_calls: bool = False
+    provenance: bool = False
 
 
 #: The default profile: execution join, outcome and at least one policy
@@ -684,6 +931,8 @@ _EVIDENCE_KEYS = frozenset({
     "api_version", "kind", "evidence_id", "content_hash", "created_at",
     "execution", "outcome", "policy_decisions", "snapshot_refs",
     "execution_request", "usage", "approvals", "artifacts", "gaps",
+    # ADR 018 Amendment 2.
+    "versions", "subject", "tool_calls", "provenance",
 })
 
 
@@ -716,6 +965,12 @@ class ExecutionEvidence:
     approvals: tuple[ApprovalRef, ...] = ()
     artifacts: tuple[ArtifactRef, ...] = ()
     gaps: tuple[Gap, ...] = ()
+    # ADR 018 Amendment 2 — absent (None/empty) on every envelope sealed
+    # before it, and then omitted from to_dict() and from the hash.
+    versions: VersionPins | None = None
+    subject: SubjectRef | None = None
+    tool_calls: tuple[ToolCallRef, ...] = ()
+    provenance: Provenance | None = None
 
     @property
     def completeness(self) -> str:
@@ -726,7 +981,7 @@ class ExecutionEvidence:
         return INCOMPLETE if any(g.required for g in self.gaps) else COMPLETE
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "api_version": self.api_version,
             "kind": self.kind,
             "evidence_id": self.evidence_id,
@@ -742,6 +997,18 @@ class ExecutionEvidence:
             "artifacts": [a.to_dict() for a in self.artifacts],
             "gaps": [g.to_dict() for g in self.gaps],
         }
+        # ADR 018 Amendment 2: emitted only when present, so every envelope
+        # sealed before the amendment round-trips byte-identically (its
+        # golden fixture carries none of these keys).
+        if self.versions is not None:
+            result["versions"] = self.versions.to_dict()
+        if self.subject is not None:
+            result["subject"] = self.subject.to_dict()
+        if self.tool_calls:
+            result["tool_calls"] = [t.to_dict() for t in self.tool_calls]
+        if self.provenance is not None:
+            result["provenance"] = self.provenance.to_dict()
+        return result
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ExecutionEvidence:
@@ -789,6 +1056,13 @@ class ExecutionEvidence:
         if not isinstance(artifacts_raw, list):
             raise ExecutionEvidenceError("artifacts must be a list")
 
+        versions_raw = mapping.get("versions")
+        subject_raw = mapping.get("subject")
+        tool_calls_raw = mapping.get("tool_calls", [])
+        if not isinstance(tool_calls_raw, list):
+            raise ExecutionEvidenceError("tool_calls must be a list")
+        provenance_raw = mapping.get("provenance")
+
         # Read-path parity with seal(): a document handed to from_dict is
         # documented as "already sealed", meaning seal() already redacted
         # every block before computing content_hash/evidence_id. Route every
@@ -812,6 +1086,14 @@ class ExecutionEvidence:
             raw_payload["approvals"] = approvals_raw
         if artifacts_raw:
             raw_payload["artifacts"] = artifacts_raw
+        if versions_raw is not None:
+            raw_payload["versions"] = versions_raw
+        if subject_raw is not None:
+            raw_payload["subject"] = subject_raw
+        if tool_calls_raw:
+            raw_payload["tool_calls"] = tool_calls_raw
+        if provenance_raw is not None:
+            raw_payload["provenance"] = provenance_raw
         safe_payload, redaction_gaps = _safe(raw_payload, requirements=DEFAULT_REQUIREMENTS)
         if redaction_gaps:
             offending = sorted({gap.block for gap in redaction_gaps})
@@ -836,6 +1118,10 @@ class ExecutionEvidence:
         usage = UsageRef.from_dict(safe_payload["usage"]) if "usage" in safe_payload else None
         approvals = tuple(ApprovalRef.from_dict(a) for a in safe_payload.get("approvals", []))
         artifacts = tuple(ArtifactRef.from_dict(a) for a in safe_payload.get("artifacts", []))
+        versions = VersionPins.from_dict(safe_payload["versions"]) if "versions" in safe_payload else None
+        subject = SubjectRef.from_dict(safe_payload["subject"]) if "subject" in safe_payload else None
+        tool_calls = tuple(ToolCallRef.from_dict(t) for t in safe_payload.get("tool_calls", []))
+        provenance = Provenance.from_dict(safe_payload["provenance"]) if "provenance" in safe_payload else None
 
         gaps_raw = mapping.get("gaps", [])
         if not isinstance(gaps_raw, list):
@@ -858,6 +1144,10 @@ class ExecutionEvidence:
             approvals=approvals,
             artifacts=artifacts,
             gaps=gaps,
+            versions=versions,
+            subject=subject,
+            tool_calls=tool_calls,
+            provenance=provenance,
         )
         evidence.validate()
         return evidence
@@ -908,6 +1198,21 @@ class ExecutionEvidence:
             _check_artifact(artifact)
         for gap in self.gaps:
             _check_gap(gap)
+        if self.versions is not None:
+            _check_versions(self.versions)
+        if self.subject is not None:
+            _check_subject(self.subject)
+            if self.provenance is None:
+                raise ExecutionEvidenceError(
+                    "subject-bound evidence must carry a provenance block (authority, observed_at): "
+                    "without it resolve_current cannot rank it against other evidence for the same subject"
+                )
+        if len(self.tool_calls) > MAX_TOOL_CALLS:
+            raise ExecutionEvidenceError(f"tool_calls holds {len(self.tool_calls)} entries, max {MAX_TOOL_CALLS}")
+        for call in self.tool_calls:
+            _check_tool_call(call)
+        if self.provenance is not None:
+            _check_provenance(self.provenance, own_evidence_id=self.evidence_id)
 
     def to_log_dict(self) -> dict[str, Any]:
         """Trace/telemetry-export shape (#195 owns traces): `evidence_id`,
@@ -1054,6 +1359,115 @@ def _check_gap(gap: Gap) -> None:
         raise ExecutionEvidenceError(f"gap.block {gap.block!r} is not one of {sorted(BLOCK_NAMES)!r}")
     if gap.code not in GAP_CODES:
         raise ExecutionEvidenceError(f"gap.code {gap.code!r} is not one of {sorted(GAP_CODES)!r}")
+    if gap.code in UNKNOWN_GAP_CODES and not gap.required:
+        raise ExecutionEvidenceError(
+            f"gap {gap.block!r}/{gap.code!r} states an unknown and must be required: "
+            "could-not-observe never leaves an envelope COMPLETE"
+        )
+
+
+def _check_bounded(value: str, pattern: re.Pattern[str], max_length: int, *, where: str) -> None:
+    if len(value) > max_length or not pattern.fullmatch(value):
+        raise ExecutionEvidenceError(f"{where} must match {pattern.pattern!r} within {max_length} characters")
+
+
+def _check_versions(pins: VersionPins) -> None:
+    if not pins.agent:
+        raise ExecutionEvidenceError("versions.agent is required when the versions block is present")
+    if not pins.definition_content_hash:
+        raise ExecutionEvidenceError(
+            "versions.definition_content_hash is required when the versions block is present: "
+            "definition_version alone names no bytes (ADR 007 sec. 4)"
+        )
+    for name in ("agent", "environment", "profile_name"):
+        value = getattr(pins, name)
+        if value:
+            _check_bounded(value, _SLUG_PATTERN, MAX_SLUG_LENGTH, where=f"versions.{name}")
+    for name in ("definition_version", "profile_version"):
+        value = getattr(pins, name)
+        if value:
+            _check_bounded(value, _VERSION_PATTERN, MAX_VERSION_LENGTH, where=f"versions.{name}")
+    for name in ("definition_content_hash", "profile_content_hash"):
+        value = getattr(pins, name)
+        if value and not _SHA256_PATTERN.fullmatch(value):
+            raise ExecutionEvidenceError(
+                f"versions.{name} must be 'sha256:' followed by 64 lowercase hex characters, got {value[:80]!r}"
+            )
+    if pins.release_revision is not None and pins.release_revision < 0:
+        raise ExecutionEvidenceError(f"versions.release_revision must be >= 0, got {pins.release_revision}")
+
+
+def _check_subject(subject: SubjectRef) -> None:
+    if subject.kind not in SUBJECT_KINDS:
+        raise ExecutionEvidenceError(f"subject.kind {subject.kind!r} is not one of {sorted(SUBJECT_KINDS)!r}")
+    if not subject.ref:
+        raise ExecutionEvidenceError("subject.ref is required when the subject block is present")
+    if subject.kind in NUMBERED_SUBJECT_KINDS:
+        if not _NUMBER_REF_PATTERN.fullmatch(subject.ref):
+            raise ExecutionEvidenceError(
+                f"subject.ref for a {subject.kind} must be its number, got {subject.ref[:80]!r}"
+            )
+    else:
+        _check_bounded(subject.ref, _SUBJECT_REF_PATTERN, MAX_SUBJECT_REF_LENGTH, where="subject.ref")
+        if ".." in subject.ref or "//" in subject.ref or subject.ref.endswith("/"):
+            raise ExecutionEvidenceError(f"subject.ref {subject.ref[:80]!r} must not carry a path fragment")
+    if subject.kind in REPOSITORY_SUBJECT_KINDS and not subject.repository:
+        raise ExecutionEvidenceError(f"subject.repository is required for a {subject.kind} subject")
+    if subject.repository and not _REPOSITORY_PATTERN.fullmatch(subject.repository):
+        raise ExecutionEvidenceError(
+            f"subject.repository must be 'owner/name', got {subject.repository[:80]!r}"
+        )
+    if subject.kind in SHA_BOUND_SUBJECT_KINDS:
+        if not subject.revision:
+            raise ExecutionEvidenceError(
+                f"subject.revision is required for a {subject.kind} subject: evidence about a moving "
+                "pointer must name the exact git SHA it observed"
+            )
+        if not _GIT_SHA_PATTERN.fullmatch(subject.revision):
+            raise ExecutionEvidenceError(
+                f"subject.revision for a {subject.kind} must be a full lowercase git SHA (40 or 64 hex), "
+                f"got {subject.revision[:80]!r}"
+            )
+    elif subject.revision:
+        _check_bounded(subject.revision, _VERSION_PATTERN, MAX_VERSION_LENGTH, where="subject.revision")
+
+
+def _check_tool_call(call: ToolCallRef) -> None:
+    if call.kind not in TOOL_CALL_KINDS:
+        raise ExecutionEvidenceError(f"tool_call.kind {call.kind!r} is not one of {sorted(TOOL_CALL_KINDS)!r}")
+    if call.name:
+        _check_bounded(call.name, _TOOL_NAME_PATTERN, MAX_TOOL_NAME_LENGTH, where="tool_call.name")
+    if not _SHA256_PATTERN.fullmatch(call.action_digest):
+        raise ExecutionEvidenceError(
+            "tool_call.action_digest must be 'sha256:' followed by 64 lowercase hex characters, "
+            f"got {call.action_digest[:80]!r}"
+        )
+    if call.status not in TOOL_CALL_STATUSES:
+        raise ExecutionEvidenceError(
+            f"tool_call.status {call.status!r} is not one of {sorted(TOOL_CALL_STATUSES)!r}"
+        )
+
+
+def _check_provenance(provenance: Provenance, *, own_evidence_id: str) -> None:
+    if provenance.authority not in AUTHORITY_RANK:
+        raise ExecutionEvidenceError(
+            f"provenance.authority {provenance.authority!r} is not one of {list(AUTHORITIES)!r}"
+        )
+    if not provenance.observed_at:
+        raise ExecutionEvidenceError("provenance.observed_at is required when the provenance block is present")
+    if len(provenance.observed_at) > MAX_CREATED_AT_LENGTH or not _CREATED_AT_PATTERN.match(provenance.observed_at):
+        raise ExecutionEvidenceError(
+            "provenance.observed_at must be an ISO8601 UTC timestamp of the form "
+            f"YYYY-MM-DDTHH:MM:SS[.ffffff]Z, got {provenance.observed_at[:80]!r}"
+        )
+    if provenance.supersedes:
+        if not _EVIDENCE_ID_PATTERN.fullmatch(provenance.supersedes):
+            raise ExecutionEvidenceError(
+                f"provenance.supersedes must be an evidence id ({EVIDENCE_ID_PREFIX!r} followed by 16 "
+                f"lowercase hex characters), got {provenance.supersedes[:80]!r}"
+            )
+        if provenance.supersedes == own_evidence_id:
+            raise ExecutionEvidenceError("provenance.supersedes must not name the envelope itself")
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1485,10 @@ def _content_payload(
     usage: UsageRef | None = None,
     approvals: Sequence[ApprovalRef] = (),
     artifacts: Sequence[ArtifactRef] = (),
+    versions: VersionPins | None = None,
+    subject: SubjectRef | None = None,
+    tool_calls: Sequence[ToolCallRef] = (),
+    provenance: Provenance | None = None,
 ) -> dict[str, Any]:
     """Every field that participates in `content_hash` — everything except
     `content_hash`, `evidence_id` and `created_at`. Every optional block
@@ -1098,6 +1516,16 @@ def _content_payload(
         payload["approvals"] = [a.to_dict() for a in approvals]
     if artifacts:
         payload["artifacts"] = [a.to_dict() for a in artifacts]
+    # ADR 018 Amendment 2 blocks: the same absent-when-empty rule, which is
+    # what keeps every pre-amendment envelope's content_hash unchanged.
+    if versions is not None:
+        payload["versions"] = versions.to_dict()
+    if subject is not None:
+        payload["subject"] = subject.to_dict()
+    if tool_calls:
+        payload["tool_calls"] = [t.to_dict() for t in tool_calls]
+    if provenance is not None:
+        payload["provenance"] = provenance.to_dict()
     return payload
 
 
@@ -1113,6 +1541,10 @@ def _check_required_blocks(
     approvals: tuple[ApprovalRef, ...],
     artifacts: tuple[ArtifactRef, ...],
     gaps: tuple[Gap, ...],
+    versions: VersionPins | None = None,
+    subject: SubjectRef | None = None,
+    tool_calls: tuple[ToolCallRef, ...] = (),
+    provenance: Provenance | None = None,
 ) -> None:
     gaps_by_block: dict[str, list[Gap]] = {}
     for g in gaps:
@@ -1137,6 +1569,10 @@ def _check_required_blocks(
     _check("usage", requirements.usage, usage is None)
     _check("approvals", requirements.approvals, len(approvals) == 0)
     _check("artifacts", requirements.artifacts, len(artifacts) == 0)
+    _check("versions", requirements.versions, versions is None)
+    _check("subject", requirements.subject, subject is None)
+    _check("tool_calls", requirements.tool_calls, len(tool_calls) == 0)
+    _check("provenance", requirements.provenance, provenance is None)
 
 
 def seal(
@@ -1152,6 +1588,10 @@ def seal(
     artifacts: Sequence[ArtifactRef] = (),
     gaps: Sequence[Gap] = (),
     requirements: Requirements = DEFAULT_REQUIREMENTS,
+    versions: VersionPins | None = None,
+    subject: SubjectRef | None = None,
+    tool_calls: Sequence[ToolCallRef] = (),
+    provenance: Provenance | None = None,
 ) -> ExecutionEvidence:
     """The only constructor that produces a sealed `ExecutionEvidence`.
 
@@ -1174,6 +1614,10 @@ def seal(
         usage=usage,
         approvals=approvals,
         artifacts=artifacts,
+        versions=versions,
+        subject=subject,
+        tool_calls=tool_calls,
+        provenance=provenance,
     )
     safe_payload, redaction_gaps = _safe(raw_payload, requirements=requirements)
     all_gaps = tuple(gaps) + redaction_gaps
@@ -1203,6 +1647,10 @@ def seal(
     clean_usage = UsageRef.from_dict(safe_payload["usage"]) if "usage" in safe_payload else None
     clean_approvals = tuple(ApprovalRef.from_dict(a) for a in safe_payload.get("approvals", []))
     clean_artifacts = tuple(ArtifactRef.from_dict(a) for a in safe_payload.get("artifacts", []))
+    clean_versions = VersionPins.from_dict(safe_payload["versions"]) if "versions" in safe_payload else None
+    clean_subject = SubjectRef.from_dict(safe_payload["subject"]) if "subject" in safe_payload else None
+    clean_tool_calls = tuple(ToolCallRef.from_dict(t) for t in safe_payload.get("tool_calls", []))
+    clean_provenance = Provenance.from_dict(safe_payload["provenance"]) if "provenance" in safe_payload else None
 
     _check_required_blocks(
         requirements=requirements,
@@ -1215,6 +1663,10 @@ def seal(
         approvals=clean_approvals,
         artifacts=clean_artifacts,
         gaps=all_gaps,
+        versions=clean_versions,
+        subject=clean_subject,
+        tool_calls=clean_tool_calls,
+        provenance=clean_provenance,
     )
 
     hash_payload = dict(safe_payload)
@@ -1238,6 +1690,10 @@ def seal(
         approvals=clean_approvals,
         artifacts=clean_artifacts,
         gaps=all_gaps,
+        versions=clean_versions,
+        subject=clean_subject,
+        tool_calls=clean_tool_calls,
+        provenance=clean_provenance,
     )
     evidence.validate()
     return evidence
@@ -1257,6 +1713,10 @@ def recompute_content_hash(evidence: ExecutionEvidence) -> str:
         usage=evidence.usage,
         approvals=evidence.approvals,
         artifacts=evidence.artifacts,
+        versions=evidence.versions,
+        subject=evidence.subject,
+        tool_calls=evidence.tool_calls,
+        provenance=evidence.provenance,
     )
     if evidence.gaps:
         payload["gaps"] = [g.to_dict() for g in evidence.gaps]
@@ -1273,12 +1733,111 @@ def evidence_ref(evidence: ExecutionEvidence, kind: str) -> dict[str, str]:
     return {"evidence_id": evidence.evidence_id, "kind": kind}
 
 
+# ---------------------------------------------------------------------------
+# Current vs historical (ADR 018 Amendment 2) — the one resolution rule,
+# pure and in-memory. Tier B must implement the same rule server-side; this
+# function is its reference and its conformance oracle.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CurrentEvidence:
+    """`resolve_current`'s answer: a `state` from `CURRENT_STATES` and, only
+    for `current`, the one envelope that is current. `unknown_revision` and
+    `ambiguous` are unknowns and must never be read as `no_evidence`."""
+
+    state: str
+    evidence: ExecutionEvidence | None = None
+
+
+def _observed_at_key(observed_at: str) -> str:
+    """A lexically comparable form of a `_CREATED_AT_PATTERN` timestamp:
+    the fraction is padded to six digits, so `...:00Z` sorts before
+    `...:00.5Z` (a raw string comparison gets that backwards: '.' < 'Z')."""
+    seconds, _, rest = observed_at.partition(".")
+    if rest:
+        return seconds + "." + rest.rstrip("Z").ljust(6, "0")
+    return observed_at.rstrip("Z") + ".000000"
+
+
+def resolve_current(
+    candidates: Sequence[ExecutionEvidence],
+    *,
+    kind: str,
+    repository: str,
+    ref: str,
+    revision: str,
+) -> CurrentEvidence:
+    """Which envelope is current for subject `(kind, repository, ref)` at
+    the `revision` the caller has just observed it at.
+
+    1. `revision` blank -> `unknown_revision`: without the live revision no
+       envelope can be called current, and "none" would be a lie.
+    2. Pool = candidates whose `subject` has exactly this key AND this
+       `revision`. Evidence for any other revision is historical by
+       definition — PR@SHA1 evidence is never current for PR@SHA2.
+    3. Drop every pool member another pool member names in
+       `provenance.supersedes` with equal or stronger authority.
+       Supersession only acts inside the pool, and never downward: an
+       `asserted` envelope naming an `observed` one retires nothing.
+    4. Empty -> `no_evidence`. Otherwise rank by authority
+       (`AUTHORITY_RANK`: observed > derived > asserted), then by
+       `observed_at` (later wins). A newer assertion never displaces an
+       older observation.
+    5. More than one distinct envelope sharing the top rank -> `ambiguous`
+       (fail closed, never an arbitrary pick); exactly one -> `current`.
+
+    `candidates` must be the complete set for this subject key: a caller
+    whose listing failed or was partial must not call this at all — that is
+    an unknown, and passing a short list would turn it into `no_evidence`."""
+    if not revision:
+        return CurrentEvidence(state="unknown_revision")
+    key = (kind, repository, ref)
+    pool = [
+        e for e in candidates
+        if e.subject is not None and e.subject.key == key and e.subject.revision == revision
+    ]
+    by_id = {e.evidence_id: e for e in pool}
+
+    def authority_rank(e: ExecutionEvidence) -> int:
+        return AUTHORITY_RANK.get(e.provenance.authority, 0) if e.provenance is not None else 0
+
+    superseded: set[str] = set()
+    for e in pool:
+        target_id = e.provenance.supersedes if e.provenance is not None else ""
+        target = by_id.get(target_id)
+        # A supersedes link counts only inside the pool (same subject key
+        # and revision) and only from equal or stronger authority: a model
+        # assertion can never retire an observation by naming it.
+        if target is not None and authority_rank(e) >= authority_rank(target):
+            superseded.add(target_id)
+    live = [e for e in pool if e.evidence_id not in superseded]
+    if not live:
+        return CurrentEvidence(state="no_evidence")
+
+    def rank(e: ExecutionEvidence) -> tuple[int, str]:
+        # validate() guarantees provenance on every subject-bound envelope;
+        # an unvalidated one ranks below every authority rather than raising.
+        if e.provenance is None:
+            return (0, "")
+        return (authority_rank(e), _observed_at_key(e.provenance.observed_at))
+
+    top = max(rank(e) for e in live)
+    winners = {e.evidence_id: e for e in live if rank(e) == top}
+    if len(winners) != 1:
+        return CurrentEvidence(state="ambiguous")
+    return CurrentEvidence(state="current", evidence=next(iter(winners.values())))
+
+
 __all__ = [
     "API_VERSION",
     "APPROVAL_ID_PREFIX",
     "APPROVAL_STATES",
+    "AUTHORITIES",
+    "AUTHORITY_RANK",
     "BLOCK_NAMES",
     "COMPLETE",
+    "CURRENT_STATES",
     "DEFAULT_REQUIREMENTS",
     "EVIDENCE_ID_PREFIX",
     "EXECUTION_ID_PREFIX",
@@ -1291,13 +1850,19 @@ __all__ = [
     "OUTCOME_CODES",
     "REQUEST_ID_PREFIX",
     "RUNTIME_EXECUTION_ID_PREFIX",
+    "SHA_BOUND_SUBJECT_KINDS",
     "SNAPSHOT_ID_PREFIX",
     "SNAPSHOT_ID_PREFIXES",
     "SNAPSHOT_LOCAL_ID_PREFIX",
+    "SUBJECT_KINDS",
     "SUPPORTED_API_VERSIONS",
+    "TOOL_CALL_KINDS",
+    "TOOL_CALL_STATUSES",
+    "UNKNOWN_GAP_CODES",
     "USAGE_DEVLOOP_STAGES",
     "ApprovalRef",
     "ArtifactRef",
+    "CurrentEvidence",
     "ExecutionEvidence",
     "ExecutionEvidenceError",
     "ExecutionJoin",
@@ -1305,10 +1870,15 @@ __all__ = [
     "Gap",
     "Outcome",
     "PolicyDecisionRef",
+    "Provenance",
     "Requirements",
     "SnapshotRef",
+    "SubjectRef",
+    "ToolCallRef",
     "UsageRef",
+    "VersionPins",
     "evidence_ref",
     "recompute_content_hash",
+    "resolve_current",
     "seal",
 ]
