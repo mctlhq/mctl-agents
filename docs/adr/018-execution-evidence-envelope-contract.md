@@ -719,7 +719,13 @@ which Tier B must reproduce and test against:
 2. Pool = candidates with exactly this `subject.key` **and** this
    `revision`, excluding any envelope with a `redacted_out` gap on
    `subject` (it is not bound to a known subject). Everything at another
-   revision is historical by definition.
+   revision is historical by definition. If two pool members claim one
+   `evidence_id` with different content (everything except `created_at`), the
+   answer is `ambiguous`, and this check runs before any step that looks
+   envelopes up by id. That is a forgery `from_dict` cannot detect, because
+   it never recomputes `content_hash`, and Tier B's accept-a-dangling-link
+   rule (item 6) can ingest it. The same envelope listed twice, or re-sealed
+   at another `created_at`, is the same evidence.
 3. A pool member named by another pool member's `provenance.supersedes` is
    dropped — but only when the superseding envelope's authority is equal
    or stronger. A link to an envelope outside the pool removes nothing.
@@ -736,7 +742,7 @@ which Tier B must reproduce and test against:
    observation; among equal authority the later observation wins
    (`observed_at` compared with the fraction normalized, not as raw text).
 5. More than one distinct envelope at the top → `ambiguous`, never an
-   arbitrary pick. Exactly one → `current`.
+   arbitrary or order-dependent pick. Exactly one → `current`.
 
 `candidates` must be the complete set for the subject key: a reader whose
 listing failed or was truncated has an unknown and must not call the rule
@@ -862,7 +868,9 @@ producer emits the new blocks:
    `subject_revision` filters to `GET /api/v1/evidence` and
    `GET /api/v1/work-items/{id}/evidence`.
 8. **Current read.** `GET /api/v1/evidence/current?subject_kind=&repository=&ref=&revision=`
-   implementing `resolve_current` exactly, including the argument
+   implementing `resolve_current` exactly (including the rule-2 id-collision
+   check, which a store keyed by `id` can only hit through forged input but
+   must still answer `ambiguous`), including the argument
    validation (a malformed parameter answers `400`, never `no_evidence`),
    and answering `{state, evidence}`
    with `state` ∈ `current`, `stale_revision`, `no_evidence`,

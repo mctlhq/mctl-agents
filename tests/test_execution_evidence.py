@@ -1671,6 +1671,7 @@ def test_resolve_current_treats_two_contents_under_one_id_as_ambiguous():
 def test_a_forged_id_collision_never_lets_list_order_pick_through_supersession(order):
     obs = _pr_evidence(authority="observed", observed_at="2026-10-04T10:00:00Z")
     ass = dataclasses.replace(obs, provenance=_provenance(authority="asserted"))  # forged: same id
+    assert ass.evidence_id == obs.evidence_id and ass != obs  # the premise: one id, two contents
     y = _pr_evidence(authority="asserted", observed_at="2026-10-04T11:00:00Z", supersedes=obs.evidence_id)
     members = (obs, ass, y)
     result = _resolve([members[i] for i in order])

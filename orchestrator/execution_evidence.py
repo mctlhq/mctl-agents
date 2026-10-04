@@ -1978,7 +1978,7 @@ def resolve_current(
     # can claim one evidence_id. Any such collision makes every id-keyed
     # step below (supersession, winners) order-dependent: fail closed before
     # it. The same envelope listed twice, even re-sealed at another
-    # created_at, is not a collision and is deduplicated.
+    # created_at, is not a collision; id-keyed steps see it once.
     contents_by_id: dict[str, set[bytes]] = {}
     for e in pool:
         contents_by_id.setdefault(e.evidence_id, set()).add(_content_key(e))
@@ -1987,7 +1987,6 @@ def resolve_current(
     by_id: dict[str, ExecutionEvidence] = {}
     for e in pool:
         by_id.setdefault(e.evidence_id, e)
-    pool = list(by_id.values())
 
     def authority_rank(e: ExecutionEvidence) -> int:
         return AUTHORITY_RANK.get(e.provenance.authority, 0) if e.provenance is not None else 0
