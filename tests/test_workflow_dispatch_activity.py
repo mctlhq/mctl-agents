@@ -339,7 +339,7 @@ def _issue(n: int, title: str) -> dict:
     return {"number": n, "title": title, "html_url": f"u/{n}"}
 
 
-def _search_handler(pages: list[Any], *, created: list | None = None):
+def _search_handler(pages: list[Any]):
     """pages[i] is a list of issues, or an int status; page i+1 is linked unless last."""
 
     def h(r: httpx.Request) -> httpx.Response:
@@ -362,10 +362,6 @@ def _search_handler(pages: list[Any], *, created: list | None = None):
         return httpx.Response(404)
 
     return h
-
-
-def _report(monkeypatch, handler):
-    return _drive(monkeypatch, handler, act.report_dispatch_failure, REP)
 
 
 def test_alert_match_on_page_two_is_commented_not_duplicated(monkeypatch):

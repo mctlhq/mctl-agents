@@ -88,6 +88,7 @@ from orchestrator.temporal.constants import (
 from orchestrator.temporal.scheduled_dispatch import (
     DISPATCH_SCHEDULE_PREFIX,
     DISPATCH_SCHEDULE_SUFFIX,
+    RETIRED_DISPATCH_SCHEDULE_IDS,
     WEEKLY_DISPATCH_TARGETS,
 )
 from orchestrator.temporal.tracing import worker_interceptors
@@ -240,7 +241,19 @@ async def _ensure_schedule(
         # nothing to converge TO, and pushing `None` would mean this function
         # deciding to clear a live value nobody asked it to touch.
         policy_stale = want_overlap is not None and live_overlap != want_overlap
-        action_stale = desired_fp is not None and _action_fingerprint_live(schedule.action) != desired_fp
+        action_stale = False
+        if desired_fp is not None:
+            live_fp = _action_fingerprint_live(schedule.action)
+            if live_fp is None:
+                # Uncomparable is "do not touch", not "differs": reading it as
+                # stale would rewrite the action and log a convergence on every
+                # boot if the SDK ever stops exposing the raw action.
+                logger.warning(
+                    "Temporal schedule %s: cannot fingerprint the live action; skipping action convergence",
+                    schedule_id,
+                )
+            else:
+                action_stale = live_fp != desired_fp
         if not spec_stale and not policy_stale and not action_stale:
             return None
         # Assign the FIELD, never the whole object. `schedule.spec =
@@ -505,18 +518,28 @@ async def setup_schedules(client: Client) -> None:
             client, target.schedule_id, dispatch_schedule, "ScheduledDispatchWorkflow", converge_action=True
         )
 
-    await _gc_dispatch_schedules(client, {t.schedule_id for t in WEEKLY_DISPATCH_TARGETS})
+    await _gc_dispatch_schedules(
+        client,
+        {t.schedule_id for t in WEEKLY_DISPATCH_TARGETS},
+        set(RETIRED_DISPATCH_SCHEDULE_IDS),
+    )
 
 
-async def _gc_dispatch_schedules(client: Client, declared: set[str]) -> None:
-    """Delete `dispatch-*-schedule` schedules no current target declares.
+async def _gc_dispatch_schedules(client: Client, declared: set[str], retired: set[str]) -> None:
+    """Delete the RETIRED `dispatch-*-schedule` schedules; only report other undeclared ones.
 
-    The prefix and suffix are owned by code (see scheduled_dispatch.py).
+    Deletion is driven by an explicit tombstone list, not by "absent from this
+    image's targets": `setup_schedules` runs once per boot in every
+    schedule-owning process, so an older image (a rollback, or a crash-restart
+    of the outgoing ReplicaSet mid-rollout) would otherwise delete a schedule a
+    newer image just created, and nothing would recreate it until the next
+    boot. An id only an older image lacks is never in `retired`.
+
     Candidates are collected before any delete, so a listing failure deletes
     nothing. Errors are logged at ERROR and never raised.
     """
     try:
-        stale = [
+        undeclared = [
             s.id
             async for s in await client.list_schedules()
             if s.id.startswith(DISPATCH_SCHEDULE_PREFIX)
@@ -526,6 +549,13 @@ async def _gc_dispatch_schedules(client: Client, declared: set[str]) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.error("Could not list Temporal schedules for dispatch GC (%s); nothing deleted", exc)
         return
+    stale = [sid for sid in undeclared if sid in retired]
+    for sid in undeclared:
+        if sid not in retired:
+            logger.warning(
+                "Undeclared dispatch schedule %s is not in RETIRED_DISPATCH_SCHEDULE_IDS; left in place",
+                sid,
+            )
     for sid in stale:
         try:
             await client.get_schedule_handle(sid).delete()

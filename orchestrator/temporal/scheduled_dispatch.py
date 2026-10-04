@@ -16,10 +16,13 @@ Epoch arithmetic: Temporal interval schedules are aligned to the Unix epoch,
 lands on the wanted weekday and time. Sunday (6) gives 3 days.
 
 Ownership: the `dispatch-` id prefix and `-schedule` suffix are owned by this
-code. `worker._gc_dispatch_schedules` deletes every `dispatch-*-schedule` whose
-id is not a `schedule_id` of a target below, so do not hand-create schedules
-with that shape. `repo` and `workflow_file` go into GitHub URL paths and are
-validated here (at import time) and again in the activities.
+code. To retire a target, remove it from `WEEKLY_DISPATCH_TARGETS` AND add its
+`schedule_id` to `RETIRED_DISPATCH_SCHEDULE_IDS`; `worker._gc_dispatch_schedules`
+deletes only those tombstoned ids and merely logs any other undeclared
+`dispatch-*-schedule`. Deleting by absence alone would let an older image
+delete a newer image's schedule during a rollback or mid-rollout restart.
+`repo` and `workflow_file` go into GitHub URL paths and are validated here
+(at import time) and again in the activities.
 
 This module imports nothing from the Temporal worker.
 """
@@ -119,3 +122,7 @@ WEEKLY_DISPATCH_TARGETS: tuple[DispatchTarget, ...] = (
         minute=1,
     ),
 )
+
+# Tombstones: schedule ids of retired targets, deleted on worker boot. An id
+# here must never also be declared above (a unit test pins that).
+RETIRED_DISPATCH_SCHEDULE_IDS: tuple[str, ...] = ()

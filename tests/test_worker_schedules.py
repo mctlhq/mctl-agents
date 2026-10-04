@@ -37,6 +37,7 @@ from orchestrator.temporal.constants import TASK_QUEUE
 from orchestrator.temporal.scheduled_dispatch import (
     DISPATCH_SCHEDULE_PREFIX,
     DISPATCH_SCHEDULE_SUFFIX,
+    RETIRED_DISPATCH_SCHEDULE_IDS,
     WEEKLY_DISPATCH_TARGETS,
     DispatchTarget,
 )
@@ -668,6 +669,18 @@ class TestActionConvergence:
 
         assert client.handle.updates == []
 
+    async def test_uncomparable_live_action_is_left_untouched(self, caplog):
+        # A live action the SDK does not expose as raw (fingerprint None) must
+        # read as "do not touch", never as "differs" -> an update every boot.
+        existing = _dispatch_schedule("main")  # constructed, not described: no raw_info
+        client = _FakeClient(existing=existing)
+
+        with caplog.at_level(logging.WARNING):
+            await _ensure_schedule(client, "s", _dispatch_schedule("release"), "W", converge_action=True)
+
+        assert client.handle.updates == []
+        assert "cannot fingerprint the live action" in caplog.text
+
     async def test_action_difference_ignored_without_opt_in(self):
         existing = _dispatch_schedule("main")
         existing.action = await _live_action("main")
@@ -709,33 +722,59 @@ class TestGcDispatchSchedules:
         "dispatch-foo",
     )
 
-    async def test_only_undeclared_dispatch_schedule_deleted(self):
+    async def test_only_retired_undeclared_dispatch_schedule_deleted(self):
         client = _FakeClient(existing=None, listed=self.LISTED)
-        await _gc_dispatch_schedules(client, {"dispatch-a-x-schedule"})
+        await _gc_dispatch_schedules(client, {"dispatch-a-x-schedule"}, {"dispatch-b-y-schedule"})
         assert client.deleted == ["dispatch-b-y-schedule"]
+
+    async def test_undeclared_but_not_retired_is_left_in_place(self, caplog):
+        # The older-image case: a rollback pod lacks a newer target, so that
+        # schedule is undeclared FOR IT. Without a tombstone it must survive.
+        client = _FakeClient(existing=None, listed=self.LISTED)
+        with caplog.at_level(logging.WARNING):
+            await _gc_dispatch_schedules(client, {"dispatch-a-x-schedule"}, set())
+        assert client.deleted == []
+        assert "dispatch-b-y-schedule is not in RETIRED_DISPATCH_SCHEDULE_IDS" in caplog.text
+
+    async def test_retired_but_declared_is_never_deleted(self):
+        client = _FakeClient(existing=None, listed=self.LISTED)
+        await _gc_dispatch_schedules(client, {"dispatch-a-x-schedule"}, {"dispatch-a-x-schedule"})
+        assert client.deleted == []
 
     async def test_list_failure_deletes_nothing_and_does_not_raise(self):
         client = _FakeClient(existing=None, listed=self.LISTED)
         client.list_fails = True
-        await _gc_dispatch_schedules(client, set())
+        await _gc_dispatch_schedules(client, set(), {"dispatch-a-x-schedule", "dispatch-b-y-schedule"})
         assert client.deleted == []
 
     async def test_delete_failure_does_not_stop_the_rest(self):
         client = _FakeClient(existing=None, listed=self.LISTED)
         client.delete_fails = {"dispatch-a-x-schedule"}
-        await _gc_dispatch_schedules(client, set())
+        await _gc_dispatch_schedules(client, set(), {"dispatch-a-x-schedule", "dispatch-b-y-schedule"})
         assert client.deleted == ["dispatch-b-y-schedule"]
 
-    async def test_empty_declared_deletes_every_dispatch_schedule(self):
+    async def test_non_dispatch_ids_are_never_deleted_even_if_retired(self):
         client = _FakeClient(existing=None, listed=self.LISTED)
-        await _gc_dispatch_schedules(client, set())
-        assert sorted(client.deleted) == ["dispatch-a-x-schedule", "dispatch-b-y-schedule"]
+        await _gc_dispatch_schedules(client, set(), {"reconcile-mctl-agents-schedule", "dispatch-foo"})
+        assert client.deleted == []
 
-    async def test_setup_schedules_runs_gc_after_registration(self):
-        client = _FakeClient(existing=None, listed=("dispatch-gone-wf-schedule", "incidents-mctl-agents-schedule"))
+    async def test_setup_schedules_deletes_only_tombstoned(self, monkeypatch):
+        import orchestrator.temporal.worker as w
+
+        monkeypatch.setattr(w, "RETIRED_DISPATCH_SCHEDULE_IDS", ("dispatch-gone-wf-schedule",))
+        client = _FakeClient(
+            existing=None,
+            listed=("dispatch-gone-wf-schedule", "dispatch-newer-wf-schedule", "incidents-mctl-agents-schedule"),
+        )
         await setup_schedules(client)
         assert client.deleted == ["dispatch-gone-wf-schedule"]
         assert client.created
+
+    def test_retired_and_declared_are_disjoint(self):
+        declared = {t.schedule_id for t in WEEKLY_DISPATCH_TARGETS}
+        assert not declared & set(RETIRED_DISPATCH_SCHEDULE_IDS)
+        for sid in RETIRED_DISPATCH_SCHEDULE_IDS:
+            assert sid.startswith(DISPATCH_SCHEDULE_PREFIX) and sid.endswith(DISPATCH_SCHEDULE_SUFFIX)
 
 
 class TestDispatchTargetValidation:

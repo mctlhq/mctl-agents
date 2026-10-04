@@ -111,6 +111,20 @@ async def test_undelivered_alert_logs_marker_and_original_error_survives(env, ca
     assert "NoGitHubToken" in caplog.text
 
 
+def test_undelivered_counter_and_log_share_the_marker():
+    # The counter is what an alert rule fires on; it must not drift from the
+    # log marker. metric_meter() is a no-op in the test env, so pin the source.
+    import inspect
+
+    from orchestrator.temporal.workflows import scheduled_dispatch as wf
+
+    src = inspect.getsource(wf.ScheduledDispatchWorkflow.run)
+    assert "create_counter(\n" in src or "create_counter(" in src
+    call = src[src.index("create_counter(") :]
+    assert call.split(")", 1)[0].split("(", 1)[1].strip().split(",")[0].strip() == "ALERT_UNDELIVERED_MARKER"
+    assert wf.ALERT_UNDELIVERED_MARKER == "scheduled_dispatch_alert_undelivered"
+
+
 async def test_invalid_dispatch_target_is_not_retried(env):
     seen, acts = _acts(dispatch_error=("InvalidDispatchTarget", False), report_error=("InvalidDispatchTarget", False))
     with pytest.raises(WorkflowFailureError):

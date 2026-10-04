@@ -34,7 +34,9 @@ ALERT_UNDELIVERED_MARKER = "scheduled_dispatch_alert_undelivered"
 
 DISPATCH_TIMEOUT = timedelta(minutes=8)
 DISPATCH_HEARTBEAT_TIMEOUT = timedelta(minutes=1)
-REPORT_TIMEOUT = timedelta(minutes=2)
+# Worst case: label lookup + ALERT_SEARCH_MAX_PAGES (10) search pages + one
+# write = 12 requests at REQUEST_TIMEOUT_SECONDS (20s) = 240s, plus slack.
+REPORT_TIMEOUT = timedelta(minutes=5)
 
 DISPATCH_NON_RETRYABLE = ["DispatchRejected", "RunNotObserved", "InvalidDispatchTarget"]
 REPORT_NON_RETRYABLE = ["AlertReportRejected", "InvalidDispatchTarget"]
