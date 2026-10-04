@@ -1044,11 +1044,21 @@ def check_binding_against_definition(binding: ReleaseBinding, definition: AgentD
         )
 
 
+def check_binding_profile_version(binding: ReleaseBinding, profile_version: str) -> None:
+    """Raise `ResolverError` unless the binding's profile.version is the
+    catalog profile's declared spec.version (`profile_version`)."""
+    if binding.profile_version != profile_version:
+        raise ResolverError(
+            f"ambiguous version: release binding profile.version {binding.profile_version!r} does "
+            f"not match the profile's declared spec.version ({profile_version!r}) — the binding is "
+            "stale or the profile was versioned without re-binding"
+        )
+
+
 def check_profile_compatibility(definition: AgentDefinition, profile_version: str) -> None:
     """Raise `ResolverError` unless `profile_version` satisfies the
-    definition's executionProfileRef.compatibility. `execute()` passes the
-    resolved profile's version; the release gate passes the binding's
-    profile.version, which `execute()` requires to be equal to it."""
+    definition's executionProfileRef.compatibility. `execute()` and the
+    release gate both pass the catalog profile's declared spec.version."""
     if not _version_satisfies(
         profile_version,
         definition.execution_profile_compatibility,
@@ -1081,13 +1091,7 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
     definition_content_hash = definition.content_hash
 
     profile = load_profile(binding.profile_name)
-    if binding.profile_version != profile.version:
-        raise ResolverError(
-            f"ambiguous version: release binding profile.version {binding.profile_version!r} does "
-            f"not match the profile's declared spec.version ({profile.version!r}) — the binding is "
-            "stale or the profile was versioned without re-binding"
-        )
-
+    check_binding_profile_version(binding, profile.version)
     check_profile_compatibility(definition, profile.version)
 
     model_selection = resolve_model(

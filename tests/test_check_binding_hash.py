@@ -63,8 +63,24 @@ def _binding_doc(content_hash: object = None, **overrides: object) -> dict:
     return doc
 
 
-def _serving(body: bytes, status: int = 200) -> httpx.MockTransport:
+_PROFILE_DOC = {
+    "apiVersion": "agents.mctl.ai/v1alpha2",
+    "kind": "ExecutionProfile",
+    "metadata": {"name": "issue-investigator-default"},
+    "spec": {"version": "1.5.1"},
+}
+
+
+def _serving(
+    body: bytes, status: int = 200, *, profile: bytes | None = None, profile_status: int = 200
+) -> httpx.MockTransport:
+    """Serve `body` for the binding and a profile (by default the one the
+    binding pins, at the version it pins) for the execution-profile read."""
+    profile_body = _yaml(_PROFILE_DOC) if profile is None else profile
+
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/profile.yaml"):
+            return httpx.Response(profile_status, content=profile_body)
         return httpx.Response(status, content=body)
 
     return httpx.MockTransport(handler)
@@ -166,17 +182,71 @@ _MIRROR_DRIFT = {
     "profile.name": ({"profile": {"name": "issue-investigator-other"}}, "profile.name"),
     "profile.version outside the range": ({"profile": {"version": "2.0.0"}}, "compatibility mismatch"),
 }
+# The catalog profile each case is served with: the out-of-range case moves
+# the catalog too, so that only the compatibility check can catch it.
+_DRIFT_PROFILE_VERSION = {"profile.version outside the range": "2.0.0"}
 
 
-@pytest.mark.parametrize("changes,needle", list(_MIRROR_DRIFT.values()), ids=list(_MIRROR_DRIFT))
-def test_a_matching_hash_with_drifted_mirrored_fields_fails(changes, needle, capsys):
-    rc = check_binding_hash.check(_serving(_yaml(_binding_doc(spec=_spec_with(**changes)))))
+@pytest.mark.parametrize("case", list(_MIRROR_DRIFT))
+def test_a_matching_hash_with_drifted_mirrored_fields_fails(case, capsys):
+    changes, needle = _MIRROR_DRIFT[case]
+    version = _DRIFT_PROFILE_VERSION.get(case, "1.5.1")
+    profile = _yaml({**_PROFILE_DOC, "spec": {"version": version}})
+    rc = check_binding_hash.check(_serving(_yaml(_binding_doc(spec=_spec_with(**changes))), profile=profile))
 
     assert rc == check_binding_hash.EXIT_MISMATCH
     err = capsys.readouterr().err
     assert "matches the shadow binding's contentHash" in err
     assert needle in err
     assert check_binding_hash.RUNBOOK in err
+
+
+def test_a_binding_stale_against_the_catalog_profile_fails(capsys):
+    """Inside the compatibility range, but not the version the catalog
+    profile declares: execute() fails it on "ambiguous version"."""
+    stale = _yaml({**_PROFILE_DOC, "spec": {"version": "1.6.0"}})
+    rc = check_binding_hash.check(_serving(_yaml(_binding_doc()), profile=stale))
+
+    assert rc == check_binding_hash.EXIT_MISMATCH
+    err = capsys.readouterr().err
+    assert "ambiguous version" in err
+    assert "1.6.0" in err
+
+
+def test_the_profile_is_read_from_the_same_gitops_ref():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=_yaml(_PROFILE_DOC))
+
+    check_binding_hash.fetch_profile("issue-investigator-default", httpx.MockTransport(handler))
+    (request,) = seen
+    assert request.url.path == (
+        "/repos/mctlhq/mctl-gitops/contents/platform-gitops/agent-platform/"
+        "execution-profiles/issue-investigator-default/profile.yaml"
+    )
+    assert request.url.params["ref"] == "main"
+
+
+_UNOBSERVABLE_PROFILE = {
+    "404": {"profile_status": 404},
+    "500": {"profile_status": 500},
+    "malformed yaml": {"profile": b"spec: [unclosed"},
+    "not a profile": {"profile": _yaml({**_PROFILE_DOC, "kind": "Something"})},
+    "another profile": {"profile": _yaml({**_PROFILE_DOC, "metadata": {"name": "other"}})},
+    "no spec.version": {"profile": _yaml({**_PROFILE_DOC, "spec": {}})},
+}
+
+
+@pytest.mark.parametrize("kwargs", list(_UNOBSERVABLE_PROFILE.values()), ids=list(_UNOBSERVABLE_PROFILE))
+def test_an_unobservable_profile_fails_closed(kwargs, capsys):
+    rc = check_binding_hash.check(_serving(_yaml(_binding_doc()), **kwargs))
+
+    assert rc == check_binding_hash.EXIT_UNOBSERVED
+    captured = capsys.readouterr()
+    assert "ok:" not in captured.out
+    assert "FAILED CLOSED" in captured.err
 
 
 def _seen_request(monkeypatch, **env: str) -> httpx.Request:
@@ -323,3 +393,4 @@ def test_the_release_gate_takes_only_manifests_from_the_release_commit():
     assert 'git checkout --quiet "$sha" -- agents/_manifests' in run
     assert "--detach" not in run
     assert "select(. != null)" in run
+    assert 'git cat-file -e "${sha}:agents/_manifests/issue-investigator/agent.yaml"' in run

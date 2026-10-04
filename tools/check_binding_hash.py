@@ -29,8 +29,9 @@ Exit codes keep "could not observe" apart from "observed a mismatch":
     0  the pins match
     1  the pins differ (contentHash or a field execute() cross-checks), or
        the local agent.yaml is itself unresolvable
-    2  the binding could not be read or validated (network error, non-200,
-       malformed YAML, missing or invalid contentHash). Never a match.
+    2  the binding, or the execution profile it names, could not be read or
+       validated (network error, non-200, malformed YAML, missing or invalid
+       contentHash or spec.version). Never a match.
 
 The re-pin procedure is docs/runbooks/agent-yaml-binding-repin.md.
 """
@@ -57,7 +58,9 @@ BINDING_PATH = f"platform-gitops/agent-platform/releases/{ENVIRONMENT}/{AGENT}.y
 # The contents API rather than raw.githubusercontent.com: the raw CDN caches
 # for up to five minutes, so right after a re-pin merges it would keep
 # serving the old hash and fail a release that is in fact correct.
-BINDING_URL = f"https://api.github.com/repos/{GITOPS_REPO}/contents/{BINDING_PATH}"
+CONTENTS_API = f"https://api.github.com/repos/{GITOPS_REPO}/contents"
+BINDING_URL = f"{CONTENTS_API}/{BINDING_PATH}"
+PROFILES_PATH = "platform-gitops/agent-platform/execution-profiles"
 RUNBOOK = "docs/runbooks/agent-yaml-binding-repin.md"
 TIMEOUT_S = 20.0
 
@@ -78,6 +81,16 @@ def fetch_binding(transport: httpx.BaseTransport | None = None) -> bytes:
     the binding being absent would make the resolver fail closed at run time
     too ("missing release"), so it is not a state a release may ship into.
     """
+    return _fetch(BINDING_URL, transport)
+
+
+def fetch_profile(name: str, transport: httpx.BaseTransport | None = None) -> bytes:
+    """Return the raw `ExecutionProfile` bytes for `name` from mctl-gitops
+    `main`, with the same failure semantics as `fetch_binding`."""
+    return _fetch(f"{CONTENTS_API}/{PROFILES_PATH}/{name}/profile.yaml", transport)
+
+
+def _fetch(url: str, transport: httpx.BaseTransport | None) -> bytes:
     headers = {"Accept": "application/vnd.github.raw", "X-GitHub-Api-Version": "2022-11-28"}
     # Optional: the repository is public. In Actions the token lifts the
     # 60-requests-per-hour anonymous limit that shared runner IPs can hit.
@@ -86,15 +99,15 @@ def fetch_binding(transport: httpx.BaseTransport | None = None) -> bytes:
         headers["Authorization"] = f"Bearer {token}"
     try:
         with httpx.Client(transport=transport, timeout=TIMEOUT_S, follow_redirects=True) as client:
-            response = client.get(BINDING_URL, params={"ref": GITOPS_REF}, headers=headers)
+            response = client.get(url, params={"ref": GITOPS_REF}, headers=headers)
     except httpx.HTTPError as exc:
-        raise BindingUnobservable(f"could not fetch {BINDING_URL}: {exc!r}") from exc
+        raise BindingUnobservable(f"could not fetch {url}: {exc!r}") from exc
     if response.status_code != 200:
         raise BindingUnobservable(
-            f"could not fetch {BINDING_URL}: HTTP {response.status_code} {response.text[:200]!r}"
+            f"could not fetch {url}: HTTP {response.status_code} {response.text[:200]!r}"
         )
     # An empty 200 needs no case of its own: it parses to no mapping, which
-    # `parse_binding` already refuses.
+    # `parse_binding` and `parse_profile_version` already refuse.
     return response.content
 
 
@@ -109,6 +122,28 @@ def parse_binding(raw: bytes) -> resolver.ReleaseBinding:
     except resolver.ResolverError as exc:
         raise BindingUnobservable(str(exc)) from exc
     return binding
+
+
+def parse_profile_version(raw: bytes, name: str) -> str:
+    """The declared spec.version of a fetched `ExecutionProfile`. Only the
+    fields this gate needs are checked, as `load_profile` checks them; the
+    rest of the profile is mctl-gitops' to validate. Anything unreadable is
+    `BindingUnobservable`."""
+    label = Path(f"{GITOPS_REPO}@{GITOPS_REF}") / PROFILES_PATH / name / "profile.yaml"
+    try:
+        document = resolver.parse_yaml_mapping(raw, path=label)
+    except resolver.ResolverError as exc:
+        raise BindingUnobservable(str(exc)) from exc
+    metadata = document.get("metadata")
+    spec = document.get("spec")
+    if document.get("kind") != "ExecutionProfile" or not isinstance(metadata, dict) or not isinstance(spec, dict):
+        raise BindingUnobservable(f"{label}: not an ExecutionProfile with metadata and spec")
+    if metadata.get("name") != name:
+        raise BindingUnobservable(f"{label}: metadata.name {metadata.get('name')!r} is not {name!r}")
+    version = spec.get("version")
+    if not isinstance(version, str) or not version:
+        raise BindingUnobservable(f"{label}: spec.version is required")
+    return version
 
 
 def _error(message: str) -> None:
@@ -159,23 +194,42 @@ def check(transport: httpx.BaseTransport | None = None) -> int:
 
     # The hash is necessary, not sufficient: execute() also requires the
     # binding's definition.name, profile.name and profileCompatibility mirror
-    # to agree with agent.yaml, and the profile version to satisfy it. A
-    # re-pin that updated only the hash would pass the comparison above and
-    # still fail every run, so the gate runs the resolver's own checks too.
+    # to agree with agent.yaml, the binding's profile.version to be the
+    # catalog profile's spec.version, and that version to satisfy agent.yaml's
+    # range. A re-pin that updated only the hash would pass the comparison
+    # above and still fail every run, so the gate runs the resolver's own
+    # checks too, against the profile on the same gitops ref.
     try:
         resolver.check_binding_against_definition(binding, definition)
-        resolver.check_profile_compatibility(definition, binding.profile_version)
     except resolver.ResolverError as exc:
+        return _mirrored_mismatch(relpath, exc)
+    try:
+        profile_version = parse_profile_version(fetch_profile(binding.profile_name, transport), binding.profile_name)
+    except BindingUnobservable as exc:
         _error(
-            f"{relpath} matches the {ENVIRONMENT} binding's contentHash, but the binding disagrees with it "
-            "elsewhere: every declarative investigation would fail with ResolverError.\n"
-            f"  {exc}\n"
-            f"Re-pin the mirrored fields in mctl-gitops too; see {RUNBOOK}."
+            f"binding check FAILED CLOSED: the execution profile {binding.profile_name!r} could not be read, "
+            "so whether the binding matches it is unknown, and unknown is not a match.\n"
+            f"  {exc}"
         )
-        return EXIT_MISMATCH
+        return EXIT_UNOBSERVED
+    try:
+        resolver.check_binding_profile_version(binding, profile_version)
+        resolver.check_profile_compatibility(definition, profile_version)
+    except resolver.ResolverError as exc:
+        return _mirrored_mismatch(relpath, exc)
 
     print(f"ok: {relpath} matches {GITOPS_REPO}@{GITOPS_REF} bindingRevision {revision} ({local_hash})")
     return EXIT_MATCH
+
+
+def _mirrored_mismatch(relpath: Path, exc: resolver.ResolverError) -> int:
+    _error(
+        f"{relpath} matches the {ENVIRONMENT} binding's contentHash, but the binding disagrees with it "
+        "elsewhere: every declarative investigation would fail with ResolverError.\n"
+        f"  {exc}\n"
+        f"Re-pin the mirrored fields in mctl-gitops too; see {RUNBOOK}."
+    )
+    return EXIT_MISMATCH
 
 
 if __name__ == "__main__":

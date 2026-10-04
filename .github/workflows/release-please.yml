@@ -103,6 +103,11 @@ jobs:
           uv sync --locked
           for sha in $SHAS; do
             echo "== release commit $sha"
+            if ! git cat-file -e "${sha}:agents/_manifests/issue-investigator/agent.yaml" 2>/dev/null; then
+              echo "::error::Release commit $sha has no agents/_manifests/issue-investigator/agent.yaml, so the gate cannot check it." \
+                   "If that release should not be cut, remove the 'autorelease: pending' label from its PR; otherwise tag it by hand."
+              exit 1
+            fi
             rm -rf agents/_manifests
             git checkout --quiet "$sha" -- agents/_manifests
             uv run --locked python tools/check_binding_hash.py

@@ -59,7 +59,10 @@ treated as a match. Re-run it once the read works.
    |---|---|
    | `metadata.name` | `spec.definition.name` |
    | `spec.executionProfileRef.name` | `spec.profile.name` |
-   | `spec.executionProfileRef.compatibility` | `spec.definition.profileCompatibility` (and `spec.profile.version` must satisfy it) |
+   | `spec.executionProfileRef.compatibility` | `spec.definition.profileCompatibility` |
+
+   `spec.profile.version` must also equal the catalog profile's `spec.version` and satisfy
+   that range; the gate reads the profile from the same mctl-gitops ref to check it.
 
    The gate runs the resolver's own checks for all of these, not only the hash.
 3. **Merge the mctl-agents PR.** Production is unaffected: it still runs the old image
@@ -134,11 +137,14 @@ ahead of time:
 - a manual `mctl_publish_agent_version` or `mctl_promote_agent`, or a rollback, to a
   version whose `agent.yaml` differs from the pin;
 - an explicit `agent_image` passed at submission;
-- a change to the binding on the mctl-gitops side.
+- a change to the binding or the execution profile on the mctl-gitops side. The
+  `binding hash` job only runs on mctl-agents events, so a gitops edit that breaks the pin
+  shows up only on the next mctl-agents PR or push, or at run time.
+- **a `promptSources` path in `agent.yaml` that is missing from the image.** The gate
+  covers the binding-vs-definition pair, not every `ResolverError` a release can
+  introduce; the `tests` job catches this one at PR time, but not in front of the release.
 - **any agent other than `issue-investigator`, or any environment other than `shadow`.**
   The tool checks exactly that one binding, because today only the investigate CWFT sets
   a declarative resolver mode. `release-deploy` bumps `agent_image` in every
   `cwft-mctl-agents-*.yaml`, so when another CWFT goes declarative, extend
-  `tools/check_binding_hash.py` to cover its binding in the same change. The `binding hash` job only runs on
-  mctl-agents events, so a gitops edit that breaks the pin shows up only on the next
-  mctl-agents PR or push, or at run time.
+  `tools/check_binding_hash.py` to cover its binding in the same change.
