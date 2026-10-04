@@ -73,6 +73,21 @@ GITHUB_PR_MERGE = "github.pull_request.merge"
 GITHUB_PR_COMMENT = "github.pull_request.comment"
 GITHUB_RUN_RERUN = "github.actions.run.rerun"
 GITHUB_ISSUE_LABEL = "github.issue.label"
+#: Every governed action kind above, as one closed set. The evidence
+#: contract's `ToolCallRef.kind` vocabulary is this set (ADR 018 Amendment 2),
+#: so a new action kind must be added here to be recordable there.
+ACTION_KINDS = frozenset({
+    GITHUB_ISSUE_COMMENT,
+    MCTL_OPERATION_EXECUTE,
+    MCTL_WORK_ITEM_WRITE,
+    MCP_TOOL_CALL,
+    GITHUB_GIT_PUSH,
+    GITHUB_PR_CREATE,
+    GITHUB_PR_MERGE,
+    GITHUB_PR_COMMENT,
+    GITHUB_RUN_RERUN,
+    GITHUB_ISSUE_LABEL,
+})
 
 # Decision codes. `allowed`/`approved` permit; every other code refuses.
 CODE_ALLOWED = "allowed"
