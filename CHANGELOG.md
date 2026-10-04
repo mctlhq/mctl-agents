@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.66.0](https://github.com/mctlhq/mctl-agents/compare/1.65.0...1.66.0) (2026-10-04)
+
+
+### Features
+
+* **agents:** issue-473-feat-human-input-prove-investigator-to-h ([6a29b5f](https://github.com/mctlhq/mctl-agents/commit/6a29b5fd489988a4247ea8a7c2e01f881e75c5ad))
+
 ## [1.65.0](https://github.com/mctlhq/mctl-agents/compare/1.64.1...1.65.0) (2026-10-04)
 
 
