@@ -1,0 +1,127 @@
+# Re-pinning the issue-investigator binding after an agent.yaml change
+
+Context: mctlhq/mctl-agents#565, mctl-gitops#1585.
+
+`mctl-agents-investigate` runs `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative`. Every
+run hashes `agents/_manifests/issue-investigator/agent.yaml` inside the image it runs and
+compares the result with `spec.sourceManifest.contentHash` in mctl-gitops
+`platform-gitops/agent-platform/releases/shadow/issue-investigator.yaml`. The run reads
+that binding from a fresh clone of mctl-gitops `main` when it starts. If the hashes
+differ, `orchestrator/resolver.py` raises `ResolverError` before the model runs, and the
+investigation fails.
+
+So any byte change to `agent.yaml`, comments and whitespace included, needs a matching
+re-pin in mctl-gitops.
+
+## What checks the pair
+
+`tools/check_binding_hash.py` compares the local `agent.yaml` hash with the binding on
+mctl-gitops `main`. It reuses the resolver's own hashing and binding parser. It runs in
+two places:
+
+- **The `binding hash` job in `pr-validation.yml`**, on every PR and every push to `main`.
+  It tells the author at PR time that the binding needs a re-pin.
+- **The `binding gate` job in `release-please.yml`.** The `release-please` job
+  `needs` it, and that job does everything a release does: it creates the tag, dispatches
+  `release-deploy` (which builds the image and bumps `agent_image` in every
+  `cwft-mctl-agents-*.yaml`), and publishes and promotes the agents in the registry. If the
+  gate fails, none of that happens, and production stays on the previous, matching release.
+  The gate only runs when a merged release PR is still labelled `autorelease: pending`, that
+  is, when the run is about to cut a release. It checks `agent.yaml` at that PR's merge
+  commit, which is the commit that gets tagged.
+
+Exit codes: `0` means the hashes match. `1` means they differ, or the local `agent.yaml`
+does not resolve. `2` means the binding could not be read or validated: a network error, a
+non-200 response, malformed YAML, or a missing or invalid `contentHash`. Code `2` is never
+treated as a match. Re-run it once the read works.
+
+## Procedure for a legitimate change
+
+1. **Open the mctl-agents PR** that changes `agent.yaml`. The `binding hash` job and the
+   real-catalog resolver tests in `tests` turn red. That is expected; review everything
+   else as usual.
+2. **Prepare the mctl-gitops re-pin PR, but do not merge it yet.** Take the hash of the
+   PR's final `agent.yaml`:
+
+   ```sh
+   git show <pr-head-sha>:agents/_manifests/issue-investigator/agent.yaml | shasum -a 256
+   ```
+
+   Set `spec.sourceManifest.contentHash: "sha256:<hex>"`, bump `bindingRevision`, set
+   `previousBindingRevision`, and add a `history` entry. If the PR changes after this
+   step, recompute the hash.
+3. **Merge the mctl-agents PR.** Production is unaffected: it still runs the old image
+   against the old pin. release-please folds the change into its release PR. The
+   `binding hash` check on `main` stays red until step 4.
+4. **Merge the re-pin.** The production window opens here. Every new investigation still
+   runs the old image, whose `agent.yaml` no longer matches the pin, and fails with
+   `ResolverError`. Runs that started earlier already hold their own clone and are not
+   affected.
+5. **Merge the release PR immediately.** The `binding gate` now passes, the release is
+   cut, `release-deploy` builds the image and bumps the CWFTs, and the registry promotes
+   `issue-investigator`.
+6. **The window closes** when both of these are true:
+   - the new image exists in GHCR, which registry-pinned DevLoop runs need, since promotion
+     happens before the build finishes;
+   - Argo CD has synced the bumped `cwft-mctl-agents-investigate`, which submissions that
+     do not pin an image need.
+
+   Check with `mctl_resolve_agent issue-investigator` and the CWFT's `agent_image` default.
+
+**How long the window is:** the release-please run, plus the image build (recent
+`release-deploy admins/mctl-agents` runs took about 1.5 to 2.5 minutes: 1.64.1, 1.65.0
+and 1.66.0), plus the Argo CD sync of the CWFT. It also includes however long the
+release PR takes to merge after the re-pin, so do steps 4 and 5 back to back. Investigations
+triggered inside the window fail and have to be re-triggered. Pick a quiet time.
+
+Reversing the order does not avoid the window, it moves it. If the release goes first,
+the new image runs against the old pin and fails in the same way. The gate refuses that
+order anyway.
+
+## The window cannot be closed with a single pinned hash
+
+The binding accepts exactly one `agent.yaml` hash, and production switches from the old
+image to the new one over an interval rather than at one instant. Whichever hash is
+pinned during that interval, one of the two images fails. Ordering the steps cannot fix
+that; it can only shorten the interval.
+
+**A proposal, not implemented:** let the binding accept a *next* hash during a
+transition, for example `spec.sourceManifest.nextContentHash` or a two-entry
+`contentHashes` list. The resolver would accept either hash, and the gate would require
+the release's hash to be one of them. The procedure would become:
+
+1. add the new hash as `next`; both images now resolve;
+2. release and promote;
+3. once nothing runs the old image, promote `next` to `contentHash` and drop the old hash.
+
+That has no failure window. It needs a binding-schema and validator change in
+mctl-gitops and a resolver change here, and the owner has to decide on it.
+
+## If the gate stopped a release
+
+Telegram reports "release stopped by the binding gate", and no tag, image or promotion
+exists.
+
+- **If the change was intended:** do steps 2 and 4 above, then re-run the failed workflow
+  run with `gh run rerun <run-id> --failed`. The release PR is still labelled
+  `autorelease: pending`, so the re-run cuts the release.
+- **If it was not intended:** revert the `agent.yaml` change on `main`. The next push
+  re-runs the gate.
+- **On exit code 2** (unknown): read the error. A GitHub outage or rate limit just needs a
+  re-run. A malformed binding on mctl-gitops `main` needs fixing there first, because the
+  resolver would fail on it at run time too.
+
+## Paths this gate does not cover
+
+These bypass the release workflow. The resolver's own run-time check still applies, so
+they fail closed rather than run with the wrong definition, but nothing warns about them
+ahead of time:
+
+- a manual `gitops-bump.yaml` or `release-deploy.yaml` dispatch in mctl-gitops with an
+  mctl-agents tag;
+- a manual `mctl_publish_agent_version` or `mctl_promote_agent`, or a rollback, to a
+  version whose `agent.yaml` differs from the pin;
+- an explicit `agent_image` passed at submission;
+- a change to the binding on the mctl-gitops side. The `binding hash` job only runs on
+  mctl-agents events, so a gitops edit that breaks the pin shows up only on the next
+  mctl-agents PR or push, or at run time.

@@ -377,6 +377,17 @@ def _read_yaml_and_hash(path: Path) -> tuple[dict[str, Any], str]:
     than a live bug — but the fix is one read instead of two.
     """
     raw = _read_bytes(path)
+    return parse_yaml_mapping(raw, path=path), _hash_bytes(raw)
+
+
+def parse_yaml_mapping(raw: bytes, *, path: Path) -> dict[str, Any]:
+    """Parse `raw` as a YAML document whose root is a mapping.
+
+    Split out of `_read_yaml_and_hash` so that bytes which did not come from
+    a local file — the release gate fetches the gitops binding over HTTP
+    (tools/check_binding_hash.py, mctlhq/mctl-agents#565) — go through the
+    exact parser the resolver uses at runtime. `path` only labels errors.
+    """
     try:
         document = yaml.safe_load(raw.decode("utf-8"))
     except UnicodeDecodeError as exc:
@@ -385,7 +396,7 @@ def _read_yaml_and_hash(path: Path) -> tuple[dict[str, Any], str]:
         raise ResolverError(f"{path}: invalid YAML: {exc}") from exc
     if not isinstance(document, dict):
         raise ResolverError(f"{path}: root must be a mapping")
-    return document, _hash_bytes(raw)
+    return document
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -774,7 +785,19 @@ def load_release_binding(agent: str, environment: str = DEFAULT_ENVIRONMENT) -> 
         raise ResolverError(
             f"missing release: no {environment!r} binding for {agent!r} at {path}"
         )
-    document = _read_yaml(path)
+    return parse_release_binding(_read_yaml(path), path=path, agent=agent, environment=environment)
+
+
+def parse_release_binding(
+    document: dict[str, Any], *, path: Path, agent: str, environment: str = DEFAULT_ENVIRONMENT
+) -> ReleaseBinding:
+    """Validate an already-parsed `ReleaseBindingIntent` document.
+
+    `load_release_binding` is this plus the file read. The release gate
+    (tools/check_binding_hash.py) calls it on a binding fetched from
+    mctl-gitops main, so a binding the gate accepts is one this resolver
+    would accept too — there is one definition of a valid binding, not two.
+    """
     if document.get("apiVersion") != SUPPORTED_DEFINITION_API_VERSION:
         raise ResolverError(f"{path}: unsupported binding apiVersion {document.get('apiVersion')!r}")
     if document.get("kind") != SUPPORTED_BINDING_KIND:

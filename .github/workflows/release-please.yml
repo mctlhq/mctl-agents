@@ -18,7 +18,118 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # mctlhq/mctl-agents#565. The investigate CWFT resolves issue-investigator
+  # declaratively (mctl-gitops#1585): every run re-hashes agent.yaml inside
+  # the image and fails closed when that differs from the gitops binding's
+  # spec.sourceManifest.contentHash. A release is what puts a new agent.yaml
+  # in front of production, along TWO paths, both driven by the
+  # release-please job below:
+  #   - "Dispatch centralized release-deploy" builds the image and bumps
+  #     agent_image in every cwft-mctl-agents-*.yaml, so any submission that
+  #     does not pin an image runs the new one as soon as Argo CD syncs;
+  #   - "Refresh agent registry" publishes and promotes issue-investigator,
+  #     which is the image_ref DevLoopWorkflow pins per run.
+  # So the gate runs BEFORE release-please, not before one of those steps:
+  # failing there stops the tag, the image, the CWFT bump and the promotion
+  # together, and production stays on the previous, matching release.
+  #
+  # Gating here also keeps recovery a plain re-run. release-please cuts a
+  # release for a merged PR still labelled "autorelease: pending" and only
+  # relabels it once the release exists, so a run stopped by this gate leaves
+  # the label in place; after the binding is re-pinned, re-running the
+  # workflow cuts the release normally. A gate placed after release creation
+  # would leave a tag with no image, and a re-run would find nothing pending.
+  binding-gate:
+    name: binding gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # Only a run that will cut a release needs the gate; on every other
+      # push to main release-please only edits its release PR. An empty,
+      # successful listing is GitHub's documented "none pending". A failed
+      # listing is not that: it falls through to gating the head commit,
+      # because a release we could not rule out is one we must check.
+      - name: Find the commit a release would be cut from
+        id: pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          if SHAS=$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged \
+                      --label "autorelease: pending" \
+                      --json mergeCommit --jq '.[].mergeCommit.oid'); then
+            if [ -z "$SHAS" ]; then
+              echo "No merged release PR is pending: this run cuts no release, nothing to gate."
+              echo "shas=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            echo "::warning::Could not list pending release PRs; gating ${GITHUB_SHA} instead of skipping."
+            SHAS="$GITHUB_SHA"
+          fi
+          # One line: a multi-line value would need the heredoc output form.
+          echo "shas=$(tr '\n' ' ' <<< "$SHAS")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ steps.pending.outputs.shas != '' }}
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        if: ${{ steps.pending.outputs.shas != '' }}
+        with:
+          version: "0.11.11"
+          python-version: "3.12"
+          enable-cache: true
+
+      # Checked at the release PR's merge commit, which is the commit
+      # release-please tags and therefore the agent.yaml the image ships —
+      # not merely whatever main's head happens to be.
+      - name: agent.yaml must match the gitops binding at the release commit
+        if: ${{ steps.pending.outputs.shas != '' }}
+        env:
+          SHAS: ${{ steps.pending.outputs.shas }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          uv sync --locked
+          for sha in $SHAS; do
+            echo "== release commit $sha"
+            git checkout --quiet --detach "$sha"
+            uv run --locked python tools/check_binding_hash.py
+          done
+
+      # A stopped release is otherwise silent: the release-please job's own
+      # notification below never runs, because that job never starts.
+      - name: Notify Telegram that the binding gate stopped a release
+        if: ${{ failure() }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "${TELEGRAM_BOT_TOKEN}" ] || [ -z "${TELEGRAM_CHAT_ID}" ]; then
+            echo "Telegram notification skipped: secrets are not configured"
+            exit 0
+          fi
+
+          MESSAGE=$(cat <<EOF
+          ❌ mctl-agents release stopped by the binding gate
+          agent.yaml does not match the mctl-gitops issue-investigator binding, or the binding could not be read. No tag, image or promotion was made.
+          Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          )
+
+          curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}" \
+            -d disable_web_page_preview=true
+
   release-please:
+    needs: binding-gate
     runs-on: ubuntu-latest
     steps:
       # Uses mctl-agents, the backend-only automation App — deliberately NOT
