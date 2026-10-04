@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from math import lcm
 from types import SimpleNamespace
 
@@ -32,6 +32,7 @@ from temporalio.client import (
 )
 
 from orchestrator.temporal.constants import TASK_QUEUE
+from orchestrator.temporal.scheduled_dispatch import WEEKLY_DISPATCH_TARGETS
 from orchestrator.temporal.worker import ISSUE_POLL_SCHEDULE_ID, _ensure_schedule, setup_schedules
 from orchestrator.temporal.workflows.incidents import IncidentLoopWorkflow
 
@@ -211,7 +212,9 @@ class TestOverlapPolicy:
 
         source = inspect.getsource(setup_schedules)
         declared = source.count("policy=SchedulePolicy(")
-        assert declared == len(client.created), (
+        # The weekly dispatch targets share ONE declaration inside a loop.
+        expected = len(client.created) - len(WEEKLY_DISPATCH_TARGETS) + (1 if WEEKLY_DISPATCH_TARGETS else 0)
+        assert declared == expected, (
             f"{len(client.created)} schedules registered but {declared} declare "
             "policy=SchedulePolicy(...) — an undeclared one inherits temporalio's "
             "default, which is SKIP today and is not a decision this repo made"
@@ -471,6 +474,21 @@ class TestIntakeCadence:
             "they race the shared mctl-gitops-main-writes mutex on every such tick"
         )
 
+    async def test_the_weekly_dispatch_fires_sunday_0901_utc(self):
+        client = _FakeClient(existing=None)
+        await setup_schedules(client)
+
+        schedule = dict(client.created)["dispatch-mctlhq-portfolio-weekly-refresh-schedule"]
+        (interval,) = schedule.spec.intervals
+        assert interval.every == timedelta(days=7)
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        reference = datetime(2026, 10, 1, tzinfo=UTC)
+        period = interval.every
+        n = (reference - epoch - interval.offset) // period + 1
+        fire = epoch + interval.offset + n * period
+        assert (fire.weekday(), fire.hour, fire.minute) == (6, 9, 1)
+        assert fire > reference
+
     async def test_no_schedule_lands_on_an_argo_cron_minute(self):
         """Temporal schedules also avoid the Argo crons holding the same mutex.
 
@@ -504,6 +522,7 @@ class TestIntakeCadence:
                 if hit:
                     offenders[schedule_id] = min(hit)
 
+        assert "dispatch-mctlhq-portfolio-weekly-refresh-schedule" in {sid for sid, _ in client.created}
         assert not offenders, (
             f"{offenders} fire on a minute an Argo cron already uses — both sides "
             "take mctl-gitops-main-writes, so this is contention on the shared mutex"

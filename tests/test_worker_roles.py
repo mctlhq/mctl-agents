@@ -649,3 +649,18 @@ def test_the_visibility_activity_names_the_workflow_schedules_by_string_exist():
         for attr in ("list_active_dev_loop_ids", "count_swept_prestart_failures")
     }
     assert names == {"list_active_dev_loop_ids", "count_swept_prestart_failures"}
+
+
+def test_the_scheduled_dispatch_registers_on_the_control_queue_only(visibility):
+    """mctl-agents#559: workflow and both activities live on the control plan."""
+    from orchestrator.temporal.workflows.scheduled_dispatch import ScheduledDispatchWorkflow
+
+    control = next(p for p in worker_plans("all", visibility) if p.task_queue == TASK_QUEUE)
+    assert ScheduledDispatchWorkflow in control.workflows
+    for name in ("dispatch_and_observe", "report_dispatch_failure"):
+        assert name in control.activity_names
+    for role in ("execution", "implementation"):
+        for plan in worker_plans(role, visibility):
+            assert ScheduledDispatchWorkflow not in plan.workflows
+            assert "dispatch_and_observe" not in plan.activity_names
+            assert "report_dispatch_failure" not in plan.activity_names

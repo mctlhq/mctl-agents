@@ -7,6 +7,8 @@ search-attribute registration) and runs DevLoopWorkflow, ReconcileWorkflow,
 IssuePollWorkflow, IncidentLoopWorkflow, ImplementSweepWorkflow (plus its
 SweptImplementWorkflow child), ActionApprovalWaitWorkflow and their activities on
 task queue TASK_QUEUE.
+ScheduledDispatchWorkflow (mctl-agents#559) dispatches a weekly GitHub workflow
+and fails visibly if no run is observed.
 Deployed as its own service (mctl-agents-worker, ingress disabled), with the
 long Argo waits served by sibling deployments selected by `--role`:
 `execution` (mctl-dev-loop-exec, ADR-008) and `implementation`
@@ -70,6 +72,7 @@ from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import record_execution
 from orchestrator.temporal.activities.stranded import find_stranded_accepted
 from orchestrator.temporal.activities.visibility import VisibilityActivities
+from orchestrator.temporal.activities.workflow_dispatch import dispatch_and_observe, report_dispatch_failure
 from orchestrator.temporal.constants import (
     CONTROL_MAX_CONCURRENT_ACTIVITIES,
     CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
@@ -82,6 +85,7 @@ from orchestrator.temporal.constants import (
     implement_sweep_max_submits,
     implementation_max_concurrent_activities,
 )
+from orchestrator.temporal.scheduled_dispatch import WEEKLY_DISPATCH_TARGETS
 from orchestrator.temporal.tracing import worker_interceptors
 from orchestrator.temporal.workflows.action_approval import ActionApprovalWaitWorkflow
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
@@ -93,6 +97,7 @@ from orchestrator.temporal.workflows.implement_sweep import (
 from orchestrator.temporal.workflows.incidents import IncidentLoopWorkflow
 from orchestrator.temporal.workflows.issue_poll import IssuePollWorkflow, IssuePollWorkflowInput
 from orchestrator.temporal.workflows.reconcile import ReconcileWorkflow, ReconcileWorkflowInput
+from orchestrator.temporal.workflows.scheduled_dispatch import ScheduledDispatchInput, ScheduledDispatchWorkflow
 
 RECONCILE_SCHEDULE_ID = "reconcile-mctl-agents-schedule"
 RECONCILE_WORKFLOW_ID = "reconcile-mctl-agents"
@@ -421,6 +426,23 @@ async def setup_schedules(client: Client) -> None:
 
     await _ensure_schedule(client, IMPLEMENT_SWEEP_SCHEDULE_ID, implement_sweep_schedule, "ImplementSweepWorkflow")
 
+    # Weekly GitHub workflow dispatches (mctl-agents#559). The interval is
+    # derived in scheduled_dispatch.py (weekly, epoch-Thursday offset). The
+    # portfolio target fires Sunday 09:01 UTC: minute :01 is not an Argo cron
+    # minute ({0, 15, 30}) and no other Temporal schedule fires at :01.
+    for target in WEEKLY_DISPATCH_TARGETS:
+        dispatch_schedule = Schedule(
+            action=ScheduleActionStartWorkflow(
+                ScheduledDispatchWorkflow.run,
+                ScheduledDispatchInput(repo=target.repo, workflow_file=target.workflow_file, ref=target.ref),
+                id=target.workflow_id,
+                task_queue=TASK_QUEUE,
+            ),
+            spec=ScheduleSpec(intervals=[target.interval()]),
+            policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
+        )
+        await _ensure_schedule(client, target.schedule_id, dispatch_schedule, "ScheduledDispatchWorkflow")
+
 
 ROLES = ("all", "control", "execution", "implementation")
 
@@ -572,6 +594,10 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         # per-tick merge, so it belongs on the control queue rather than the
         # long-holding execution one.
         merge_pull_request_gated,
+        # mctl-agents#559: bounded GitHub REST calls for the weekly dispatch
+        # and its failure alert issue.
+        dispatch_and_observe,
+        report_dispatch_failure,
     ]
     workflows: list[type] = [
         DevLoopWorkflow,
@@ -580,6 +606,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         IncidentLoopWorkflow,
         ImplementSweepWorkflow,
         SweptImplementWorkflow,
+        ScheduledDispatchWorkflow,
         # The durable wait for a human approval (#198). A new type: started
         # only as a child of a workflow step whose gated activity answered
         # `approval_pending`, which needs MCTL_POLICY_APPROVALS=mctl-api.
