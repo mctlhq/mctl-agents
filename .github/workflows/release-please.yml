@@ -126,12 +126,12 @@ jobs:
             exit 0
           fi
 
-          MESSAGE=$(cat <<EOF
-          ❌ mctl-agents release stopped by the binding gate
-          agent.yaml does not match the mctl-gitops issue-investigator binding, or the binding could not be read. No tag, image or promotion was made.
-          Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
-          EOF
-          )
+          # printf rather than a heredoc: one line per argument, nothing that
+          # depends on how the block scalar's indentation is stripped.
+          MESSAGE=$(printf '%s\n' \
+            "❌ mctl-agents release stopped by the binding gate" \
+            "agent.yaml does not match the mctl-gitops issue-investigator binding, or the binding or its execution profile could not be read. No tag, image or promotion was made." \
+            "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
 
           curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
