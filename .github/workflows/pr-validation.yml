@@ -229,6 +229,34 @@ jobs:
           MCTL_GITOPS_ROOT: ${{ github.workspace }}/_gitops/platform-gitops
         run: uv run --locked pytest -q
 
+  # mctlhq/mctl-agents#565: the PR-time half of the release binding gate in
+  # release-please.yml. Fails when agent.yaml no longer matches the
+  # issue-investigator binding on mctl-gitops main, so the author learns at
+  # PR time that the binding needs a re-pin rather than at release time. Its
+  # own job, not a step of `tests`, so the red check names the cause; the
+  # `tests` job fails on the same drift too (the real-catalog resolver
+  # tests), but as one ResolverError among many. Network on purpose: the
+  # unit tests mock the fetch, and this is the one live comparison.
+  binding-hash:
+    name: binding hash
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.11.11"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: agent.yaml must match the gitops binding
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          uv sync --locked
+          uv run --locked python tools/check_binding_hash.py
+
   lint:
     name: lint
     runs-on: ubuntu-latest

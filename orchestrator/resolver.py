@@ -377,6 +377,17 @@ def _read_yaml_and_hash(path: Path) -> tuple[dict[str, Any], str]:
     than a live bug — but the fix is one read instead of two.
     """
     raw = _read_bytes(path)
+    return parse_yaml_mapping(raw, path=path), _hash_bytes(raw)
+
+
+def parse_yaml_mapping(raw: bytes, *, path: Path) -> dict[str, Any]:
+    """Parse `raw` as a YAML document whose root is a mapping.
+
+    Split out of `_read_yaml_and_hash` so that bytes which did not come from
+    a local file — the release gate fetches the gitops binding over HTTP
+    (tools/check_binding_hash.py, mctlhq/mctl-agents#565) — go through the
+    exact parser the resolver uses at runtime. `path` only labels errors.
+    """
     try:
         document = yaml.safe_load(raw.decode("utf-8"))
     except UnicodeDecodeError as exc:
@@ -385,7 +396,7 @@ def _read_yaml_and_hash(path: Path) -> tuple[dict[str, Any], str]:
         raise ResolverError(f"{path}: invalid YAML: {exc}") from exc
     if not isinstance(document, dict):
         raise ResolverError(f"{path}: root must be a mapping")
-    return document, _hash_bytes(raw)
+    return document
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -774,7 +785,19 @@ def load_release_binding(agent: str, environment: str = DEFAULT_ENVIRONMENT) -> 
         raise ResolverError(
             f"missing release: no {environment!r} binding for {agent!r} at {path}"
         )
-    document = _read_yaml(path)
+    return parse_release_binding(_read_yaml(path), path=path, agent=agent, environment=environment)
+
+
+def parse_release_binding(
+    document: dict[str, Any], *, path: Path, agent: str, environment: str = DEFAULT_ENVIRONMENT
+) -> ReleaseBinding:
+    """Validate an already-parsed `ReleaseBindingIntent` document.
+
+    `load_release_binding` is this plus the file read. The release gate
+    (tools/check_binding_hash.py) calls it on a binding fetched from
+    mctl-gitops main, so a binding the gate accepts is one this resolver
+    would accept too — there is one definition of a valid binding, not two.
+    """
     if document.get("apiVersion") != SUPPORTED_DEFINITION_API_VERSION:
         raise ResolverError(f"{path}: unsupported binding apiVersion {document.get('apiVersion')!r}")
     if document.get("kind") != SUPPORTED_BINDING_KIND:
@@ -956,20 +979,16 @@ def _require_catalog_present() -> None:
     )
 
 
-def execute(agent: str, task: Task) -> ExecutionPlan:
-    """Resolve one immutable `ExecutionPlan` for `agent`, entirely from
-    checked-in v1alpha2 fixtures. Raises `ResolverError` — never falls back —
-    for every missing/ambiguous/disabled/incompatible/unbounded/unapproved
-    condition ADR 007 and mctlhq/mctl-agents#227's acceptance criteria name.
+def check_binding_against_definition(binding: ReleaseBinding, definition: AgentDefinition) -> None:
+    """Every check `execute()` makes between the release binding and this
+    repository's agent.yaml that needs no profile from the catalog.
+
+    Split out of `execute()` so the release gate (tools/check_binding_hash.py,
+    mctlhq/mctl-agents#565) runs exactly these checks, not a subset: the
+    content hash alone is not enough, because a re-pin that updates only the
+    hash would pass while the name or compatibility mirror still drifted and
+    every declarative run would fail on it. Raises `ResolverError`.
     """
-    _require_catalog_present()
-
-    if not task.target_repository_sha or not task.target_repository_sha.strip():
-        raise ResolverError("task.target_repository_sha is required and must be non-empty")
-
-    definition = load_definition(agent)
-    binding = load_release_binding(agent)
-
     if binding.environment != DEFAULT_ENVIRONMENT:
         raise ResolverError(
             f"release binding environment {binding.environment!r} is not the resolver's "
@@ -980,7 +999,6 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
             f"unknown reference: release binding definition.name {binding.definition_name!r} does "
             f"not match resolved definition {definition.name!r}"
         )
-    definition_content_hash = definition.content_hash
 
     # Restore the definition pin the move to the catalog dropped. The
     # fixture this replaced pinned BOTH halves by content hash; the catalog
@@ -994,11 +1012,11 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
     # that one cannot be closed from this repository and is documented and
     # tested as accepted. This one is a gate that existed and was lost, so
     # it is restored rather than described.
-    if binding.definition_content_hash != definition_content_hash:
+    if binding.definition_content_hash != definition.content_hash:
         raise ResolverError(
             f"ambiguous version: release binding sourceManifest.contentHash "
             f"{binding.definition_content_hash!r} does not match the current definition file "
-            f"content ({definition_content_hash!r}) at {definition.path} — the binding is stale "
+            f"content ({definition.content_hash!r}) at {definition.path} — the binding is stale "
             "or the definition changed without re-pinning it"
         )
 
@@ -1024,16 +1042,25 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
             f"{definition.execution_profile_name!r} does not match release binding profile.name "
             f"{binding.profile_name!r}"
         )
-    profile = load_profile(binding.profile_name)
-    if binding.profile_version != profile.version:
+
+
+def check_binding_profile_version(binding: ReleaseBinding, profile_version: str) -> None:
+    """Raise `ResolverError` unless the binding's profile.version is the
+    catalog profile's declared spec.version (`profile_version`)."""
+    if binding.profile_version != profile_version:
         raise ResolverError(
             f"ambiguous version: release binding profile.version {binding.profile_version!r} does "
-            f"not match the profile's declared spec.version ({profile.version!r}) — the binding is "
+            f"not match the profile's declared spec.version ({profile_version!r}) — the binding is "
             "stale or the profile was versioned without re-binding"
         )
 
+
+def check_profile_compatibility(definition: AgentDefinition, profile_version: str) -> None:
+    """Raise `ResolverError` unless `profile_version` satisfies the
+    definition's executionProfileRef.compatibility. `execute()` and the
+    release gate both pass the catalog profile's declared spec.version."""
     if not _version_satisfies(
-        profile.version,
+        profile_version,
         definition.execution_profile_compatibility,
         path=definition.path,
         field_path="spec.executionProfileRef.compatibility",
@@ -1041,9 +1068,31 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
         raise ResolverError(
             f"compatibility mismatch: definition executionProfileRef.compatibility "
             f"{definition.execution_profile_compatibility!r} does not accept the concrete "
-            f"selected profile version {profile.version!r} — compatibility is evaluated "
+            f"selected profile version {profile_version!r} — compatibility is evaluated "
             "against the resolved profile version, not a profile-owned range"
         )
+
+
+def execute(agent: str, task: Task) -> ExecutionPlan:
+    """Resolve one immutable `ExecutionPlan` for `agent`, entirely from
+    checked-in v1alpha2 fixtures. Raises `ResolverError` — never falls back —
+    for every missing/ambiguous/disabled/incompatible/unbounded/unapproved
+    condition ADR 007 and mctlhq/mctl-agents#227's acceptance criteria name.
+    """
+    _require_catalog_present()
+
+    if not task.target_repository_sha or not task.target_repository_sha.strip():
+        raise ResolverError("task.target_repository_sha is required and must be non-empty")
+
+    definition = load_definition(agent)
+    binding = load_release_binding(agent)
+
+    check_binding_against_definition(binding, definition)
+    definition_content_hash = definition.content_hash
+
+    profile = load_profile(binding.profile_name)
+    check_binding_profile_version(binding, profile.version)
+    check_profile_compatibility(definition, profile.version)
 
     model_selection = resolve_model(
         profile.model_policy_task,
