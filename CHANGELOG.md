@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.67.1](https://github.com/mctlhq/mctl-agents/compare/1.67.0...1.67.1) (2026-10-04)
+
+
+### Bug Fixes
+
+* **human-input:** close the deferred P3s from the [#558](https://github.com/mctlhq/mctl-agents/issues/558) review ([8bc2275](https://github.com/mctlhq/mctl-agents/commit/8bc22758364ffe841b7d6fde3e9df4cb88676f79))
+* **human-input:** close the deferred P3s from the [#558](https://github.com/mctlhq/mctl-agents/issues/558) review ([ea0a79d](https://github.com/mctlhq/mctl-agents/commit/ea0a79d953573f7f03429b4f20355a0bd6e16c8c)), closes [#563](https://github.com/mctlhq/mctl-agents/issues/563)
+
 ## [1.67.0](https://github.com/mctlhq/mctl-agents/compare/1.66.0...1.67.0) (2026-10-04)
 
 
