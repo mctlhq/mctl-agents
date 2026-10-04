@@ -38,6 +38,8 @@ _AGENT_YAML = _REPO_ROOT / "agents" / "_manifests" / "issue-investigator" / "age
 def _no_retry_backoff(monkeypatch):
     """Retries are exercised, their sleeps are not."""
     monkeypatch.setattr(check_binding_hash, "RETRY_BACKOFF_S", 0.0)
+    # A 429's Retry-After bypasses RETRY_BACKOFF_S, so stub sleep itself.
+    monkeypatch.setattr(check_binding_hash.time, "sleep", lambda seconds: None)
 
 
 def _sha256(raw: bytes) -> str:

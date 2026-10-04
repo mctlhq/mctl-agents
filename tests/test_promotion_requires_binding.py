@@ -411,7 +411,7 @@ def test_dry_run_reports_the_verdict_and_writes_nothing(registry, capsys):
 @pytest.mark.parametrize(
     ("header", "expected"),
     [("7", 7.0), ("60", 60.0), ("Wed, 21 Oct 2026 07:28:00 GMT", 2.0), (None, 2.0)],
-    ids=["seconds", "at the cap", "http-date", "absent"],
+    ids=["seconds", "at the limit", "http-date", "absent"],
 )
 def test_a_429_waits_for_retry_after(header, expected, registry, monkeypatch):
     monkeypatch.setattr(gate, "RETRY_BACKOFF_S", 2.0)

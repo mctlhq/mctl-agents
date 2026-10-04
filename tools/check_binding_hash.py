@@ -86,7 +86,7 @@ RETRY_BACKOFF_S = 2.0
 # A 429's Retry-After (normally 60s) is honoured up to this cap. A hint above
 # it refuses at once as unobservable rather than retrying early, which GitHub
 # documents can extend the block: wait it out and promote by hand.
-RETRY_AFTER_CAP_S = 60.0
+RETRY_AFTER_MAX_S = 60.0
 
 EXIT_MATCH = 0
 EXIT_MISMATCH = 1
@@ -182,7 +182,7 @@ def _fetch(url: str, transport: httpx.BaseTransport | None) -> bytes:
 
 def _retry_after(response: httpx.Response, *, default: float) -> float | None:
     """Seconds a 429 asks us to wait, or None when that exceeds
-    RETRY_AFTER_CAP_S and the read should give up now. The header may also be
+    RETRY_AFTER_MAX_S and the read should give up now. The header may also be
     an HTTP-date; anything unparseable uses `default`."""
     try:
         wait = float(response.headers.get("Retry-After", default))
@@ -190,7 +190,7 @@ def _retry_after(response: httpx.Response, *, default: float) -> float | None:
         wait = default
     if wait != wait:  # nan
         wait = default
-    if wait > RETRY_AFTER_CAP_S:
+    if wait > RETRY_AFTER_MAX_S:
         return None
     return max(0.0, wait)
 
