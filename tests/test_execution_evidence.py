@@ -10,6 +10,7 @@ tests/test_context_snapshot.py.
 """
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import json
 import re
@@ -1240,8 +1241,9 @@ def test_resolve_current_never_returns_sha1_evidence_for_sha2():
     at_sha1 = _pr_evidence(revision=_SHA1)
     assert _resolve([at_sha1], revision=_SHA1).evidence == at_sha1
     result = _resolve([at_sha1], revision=_SHA2)
-    assert result.state == "no_evidence"
+    assert result.state == "stale_revision"
     assert result.evidence is None
+    assert _resolve([], revision=_SHA2).state == "no_evidence"
 
 
 def test_resolve_current_drops_a_superseded_envelope():
@@ -1468,9 +1470,87 @@ def test_resolve_current_pools_issue_evidence_by_its_version_token():
     versioned = _issue_evidence(revision="2026-10-04T10:00:00Z")
     assert _resolve_issue([unversioned, versioned]).evidence == unversioned
     assert _resolve_issue([unversioned, versioned], revision="2026-10-04T10:00:00Z").evidence == versioned
-    assert _resolve_issue([unversioned], revision="2026-10-04T10:00:00Z").state == "no_evidence"
+    assert _resolve_issue([unversioned], revision="2026-10-04T10:00:00Z").state == "stale_revision"
+    assert _resolve_issue([], revision="2026-10-04T10:00:00Z").state == "no_evidence"
 
 
 def test_a_blank_revision_is_unknown_only_for_sha_bound_kinds():
     assert _resolve([_pr_evidence()], revision="").state == "unknown_revision"
     assert _resolve_issue([_issue_evidence()]).state == "current"
+
+
+# -- review round 3 (PR #575) -----------------------------------------------
+
+
+def _fully_populated(subject: ee.SubjectRef) -> ee.ExecutionEvidence:
+    return _seal(versions=_versions(), subject=subject, tool_calls=[_tool_call()], provenance=_provenance())
+
+
+def _blank_leaf(evidence: ee.ExecutionEvidence, leaf: str) -> ee.ExecutionEvidence:
+    block, field_name = leaf.split(".", 1)
+    field_name = "ref" if field_name == "number" else field_name
+    if block == "tool_call":
+        return dataclasses.replace(
+            evidence, tool_calls=(dataclasses.replace(evidence.tool_calls[0], **{field_name: ""}),)
+        )
+    return dataclasses.replace(evidence, **{block: dataclasses.replace(getattr(evidence, block), **{field_name: ""})})
+
+
+_GAP_BLOCK = {"tool_call": "tool_calls"}
+
+
+@pytest.mark.parametrize(
+    "subject",
+    (_subject(), _subject(kind="branch", ref="feat/x"), _subject(kind="release", ref="1.2.0")),
+    ids=("pull_request", "branch", "release"),
+)
+def test_redactable_required_leaves_is_exactly_the_set_a_redaction_gap_excuses(subject):
+    sealed = _fully_populated(subject)
+    leaves = [leaf for leaf, _, _ in ee._required_leaves(
+        versions=sealed.versions, subject=sealed.subject, tool_calls=sealed.tool_calls, provenance=sealed.provenance,
+    )]
+    excused = set()
+    for leaf in leaves:
+        blanked = _blank_leaf(sealed, leaf)
+        with pytest.raises(ee.ExecutionEvidenceError):
+            blanked.validate()  # never excused without a gap
+        block = leaf.split(".", 1)[0]
+        gapped = dataclasses.replace(
+            blanked, gaps=(ee.Gap(block=_GAP_BLOCK.get(block, block), code="redacted_out", required=True),)
+        )
+        try:
+            gapped.validate()
+            excused.add(leaf)
+        except ee.ExecutionEvidenceError:
+            pass
+    assert excused == ee.REDACTABLE_REQUIRED_LEAVES & set(leaves)
+
+
+def test_a_numbered_ref_is_never_excused_by_a_declared_redaction_gap():
+    sealed = _seal(subject=_subject(), provenance=_provenance())
+    doc = sealed.to_dict()
+    doc["subject"]["ref"] = ""
+    doc["gaps"] = [{"block": "subject", "code": "redacted_out", "required": True}]
+    with pytest.raises(ee.ExecutionEvidenceError, match=r"subject\.ref is required"):
+        ee.ExecutionEvidence.from_dict(doc)
+
+
+def _work_item_evidence(**subject_overrides) -> ee.ExecutionEvidence:
+    fields = dict(kind="work_item", ref="wi-1", repository="", revision="")
+    fields.update(subject_overrides)
+    return _seal(subject=_subject(**fields), provenance=_provenance())
+
+
+def test_resolve_current_answers_current_for_a_work_item_subject():
+    evidence = _work_item_evidence()
+    result = ee.resolve_current([evidence], kind="work_item", repository="", ref="wi-1", revision="")
+    assert result.state == "current"
+    assert result.evidence == evidence
+
+
+def test_resolve_current_never_pools_an_envelope_whose_subject_was_redacted():
+    redacted = _work_item_evidence(repository="mctlhq/" + _CREDENTIAL)
+    assert redacted.subject is not None and redacted.subject.key == ("work_item", "", "wi-1")
+    result = ee.resolve_current([redacted], kind="work_item", repository="", ref="wi-1", revision="")
+    assert result.state == "no_evidence"
+    assert result.evidence is None

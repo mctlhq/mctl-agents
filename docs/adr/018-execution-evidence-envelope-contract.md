@@ -669,25 +669,32 @@ and **for the four Amendment 2 blocks that gap is always `required=True`**
 (`AMENDMENT_2_BLOCKS` in `_is_block_required`): each block binds
 identity or trust, so a partly dropped one must leave the envelope
 `INCOMPLETE`. Only three required leaves can legitimately be dropped:
-`subject.ref`, `subject.repository` and `versions.agent`
-(`REDACTABLE_REQUIRED_LEAVES`). These are free-form, pattern-bounded
-strings, and a branch named after a token can trip the credential screen.
+`subject.ref` (for non-numbered kinds only: a `pull_request`/`issue` ref
+is a short decimal that `_safe()` can never drop), `subject.repository`
+and `versions.agent` (`REDACTABLE_REQUIRED_LEAVES`). These are free-form,
+pattern-bounded strings, and a branch named after a token can trip the
+credential screen. One table, `_required_leaves`, lists every required
+leaf. It drives both checks, and `_check_required_leaves` consults
+`REDACTABLE_REQUIRED_LEAVES` directly, so the set is the rule rather than
+a description of it.
 `validate()` tolerates a blank one of those only when a `redacted_out` gap
 names its block, so `seal()` degrades to an explicit gap instead of losing
 the envelope. Every other required leaf is a closed vocabulary, a
 `sha256:` hash, a git SHA or a timestamp. No legitimate value of those can
 trip `_safe()`, so a blank one is always rejected, gap or no gap: a
 credential there is a producer bug and raises. `seal()` also runs a
-presence check on the caller's blocks *before* redaction
-(`_check_required_leaves_supplied`). A leaf the caller never supplied is
+presence check on the caller's blocks *before* redaction (the same
+`_check_required_leaves`, with no redacted blocks). A leaf the caller never supplied is
 therefore never excused by a sibling leaf's redaction. A non-required
 `redacted_out` gap on a new block is rejected (seal never writes one).
 
 **The excusal is declarative.** `from_dict` cannot re-run the redaction
 that produced a gap, so it trusts a required `redacted_out` gap as
-written. That is deliberate and bounded: the envelope is `INCOMPLETE`, only
-the three free-form leaves can be excused, and a blank `ref`/`repository`
-matches no `resolve_current` pool, so such an envelope is never current.
+written. That is deliberate and bounded. The envelope is `INCOMPLETE`,
+only the three free-form leaves can be excused, and `resolve_current`
+excludes every envelope that carries a `redacted_out` gap on `subject`
+from every pool. Such an envelope is never current and never makes a
+subject `stale_revision`.
 
 `Requirements` gains `versions`, `subject`, `tool_calls` and `provenance`
 flags, all `False` by default, so `DEFAULT_REQUIREMENTS` — and every
@@ -708,11 +715,16 @@ which Tier B must reproduce and test against:
    `no_evidence`. For `issue`/`work_item` a blank `revision` *is* the
    revision ("unversioned") and pools with blank-revision evidence.
 2. Pool = candidates with exactly this `subject.key` **and** this
-   `revision`. Everything at another revision is historical by definition.
+   `revision`, excluding any envelope with a `redacted_out` gap on
+   `subject` (it is not bound to a known subject). Everything at another
+   revision is historical by definition.
 3. A pool member named by another pool member's `provenance.supersedes` is
    dropped — but only when the superseding envelope's authority is equal
    or stronger. A link to an envelope outside the pool removes nothing.
-4. Empty → `no_evidence`. Otherwise the highest `(authority rank,
+4. Empty → `stale_revision` when the subject key has (unredacted)
+   evidence at other revisions, else `no_evidence`. "Re-run for this SHA"
+   and "the pipeline never ran" are different decisions for a reader.
+   Otherwise the highest `(authority rank,
    observed_at)` wins: a newer assertion never displaces an older
    observation; among equal authority the later observation wins
    (`observed_at` compared with the fraction normalized, not as raw text).
@@ -801,8 +813,9 @@ producer emits the new blocks:
    "`subject` requires `provenance`", `MAX_TOOL_CALLS`, and
    "`observation_failed` gaps must be `required: true`", "a `redacted_out`
    gap on an Amendment 2 block must be `required: true`, and only such a
-   gap excuses a blank `subject.ref`, `subject.repository` or
-   `versions.agent` (never any other leaf)", the `subject.repository`
+   gap excuses a blank `subject.ref` (non-numbered kinds only),
+   `subject.repository` or `versions.agent`, and never any other leaf", the
+   `subject.repository`
    path-fragment rule, and `release_revision` within signed 64-bit range.
    Violations answer `400 evidence_invalid`.
 3. **Conformance.** Copy `shepherd-pr-evidence.json` and
@@ -822,8 +835,9 @@ producer emits the new blocks:
    ('pull_request','branch','release') OR subject_revision ~
    '^[0-9a-f]{40}([0-9a-f]{24})?$'` (never excused). `subject_ref` /
    `subject_repository` may be `''` only on a row whose envelope carries a
-   required `redacted_out` gap for `subject`. That is the declarative
-   excusal above, not a bug to tighten away. `versions` and `tool_calls`
+   required `redacted_out` gap for `subject` (never `subject_ref` for a
+   `pull_request`/`issue`). That is the declarative excusal above, not a
+   bug to tighten away, and such rows are excluded from the current read. `versions` and `tool_calls`
    stay in the
    verbatim envelope only — no columns, no second copy.
 5. **Index.** `(subject_kind, subject_repository, subject_ref,
@@ -844,8 +858,9 @@ producer emits the new blocks:
    implementing `resolve_current` exactly, including the argument
    validation (a malformed parameter answers `400`, never `no_evidence`),
    and answering `{state, evidence}`
-   with `state` ∈ `current`, `no_evidence`, `unknown_revision`
-   (missing `revision`), `ambiguous`. It loads the complete pool; a pool
+   with `state` ∈ `current`, `stale_revision`, `no_evidence`,
+   `unknown_revision` (missing `revision` for a SHA-bound kind),
+   `ambiguous`. It loads the complete pool; a pool
    larger than the server cap, or any read error, is a `5xx`/typed error —
    never a truncated `no_evidence`. Same authorization as `GET
    /api/v1/evidence` (admin), plus the work-item-scoped variant through
