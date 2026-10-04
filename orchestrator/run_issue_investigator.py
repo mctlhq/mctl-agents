@@ -1597,7 +1597,9 @@ def _parse_human_input_responses(raw: str | None) -> list[dict]:
 
     try:
         data = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: a deeply nested document, which json.loads does
+        # not turn into a ValueError.
         raise bad("is not valid JSON") from None
     if not isinstance(data, list):
         raise bad("must be a JSON array")
@@ -1617,8 +1619,8 @@ def _parse_human_input_responses(raw: str | None) -> list[dict]:
         if not _HUMAN_REQUEST_HASH_RE.fullmatch(entry["request_hash"]):
             raise bad(f"entry {index}: request_hash must be 'sha256:' followed by 64 hex digits")
         try:
-            human_input._parse_iso(entry["received_at"], where="received_at")
-        except human_input.HumanInputError:
+            datetime.fromisoformat(entry["received_at"])
+        except ValueError:
             raise bad(f"entry {index}: received_at is not an ISO-8601 timestamp") from None
         value = entry["value"]
         if not (
@@ -1643,8 +1645,10 @@ def _parse_human_input_responses(raw: str | None) -> list[dict]:
 
 def _human_input_ask_block(granted: bool, answered_count: int) -> str:
     """How to ask for clarification. "" (zero bytes added) unless the plan
-    grants `human.request_input` and a round remains. Appended by `_run_agent`,
-    the only place the resolved plan is known."""
+    grants `human.request_input` and a round remains. Appended by
+    `_build_prompt` for the granted rendering; `_run_agent`, the only place
+    the resolved plan is known, decides whether that rendering is sent
+    (`InvestigatorPrompt.granted()`)."""
     if granted and answered_count < human_input.MAX_CLARIFICATION_ROUNDS:
         return (
             f"""\
@@ -1817,6 +1821,12 @@ def _seal_draft(
     else:
         failure = ""
     _remove_rejected(human_dir)
+    if human_dir.is_symlink() or human_dir.exists():
+        # `_remove_rejected` swallows OSError. What is left is agent-written
+        # and would be published as if it were orchestrator output, so the
+        # run fails here, by name, rather than publishing it or tripping
+        # over it in the mkdir below (#563).
+        raise OSError(f"could not remove {HUMAN_INPUT_DIRNAME}/ from the proposal staging directory")
     if raw is None and not failure:
         return None, ""
 
@@ -1852,11 +1862,16 @@ def _seal_draft(
             or not isinstance(draft["response"], dict)
         ):
             return reject("malformed")
-        moment = now or datetime.now(UTC)
-        created_at = moment.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        moment = (now or datetime.now(UTC)).replace(microsecond=0)
+        created_at = moment.isoformat().replace("+00:00", "Z")
+        # `expires_at` is hash-covered, unlike `created_at`, so it is anchored
+        # to the next whole UTC hour rather than to `moment`: a retried Argo
+        # step re-sealing the same draft within that hour gets the same
+        # request_id, as `seal_request` documents (#563). The TTL becomes
+        # (24h, 25h], well inside MAX_REQUEST_TTL_SECONDS.
         expires_at = (
-            moment.replace(microsecond=0)
-            + timedelta(seconds=human_input.DEFAULT_REQUEST_TTL_SECONDS)
+            moment.replace(minute=0, second=0)
+            + timedelta(hours=1, seconds=human_input.DEFAULT_REQUEST_TTL_SECONDS)
         ).isoformat().replace("+00:00", "Z")
         request = human_input.seal_request(
             work_item_id=work_item_id or _canonical_issue_key(issue_url),
@@ -1905,15 +1920,27 @@ def _apply_human_input_continuation(
     # `human-input` is removed (never followed), as `_seal_draft` does.
     if human_dir.is_symlink() or (human_dir.exists() and not human_dir.is_dir()):
         _remove_rejected(human_dir)
+        if human_dir.is_symlink() or human_dir.exists():
+            # `_remove_rejected` swallows OSError; everything below would
+            # then read and write through what it failed to remove.
+            raise OSError(f"could not remove a carried {HUMAN_INPUT_DIRNAME} that is not a directory")
     human_dir.mkdir(exist_ok=True)
     answered_ids = {a["request_id"] for a in answers}
     carried = human_dir / HUMAN_INPUT_REQUEST
     # A request this run sealed is in staging already and won the
     # carry-forward collision; only a carried, answered one is dropped.
     if sealed is None and _is_plain_file(carried):
+        # Carried from gitops, not written by this run: read with the same
+        # bounds as `_human_input_known_questions` (size cap, no-follow,
+        # RecursionError), since an escape here would roll back a run that
+        # already produced a valid triplet (#563).
         try:
-            carried_id = json.loads(carried.read_text(encoding="utf-8")).get("request_id")
-        except (OSError, ValueError, AttributeError):
+            raw = _read_plain_file_nofollow(human_dir, HUMAN_INPUT_REQUEST, HUMAN_INPUT_READBACK_MAX_BYTES)
+            if raw is None or len(raw) > HUMAN_INPUT_READBACK_MAX_BYTES:
+                carried_id = None
+            else:
+                carried_id = json.loads(raw).get("request_id")
+        except (OSError, ValueError, RecursionError, AttributeError):
             carried_id = None
         if carried_id in answered_ids:
             carried.unlink()
@@ -1926,20 +1953,46 @@ def _apply_human_input_continuation(
     # `question` (model-authored, already published in that round's
     # request.json) is carried so a later round can pair every earlier answer
     # with what was asked; it is omitted when it could not be read back.
-    # Never `value`.
+    # Never `value`. Bounded at the render cap (so nothing the prompt would
+    # show is lost) and not ASCII-escaped, so MAX_CLARIFICATION_ROUNDS
+    # questions can never push the marker past the all-or-nothing
+    # HUMAN_INPUT_READBACK_MAX_BYTES its reader applies (#563).
     known = questions or {}
     entries = []
     for a in answers:
         entry = {k: a[k] for k in ("request_id", "request_hash", "received_at")}
         if known.get(a["request_id"]):
-            entry["question"] = known[a["request_id"]]
+            entry["question"] = _bounded(known[a["request_id"]], HUMAN_INPUT_QUESTION_RENDER_MAX_CHARS)
         entries.append(entry)
-    payload = json.dumps(entries, sort_keys=True).encode("utf-8")
-    fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    payload = json.dumps(entries, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    # Best effort: the marker is provenance that no consumer gates on (ADR
+    # 013), so failing to write it (a stale one `_remove_rejected` could not
+    # delete, say) must not cost the run its proposal (#563).
     try:
-        os.write(fd, payload)
-    finally:
-        os.close(fd)
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        print(f"warn: {HUMAN_INPUT_DIRNAME}/{HUMAN_INPUT_ANSWERED} not written: {type(exc).__name__}")
+
+
+def _copy_human_input_mode(staging: Path, replaced: Path | None, fallback: Path) -> None:
+    """Give `staging/human-input` a mode from the checkout, like everything
+    else the swap publishes. `_seal_draft` and `_apply_human_input_continuation`
+    create it with the umask default, and `_carry_forward` carries file modes
+    but never a directory's, so under a `umask 077` the published directory
+    would be unreadable to the implementer and shepherd (#563). The mode of
+    the `human-input` it replaces wins; without one, the proposal
+    directory's own (`fallback`, the same source the swap uses for it)."""
+    human_dir = staging / HUMAN_INPUT_DIRNAME
+    if human_dir.is_symlink() or not human_dir.is_dir():
+        return
+    if replaced is not None and replaced.is_dir() and not replaced.is_symlink():
+        _copy_mode_nofollow(replaced, human_dir)
+    else:
+        _copy_mode_nofollow(fallback, human_dir)
 
 
 _PRESENCE_LINE = "**No human is present. Do not ask for input. Work with what you have.**"
@@ -2200,15 +2253,14 @@ async def _run_agent(
     temporal_workflow_id: str | None = None,
     temporal_run_id: str | None = None,
     argo_workflow_name: str | None = None,
-    human_input_answers: list[dict] | None = None,
 ) -> Any:
     """Returns the sealed `ExecutionCorrelation` when the resolved plan grants
-    `human.request_input` (mctlhq/mctl-agents#473), else None; the caller seals
-    a model-written draft with it. When it does and `prompt` is an
+    `human.request_input` (mctlhq/mctl-agents#473) and the run can seal a
+    draft (an issue_url plus loop ids), else None; the caller seals a
+    model-written draft with it. When it does and `prompt` is an
     `InvestigatorPrompt`, the granted rendering is sent instead (consistent
     presence/ambiguity lines plus the ask block, which `_build_prompt` sizes
-    from the answers it already holds). `human_input_answers` is kept for
-    call-site symmetry and correlation only; it no longer shapes the prompt.
+    from the answers it already holds).
 
     The four keyword-only parameters (mctlhq/mctl-agents#242 slice 3) feed
     `context_assembly.build_execution_correlation` on the discovery-mode
@@ -2326,10 +2378,19 @@ async def _run_agent(
                 temporal_run_id=temporal_run_id,
                 argo_workflow_name=argo_workflow_name,
             )
-        if human_input_granted and correlation is not None:
-            human_input_correlation = correlation
         # The invitation and the sealing capability stay in lockstep: the
-        # model is only told it may ask when a draft could actually be sealed.
+        # model is only told it may ask when a draft could actually be
+        # sealed, so every gate `_seal_draft` applies to the correlation is
+        # applied here too. A run nothing loop-submitted (an intake sweep, a
+        # manual Argo submit, a local run) carries no temporal_run_id, which
+        # `_seal_draft` refuses as `no-loop-ids` (#563).
+        if (
+            human_input_granted
+            and correlation is not None
+            and correlation.temporal_run_id
+            and correlation.temporal_workflow_id
+        ):
+            human_input_correlation = correlation
         if human_input_correlation is not None and isinstance(prompt, InvestigatorPrompt):
             # The granted rendering: consistent presence/ambiguity lines plus
             # the ask block (absent at the round limit). A plain-str prompt
@@ -3603,7 +3664,6 @@ def _investigate(
                 temporal_workflow_id=temporal_workflow_id,
                 temporal_run_id=temporal_run_id,
                 argo_workflow_name=execution_context.correlation.argo_workflow_name,
-                human_input_answers=human_answers,
             ), clone / "repo", prompt, staging.resolve())
 
         # 4a. Before looking INSIDE staging, check staging itself is still
@@ -3886,11 +3946,13 @@ def _investigate(
                 # group-shared, the fix belongs in the CWFT that creates
                 # it, not in a chown attempt here (codex P2 on #247).
                 shutil.copymode(aside, staging)
+                _copy_human_input_mode(staging, aside / HUMAN_INPUT_DIRNAME, aside)
             else:
                 _apply_human_input_continuation(
                     staging, human_answers, sealed_request, human_questions
                 )
                 shutil.copymode(proposal_dir.parent, staging)
+                _copy_human_input_mode(staging, None, proposal_dir.parent)
 
             # Renaming staging OUT of the wrapper needs the wrapper
             # writable again, so it is reopened as late as possible and the

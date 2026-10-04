@@ -6,7 +6,8 @@ import importlib.util
 import json
 import logging
 import os
-from datetime import UTC, datetime
+import stat
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import anyio
@@ -192,13 +193,15 @@ def _prompt(answers=None, questions=None):
     ))
 
 
-def _call_run_agent(tmp_path, *, issue_url=harness_mod.ISSUE_URL, answers=None, prompt=None):
+def _call_run_agent(
+    tmp_path, *, issue_url=harness_mod.ISSUE_URL, answers=None, prompt=None, run_id="run-1"
+):
     repo, proposal = tmp_path / "repo", tmp_path / "proposal"
     repo.mkdir(exist_ok=True)
     proposal.mkdir(exist_ok=True)
     return anyio.run(functools.partial(
         rii._run_agent, issue_url=issue_url, temporal_workflow_id="dev-loop-1",
-        temporal_run_id="run-1", argo_workflow_name="argo-1", human_input_answers=answers,
+        temporal_run_id=run_id, argo_workflow_name="argo-1",
     ), repo, _prompt(answers) if prompt is None else prompt, proposal)
 
 
@@ -269,6 +272,14 @@ class TestRunAgentGrantGate:
         assert _call_run_agent(tmp_path, issue_url=None) is None
         assert h.prompts == [str(_prompt())]
 
+    def test_granted_without_a_loop_run_id_neither_invites_nor_correlates(self, tmp_path, monkeypatch):
+        # #563 item 1: `_seal_draft` refuses a correlation without loop ids
+        # (`no-loop-ids`), so a run nothing loop-submitted is not invited to
+        # write a draft that can only be discarded.
+        h = harness_mod.install(tmp_path, monkeypatch, grant=True)
+        assert _call_run_agent(tmp_path, run_id=None) is None
+        assert h.prompts == [str(_prompt())]
+
     def test_a_plain_str_prompt_is_sent_as_is_even_when_granted(self, tmp_path, monkeypatch):
         # Only an InvestigatorPrompt can be re-rendered consistently; a bare
         # string is never patched, so it can never carry a contradiction.
@@ -331,7 +342,10 @@ def test_seal_draft_happy_path(tmp_path, capsys):
     assert request.work_item_id == "wi-1"
     created = datetime.fromisoformat(request.created_at.replace("Z", "+00:00"))
     expires = datetime.fromisoformat(request.expires_at.replace("Z", "+00:00"))
-    assert (expires - created).total_seconds() == hi.DEFAULT_REQUEST_TTL_SECONDS
+    # Anchored to the next whole hour (#563 item 5), so (24h, 25h].
+    assert hi.DEFAULT_REQUEST_TTL_SECONDS < (expires - created).total_seconds() <= (
+        hi.DEFAULT_REQUEST_TTL_SECONDS + 3600
+    )
     # T7: no question or reason text in the log.
     out = capsys.readouterr().out
     assert QUESTION not in out and REASON not in out
@@ -748,13 +762,27 @@ class TestAnswersCarryTheirQuestions:
         assert rii.HUMAN_INPUT_TRUNCATED_MARKER in block
         assert "q" * (rii.HUMAN_INPUT_QUESTION_RENDER_MAX_CHARS + 1) not in block
 
-    def test_the_whole_block_is_bounded(self):
-        answers = [_answer(request_id=f"hir-{i:016x}", value="v" * rii.HUMAN_INPUT_ANSWER_MAX_CHARS)
+    @pytest.mark.parametrize("value", [
+        "\x02" * rii.HUMAN_INPUT_ANSWER_MAX_CHARS,
+        # The largest structured value the parser admits whose default
+        # re-rendering expands the most over its compact measurement (1.5x).
+        {"a": [1] * 3996},
+    ], ids=["escaped-string", "structured"])
+    def test_no_valid_run_is_truncated(self, value):
+        """#563 item 8: render-level, not arithmetic. The worst-case
+        question and answer the parser admits, for every round, through
+        `_parse_human_input_responses` -> `_human_input_answers_block`, must
+        render without the block cap biting."""
+        question = "\x01" * (rii.HUMAN_INPUT_QUESTION_RENDER_MAX_CHARS + 1)
+        answers = [_answer(request_id=f"hir-{i:016x}", value=value)
                    for i in range(hi.MAX_CLARIFICATION_ROUNDS)]
-        questions = {a["request_id"]: "w" * rii.HUMAN_INPUT_QUESTION_RENDER_MAX_CHARS for a in answers}
-        block = rii._human_input_answers_block(answers, questions)
+        parsed = rii._parse_human_input_responses(json.dumps(answers))
+        assert len(parsed) == hi.MAX_CLARIFICATION_ROUNDS
+        block = rii._human_input_answers_block(parsed, {a["request_id"]: question for a in parsed})
         body = block.split("<human_answers>\n", 1)[1].rsplit("\n</human_answers>", 1)[0]
-        assert len(body) <= rii.HUMAN_INPUT_ANSWERS_BLOCK_MAX_CHARS + len(rii.HUMAN_INPUT_TRUNCATED_MARKER)
+        assert not body.endswith(rii.HUMAN_INPUT_TRUNCATED_MARKER)
+        assert body.count(rii.HUMAN_INPUT_TRUNCATED_MARKER) == hi.MAX_CLARIFICATION_ROUNDS  # the questions'
+        assert body.count("\n  answer: ") == hi.MAX_CLARIFICATION_ROUNDS
 
     def test_the_block_bound_truncates_with_a_marker(self, monkeypatch):
         monkeypatch.setattr(rii, "HUMAN_INPUT_ANSWERS_BLOCK_MAX_CHARS", 100)
@@ -831,3 +859,160 @@ def test_every_round_sees_every_earlier_question(tmp_path, monkeypatch):
     for question, answer in zip(questions, ("answer 1", "answer 2"), strict=True):
         assert f'question: "{question}"\n  answer: "{answer}"' in final
     assert rii.HUMAN_INPUT_QUESTION_UNAVAILABLE not in final
+
+
+# #563: deferred P3s from the #558 review.
+class TestRetryIdempotency:
+    """Item 5: `expires_at` is hash-covered, so it must not carry the wall
+    clock into the request identity."""
+
+    def test_a_retry_within_the_hour_seals_the_same_identity(self, tmp_path):
+        first, second = tmp_path / "a", tmp_path / "b"
+        for proposal in (first, second):
+            proposal.mkdir()
+            _draft(proposal)
+        early, _ = _seal(first, now=NOW + timedelta(minutes=5, seconds=7))
+        late, _ = _seal(second, now=NOW + timedelta(minutes=58, seconds=31))
+        assert early.created_at != late.created_at
+        assert (early.request_id, early.request_hash) == (late.request_id, late.request_hash)
+        assert early.expires_at == late.expires_at == "2026-10-05T13:00:00Z"
+
+
+class TestUnremovableLeftovers:
+    """Item 6: `_remove_rejected` swallows OSError. What it could not remove
+    must neither be published silently nor cost the run its proposal when it
+    is only the provenance marker."""
+
+    def test_seal_draft_fails_by_name_when_human_input_survives_removal(self, tmp_path, monkeypatch):
+        leftover = tmp_path / "human-input" / "notes.txt"
+        leftover.parent.mkdir()
+        leftover.write_text("agent-written")
+        monkeypatch.setattr(rii, "_remove_rejected", lambda path: None)
+        with pytest.raises(OSError, match="could not remove human-input/"):
+            _seal(tmp_path)
+
+    def test_continuation_refuses_a_carried_symlink_it_could_not_remove(self, tmp_path, monkeypatch):
+        staging, target = tmp_path / "staging", tmp_path / "target"
+        staging.mkdir()
+        target.mkdir()
+        os.symlink(target, staging / "human-input")
+        monkeypatch.setattr(rii, "_remove_rejected", lambda path: None)
+        with pytest.raises(OSError, match="could not remove a carried human-input"):
+            rii._apply_human_input_continuation(staging, [_answer()], None)
+        assert list(target.iterdir()) == []
+
+    def test_an_unwritable_marker_is_a_warning_not_a_failed_run(self, tmp_path, monkeypatch, capsys):
+        staging = tmp_path / "staging"
+        (staging / "human-input").mkdir(parents=True)
+        stale = staging / "human-input" / "answered.json"
+        stale.write_text("[]")
+        monkeypatch.setattr(rii, "_remove_rejected", lambda path: None)
+        rii._apply_human_input_continuation(staging, [_answer()], None)
+        assert "warn: human-input/answered.json not written" in capsys.readouterr().out
+        assert stale.read_text() == "[]"
+
+
+class TestCarriedRequestRead:
+    """Item 2: the carried request.json comes from gitops, so it is read
+    with the same bounds as every other read-back."""
+
+    def test_a_deeply_nested_carried_request_is_unreadable_not_a_crash(self, tmp_path):
+        staging = tmp_path / "staging"
+        (staging / "human-input").mkdir(parents=True)
+        carried = staging / "human-input" / "request.json"
+        carried.write_text('{"a":' * 100_000 + "1" + "}" * 100_000)
+        rii._apply_human_input_continuation(staging, [_answer()], None)
+        assert carried.exists()
+        assert json.loads((staging / "human-input" / "answered.json").read_text()) == _MARKER
+
+    def test_an_oversize_carried_request_is_not_read(self, tmp_path):
+        staging = tmp_path / "staging"
+        (staging / "human-input").mkdir(parents=True)
+        carried = staging / "human-input" / "request.json"
+        carried.write_text(json.dumps({"request_id": "hir-0123456789abcdef",
+                                       "pad": "x" * rii.HUMAN_INPUT_READBACK_MAX_BYTES}))
+        rii._apply_human_input_continuation(staging, [_answer()], None)
+        assert carried.exists(), "an oversize carried request was read whole"
+
+    def test_a_deeply_nested_responses_flag_is_a_clean_exit(self):
+        with pytest.raises(SystemExit, match="is not valid JSON"):
+            rii._parse_human_input_responses("[" * 100_000 + "]" * 100_000)
+
+
+class TestMarkerQuestionSize:
+    """Item 3: the marker's questions stay inside the all-or-nothing
+    read-back cap, so one long question cannot lose every question."""
+
+    LONG = "\u0416" * 5400  # Cyrillic: fits a 16 KiB draft, 6 bytes each escaped
+
+    def _ids(self):
+        return [f"hir-{i:016x}" for i in range(hi.MAX_CLARIFICATION_ROUNDS)]
+
+    def test_every_round_reads_back_after_the_longest_questions(self, tmp_path):
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        ids = self._ids()
+        rii._apply_human_input_continuation(
+            staging, [_answer(request_id=i) for i in ids], None, dict.fromkeys(ids, self.LONG)
+        )
+        assert set(rii._human_input_known_questions(staging)) == set(ids)
+
+    def test_the_stored_question_is_bounded_and_renders_unchanged(self, tmp_path):
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        rii._apply_human_input_continuation(staging, [_answer()], None, {_MARKER[0]["request_id"]: self.LONG})
+        stored = json.loads((staging / "human-input" / "answered.json").read_text())[0]["question"]
+        assert len(stored) <= rii.HUMAN_INPUT_QUESTION_RENDER_MAX_CHARS + len(rii.HUMAN_INPUT_TRUNCATED_MARKER)
+        # Nothing the prompt would have shown is lost by storing less.
+        assert rii._human_input_answers_block([_answer()], {_MARKER[0]["request_id"]: stored}) == (
+            rii._human_input_answers_block([_answer()], {_MARKER[0]["request_id"]: self.LONG})
+        )
+
+    def test_the_marker_is_not_ascii_escaped(self, tmp_path):
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        rii._apply_human_input_continuation(staging, [_answer()], None, {_MARKER[0]["request_id"]: "\u0416?"})
+        assert "\u0416?".encode() in (staging / "human-input" / "answered.json").read_bytes()
+
+
+class TestHumanInputMode:
+    """Item 7: `human-input/` gets its mode from the checkout, never from
+    the umask, like everything else the swap publishes."""
+
+    def test_falls_back_to_the_proposal_directory_mode(self, tmp_path):
+        staging, source = tmp_path / "staging", tmp_path / "source"
+        (staging / "human-input").mkdir(parents=True)
+        source.mkdir()
+        os.chmod(staging / "human-input", 0o700)
+        chosen = stat.S_IRWXU | stat.S_IXGRP
+        os.chmod(source, chosen)
+        rii._copy_human_input_mode(staging, None, source)
+        assert stat.S_IMODE((staging / "human-input").stat().st_mode) == chosen
+
+    def test_re_investigation_keeps_the_mode_of_the_human_input_it_replaces(self, tmp_path, monkeypatch):
+        from tests.test_run_issue_investigator import _investigate_harness
+
+        def agent(repo_dir, prompt, proposal_dir):
+            harness_mod.write_triplet(proposal_dir)
+            _draft(proposal_dir, {"question": f"q{len(agent.prompts)}", "reason": REASON,
+                                  "response": {"type": "free_text"}})
+            agent.prompts.append(prompt)
+            return _correlation()
+
+        agent.prompts = []
+        issue = _investigate_harness(tmp_path, monkeypatch, agent=agent)
+        issue.author = "alice"
+        first = rii.investigate(issue.ref.url, state_dir=tmp_path, temporal_workflow_id="dev-loop-1",
+                                temporal_run_id="run-1")
+        assert first.error is None
+        human_dir = first.proposal_dir / "human-input"
+        distinctive = stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP
+        os.chmod(human_dir, distinctive)
+        request = hi.HumanInputRequest.from_dict(json.loads((human_dir / "request.json").read_text()))
+        second = rii.investigate(
+            issue.ref.url, state_dir=tmp_path, temporal_workflow_id="dev-loop-1", temporal_run_id="run-1",
+            human_input_responses=json.dumps([_answer(request_id=request.request_id,
+                                                      request_hash=request.request_hash)]),
+        )
+        assert second.error is None
+        assert stat.S_IMODE((second.proposal_dir / "human-input").stat().st_mode) == distinctive
