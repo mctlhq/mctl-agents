@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.67.0](https://github.com/mctlhq/mctl-agents/compare/1.66.0...1.67.0) (2026-10-04)
+
+
+### Features
+
+* **agents:** issue-561-scheduled-dispatch-converge-actions-gc-u ([d6a27d7](https://github.com/mctlhq/mctl-agents/commit/d6a27d72763263f329f43aa95b89ea176a650974))
+* **agents:** issue-561-scheduled-dispatch-converge-actions-gc-u ([5f72799](https://github.com/mctlhq/mctl-agents/commit/5f7279916b1066f0e139c03a2c021bbc1d7163d5))
+
+
+### Bug Fixes
+
+* **agents:** tombstone-driven dispatch GC, safe action convergence ([eeb186d](https://github.com/mctlhq/mctl-agents/commit/eeb186da48a6a0246fe6380a292ce857962991e5))
+
 ## [1.66.0](https://github.com/mctlhq/mctl-agents/compare/1.65.0...1.66.0) (2026-10-04)
 
 
