@@ -1252,7 +1252,9 @@ def _real_catalog_evidence_records() -> list[str]:
         strategy_implementation_hash=version.implementation_hash, evaluator_name=ce.EVALUATOR_NAME,
         evaluator_version=ce.EVALUATOR_VERSION, metrics_contract_version=ce.METRICS_CONTRACT_VERSION,
     )
-    isos = ("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z")
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    isos = tuple((now - timedelta(days=d)).strftime("%Y-%m-%dT%H:%M:%SZ") for d in (1, 2, 3))
     records = [
         ce.EvalRecord(
             record_kind=ce.RECORD_KIND, evaluator_name=ce.EVALUATOR_NAME, evaluator_version=ce.EVALUATOR_VERSION,
