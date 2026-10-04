@@ -149,6 +149,68 @@ def test_a_binding_pinned_to_other_bytes_fails(capsys):
     assert other in capsys.readouterr().err
 
 
+def _spec_with(**changes: dict) -> dict:
+    spec = _binding_doc()["spec"]
+    return {**spec, **{key: {**spec[key], **value} for key, value in changes.items()}}
+
+
+# The hash matches in every one of these; what drifted is a field execute()
+# also cross-checks against agent.yaml. A re-pin that updated only the hash
+# lands exactly here, and every run would fail on it.
+_MIRROR_DRIFT = {
+    "definition.name": ({"definition": {"name": "issue-investigator-old"}}, "definition.name"),
+    "profileCompatibility mirror": (
+        {"definition": {"profileCompatibility": ">=1.0.0 <3.0.0"}},
+        "mirror drift",
+    ),
+    "profile.name": ({"profile": {"name": "issue-investigator-other"}}, "profile.name"),
+    "profile.version outside the range": ({"profile": {"version": "2.0.0"}}, "compatibility mismatch"),
+}
+
+
+@pytest.mark.parametrize("changes,needle", list(_MIRROR_DRIFT.values()), ids=list(_MIRROR_DRIFT))
+def test_a_matching_hash_with_drifted_mirrored_fields_fails(changes, needle, capsys):
+    rc = check_binding_hash.check(_serving(_yaml(_binding_doc(spec=_spec_with(**changes)))))
+
+    assert rc == check_binding_hash.EXIT_MISMATCH
+    err = capsys.readouterr().err
+    assert "matches the shadow binding's contentHash" in err
+    assert needle in err
+    assert check_binding_hash.RUNBOOK in err
+
+
+def _seen_request(monkeypatch, **env: str) -> httpx.Request:
+    for name in ("GITHUB_TOKEN", "GH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=_yaml(_binding_doc()))
+
+    check_binding_hash.fetch_binding(httpx.MockTransport(handler))
+    (request,) = seen
+    return request
+
+
+def test_github_token_is_sent_as_a_bearer_header(monkeypatch):
+    request = _seen_request(monkeypatch, **{"GITHUB_TOKEN": "t-github", "GH_TOKEN": "t-gh"})
+    assert request.headers["authorization"] == "Bearer t-github"
+
+
+def test_gh_token_is_the_fallback(monkeypatch):
+    request = _seen_request(monkeypatch, **{"GH_TOKEN": "t-gh"})
+    assert request.headers["authorization"] == "Bearer t-gh"
+
+
+@pytest.mark.parametrize("env", [{}, {"GITHUB_TOKEN": ""}], ids=["unset", "empty"])
+def test_no_token_sends_no_authorization(monkeypatch, env):
+    request = _seen_request(monkeypatch, **env)
+    assert "authorization" not in request.headers
+
+
 # ---------------------------------------------------------------------------
 # Could not observe is never observed-equal
 # ---------------------------------------------------------------------------
@@ -250,3 +312,14 @@ def test_release_please_cannot_start_before_the_binding_gate():
 def test_the_pr_validation_runs_the_live_comparison():
     job = _workflow("pr-validation.yml")["jobs"]["binding-hash"]
     assert any("tools/check_binding_hash.py" in str(step.get("run", "")) for step in job["steps"])
+
+
+def test_the_release_gate_takes_only_manifests_from_the_release_commit():
+    """The script, the resolver and the lockfile must come from the run's
+    head: a pending release commit that predates the gate has no script, and
+    checking out its whole tree would fail on a missing file forever."""
+    steps = _workflow("release-please.yml")["jobs"]["binding-gate"]["steps"]
+    run = " ".join(str(step.get("run", "")) for step in steps)
+    assert 'git checkout --quiet "$sha" -- agents/_manifests' in run
+    assert "--detach" not in run
+    assert "select(. != null)" in run

@@ -17,15 +17,18 @@ mctl-gitops `main` — the one the CWFT clones at run time:
 
 Both halves come from the resolver itself rather than being reimplemented:
 the local hash is `resolver.load_definition(...).content_hash`, the value
-`execute()` compares, and the fetched binding goes through
-`resolver.parse_yaml_mapping` and `resolver.parse_release_binding`. A binding
+`execute()` compares, the fetched binding goes through
+`resolver.parse_yaml_mapping` and `resolver.parse_release_binding`, and the
+remaining binding-vs-definition checks are `execute()`'s own
+`check_binding_against_definition` and `check_profile_compatibility`. A binding
 this accepts is one the resolver would accept, and the two cannot hash or
 parse differently.
 
 Exit codes keep "could not observe" apart from "observed a mismatch":
 
     0  the pins match
-    1  the pins differ, or the local agent.yaml is itself unresolvable
+    1  the pins differ (contentHash or a field execute() cross-checks), or
+       the local agent.yaml is itself unresolvable
     2  the binding could not be read or validated (network error, non-200,
        malformed YAML, missing or invalid contentHash). Never a match.
 
@@ -91,22 +94,21 @@ def fetch_binding(transport: httpx.BaseTransport | None = None) -> bytes:
             f"could not fetch {BINDING_URL}: HTTP {response.status_code} {response.text[:200]!r}"
         )
     # An empty 200 needs no case of its own: it parses to no mapping, which
-    # `binding_content_hash` already refuses.
+    # `parse_binding` already refuses.
     return response.content
 
 
-def binding_content_hash(raw: bytes) -> tuple[str, int]:
-    """`(contentHash, bindingRevision)` of a fetched binding, validated by
-    the resolver's own parser. Any `ResolverError` — malformed YAML, a
-    missing or non-`sha256:` contentHash, a wrong agent or environment —
-    becomes `BindingUnobservable`."""
+def parse_binding(raw: bytes) -> resolver.ReleaseBinding:
+    """A fetched binding, validated by the resolver's own parser. Any
+    `ResolverError` — malformed YAML, a missing or non-`sha256:` contentHash,
+    a wrong agent or environment — becomes `BindingUnobservable`."""
     label = Path(f"{GITOPS_REPO}@{GITOPS_REF}") / BINDING_PATH
     try:
         document = resolver.parse_yaml_mapping(raw, path=label)
         binding = resolver.parse_release_binding(document, path=label, agent=AGENT, environment=ENVIRONMENT)
     except resolver.ResolverError as exc:
         raise BindingUnobservable(str(exc)) from exc
-    return binding.definition_content_hash, binding.release_revision
+    return binding
 
 
 def _error(message: str) -> None:
@@ -120,10 +122,11 @@ def _error(message: str) -> None:
 
 def check(transport: httpx.BaseTransport | None = None) -> int:
     try:
-        local_hash = resolver.load_definition(AGENT).content_hash
+        definition = resolver.load_definition(AGENT)
     except resolver.ResolverError as exc:
         _error(f"agent.yaml for {AGENT} does not resolve locally: {exc}")
         return EXIT_MISMATCH
+    local_hash = definition.content_hash
     definition_path = resolver.DEFINITIONS_DIR / AGENT / "agent.yaml"
     relpath = (
         definition_path.relative_to(resolver.REPO_ROOT)
@@ -132,7 +135,7 @@ def check(transport: httpx.BaseTransport | None = None) -> int:
     )
 
     try:
-        pinned_hash, revision = binding_content_hash(fetch_binding(transport))
+        binding = parse_binding(fetch_binding(transport))
     except BindingUnobservable as exc:
         _error(
             f"binding check FAILED CLOSED: the {ENVIRONMENT} binding for {AGENT} could not be read, "
@@ -142,6 +145,7 @@ def check(transport: httpx.BaseTransport | None = None) -> int:
         )
         return EXIT_UNOBSERVED
 
+    pinned_hash, revision = binding.definition_content_hash, binding.release_revision
     if pinned_hash != local_hash:
         _error(
             f"{relpath} does not match the mctl-gitops {ENVIRONMENT} binding: every declarative "
@@ -150,6 +154,23 @@ def check(transport: httpx.BaseTransport | None = None) -> int:
             f"  {GITOPS_REPO}@{GITOPS_REF}:{BINDING_PATH}\n"
             f"    spec.sourceManifest.contentHash (bindingRevision {revision}): {pinned_hash}\n"
             f"Re-pin spec.sourceManifest.contentHash in mctl-gitops; see {RUNBOOK} for the order of steps."
+        )
+        return EXIT_MISMATCH
+
+    # The hash is necessary, not sufficient: execute() also requires the
+    # binding's definition.name, profile.name and profileCompatibility mirror
+    # to agree with agent.yaml, and the profile version to satisfy it. A
+    # re-pin that updated only the hash would pass the comparison above and
+    # still fail every run, so the gate runs the resolver's own checks too.
+    try:
+        resolver.check_binding_against_definition(binding, definition)
+        resolver.check_profile_compatibility(definition, binding.profile_version)
+    except resolver.ResolverError as exc:
+        _error(
+            f"{relpath} matches the {ENVIRONMENT} binding's contentHash, but the binding disagrees with it "
+            "elsewhere: every declarative investigation would fail with ResolverError.\n"
+            f"  {exc}\n"
+            f"Re-pin the mirrored fields in mctl-gitops too; see {RUNBOOK}."
         )
         return EXIT_MISMATCH
 

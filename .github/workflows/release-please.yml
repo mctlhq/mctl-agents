@@ -60,7 +60,7 @@ jobs:
           set -uo pipefail
           if SHAS=$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged \
                       --label "autorelease: pending" \
-                      --json mergeCommit --jq '.[].mergeCommit.oid'); then
+                      --json mergeCommit --jq '.[].mergeCommit.oid | select(. != null)'); then
             if [ -z "$SHAS" ]; then
               echo "No merged release PR is pending: this run cuts no release, nothing to gate."
               echo "shas=" >> "$GITHUB_OUTPUT"
@@ -88,7 +88,11 @@ jobs:
 
       # Checked at the release PR's merge commit, which is the commit
       # release-please tags and therefore the agent.yaml the image ships —
-      # not merely whatever main's head happens to be.
+      # not merely whatever main's head happens to be. Only the manifests
+      # come from that commit; the gate itself, the resolver and the lockfile
+      # stay at this run's head. A pending release commit that predates the
+      # gate (or a later move of the script) would otherwise fail on a
+      # missing file, and no re-pin or re-run could ever clear that.
       - name: agent.yaml must match the gitops binding at the release commit
         if: ${{ steps.pending.outputs.shas != '' }}
         env:
@@ -99,7 +103,8 @@ jobs:
           uv sync --locked
           for sha in $SHAS; do
             echo "== release commit $sha"
-            git checkout --quiet --detach "$sha"
+            rm -rf agents/_manifests
+            git checkout --quiet "$sha" -- agents/_manifests
             uv run --locked python tools/check_binding_hash.py
           done
 

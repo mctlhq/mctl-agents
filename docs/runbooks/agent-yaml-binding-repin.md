@@ -50,6 +50,18 @@ treated as a match. Re-run it once the read works.
    Set `spec.sourceManifest.contentHash: "sha256:<hex>"`, bump `bindingRevision`, set
    `previousBindingRevision`, and add a `history` entry. If the PR changes after this
    step, recompute the hash.
+
+   The hash is not the only thing the binding mirrors. If the PR also changes any of
+   these in `agent.yaml`, update the binding to match, or every run fails on them even
+   with a correct hash:
+
+   | `agent.yaml` | binding |
+   |---|---|
+   | `metadata.name` | `spec.definition.name` |
+   | `spec.executionProfileRef.name` | `spec.profile.name` |
+   | `spec.executionProfileRef.compatibility` | `spec.definition.profileCompatibility` (and `spec.profile.version` must satisfy it) |
+
+   The gate runs the resolver's own checks for all of these, not only the hash.
 3. **Merge the mctl-agents PR.** Production is unaffected: it still runs the old image
    against the old pin. release-please folds the change into its release PR. The
    `binding hash` check on `main` stays red until step 4.
@@ -122,6 +134,11 @@ ahead of time:
 - a manual `mctl_publish_agent_version` or `mctl_promote_agent`, or a rollback, to a
   version whose `agent.yaml` differs from the pin;
 - an explicit `agent_image` passed at submission;
-- a change to the binding on the mctl-gitops side. The `binding hash` job only runs on
+- a change to the binding on the mctl-gitops side.
+- **any agent other than `issue-investigator`, or any environment other than `shadow`.**
+  The tool checks exactly that one binding, because today only the investigate CWFT sets
+  a declarative resolver mode. `release-deploy` bumps `agent_image` in every
+  `cwft-mctl-agents-*.yaml`, so when another CWFT goes declarative, extend
+  `tools/check_binding_hash.py` to cover its binding in the same change. The `binding hash` job only runs on
   mctl-agents events, so a gitops edit that breaks the pin shows up only on the next
   mctl-agents PR or push, or at run time.
