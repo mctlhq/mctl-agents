@@ -888,9 +888,9 @@ def test_every_drain_timeout_honours_its_env_override(monkeypatch, name):
 
 
 def test_plan_grants_human_input_tracks_the_capability_in_plan_tools():
-    """`plan_grants_human_input` has no caller yet (the producer lands with
-    mctl-gitops#1277); pin its contract directly so it does not rot as dead
-    code in the meantime."""
+    """Pin `plan_grants_human_input`'s contract directly. Its one caller is
+    the investigator's `_run_agent` (mctlhq/mctl-agents#473), whose grant
+    gate is covered end to end in tests/test_human_input_producer.py."""
     plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="a" * 40))
 
     granted = dataclasses.replace(
