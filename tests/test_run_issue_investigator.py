@@ -5755,3 +5755,20 @@ def test_main_prints_ctx_verdict_for_a_context_only_run(tmp_path, monkeypatch, c
     run_issue_investigator.main()
     out = capsys.readouterr().out
     assert "  ctx  mctl-telegram/issue-1-x:" in out
+
+
+def test_answers_block_cap_covers_worst_case_parsed_rounds():
+    m = run_issue_investigator
+    per_answer = (
+        6 * m.HUMAN_INPUT_QUESTION_RENDER_MAX_CHARS
+        + max(
+            6 * m.HUMAN_INPUT_ANSWER_MAX_CHARS,
+            m.HUMAN_INPUT_STRUCTURED_ANSWER_MAX_CHARS,
+        )
+    )
+    # Must never bite a valid run: at least every accepted round at its
+    # worst-case size, and strictly above the old fixed 24000 literal.
+    assert m.HUMAN_INPUT_ANSWERS_BLOCK_MAX_CHARS >= (
+        m.human_input.MAX_CLARIFICATION_ROUNDS * per_answer
+    )
+    assert m.HUMAN_INPUT_ANSWERS_BLOCK_MAX_CHARS > 24000
