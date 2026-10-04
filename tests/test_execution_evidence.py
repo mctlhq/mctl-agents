@@ -1623,7 +1623,12 @@ def _non_string_leaf_cases():
     # so a name dropped from a _check_string_fields tuple always fails here.
     # work_item is the kind with the fewest required subject leaves, so its
     # repository/revision are guarded only by the string-field check.
-    blocks = {"versions": ee.VersionPins, "subject": ee.SubjectRef, "tool_call": ee.ToolCallRef, "provenance": ee.Provenance}
+    blocks = {
+        "versions": ee.VersionPins,
+        "subject": ee.SubjectRef,
+        "tool_call": ee.ToolCallRef,
+        "provenance": ee.Provenance,
+    }
     for block, cls in blocks.items():
         for field in dataclasses.fields(cls):
             yield pytest.param(block, {field.name: [field.name]}, id=f"{block}.{field.name}")
