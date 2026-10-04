@@ -1491,7 +1491,9 @@ def _check_bounded(value: str, pattern: re.Pattern[str], max_length: int, *, whe
         raise ExecutionEvidenceError(f"{where} must match {pattern.pattern!r} within {max_length} characters")
 
 
-def _check_string_fields(block: Any, names: Sequence[str], *, where: str) -> None:
+def _check_string_fields(
+    block: VersionPins | SubjectRef | ToolCallRef | Provenance, names: Sequence[str], *, where: str
+) -> None:
     for name in names:
         if not isinstance(getattr(block, name), str):
             raise ExecutionEvidenceError(f"{where}.{name} must be a string")

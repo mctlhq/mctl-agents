@@ -1615,12 +1615,18 @@ def test_an_unhashable_leaf_fails_as_an_evidence_error_not_a_type_error(override
         _seal(**overrides)
 
 
+# -- review round 5 (PR #575) -----------------------------------------------
+
 
 @pytest.mark.parametrize(
     "block,overrides",
     (
         ("versions", {"environment": ["shadow"]}),
+        ("versions", {"definition_version": ["1"]}),
+        ("versions", {"profile_version": ["3"]}),
+        ("versions", {"profile_content_hash": ["sha256:" + "f3" * 32]}),
         ("versions", {"release_revision": "7"}),
+        ("versions", {"release_revision": True}),
         ("tool_call", {"name": ["merge"]}),
         ("provenance", {"supersedes": ["ev-0"]}),
     ),
