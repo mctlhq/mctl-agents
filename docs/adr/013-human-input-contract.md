@@ -49,10 +49,13 @@ signal validates.
 - **Durable answered-marker (producer-side, mctlhq/mctl-agents#473).** Every
   continuation run, i.e. one invoked with `--human-input-responses`, writes
   `human-input/answered.json`: a JSON array of
-  `{request_id, request_hash, received_at}` covering every answer it was
-  given, rewritten in full on each continuation, including one that also
-  seals a new question. It carries ids, hashes and timestamps only, never
-  `value`, so the "No transcripts" invariant holds for it. The same run drops
+  `{request_id, request_hash, received_at, question?}` covering every
+  answer it was given, rewritten in full on each continuation, including one
+  that also seals a new question. `question` is the model-authored text that
+  round's `request.json` already published; it is what lets every later
+  round's prompt pair each earlier answer with what was asked (an answer
+  whose question cannot be read back renders as "question text
+  unavailable", never silently dropped). The marker never carries `value`. The same run drops
   a carried-forward `request.json` whose `request_id` was answered. The
   consumer does not read the marker; it skips a resolved `question_hash`
   on its own. The marker exists for later executions and human readers of
@@ -61,6 +64,17 @@ signal validates.
   The continuation params do not forward `work_item_id`, so rounds 2+ of
   one loop may seal the canonical issue key where round 1 sealed a `wi_`
   id. This affects provenance only: nothing validates the field.
+- **Bounded answers (producer-side).** `--human-input-responses` refuses a
+  string `value` longer than 2000 code points, exactly the Telegram
+  adapter's `maxAnswerRunes`, which also refuses rather than truncates. A
+  list or object `value` is refused when its compact JSON encoding exceeds
+  8000 characters. The question text re-rendered next to an answer, and
+  the whole answers block, are truncated with an explicit marker.
+- **A human respondent.** A request names the issue author as its only
+  respondent. If `gh` reports the author as a bot, `_seal_draft` discards
+  the draft with `no-human-author` instead of sealing a request no human
+  surface could answer. The triplet still publishes, with outcome
+  `human-input-draft-rejected`.
 - **No transcripts.** Logs and the `human_input_state` query expose
   hashes, ids, timestamps and counters — never `question`, `reason` or
   `value`.

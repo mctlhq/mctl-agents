@@ -140,7 +140,7 @@ async def _wait_for_approval_park(handle, *, resume_count: int) -> None:
 async def test_investigator_asks_human_answers_loop_continues_then_approval_gate(
     env, tmp_path, monkeypatch,  # noqa: F811
 ):
-    loop = _Loop(tmp_path, monkeypatch, [_asks("Use library A or library B?"), _answers_only])
+    loop = _Loop(tmp_path, monkeypatch, [_asks("Which of the two libraries should we use?"), _answers_only])
     activities, calls, _investigate_ran, _ = _fake_activities(
         released=True, investigate_hook=loop.hook, human_input_reader=loop.published,
     )
@@ -157,6 +157,9 @@ async def test_investigator_asks_human_answers_loop_continues_then_approval_gate
         assert sealed.round == 1
         assert sealed.requested_from.actor_refs == ("github:alice",)
         assert ASK_HEADER in loop.harness.prompts[0]
+        # The granted prompt does not also deny that anyone can be asked.
+        assert "Do not ask for input" not in loop.harness.prompts[0]
+        assert "never stop to ask" not in loop.harness.prompts[0]
 
         # (b) ...and it parks the workflow.
         await _wait_for_pending_request(handle, sealed.request_id)
@@ -174,13 +177,15 @@ async def test_investigator_asks_human_answers_loop_continues_then_approval_gate
         # (e) The prompt the continuation sent the model renders it: built by
         # the real `_build_prompt` inside investigate(), not by a helper here.
         continuation_prompt = loop.harness.prompts[1]
-        assert rii._human_input_answers_block(answers) in continuation_prompt
-        assert "library B" in continuation_prompt and "RESOLVED" in continuation_prompt
+        assert rii._human_input_answers_block(answers, {sealed.request_id: sealed.question}) \
+            in continuation_prompt
+        assert f'question: "{sealed.question}"\n  answer: "library B"' in continuation_prompt
+        assert "RESOLVED" in continuation_prompt
         # The answered request is gone from what was published, and the
         # marker records it without the value.
         assert loop.published() is None
         marker = json.loads((loop.results[1].proposal_dir / "human-input" / "answered.json").read_text())
-        assert [m["request_id"] for m in marker] == [sealed.request_id]
+        assert [(m["request_id"], m["question"]) for m in marker] == [(sealed.request_id, sealed.question)]
         assert "library B" not in json.dumps(marker)
 
         # (f) Clarification is not approval: parked at the approval gate,
@@ -228,6 +233,9 @@ async def test_round_two_parks_again_and_the_third_answer_hits_the_round_bound(
             assert request.round == n
             assert request.question == questions[n - 1]
             assert ASK_HEADER in loop.harness.prompts[n - 1]
+            # Every earlier question reaches this round's prompt with its answer.
+            for earlier in questions[: n - 1]:
+                assert f'question: "{earlier}"\n  answer: "library A"' in loop.harness.prompts[n - 1]
             await _wait_for_pending_request(handle, request.request_id)
             state = await handle.query(DevLoopWorkflow.human_input_state)
             assert (state.round, state.resume_count) == (n, n - 1)
