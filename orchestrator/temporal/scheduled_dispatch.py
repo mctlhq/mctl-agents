@@ -15,16 +15,52 @@ Epoch arithmetic: Temporal interval schedules are aligned to the Unix epoch,
 `((weekday - 3) % 7)` days (Monday=0, so Thursday=3) plus the hour and minute
 lands on the wanted weekday and time. Sunday (6) gives 3 days.
 
+Ownership: the `dispatch-` id prefix and `-schedule` suffix are owned by this
+code. `worker._gc_dispatch_schedules` deletes every `dispatch-*-schedule` whose
+id is not a `schedule_id` of a target below, so do not hand-create schedules
+with that shape. `repo` and `workflow_file` go into GitHub URL paths and are
+validated here (at import time) and again in the activities.
+
 This module imports nothing from the Temporal worker.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 
 from temporalio.client import ScheduleIntervalSpec
 
 EPOCH_WEEKDAY = 3  # 1970-01-01 was a Thursday (Monday=0)
+
+DISPATCH_SCHEDULE_PREFIX = "dispatch-"
+DISPATCH_SCHEDULE_SUFFIX = "-schedule"
+
+_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_WORKFLOW_FILE_RE = re.compile(r"[A-Za-z0-9_.-]+\.ya?ml")
+_BAD_REF_RE = re.compile(r"[\s\x00-\x1f\x7f]")
+
+
+def validate_repo(value: str) -> str:
+    """Return `value` if it is a safe `<owner>/<name>`, else raise ValueError."""
+    if (
+        not isinstance(value, str)
+        or not _REPO_RE.fullmatch(value)
+        or any(seg in (".", "..") for seg in value.split("/"))
+    ):
+        raise ValueError(f"invalid repo {value!r}: expected <owner>/<name> of [A-Za-z0-9_.-]")
+    return value
+
+
+def validate_workflow_file(value: str) -> str:
+    """Return `value` if it is a bare workflow file name, else raise ValueError."""
+    if (
+        not isinstance(value, str)
+        or not _WORKFLOW_FILE_RE.fullmatch(value)
+        or value in (".yml", ".yaml")
+    ):
+        raise ValueError(f"invalid workflow_file {value!r}: expected a bare [A-Za-z0-9_.-]+.yml/.yaml name")
+    return value
 
 
 @dataclass(frozen=True)
@@ -36,17 +72,29 @@ class DispatchTarget:
     hour: int
     minute: int
 
+    def __post_init__(self) -> None:
+        validate_repo(self.repo)
+        validate_workflow_file(self.workflow_file)
+        if not self.ref or _BAD_REF_RE.search(self.ref):
+            raise ValueError(f"invalid ref {self.ref!r}: must be non-empty without whitespace or control characters")
+        if not 0 <= self.weekday <= 6:
+            raise ValueError(f"invalid weekday {self.weekday!r}: expected 0..6")
+        if not 0 <= self.hour <= 23:
+            raise ValueError(f"invalid hour {self.hour!r}: expected 0..23")
+        if not 0 <= self.minute <= 59:
+            raise ValueError(f"invalid minute {self.minute!r}: expected 0..59")
+
     @property
     def _slug(self) -> str:
         return f"{self.repo.replace('/', '-')}-{self.workflow_file.rsplit('.', 1)[0]}"
 
     @property
     def schedule_id(self) -> str:
-        return f"dispatch-{self._slug}-schedule"
+        return f"{DISPATCH_SCHEDULE_PREFIX}{self._slug}{DISPATCH_SCHEDULE_SUFFIX}"
 
     @property
     def workflow_id(self) -> str:
-        return f"dispatch-{self._slug}"
+        return f"{DISPATCH_SCHEDULE_PREFIX}{self._slug}"
 
     def interval(self) -> ScheduleIntervalSpec:
         return ScheduleIntervalSpec(

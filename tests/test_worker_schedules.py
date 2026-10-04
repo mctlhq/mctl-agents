@@ -20,6 +20,7 @@ from math import lcm
 from types import SimpleNamespace
 
 import pytest
+from temporalio.api.workflow.v1 import NewWorkflowExecutionInfo
 from temporalio.client import (
     Schedule,
     ScheduleActionStartWorkflow,
@@ -30,10 +31,21 @@ from temporalio.client import (
     ScheduleSpec,
     ScheduleState,
 )
+from temporalio.converter import DataConverter
 
 from orchestrator.temporal.constants import TASK_QUEUE
-from orchestrator.temporal.scheduled_dispatch import WEEKLY_DISPATCH_TARGETS
-from orchestrator.temporal.worker import ISSUE_POLL_SCHEDULE_ID, _ensure_schedule, setup_schedules
+from orchestrator.temporal.scheduled_dispatch import (
+    DISPATCH_SCHEDULE_PREFIX,
+    DISPATCH_SCHEDULE_SUFFIX,
+    WEEKLY_DISPATCH_TARGETS,
+    DispatchTarget,
+)
+from orchestrator.temporal.worker import (
+    ISSUE_POLL_SCHEDULE_ID,
+    _ensure_schedule,
+    _gc_dispatch_schedules,
+    setup_schedules,
+)
 from orchestrator.temporal.workflows.incidents import IncidentLoopWorkflow
 
 pytestmark = pytest.mark.anyio
@@ -76,9 +88,28 @@ class _FakeHandle:
             self.updates.append(result)
 
 
+class _AsyncIter:
+    def __init__(self, items):
+        self._items = list(items)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._items:
+            raise StopAsyncIteration
+        return self._items.pop(0)
+
+
 class _FakeClient:
-    def __init__(self, existing: Schedule | None, *, handle_fails: bool = False) -> None:
+    data_converter = DataConverter.default
+
+    def __init__(self, existing: Schedule | None, *, handle_fails: bool = False, listed=()) -> None:
         self.created: list[tuple[str, Schedule]] = []
+        self.listed = list(listed)
+        self.list_fails = False
+        self.deleted: list[str] = []
+        self.delete_fails: set[str] = set()
         self.handle = _FakeHandle(existing, fail=handle_fails) if existing is not None else None
 
     async def create_schedule(self, schedule_id: str, schedule: Schedule) -> None:
@@ -86,7 +117,22 @@ class _FakeClient:
             raise ScheduleAlreadyRunningError
         self.created.append((schedule_id, schedule))
 
+    async def list_schedules(self):
+        if self.list_fails:
+            raise RuntimeError("visibility down")
+        return _AsyncIter(SimpleNamespace(id=i) for i in self.listed)
+
     def get_schedule_handle(self, schedule_id: str):
+        if schedule_id in self.listed:
+            client = self
+
+            class _H:
+                async def delete(self_inner):
+                    if schedule_id in client.delete_fails:
+                        raise RuntimeError("nope")
+                    client.deleted.append(schedule_id)
+
+            return _H()
         assert self.handle is not None
         return self.handle
 
@@ -563,3 +609,166 @@ class TestIntakeCadence:
             ScheduleIntervalSpec(every=timedelta(hours=1), offset=timedelta(minutes=11))
         ) == {11}
 
+
+
+async def _live_action(ref: str, *, id: str = "dispatch-x-y") -> ScheduleActionStartWorkflow:
+    """What describe() returns: an action carrying only raw_info protos."""
+    from temporalio.api.common.v1 import Payloads
+
+    from orchestrator.temporal.workflows.scheduled_dispatch import ScheduledDispatchInput
+
+    payloads = await DataConverter.default.encode([ScheduledDispatchInput(repo="a/b", workflow_file="c.yml", ref=ref)])
+    raw = NewWorkflowExecutionInfo(workflow_id=id)
+    raw.workflow_type.name = "ScheduledDispatchWorkflow"
+    raw.task_queue.name = TASK_QUEUE
+    raw.input.CopyFrom(Payloads(payloads=payloads))
+    return ScheduleActionStartWorkflow("<unset>", raw_info=raw)
+
+
+def _dispatch_schedule(ref: str, every: timedelta = timedelta(days=7), overlap=ScheduleOverlapPolicy.SKIP):
+    from orchestrator.temporal.workflows.scheduled_dispatch import (
+        ScheduledDispatchInput,
+        ScheduledDispatchWorkflow,
+    )
+
+    return Schedule(
+        action=ScheduleActionStartWorkflow(
+            ScheduledDispatchWorkflow.run,
+            ScheduledDispatchInput(repo="a/b", workflow_file="c.yml", ref=ref),
+            id="dispatch-x-y",
+            task_queue=TASK_QUEUE,
+        ),
+        spec=ScheduleSpec(intervals=[ScheduleIntervalSpec(every=every)]),
+        policy=SchedulePolicy(overlap=overlap),
+    )
+
+
+class TestActionConvergence:
+    async def test_stale_ref_is_replaced_and_state_kept(self):
+        existing = _dispatch_schedule("main")
+        existing.action = await _live_action("main")
+        existing.state = ScheduleState(note="held", paused=True)
+        client = _FakeClient(existing=existing)
+        desired = _dispatch_schedule("release")
+
+        await _ensure_schedule(client, "dispatch-x-y-schedule", desired, "W", converge_action=True)
+
+        assert len(client.handle.updates) == 1
+        updated = client.handle.updates[0].schedule
+        assert updated.action is desired.action
+        assert updated.state.paused is True
+        assert updated.state.note == "held"
+
+    async def test_identical_action_no_update(self):
+        existing = _dispatch_schedule("main")
+        existing.action = await _live_action("main")
+        client = _FakeClient(existing=existing)
+
+        await _ensure_schedule(client, "s", _dispatch_schedule("main"), "W", converge_action=True)
+
+        assert client.handle.updates == []
+
+    async def test_action_difference_ignored_without_opt_in(self):
+        existing = _dispatch_schedule("main")
+        existing.action = await _live_action("main")
+        client = _FakeClient(existing=existing)
+
+        await _ensure_schedule(client, "s", _dispatch_schedule("release"), "W")
+
+        assert client.handle.updates == []
+
+    async def test_all_stale_one_update_and_retry_does_not_double_count(self, caplog):
+        existing = _dispatch_schedule("main", every=timedelta(days=1), overlap=ScheduleOverlapPolicy.BUFFER_ONE)
+        existing.action = await _live_action("main")
+        client = _FakeClient(existing=existing)
+        desired = _dispatch_schedule("release")
+        handle = client.handle
+        original = handle.update
+
+        async def _twice(updater):
+            await original(updater)
+            handle.updates.clear()
+            existing.spec.intervals = [ScheduleIntervalSpec(every=timedelta(days=1))]
+            existing.policy.overlap = ScheduleOverlapPolicy.BUFFER_ONE
+            existing.action = await _live_action("main")
+            await original(updater)
+
+        handle.update = _twice
+        with caplog.at_level(logging.INFO):
+            await _ensure_schedule(client, "s", desired, "W", converge_action=True)
+
+        assert len(handle.updates) == 1
+        assert "spec and overlap policy and action" in caplog.text
+
+
+class TestGcDispatchSchedules:
+    LISTED = (
+        "dispatch-a-x-schedule",
+        "dispatch-b-y-schedule",
+        "reconcile-mctl-agents-schedule",
+        "dispatch-foo",
+    )
+
+    async def test_only_undeclared_dispatch_schedule_deleted(self):
+        client = _FakeClient(existing=None, listed=self.LISTED)
+        await _gc_dispatch_schedules(client, {"dispatch-a-x-schedule"})
+        assert client.deleted == ["dispatch-b-y-schedule"]
+
+    async def test_list_failure_deletes_nothing_and_does_not_raise(self):
+        client = _FakeClient(existing=None, listed=self.LISTED)
+        client.list_fails = True
+        await _gc_dispatch_schedules(client, set())
+        assert client.deleted == []
+
+    async def test_delete_failure_does_not_stop_the_rest(self):
+        client = _FakeClient(existing=None, listed=self.LISTED)
+        client.delete_fails = {"dispatch-a-x-schedule"}
+        await _gc_dispatch_schedules(client, set())
+        assert client.deleted == ["dispatch-b-y-schedule"]
+
+    async def test_empty_declared_deletes_every_dispatch_schedule(self):
+        client = _FakeClient(existing=None, listed=self.LISTED)
+        await _gc_dispatch_schedules(client, set())
+        assert sorted(client.deleted) == ["dispatch-a-x-schedule", "dispatch-b-y-schedule"]
+
+    async def test_setup_schedules_runs_gc_after_registration(self):
+        client = _FakeClient(existing=None, listed=("dispatch-gone-wf-schedule", "incidents-mctl-agents-schedule"))
+        await setup_schedules(client)
+        assert client.deleted == ["dispatch-gone-wf-schedule"]
+        assert client.created
+
+
+class TestDispatchTargetValidation:
+    def _t(self, **kw):
+        base = dict(
+            repo="mctlhq/portfolio", workflow_file="weekly-refresh.yml", ref="main", weekday=6, hour=10, minute=1
+        )
+        base.update(kw)
+        return DispatchTarget(**base)
+
+    def test_valid(self):
+        assert self._t().schedule_id == "dispatch-mctlhq-portfolio-weekly-refresh-schedule"
+
+    @pytest.mark.parametrize(
+        "kw",
+        [
+            {"repo": "mctlhq/../x"},
+            {"repo": "a/b/c"},
+            {"repo": "mctlhq/portfolio?x"},
+            {"workflow_file": "wf.yml/../dispatches"},
+            {"workflow_file": "wf.txt"},
+            {"workflow_file": ".yml"},
+            {"ref": ""},
+            {"ref": "a b"},
+            {"weekday": 7},
+            {"minute": 60},
+        ],
+    )
+    def test_invalid(self, kw):
+        with pytest.raises(ValueError):
+            self._t(**kw)
+
+    def test_declared_ids_unique_and_shaped(self):
+        ids = [t.schedule_id for t in WEEKLY_DISPATCH_TARGETS]
+        assert len(ids) == len(set(ids))
+        assert all(i.startswith(DISPATCH_SCHEDULE_PREFIX) and i.endswith(DISPATCH_SCHEDULE_SUFFIX) for i in ids)

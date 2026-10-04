@@ -85,7 +85,11 @@ from orchestrator.temporal.constants import (
     implement_sweep_max_submits,
     implementation_max_concurrent_activities,
 )
-from orchestrator.temporal.scheduled_dispatch import WEEKLY_DISPATCH_TARGETS
+from orchestrator.temporal.scheduled_dispatch import (
+    DISPATCH_SCHEDULE_PREFIX,
+    DISPATCH_SCHEDULE_SUFFIX,
+    WEEKLY_DISPATCH_TARGETS,
+)
 from orchestrator.temporal.tracing import worker_interceptors
 from orchestrator.temporal.workflows.action_approval import ActionApprovalWaitWorkflow
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
@@ -131,8 +135,42 @@ logger = logging.getLogger(__name__)
 CRASH_DRAIN_TIMEOUT_SECONDS = 20.0
 
 
-async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, label: str) -> None:
+def _payload_key(p: Any) -> tuple:
+    return (tuple(sorted((k, bytes(v)) for k, v in p.metadata.items())), bytes(p.data))
+
+
+def _action_fingerprint_live(action: Any) -> tuple | None:
+    """Comparable (type, id, task queue, input payloads) of a DESCRIBED action.
+
+    temporalio 1.31 builds a described action from `raw_info`:
+    `ScheduleActionStartWorkflow("<unset>", raw_info=...)` copies the workflow
+    type, id, task queue and the input payloads (still encoded protos) onto
+    the action. None when the action did not come from the server.
+    """
+    if not getattr(action, "_from_raw", False):
+        return None
+    return (action.workflow, action.id, action.task_queue, tuple(_payload_key(p) for p in action.args))
+
+
+async def _action_fingerprint_desired(client: Client, action: ScheduleActionStartWorkflow) -> tuple:
+    """Same tuple for the declared action, encoded by the client's own converter."""
+    encoded = await client.data_converter.encode(list(action.args))
+    return (action.workflow, action.id, action.task_queue, tuple(_payload_key(p) for p in encoded))
+
+
+async def _ensure_schedule(
+    client: Client,
+    schedule_id: str,
+    desired: Schedule,
+    label: str,
+    *,
+    converge_action: bool = False,
+) -> None:
     """Create the schedule, or converge an existing one's spec to `desired`.
+
+    With `converge_action=True` (opt-in; only the dispatch schedules) the
+    whole action is also replaced when its workflow type, id, task queue or
+    encoded input differs, so a changed `ref` reaches the live schedule.
 
     `create_schedule` is a no-op once the schedule exists, so for the first
     year of this worker's life the interval declared here was decorative:
@@ -165,6 +203,20 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
 
     changed: list[str] = []
 
+    # Computed once, outside the update callback, which may run again on an
+    # optimistic-concurrency conflict and must stay cheap and pure.
+    desired_fp: tuple | None = None
+    if converge_action:
+        try:
+            desired_fp = await _action_fingerprint_desired(client, desired.action)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Temporal schedule %s: cannot fingerprint the declared action (%s); "
+                "skipping action convergence",
+                schedule_id,
+                exc,
+            )
+
     async def _converge_spec(input: ScheduleUpdateInput) -> ScheduleUpdate | None:
         # Cleared first: `update()` uses optimistic concurrency and may call
         # this callback again after a conflicting server-side write. Without
@@ -188,7 +240,8 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
         # nothing to converge TO, and pushing `None` would mean this function
         # deciding to clear a live value nobody asked it to touch.
         policy_stale = want_overlap is not None and live_overlap != want_overlap
-        if not spec_stale and not policy_stale:
+        action_stale = desired_fp is not None and _action_fingerprint_live(schedule.action) != desired_fp
+        if not spec_stale and not policy_stale and not action_stale:
             return None
         # Assign the FIELD, never the whole object. `schedule.spec =
         # desired.spec` would drop any jitter/calendars/time_zone_name the
@@ -218,6 +271,12 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
                 schedule.policy = SchedulePolicy()
             schedule.policy.overlap = desired_policy.overlap
             changed.append("overlap policy")
+        if action_stale:
+            # The whole action is replaced on purpose: code owns every field
+            # of a dispatch action, and nobody edits it by hand (unlike state).
+            logger.info("Updating Temporal schedule %s action", schedule_id)
+            schedule.action = desired.action
+            changed.append("action")
         return ScheduleUpdate(schedule=schedule)
 
     try:
@@ -236,13 +295,14 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
             )
         else:
             logger.info(
-                "Temporal schedule %s already exists; spec and overlap policy are current",
+                "Temporal schedule %s already exists; %s are current",
                 schedule_id,
+                "spec, overlap policy and action" if converge_action else "spec and overlap policy",
             )
     except Exception as exc:  # noqa: BLE001
         logger.error(
-            "Temporal schedule %s NOT converged (%s) — its live spec or overlap "
-            "policy may differ from the ones declared here",
+            "Temporal schedule %s NOT converged (%s) — its live spec, overlap "
+            "policy or action may differ from the ones declared here",
             schedule_id,
             exc,
         )
@@ -441,7 +501,37 @@ async def setup_schedules(client: Client) -> None:
             spec=ScheduleSpec(intervals=[target.interval()]),
             policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
         )
-        await _ensure_schedule(client, target.schedule_id, dispatch_schedule, "ScheduledDispatchWorkflow")
+        await _ensure_schedule(
+            client, target.schedule_id, dispatch_schedule, "ScheduledDispatchWorkflow", converge_action=True
+        )
+
+    await _gc_dispatch_schedules(client, {t.schedule_id for t in WEEKLY_DISPATCH_TARGETS})
+
+
+async def _gc_dispatch_schedules(client: Client, declared: set[str]) -> None:
+    """Delete `dispatch-*-schedule` schedules no current target declares.
+
+    The prefix and suffix are owned by code (see scheduled_dispatch.py).
+    Candidates are collected before any delete, so a listing failure deletes
+    nothing. Errors are logged at ERROR and never raised.
+    """
+    try:
+        stale = [
+            s.id
+            async for s in await client.list_schedules()
+            if s.id.startswith(DISPATCH_SCHEDULE_PREFIX)
+            and s.id.endswith(DISPATCH_SCHEDULE_SUFFIX)
+            and s.id not in declared
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Could not list Temporal schedules for dispatch GC (%s); nothing deleted", exc)
+        return
+    for sid in stale:
+        try:
+            await client.get_schedule_handle(sid).delete()
+            logger.warning("Deleted undeclared dispatch schedule %s", sid)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Could not delete undeclared dispatch schedule %s (%s)", sid, exc)
 
 
 ROLES = ("all", "control", "execution", "implementation")

@@ -13,7 +13,12 @@ An unreadable runs listing is never read as "no run", and a non-2xx dispatch
 is never read as success.
 
 `report_dispatch_failure` files (or comments on) one alert issue in the target
-repo, because a failed Temporal execution alerts nobody.
+repo, because a failed Temporal execution alerts nobody. Its search for an
+existing alert issue follows the `Link: rel="next"` header (up to
+`ALERT_SEARCH_MAX_PAGES`); an incomplete listing is never read as "no issue".
+
+`repo` and `workflow_file` go into URL paths, so both activities validate them
+before resolving a token or making any request (`InvalidDispatchTarget`).
 """
 from __future__ import annotations
 
@@ -28,6 +33,7 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from orchestrator.temporal.activities.proposals import _resolve_token
+from orchestrator.temporal.scheduled_dispatch import validate_repo, validate_workflow_file
 
 GITHUB_API = "https://api.github.com"
 REQUEST_TIMEOUT_SECONDS = 20.0
@@ -37,6 +43,7 @@ SKEW_SLACK = timedelta(seconds=60)
 
 ALERT_LABEL = "scheduled-dispatch-failed"
 ALERT_LABEL_COLOR = "d73a4a"
+ALERT_SEARCH_MAX_PAGES = 10
 
 DISPATCHED_MARK = "dispatched"
 
@@ -56,6 +63,11 @@ class NoGitHubToken(ApplicationError):
 class DispatchRejected(ApplicationError):
     def __init__(self, message: str) -> None:
         super().__init__(message, type="DispatchRejected", non_retryable=True)
+
+
+class InvalidDispatchTarget(ApplicationError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message, type="InvalidDispatchTarget", non_retryable=True)
 
 
 class DispatchFailed(ApplicationError):
@@ -134,6 +146,14 @@ async def _token() -> str:
     return token
 
 
+def _validated(repo: str, workflow_file: str) -> None:
+    try:
+        validate_repo(repo)
+        validate_workflow_file(workflow_file)
+    except ValueError as exc:
+        raise InvalidDispatchTarget(str(exc)) from exc
+
+
 def _parse_utc(value: str) -> datetime:
     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
@@ -180,6 +200,7 @@ def _prior_dispatch() -> bool:
 
 @activity.defn
 async def dispatch_and_observe(inp: DispatchInput) -> DispatchResult:
+    _validated(inp.repo, inp.workflow_file)
     already_dispatched = _prior_dispatch()
     token = await _token()
     since = _parse_utc(inp.not_before) - SKEW_SLACK
@@ -252,6 +273,7 @@ async def _call(what: str, coro: Any) -> httpx.Response:
 
 @activity.defn
 async def report_dispatch_failure(rep: FailureReport) -> FailureReportResult:
+    _validated(rep.repo, rep.workflow_file)
     token = await _token()
     title = f"Scheduled dispatch failed: {rep.workflow_file}"
     body = (
@@ -277,26 +299,36 @@ async def report_dispatch_failure(rep: FailureReport) -> FailureReportResult:
         else:
             _check(resp, "label lookup", ok=(200,))
 
-        resp = await _call(
-            "issue search",
-            client.get(
-                f"/repos/{rep.repo}/issues",
-                params={"state": "open", "labels": ALERT_LABEL, "per_page": 100},
-            ),
-        )
-        if resp.status_code != 200:
-            if resp.status_code == 429 or resp.status_code >= 500:
-                raise AlertIssueSearchUnreadable(f"issue search returned HTTP {resp.status_code}")
-            raise AlertReportRejected(f"issue search returned HTTP {resp.status_code}")
-        try:
-            issues = resp.json()
-            if not isinstance(issues, list):
-                raise TypeError("issues body is not a list")
-            match = next(
-                (i for i in issues if i.get("title") == title and "pull_request" not in i), None
+        url: str = f"/repos/{rep.repo}/issues"
+        params: dict[str, Any] | None = {"state": "open", "labels": ALERT_LABEL, "per_page": 100}
+        match = None
+        for _ in range(ALERT_SEARCH_MAX_PAGES):
+            resp = await _call("issue search", client.get(url, params=params))
+            if resp.status_code != 200:
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    raise AlertIssueSearchUnreadable(f"issue search returned HTTP {resp.status_code}")
+                raise AlertReportRejected(f"issue search returned HTTP {resp.status_code}")
+            try:
+                issues = resp.json()
+                if not isinstance(issues, list):
+                    raise TypeError("issues body is not a list")
+                match = next(
+                    (i for i in issues if i.get("title") == title and "pull_request" not in i), None
+                )
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise AlertIssueSearchUnreadable(f"issue search malformed: {exc}") from exc
+            if match is not None:
+                break
+            nxt = resp.links.get("next", {}).get("url")
+            if not nxt:
+                break  # listing complete, no match
+            if not str(nxt).startswith(GITHUB_API + "/"):
+                raise AlertIssueSearchUnreadable("issue search next link points outside the GitHub API")
+            url, params = str(nxt), None
+        else:
+            raise AlertIssueSearchUnreadable(
+                f"issue search exceeded {ALERT_SEARCH_MAX_PAGES} pages without a match"
             )
-        except (ValueError, TypeError, AttributeError) as exc:
-            raise AlertIssueSearchUnreadable(f"issue search malformed: {exc}") from exc
 
         if match is not None:
             number = int(match["number"])

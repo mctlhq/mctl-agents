@@ -97,3 +97,23 @@ async def test_report_retry_policy_and_original_error_survives(env, report_error
         await _run(env, acts)
     assert len(seen["report"]) == attempts
     assert _original(ei.value).type == "RunNotObserved"
+
+
+async def test_undelivered_alert_logs_marker_and_original_error_survives(env, caplog):
+    import logging
+
+    _seen, acts = _acts(dispatch_error=("RunNotObserved", True), report_error=("NoGitHubToken", False))
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(WorkflowFailureError) as ei:
+            await _run(env, acts)
+    assert _original(ei.value).type == "RunNotObserved"
+    assert "scheduled_dispatch_alert_undelivered" in caplog.text
+    assert "NoGitHubToken" in caplog.text
+
+
+async def test_invalid_dispatch_target_is_not_retried(env):
+    seen, acts = _acts(dispatch_error=("InvalidDispatchTarget", False), report_error=("InvalidDispatchTarget", False))
+    with pytest.raises(WorkflowFailureError):
+        await _run(env, acts)
+    assert len(seen["dispatch"]) == 1
+    assert len(seen["report"]) == 1
