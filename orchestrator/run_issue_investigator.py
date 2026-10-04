@@ -1561,7 +1561,15 @@ HUMAN_INPUT_STRUCTURED_ANSWER_MAX_CHARS = 8000
 # question is not the respondent's input, so refusing the run over it would
 # punish the wrong party).
 HUMAN_INPUT_QUESTION_RENDER_MAX_CHARS = 2000
-HUMAN_INPUT_ANSWERS_BLOCK_MAX_CHARS = 24000
+# Sized from the worst case the parser accepts, so the cap never bites a
+# valid run (and so never eats the newest answer): per answer, a question
+# (JSON-escaped, up to 6x for control characters) plus an answer (a string
+# escaped the same way, or a structured value), plus the entry's fixed text.
+HUMAN_INPUT_ANSWERS_BLOCK_MAX_CHARS = human_input.MAX_CLARIFICATION_ROUNDS * (
+    6 * HUMAN_INPUT_QUESTION_RENDER_MAX_CHARS
+    + max(6 * HUMAN_INPUT_ANSWER_MAX_CHARS, HUMAN_INPUT_STRUCTURED_ANSWER_MAX_CHARS)
+    + 512
+)
 HUMAN_INPUT_TRUNCATED_MARKER = " [truncated]"
 HUMAN_INPUT_QUESTION_UNAVAILABLE = "(question text unavailable)"
 # What a continuation reads back to pair answers with their questions.
