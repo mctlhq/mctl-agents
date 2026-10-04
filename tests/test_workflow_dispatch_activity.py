@@ -317,3 +317,83 @@ def test_5xx_429_retryable(monkeypatch, kw, issues):
     with pytest.raises(act.AlertReportFailed) as ei:
         _report(monkeypatch, _gh(**kw))
     assert not ei.value.non_retryable
+
+
+@pytest.mark.parametrize("bad", [{"repo": "a/../b"}, {"workflow_file": "x.txt"}, {"repo": "a/b?c"}])
+def test_invalid_target_makes_no_request_and_no_token_lookup(monkeypatch, bad):
+    def _no_token():
+        raise AssertionError("token resolved")
+
+    monkeypatch.setattr(act, "_resolve_token", _no_token)
+    for fn, arg in (
+        (act.dispatch_and_observe, act.DispatchInput(**{**INP.__dict__, **bad})),
+        (act.report_dispatch_failure, act.FailureReport(**{**REP.__dict__, **bad})),
+    ):
+        with pytest.raises(act.InvalidDispatchTarget) as ei:
+            _drive(monkeypatch, lambda r: httpx.Response(500), fn, arg)
+        assert ei.value.non_retryable
+        assert ei.value.calls == []
+
+
+def _issue(n: int, title: str) -> dict:
+    return {"number": n, "title": title, "html_url": f"u/{n}"}
+
+
+def _search_handler(pages: list[Any]):
+    """pages[i] is a list of issues, or an int status; page i+1 is linked unless last."""
+
+    def h(r: httpx.Request) -> httpx.Response:
+        path = r.url.path
+        if path.endswith(f"/labels/{act.ALERT_LABEL}"):
+            return httpx.Response(200, json={})
+        if r.method == "GET" and path.endswith("/issues"):
+            page = int(r.url.params.get("page", "1"))
+            body = pages[page - 1]
+            if isinstance(body, int):
+                return httpx.Response(body)
+            headers = {}
+            if page < len(pages):
+                headers["Link"] = f'<https://api.github.com/repos/mctlhq/portfolio/issues?page={page + 1}>; rel="next"'
+            return httpx.Response(200, json=body, headers=headers)
+        if r.method == "POST" and path.endswith("/comments"):
+            return httpx.Response(201, json={})
+        if r.method == "POST" and path.endswith("/issues"):
+            return httpx.Response(201, json={"number": 99, "html_url": "new"})
+        return httpx.Response(404)
+
+    return h
+
+
+def test_alert_match_on_page_two_is_commented_not_duplicated(monkeypatch):
+    res, calls = _report(monkeypatch, _search_handler([[_issue(1, "other")], [_issue(7, TITLE)]]))
+    assert res.issue_number == 7 and res.created is False
+    assert [c.url.path for c in _posts(calls)] == ["/repos/mctlhq/portfolio/issues/7/comments"]
+
+
+def test_no_match_across_complete_listing_creates(monkeypatch):
+    res, _calls = _report(monkeypatch, _search_handler([[_issue(1, "a")], [_issue(2, "b")]]))
+    assert res.created is True
+
+
+def test_page_cap_reached_is_unreadable_and_creates_nothing(monkeypatch):
+    pages = [[_issue(i, "other")] for i in range(1, act.ALERT_SEARCH_MAX_PAGES + 2)]
+    with pytest.raises(act.AlertIssueSearchUnreadable) as ei:
+        _report(monkeypatch, _search_handler(pages))
+    assert _posts(ei.value.calls) == []
+
+
+def test_foreign_host_next_link_is_not_followed(monkeypatch):
+    def h(r):
+        if r.url.path.endswith("/labels/" + act.ALERT_LABEL):
+            return httpx.Response(200, json={})
+        return httpx.Response(200, json=[], headers={"Link": '<https://evil.example/x>; rel="next"'})
+
+    with pytest.raises(act.AlertIssueSearchUnreadable) as ei:
+        _report(monkeypatch, h)
+    assert all(c.url.host == "api.github.com" for c in ei.value.calls)
+
+
+def test_server_error_on_page_two_is_unreadable(monkeypatch):
+    with pytest.raises(act.AlertIssueSearchUnreadable) as ei:
+        _report(monkeypatch, _search_handler([[_issue(1, "a")], 500]))
+    assert _posts(ei.value.calls) == []
