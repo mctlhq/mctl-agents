@@ -610,7 +610,7 @@ every pre-amendment block already follows, which keeps redaction
 | `kind` | required; closed `SUBJECT_KINDS` = `pull_request`, `issue`, `branch`, `release`, `work_item` | subject class |
 | `repository` | `owner/name`; required for `pull_request`, `issue`, `branch`, `release`; the name half may not be all dots or contain `..` (`.github` is fine) | the GitHub repository |
 | `ref` | required; the number for `pull_request`/`issue` (`[1-9][0-9]{0,9}`), otherwise `[A-Za-z0-9][A-Za-z0-9._/+-]*` ≤256 with no `..`, `//` or trailing `/` | PR/issue number, branch, tag or work item id |
-| `revision` | **required full lowercase git SHA (40 or 64 hex) for `SHA_BOUND_SUBJECT_KINDS` = `pull_request`, `branch`, `release`**; optional version token otherwise | the exact version observed |
+| `revision` | **required full lowercase git SHA (40 or 64 hex) for `SHA_BOUND_SUBJECT_KINDS` = `pull_request`, `branch`, `release`**; for `issue`/`work_item` an optional version token the producer and its readers agree on (for example the issue's `updated_at`), where blank means "unversioned" | the exact version observed |
 
 `revision` is in the hashed payload, so **PR@SHA1 and PR@SHA2 can never
 share a `content_hash` or `evidence_id`**. A moving pointer without its
@@ -668,12 +668,26 @@ every other one. A dropped leaf becomes `""` plus a `redacted_out` gap,
 and **for the four Amendment 2 blocks that gap is always `required=True`**
 (`AMENDMENT_2_BLOCKS` in `_is_block_required`): each block binds
 identity or trust, so a partly dropped one must leave the envelope
-`INCOMPLETE`. `validate()` then tolerates a blank *required* leaf (for
-example `subject.ref` on a branch whose name trips the credential screen)
-only when such a gap names that block, so `seal()` degrades to an
-explicit gap and never loses the whole envelope. A blank required leaf
-with no redaction gap was never supplied and is still rejected, and so is
-a non-required `redacted_out` gap on a new block (seal never writes one).
+`INCOMPLETE`. Only three required leaves can legitimately be dropped:
+`subject.ref`, `subject.repository` and `versions.agent`
+(`REDACTABLE_REQUIRED_LEAVES`). These are free-form, pattern-bounded
+strings, and a branch named after a token can trip the credential screen.
+`validate()` tolerates a blank one of those only when a `redacted_out` gap
+names its block, so `seal()` degrades to an explicit gap instead of losing
+the envelope. Every other required leaf is a closed vocabulary, a
+`sha256:` hash, a git SHA or a timestamp. No legitimate value of those can
+trip `_safe()`, so a blank one is always rejected, gap or no gap: a
+credential there is a producer bug and raises. `seal()` also runs a
+presence check on the caller's blocks *before* redaction
+(`_check_required_leaves_supplied`). A leaf the caller never supplied is
+therefore never excused by a sibling leaf's redaction. A non-required
+`redacted_out` gap on a new block is rejected (seal never writes one).
+
+**The excusal is declarative.** `from_dict` cannot re-run the redaction
+that produced a gap, so it trusts a required `redacted_out` gap as
+written. That is deliberate and bounded: the envelope is `INCOMPLETE`, only
+the three free-form leaves can be excused, and a blank `ref`/`repository`
+matches no `resolve_current` pool, so such an envelope is never current.
 
 `Requirements` gains `versions`, `subject`, `tool_calls` and `provenance`
 flags, all `False` by default, so `DEFAULT_REQUIREMENTS` — and every
@@ -689,8 +703,10 @@ which Tier B must reproduce and test against:
    `revision` excepted). A malformed one, such as an abbreviated or uppercase
    SHA or a `kind` outside `SUBJECT_KINDS`, raises
    `ExecutionEvidenceError`. It is a caller bug, never `no_evidence`.
-1. `revision` (the subject's live revision, which the *reader* has just
-   observed) blank → `unknown_revision`. Never `no_evidence`.
+1. For a SHA-bound kind, a blank `revision` (the subject's live SHA, which
+   the *reader* has just observed) → `unknown_revision`, never
+   `no_evidence`. For `issue`/`work_item` a blank `revision` *is* the
+   revision ("unversioned") and pools with blank-revision evidence.
 2. Pool = candidates with exactly this `subject.key` **and** this
    `revision`. Everything at another revision is historical by definition.
 3. A pool member named by another pool member's `provenance.supersedes` is
@@ -785,7 +801,8 @@ producer emits the new blocks:
    "`subject` requires `provenance`", `MAX_TOOL_CALLS`, and
    "`observation_failed` gaps must be `required: true`", "a `redacted_out`
    gap on an Amendment 2 block must be `required: true`, and only such a
-   gap excuses a blank required leaf in that block", the `subject.repository`
+   gap excuses a blank `subject.ref`, `subject.repository` or
+   `versions.agent` (never any other leaf)", the `subject.repository`
    path-fragment rule, and `release_revision` within signed 64-bit range.
    Violations answer `400 evidence_invalid`.
 3. **Conformance.** Copy `shepherd-pr-evidence.json` and
@@ -803,9 +820,11 @@ producer emits the new blocks:
    '^ev-[0-9a-f]{16}$'`; `supersedes <> id`; `subject_kind = '' OR
    (authority <> '' AND observed_at IS NOT NULL)`; `subject_kind NOT IN
    ('pull_request','branch','release') OR subject_revision ~
-   '^[0-9a-f]{40}([0-9a-f]{24})?$'` (or `''` when a `redacted_out` gap
-   excused it, which leaves the row out of every current pool). `versions`
-   and `tool_calls` stay in the
+   '^[0-9a-f]{40}([0-9a-f]{24})?$'` (never excused). `subject_ref` /
+   `subject_repository` may be `''` only on a row whose envelope carries a
+   required `redacted_out` gap for `subject`. That is the declarative
+   excusal above, not a bug to tighten away. `versions` and `tool_calls`
+   stay in the
    verbatim envelope only — no columns, no second copy.
 5. **Index.** `(subject_kind, subject_repository, subject_ref,
    subject_revision, observed_at DESC) WHERE subject_kind <> ''` and

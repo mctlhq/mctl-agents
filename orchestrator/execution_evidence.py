@@ -845,6 +845,57 @@ DEFAULT_REQUIREMENTS = Requirements()
 #: which subject, which call, how authoritative), so a partly dropped one
 #: must leave the envelope INCOMPLETE rather than sealed COMPLETE.
 AMENDMENT_2_BLOCKS = frozenset({"versions", "subject", "tool_calls", "provenance"})
+#: The only required Amendment 2 leaves a legitimate value can lose to
+#: `_safe()`: free-form, pattern-bounded strings that may contain a
+#: credential shape (a branch named after a token, say). Every other
+#: required leaf is a closed vocabulary, a hash, a git SHA or a timestamp,
+#: and is never excused.
+REDACTABLE_REQUIRED_LEAVES = frozenset({"versions.agent", "subject.ref", "subject.repository"})
+
+
+def _check_required_leaves_supplied(
+    *,
+    versions: VersionPins | None,
+    subject: SubjectRef | None,
+    tool_calls: Sequence[ToolCallRef],
+    provenance: Provenance | None,
+) -> None:
+    """seal()'s pre-redaction presence check. It runs on the caller's blocks
+    before `_safe()`, so a required leaf the caller never supplied is
+    rejected even when `_safe()` later drops a sibling leaf in the same
+    block. Shapes are checked after redaction by `validate()`."""
+    if versions is not None:
+        _require_leaf(versions.agent, False, "versions.agent is required when the versions block is present")
+        _require_leaf(
+            versions.definition_content_hash, False,
+            "versions.definition_content_hash is required when the versions block is present: "
+            "definition_version alone names no bytes (ADR 007 sec. 4)",
+        )
+    if subject is not None:
+        _require_leaf(subject.kind, False, "subject.kind is required when the subject block is present")
+        _require_leaf(subject.ref, False, "subject.ref is required when the subject block is present")
+        if subject.kind in REPOSITORY_SUBJECT_KINDS:
+            _require_leaf(
+                subject.repository, False, f"subject.repository is required for a {subject.kind} subject"
+            )
+        if subject.kind in SHA_BOUND_SUBJECT_KINDS:
+            _require_leaf(
+                subject.revision, False,
+                f"subject.revision is required for a {subject.kind} subject: evidence about a moving "
+                "pointer must name the exact git SHA it observed",
+            )
+    for call in tool_calls:
+        _require_leaf(call.kind, False, "tool_call.kind is required")
+        _require_leaf(call.action_digest, False, "tool_call.action_digest is required")
+        _require_leaf(call.status, False, "tool_call.status is required")
+    if provenance is not None:
+        _require_leaf(
+            provenance.authority, False, "provenance.authority is required when the provenance block is present"
+        )
+        _require_leaf(
+            provenance.observed_at, False,
+            "provenance.observed_at is required when the provenance block is present",
+        )
 
 
 def _is_block_required(block: str, requirements: Requirements) -> bool:
@@ -1197,10 +1248,14 @@ class ExecutionEvidence:
             _check_artifact(artifact)
         for gap in self.gaps:
             _check_gap(gap)
-        # A blank required leaf inside an Amendment 2 block is tolerated only
-        # when a redacted_out gap for that block accounts for it (_safe()
-        # dropped it); _is_block_required makes that gap required, so the
-        # envelope is sealed INCOMPLETE instead of being lost.
+        # A blank required FREE-FORM leaf (REDACTABLE_REQUIRED_LEAVES) is
+        # tolerated only when a redacted_out gap names its block: _safe()
+        # dropped it, _is_block_required made that gap required, and the
+        # envelope is INCOMPLETE rather than lost. The excusal is declarative
+        # (ADR 018 Amendment 2): from_dict trusts the gap as written. seal()
+        # additionally checks every required leaf is present BEFORE
+        # redaction (_check_required_leaves_supplied), so a leaf the caller
+        # never supplied is never excused by a sibling's redaction.
         redacted = {g.block for g in self.gaps if g.code == "redacted_out"}
         for gap in self.gaps:
             if gap.code == "redacted_out" and gap.block in AMENDMENT_2_BLOCKS and not gap.required:
@@ -1220,11 +1275,9 @@ class ExecutionEvidence:
         if len(self.tool_calls) > MAX_TOOL_CALLS:
             raise ExecutionEvidenceError(f"tool_calls holds {len(self.tool_calls)} entries, max {MAX_TOOL_CALLS}")
         for call in self.tool_calls:
-            _check_tool_call(call, redacted="tool_calls" in redacted)
+            _check_tool_call(call)
         if self.provenance is not None:
-            _check_provenance(
-                self.provenance, own_evidence_id=self.evidence_id, redacted="provenance" in redacted
-            )
+            _check_provenance(self.provenance, own_evidence_id=self.evidence_id)
 
     def to_log_dict(self) -> dict[str, Any]:
         """Trace/telemetry-export shape (#195 owns traces): `evidence_id`,
@@ -1390,10 +1443,12 @@ def _check_bounded(value: str, pattern: re.Pattern[str], max_length: int, *, whe
 
 def _require_leaf(value: str, redacted: bool, message: str) -> bool:
     """Whether a required Amendment 2 leaf is present and should be shape
-    checked. A blank leaf in a block `_safe()` redacted (a `redacted_out`
-    gap names the block) is the documented "dropped" value, accounted for
-    by that gap, so it is skipped like every pre-amendment blank leaf; a
-    blank leaf nobody redacted was simply never supplied and is an error."""
+    checked. Only the free-form leaves in `REDACTABLE_REQUIRED_LEAVES` are
+    ever called with `redacted=True`: a blank one in a block that a
+    `redacted_out` gap names is the documented "dropped" value and is
+    skipped. Every closed-vocabulary, hash, SHA or timestamp leaf is called
+    with `redacted=False`. No legitimate value of those can trip `_safe()`,
+    so a blank one is always an error."""
     if value:
         return True
     if redacted:
@@ -1404,7 +1459,7 @@ def _require_leaf(value: str, redacted: bool, message: str) -> bool:
 def _check_versions(pins: VersionPins, *, redacted: bool = False) -> None:
     _require_leaf(pins.agent, redacted, "versions.agent is required when the versions block is present")
     _require_leaf(
-        pins.definition_content_hash, redacted,
+        pins.definition_content_hash, False,
         "versions.definition_content_hash is required when the versions block is present: "
         "definition_version alone names no bytes (ADR 007 sec. 4)",
     )
@@ -1441,7 +1496,7 @@ def _check_subject(subject: SubjectRef, *, redacted: bool = False, require_revis
     for field_name in ("kind", "repository", "ref", "revision"):
         if not isinstance(getattr(subject, field_name), str):
             raise ExecutionEvidenceError(f"subject.{field_name} must be a string")
-    if _require_leaf(subject.kind, redacted, "subject.kind is required when the subject block is present"):
+    if _require_leaf(subject.kind, False, "subject.kind is required when the subject block is present"):
         if subject.kind not in SUBJECT_KINDS:
             raise ExecutionEvidenceError(f"subject.kind {subject.kind!r} is not one of {sorted(SUBJECT_KINDS)!r}")
     if _require_leaf(subject.ref, redacted, "subject.ref is required when the subject block is present"):
@@ -1460,7 +1515,7 @@ def _check_subject(subject: SubjectRef, *, redacted: bool = False, require_revis
         _check_repository(subject.repository)
     if subject.kind in SHA_BOUND_SUBJECT_KINDS:
         present = _require_leaf(
-            subject.revision, redacted or not require_revision,
+            subject.revision, not require_revision,
             f"subject.revision is required for a {subject.kind} subject: evidence about a moving "
             "pointer must name the exact git SHA it observed",
         )
@@ -1473,33 +1528,33 @@ def _check_subject(subject: SubjectRef, *, redacted: bool = False, require_revis
         _check_bounded(subject.revision, _VERSION_PATTERN, MAX_VERSION_LENGTH, where="subject.revision")
 
 
-def _check_tool_call(call: ToolCallRef, *, redacted: bool = False) -> None:
-    if _require_leaf(call.kind, redacted, "tool_call.kind is required") and call.kind not in TOOL_CALL_KINDS:
+def _check_tool_call(call: ToolCallRef) -> None:
+    if _require_leaf(call.kind, False, "tool_call.kind is required") and call.kind not in TOOL_CALL_KINDS:
         raise ExecutionEvidenceError(f"tool_call.kind {call.kind!r} is not one of {sorted(TOOL_CALL_KINDS)!r}")
     if call.name:
         _check_bounded(call.name, _TOOL_NAME_PATTERN, MAX_TOOL_NAME_LENGTH, where="tool_call.name")
     if _require_leaf(
-        call.action_digest, redacted, "tool_call.action_digest is required"
+        call.action_digest, False, "tool_call.action_digest is required"
     ) and not _SHA256_PATTERN.fullmatch(call.action_digest):
         raise ExecutionEvidenceError(
             "tool_call.action_digest must be 'sha256:' followed by 64 lowercase hex characters, "
             f"got {call.action_digest[:80]!r}"
         )
-    if _require_leaf(call.status, redacted, "tool_call.status is required") and call.status not in TOOL_CALL_STATUSES:
+    if _require_leaf(call.status, False, "tool_call.status is required") and call.status not in TOOL_CALL_STATUSES:
         raise ExecutionEvidenceError(
             f"tool_call.status {call.status!r} is not one of {sorted(TOOL_CALL_STATUSES)!r}"
         )
 
 
-def _check_provenance(provenance: Provenance, *, own_evidence_id: str, redacted: bool = False) -> None:
+def _check_provenance(provenance: Provenance, *, own_evidence_id: str) -> None:
     if _require_leaf(
-        provenance.authority, redacted, "provenance.authority is required when the provenance block is present"
+        provenance.authority, False, "provenance.authority is required when the provenance block is present"
     ) and provenance.authority not in AUTHORITY_RANK:
         raise ExecutionEvidenceError(
             f"provenance.authority {provenance.authority!r} is not one of {list(AUTHORITIES)!r}"
         )
     if _require_leaf(
-        provenance.observed_at, redacted, "provenance.observed_at is required when the provenance block is present"
+        provenance.observed_at, False, "provenance.observed_at is required when the provenance block is present"
     ) and (
         len(provenance.observed_at) > MAX_CREATED_AT_LENGTH or not _CREATED_AT_PATTERN.match(provenance.observed_at)
     ):
@@ -1652,6 +1707,9 @@ def seal(
     content_hash[7:23]` -> `validate()` before returning. `created_at` is
     caller-supplied and excluded from the hash, so sealing identical inputs
     twice at different times yields the same identity."""
+    _check_required_leaves_supplied(
+        versions=versions, subject=subject, tool_calls=tool_calls, provenance=provenance
+    )
     raw_payload = _content_payload(
         execution=execution,
         outcome=outcome,
@@ -1818,8 +1876,11 @@ def resolve_current(
     """Which envelope is current for subject `(kind, repository, ref)` at
     the `revision` the caller has just observed it at.
 
-    1. `revision` blank -> `unknown_revision`: without the live revision no
-       envelope can be called current, and "none" would be a lie.
+    1. `revision` blank for a `SHA_BOUND_SUBJECT_KINDS` kind ->
+       `unknown_revision`: without the live SHA no envelope can be called
+       current, and "none" would be a lie. For `issue`/`work_item` the
+       revision is an optional, producer-chosen version token: a blank one
+       is itself the revision ("unversioned"), pooled with other blank ones.
     2. Pool = candidates whose `subject` has exactly this key AND this
        `revision`. Evidence for any other revision is historical by
        definition — PR@SHA1 evidence is never current for PR@SHA2.
@@ -1847,7 +1908,7 @@ def resolve_current(
     _check_subject(
         SubjectRef(kind=kind, repository=repository, ref=ref, revision=revision), require_revision=False
     )
-    if not revision:
+    if not revision and kind in SHA_BOUND_SUBJECT_KINDS:
         return CurrentEvidence(state="unknown_revision")
     key = (kind, repository, ref)
     pool = [

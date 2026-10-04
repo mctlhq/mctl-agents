@@ -1320,23 +1320,77 @@ def test_resolve_current_over_the_golden_supersession_pair():
             "subject",
             {"subject": _subject(kind="branch", ref="feat/rotate-" + _CREDENTIAL), "provenance": _provenance()},
         ),
-        ("subject", {"subject": _subject(revision=_CREDENTIAL), "provenance": _provenance()}),
-        ("tool_calls", {"tool_calls": [_tool_call(action_digest=_CREDENTIAL)]}),
-        ("provenance", {"provenance": _provenance(observed_at=_CREDENTIAL)}),
-        ("provenance", {"provenance": _provenance(authority=_CREDENTIAL)}),
-        ("versions", {"versions": _versions(definition_content_hash=_CREDENTIAL)}),
+        ("subject", {"subject": _subject(repository="mctlhq/" + _CREDENTIAL), "provenance": _provenance()}),
+        ("versions", {"versions": _versions(agent="sk-" + "a" * 20)}),
     ),
-    ids=("subject.ref", "subject.revision", "tool_call.action_digest", "provenance.observed_at",
-         "provenance.authority", "versions.definition_content_hash"),
+    ids=("subject.ref", "subject.repository", "versions.agent"),
 )
-def test_a_redacted_required_leaf_seals_incomplete_instead_of_losing_the_envelope(block, overrides):
+def test_a_redacted_free_form_required_leaf_seals_incomplete_instead_of_losing_the_envelope(block, overrides):
     evidence = _seal(**overrides)
-    assert _CREDENTIAL not in json.dumps(evidence.to_dict())
+    dumped = json.dumps(evidence.to_dict())
+    assert _CREDENTIAL not in dumped and "sk-" + "a" * 20 not in dumped
     gaps = [g for g in evidence.gaps if g.block == block and g.code == "redacted_out"]
     assert len(gaps) == 1 and gaps[0].required
     assert evidence.completeness == ee.INCOMPLETE
     assert ee.recompute_content_hash(evidence) == evidence.content_hash
     assert ee.ExecutionEvidence.from_dict(evidence.to_dict()) == evidence
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    (
+        ({"subject": _subject(revision=_CREDENTIAL), "provenance": _provenance()}, r"subject\.revision"),
+        ({"tool_calls": [_tool_call(action_digest=_CREDENTIAL)]}, r"tool_call\.action_digest"),
+        ({"tool_calls": [_tool_call(kind=_CREDENTIAL)]}, r"tool_call\.kind"),
+        ({"provenance": _provenance(observed_at=_CREDENTIAL)}, r"provenance\.observed_at"),
+        ({"provenance": _provenance(authority=_CREDENTIAL)}, r"provenance\.authority"),
+        ({"versions": _versions(definition_content_hash=_CREDENTIAL)}, r"versions\.definition_content_hash"),
+    ),
+    ids=("subject.revision", "tool_call.action_digest", "tool_call.kind", "provenance.observed_at",
+         "provenance.authority", "versions.definition_content_hash"),
+)
+def test_a_redacted_vocabulary_or_shape_leaf_is_never_excused(overrides, match):
+    # No legitimate value of these leaves can trip _safe(): a credential
+    # there is a producer bug and must raise, not seal INCOMPLETE.
+    with pytest.raises(ee.ExecutionEvidenceError, match=match):
+        _seal(**overrides)
+
+
+def test_a_sibling_redaction_never_excuses_a_never_supplied_leaf():
+    # ref is redacted (excusable) but revision was simply forgotten: seal()'s
+    # pre-redaction presence check must still reject it.
+    with pytest.raises(ee.ExecutionEvidenceError, match=r"subject\.revision is required"):
+        _seal(subject=_subject(ref="524", repository="mctlhq/" + _CREDENTIAL, revision=""), provenance=_provenance())
+    # Two excusable free-form leaves: one redacted, one never supplied.
+    with pytest.raises(ee.ExecutionEvidenceError, match=r"subject\.repository is required"):
+        _seal(
+            subject=_subject(kind="branch", ref="feat/x-" + _CREDENTIAL, repository=""), provenance=_provenance()
+        )
+    with pytest.raises(ee.ExecutionEvidenceError, match=r"versions\.agent is required"):
+        _seal(versions=_versions(environment=_CREDENTIAL, agent=""))
+    with pytest.raises(ee.ExecutionEvidenceError, match="definition_content_hash is required"):
+        _seal(versions=_versions(environment=_CREDENTIAL, definition_content_hash=""))
+    with pytest.raises(ee.ExecutionEvidenceError, match=r"tool_call\.status is required"):
+        _seal(tool_calls=[_tool_call(name=_CREDENTIAL), _tool_call(status="")])
+
+
+def test_from_dict_excuses_a_blank_free_form_leaf_only_under_a_declared_redaction_gap():
+    # The excusal is declarative (ADR 018 Amendment 2): from_dict trusts a
+    # required redacted_out gap as written, for the free-form leaves only.
+    sealed = _seal(subject=_subject(kind="branch", ref="feat/x-" + _CREDENTIAL), provenance=_provenance())
+    doc = sealed.to_dict()
+    assert doc["subject"]["ref"] == ""
+    assert ee.ExecutionEvidence.from_dict(doc) == sealed
+    # Without the gap, the same blank ref is rejected.
+    doc_without_gap = {**doc, "gaps": []}
+    with pytest.raises(ee.ExecutionEvidenceError, match=r"subject\.ref is required"):
+        ee.ExecutionEvidence.from_dict(doc_without_gap)
+    # A declared gap never excuses a blank SHA on a SHA-bound subject.
+    forged = json.loads(json.dumps(doc))
+    forged["subject"]["ref"] = "feat/x"
+    forged["subject"]["revision"] = ""
+    with pytest.raises(ee.ExecutionEvidenceError, match=r"subject\.revision is required"):
+        ee.ExecutionEvidence.from_dict(forged)
 
 
 def test_a_blank_required_leaf_with_only_a_non_required_redaction_gap_is_rejected():
@@ -1354,6 +1408,7 @@ def test_a_blank_required_leaf_with_only_a_non_required_redaction_gap_is_rejecte
         ("pull_request", "mctlhq/mctl-agents", "524", "A" * 40),
         ("pr", "mctlhq/mctl-agents", "524", _SHA1),
         ("PullRequest", "mctlhq/mctl-agents", "524", ""),
+        ("issue", "mctlhq/mctl-agents", "199", "has space"),
         ("pull_request", "mctl-agents", "524", _SHA1),
         ("pull_request", "mctlhq/mctl-agents", "#524", _SHA1),
         ("pull_request", "mctlhq/mctl-agents", 524, _SHA1),
@@ -1388,3 +1443,34 @@ def test_to_log_dict_reports_the_amendment_2_codes():
     assert log["subject_kind"] == "pull_request"
     assert log["authority"] == "observed"
     assert _seal().to_log_dict()["subject_kind"] == ""
+
+
+def _issue_evidence(revision="", **provenance) -> ee.ExecutionEvidence:
+    return _seal(subject=_subject(kind="issue", ref="199", revision=revision), provenance=_provenance(**provenance))
+
+
+def _resolve_issue(candidates, revision=""):
+    return ee.resolve_current(
+        candidates, kind="issue", repository="mctlhq/mctl-agents", ref="199", revision=revision,
+    )
+
+
+def test_resolve_current_answers_current_for_an_unversioned_issue_subject():
+    older = _issue_evidence(observed_at="2026-10-04T10:00:00Z")
+    newer = _issue_evidence(observed_at="2026-10-04T11:00:00Z")
+    result = _resolve_issue([older, newer])
+    assert result.state == "current"
+    assert result.evidence == newer
+
+
+def test_resolve_current_pools_issue_evidence_by_its_version_token():
+    unversioned = _issue_evidence()
+    versioned = _issue_evidence(revision="2026-10-04T10:00:00Z")
+    assert _resolve_issue([unversioned, versioned]).evidence == unversioned
+    assert _resolve_issue([unversioned, versioned], revision="2026-10-04T10:00:00Z").evidence == versioned
+    assert _resolve_issue([unversioned], revision="2026-10-04T10:00:00Z").state == "no_evidence"
+
+
+def test_a_blank_revision_is_unknown_only_for_sha_bound_kinds():
+    assert _resolve([_pr_evidence()], revision="").state == "unknown_revision"
+    assert _resolve_issue([_issue_evidence()]).state == "current"
