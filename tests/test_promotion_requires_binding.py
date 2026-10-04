@@ -142,7 +142,10 @@ def registry(monkeypatch) -> _Registry:
 
 @pytest.fixture(autouse=True)
 def _no_retry_backoff(monkeypatch):
+    """Retries are exercised, their sleeps are not: a 429's Retry-After
+    bypasses RETRY_BACKOFF_S, so sleep itself is stubbed too."""
     monkeypatch.setattr(gate, "RETRY_BACKOFF_S", 0.0)
+    monkeypatch.setattr(gate.time, "sleep", lambda seconds: None)
 
 
 def _publish(agent: str, transport: httpx.BaseTransport, *, dry_run: bool = False):
@@ -339,7 +342,7 @@ def _flaky(failures: list[Responder], then: bytes) -> tuple[Responder, list[int]
     "failure",
     [
         lambda r: httpx.Response(502),
-        lambda r: httpx.Response(429, headers={"Retry-After": "0"}),
+        lambda r: httpx.Response(429, headers={"Retry-After": "30"}),
         _raise(httpx.ConnectError),
         _raise(httpx.ReadTimeout),
     ],
@@ -407,8 +410,8 @@ def test_dry_run_reports_the_verdict_and_writes_nothing(registry, capsys):
 
 @pytest.mark.parametrize(
     ("header", "expected"),
-    [("7", 7.0), ("600", 60.0), ("Wed, 21 Oct 2026 07:28:00 GMT", 2.0), (None, 2.0)],
-    ids=["seconds", "capped", "http-date", "absent"],
+    [("7", 7.0), ("60", 60.0), ("Wed, 21 Oct 2026 07:28:00 GMT", 2.0), (None, 2.0)],
+    ids=["seconds", "at the cap", "http-date", "absent"],
 )
 def test_a_429_waits_for_retry_after(header, expected, registry, monkeypatch):
     monkeypatch.setattr(gate, "RETRY_BACKOFF_S", 2.0)
@@ -419,6 +422,19 @@ def test_a_429_waits_for_retry_after(header, expected, registry, monkeypatch):
     outcome = _publish(_V2, _gitops({_V2: responder}))
     assert outcome.state == publish_agent_release.PROMOTED
     assert slept == [expected]
+
+
+def test_a_retry_after_beyond_the_cap_refuses_at_once(registry, monkeypatch):
+    """Retrying before the window ends can extend the block, and the verdict
+    would be the same: refuse now, without sleeping or re-sending."""
+    slept: list[float] = []
+    monkeypatch.setattr(gate.time, "sleep", slept.append)
+    over_cap = [lambda r: httpx.Response(429, headers={"Retry-After": "600"})] * 5
+    responder, seen = _flaky(over_cap, _binding(_V2))
+    outcome = _publish(_V2, _gitops({_V2: responder}))
+    _refused(outcome, registry, _V2, gate.VERDICT_UNOBSERVED)
+    assert slept == []
+    assert len(seen) == 1
 
 
 # ---------------------------------------------------------------------------

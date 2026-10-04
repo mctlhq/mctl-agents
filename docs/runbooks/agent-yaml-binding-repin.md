@@ -178,7 +178,9 @@ job summary.
   `mctl_promote_agent`.
 - **Refused: mismatch or unobservable**: a binding exists but is stale or disagrees
   with the release, or it (or its profile) could not be read. This fails the step.
-  Reads are retried three times on connect errors, timeouts, 5xx and 429 (the secondary
-  rate limit, honouring its `Retry-After` up to 60s); 403 (the primary rate limit) and
-  404 are not retried. A rate-limit refusal means wait and promote by hand, not re-pin. Re-pin as described above, or wait until the read works, and then
-  promote by hand: re-running the workflow does not repeat this step.
+  Reads are retried three times on connect errors, timeouts, 5xx and 429 (the
+  secondary rate limit, honouring a `Retry-After` of up to 60s; a longer one
+  refuses at once). 403 (the primary rate limit) and 404 are not retried.
+  For a stale or mismatched binding, re-pin as described above. For an unreadable
+  one, including a rate limit, wait until the read works. Then promote by hand:
+  re-running the workflow does not repeat this step.

@@ -83,9 +83,9 @@ TIMEOUT_S = 20.0
 # answers, not blips, and are not retried.
 FETCH_ATTEMPTS = 3
 RETRY_BACKOFF_S = 2.0
-# A 429's Retry-After (normally 60s) is honoured up to this cap, so one hint
-# cannot stall the release step. A window longer than the cap still refuses
-# as unobservable: wait it out and promote by hand, do not re-pin.
+# A 429's Retry-After (normally 60s) is honoured up to this cap. A hint above
+# it refuses at once as unobservable rather than retrying early, which GitHub
+# documents can extend the block: wait it out and promote by hand.
 RETRY_AFTER_CAP_S = 60.0
 
 EXIT_MATCH = 0
@@ -156,7 +156,10 @@ def _fetch(url: str, transport: httpx.BaseTransport | None) -> bytes:
                 if not retryable or attempt == FETCH_ATTEMPTS:
                     break
                 if response.status_code == 429:
-                    time.sleep(_retry_after(response, default=RETRY_BACKOFF_S * attempt))
+                    wait = _retry_after(response, default=RETRY_BACKOFF_S * attempt)
+                    if wait is None:
+                        break
+                    time.sleep(wait)
                     continue
             time.sleep(RETRY_BACKOFF_S * attempt)
     finally:
@@ -177,14 +180,19 @@ def _fetch(url: str, transport: httpx.BaseTransport | None) -> bytes:
     return response.content
 
 
-def _retry_after(response: httpx.Response, *, default: float) -> float:
-    """Seconds a 429 asks us to wait, capped at RETRY_AFTER_CAP_S. The
-    header may also be an HTTP-date; anything unparseable uses `default`."""
+def _retry_after(response: httpx.Response, *, default: float) -> float | None:
+    """Seconds a 429 asks us to wait, or None when that exceeds
+    RETRY_AFTER_CAP_S and the read should give up now. The header may also be
+    an HTTP-date; anything unparseable uses `default`."""
     try:
         wait = float(response.headers.get("Retry-After", default))
     except ValueError:
         wait = default
-    return max(0.0, min(wait, RETRY_AFTER_CAP_S))
+    if wait != wait:  # nan
+        wait = default
+    if wait > RETRY_AFTER_CAP_S:
+        return None
+    return max(0.0, wait)
 
 
 def parse_binding(raw: bytes, *, agent: str = AGENT) -> resolver.ReleaseBinding:
