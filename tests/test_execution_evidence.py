@@ -1623,13 +1623,8 @@ def _non_string_leaf_cases():
     # so a name dropped from a _check_string_fields tuple always fails here.
     # work_item is the kind with the fewest required subject leaves, so its
     # repository/revision are guarded only by the string-field check.
-    blocks = {
-        "versions": (ee.VersionPins, "versions"),
-        "subject": (ee.SubjectRef, "subject"),
-        "tool_call": (ee.ToolCallRef, "tool_calls"),
-        "provenance": (ee.Provenance, "provenance"),
-    }
-    for block, (cls, _) in blocks.items():
+    blocks = {"versions": ee.VersionPins, "subject": ee.SubjectRef, "tool_call": ee.ToolCallRef, "provenance": ee.Provenance}
+    for block, cls in blocks.items():
         for field in dataclasses.fields(cls):
             yield pytest.param(block, {field.name: [field.name]}, id=f"{block}.{field.name}")
     yield pytest.param("versions", {"release_revision": "7"}, id="versions.release_revision-str")
@@ -1646,5 +1641,6 @@ def test_validate_rejects_a_non_string_leaf_as_an_evidence_error(block, override
         forged = dataclasses.replace(sealed, tool_calls=(dataclasses.replace(sealed.tool_calls[0], **overrides),))
     else:
         forged = dataclasses.replace(sealed, **{block: dataclasses.replace(getattr(sealed, block), **overrides)})
-    with pytest.raises(ee.ExecutionEvidenceError, match="must be"):
+    # The type rejection specifically, never a downstream shape message.
+    with pytest.raises(ee.ExecutionEvidenceError, match=r"must be a string|must be an int or null"):
         forged.validate()
