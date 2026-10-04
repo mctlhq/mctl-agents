@@ -249,19 +249,35 @@ jobs:
       # `pip install` on a PEP 668 image ("externally managed environment")
       # fails outright, and this step is the release pipeline — it must not
       # depend on whether the runner image happens to ship that marker, or
-      # on `python` being symlinked to `python3` (agy P1). setup-python puts
-      # a non-managed interpreter on PATH under both names.
-      - name: Set up Python
+      # on `python` being symlinked to `python3` (agy P1).
+      #
+      # uv and the lockfile rather than `pip install httpx pyyaml`: since
+      # #470 the publish tool gates every production promotion on the
+      # mctl-gitops binding through orchestrator.resolver, which imports the
+      # project's config package and its dependencies. Same pins as the
+      # binding-gate job, so both gates run against the same resolver.
+      - name: Set up uv
         if: ${{ steps.release.outputs.release_created == 'true' }}
-        uses: actions/setup-python@v5
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
-          python-version: '3.12'
+          version: "0.11.11"
+          python-version: "3.12"
+          enable-cache: true
 
+      # Publishes every agent in the tag, but PROMOTES to production only
+      # the agents whose mctl-gitops release binding pins this tag's exact
+      # agent.yaml (mctlhq/mctl-agents#470). A missing, stale or unreadable
+      # binding refuses that agent's promotion; the per-agent outcome lands
+      # in the log and the job summary. See the tool's docstring for which
+      # refusals fail this step.
       - name: Refresh agent registry
         if: ${{ steps.release.outputs.release_created == 'true' }}
         env:
           VAULT_ADDR: https://secrets.mctl.ai
           TAG: ${{ steps.release.outputs.tag_name }}
+          # Read-only use: lifts the anonymous rate limit on the mctl-gitops
+          # binding reads. This job's default token, not an App token.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           JWT=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
@@ -280,8 +296,8 @@ jobs:
             | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["data"]["mctl-token"])')
           echo "::add-mask::$MCTL_TOKEN"
 
-          python -m pip install --quiet httpx pyyaml
-          MCTL_TOKEN="$MCTL_TOKEN" python tools/publish_agent_release.py "$TAG"
+          uv sync --locked --quiet
+          MCTL_TOKEN="$MCTL_TOKEN" uv run --locked python tools/publish_agent_release.py "$TAG"
 
       - name: Notify Telegram on release/deploy failure
         if: ${{ failure() && steps.release.outputs.release_created == 'true' }}
@@ -296,8 +312,8 @@ jobs:
           fi
 
           MESSAGE=$(cat <<EOF
-          ❌ mctl-agents release-deploy dispatch failed
-          Tag ${TAG} was created but the centralized deploy did not dispatch.
+          ❌ mctl-agents release step failed
+          Tag ${TAG} was created, but the deploy dispatch, the registry publish, or the per-agent promotion gate failed (see the job summary for which agents were refused).
           Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
           EOF
           )

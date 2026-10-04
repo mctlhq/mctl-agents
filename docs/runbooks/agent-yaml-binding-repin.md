@@ -156,3 +156,22 @@ ahead of time:
   a declarative resolver mode. `release-deploy` bumps `agent_image` in every
   `cwft-mctl-agents-*.yaml`, so when another CWFT goes declarative, extend
   `tools/check_binding_hash.py` to cover its binding in the same change.
+
+## Production promotion of every agent (mctlhq/mctl-agents#470)
+
+Separately from the release-blocking gate above, `tools/publish_agent_release.py`
+promotes an agent to `production` only when
+`check_binding_hash.evaluate_promotion` finds its binding on mctl-gitops `main`
+(`releases/shadow/<agent>.yaml`, the same catalog the resolver reads) pinning the
+exact `agent.yaml` in the tag, with the profile it pins present at that version. This
+applies to every manifest, not only `issue-investigator`. The version is still
+published, so it stays inactive until someone promotes it. Each agent's outcome
+(promoted, or refused with the reason) is in the "Refresh agent registry" log and the
+job summary.
+
+- **Refused: missing**: the agent has no binding. This is a warning, and the step stays
+  green. Production keeps the version it had. To activate the release, add a binding
+  in mctl-gitops and then promote the published version with `mctl_promote_agent`.
+- **Refused: mismatch or unobservable**: a binding exists but is stale or disagrees
+  with the release, or it (or its profile) could not be read. This fails the step.
+  Re-pin as described above, or retry once the read works, and then promote by hand.

@@ -36,11 +36,19 @@ Exit codes keep "could not observe" apart from "observed a mismatch":
        contentHash or spec.version). Never a match.
 
 The re-pin procedure is docs/runbooks/agent-yaml-binding-repin.md.
+
+mctlhq/mctl-agents#470 generalises the same comparison to every agent:
+`evaluate_promotion(agent, raw_agent_yaml)` is what
+tools/publish_agent_release.py asks before it promotes an agent to
+production. It reuses every piece above — the fetch, the resolver's parser,
+the resolver's hash and cross-checks — and returns a verdict instead of an
+exit code, so one refused agent does not decide the others.
 """
 from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -56,7 +64,8 @@ AGENT = "issue-investigator"
 ENVIRONMENT = resolver.DEFAULT_ENVIRONMENT
 GITOPS_REPO = "mctlhq/mctl-gitops"
 GITOPS_REF = "main"
-BINDING_PATH = f"platform-gitops/agent-platform/releases/{ENVIRONMENT}/{AGENT}.yaml"
+RELEASES_PATH = f"platform-gitops/agent-platform/releases/{ENVIRONMENT}"
+BINDING_PATH = f"{RELEASES_PATH}/{AGENT}.yaml"
 # The contents API rather than raw.githubusercontent.com: the raw CDN caches
 # for up to five minutes, so right after a re-pin merges it would keep
 # serving the old hash and fail a release that is in fact correct.
@@ -76,14 +85,27 @@ class BindingUnobservable(RuntimeError):
     a match: the gate fails on it either way, with its own exit code."""
 
 
-def fetch_binding(transport: httpx.BaseTransport | None = None) -> bytes:
-    """Return the raw binding bytes from mctl-gitops `main`.
+class BindingMissing(BindingUnobservable):
+    """GitHub answered 404: there is no binding at that path on the ref.
 
-    Anything but a 200 is `BindingUnobservable`. A 404 included:
-    the binding being absent would make the resolver fail closed at run time
-    too ("missing release"), so it is not a state a release may ship into.
+    A subclass, so every caller that only knows `BindingUnobservable` keeps
+    failing closed on it exactly as before. Only the promotion gate tells
+    the two apart, and only to word its refusal — both refuse."""
+
+
+def binding_path(agent: str) -> str:
+    return f"{RELEASES_PATH}/{agent}.yaml"
+
+
+def fetch_binding(transport: httpx.BaseTransport | None = None, *, agent: str = AGENT) -> bytes:
+    """Return the raw binding bytes for `agent` from mctl-gitops `main`.
+
+    Anything but a 200 is `BindingUnobservable`. A 404 included (as its
+    `BindingMissing` subclass): the binding being absent would make the
+    resolver fail closed at run time too ("missing release"), so it is not a
+    state a release may ship into.
     """
-    return _fetch(BINDING_URL, transport)
+    return _fetch(f"{CONTENTS_API}/{binding_path(agent)}", transport)
 
 
 def fetch_profile(name: str, transport: httpx.BaseTransport | None = None) -> bytes:
@@ -104,6 +126,10 @@ def _fetch(url: str, transport: httpx.BaseTransport | None) -> bytes:
             response = client.get(url, params={"ref": GITOPS_REF}, headers=headers)
     except httpx.HTTPError as exc:
         raise BindingUnobservable(f"could not fetch {url}: {exc!r}") from exc
+    # 404 is the contents API's documented "no such path on this ref". Every
+    # other non-200 (403 rate limit, 5xx) says nothing about the binding.
+    if response.status_code == 404:
+        raise BindingMissing(f"no file at {url} on {GITOPS_REF} (HTTP 404)")
     if response.status_code != 200:
         raise BindingUnobservable(
             f"could not fetch {url}: HTTP {response.status_code} {response.text[:200]!r}"
@@ -113,14 +139,14 @@ def _fetch(url: str, transport: httpx.BaseTransport | None) -> bytes:
     return response.content
 
 
-def parse_binding(raw: bytes) -> resolver.ReleaseBinding:
+def parse_binding(raw: bytes, *, agent: str = AGENT) -> resolver.ReleaseBinding:
     """A fetched binding, validated by the resolver's own parser. Any
     `ResolverError` — malformed YAML, a missing or non-`sha256:` contentHash,
     a wrong agent or environment — becomes `BindingUnobservable`."""
-    label = Path(f"{GITOPS_REPO}@{GITOPS_REF}") / BINDING_PATH
+    label = Path(f"{GITOPS_REPO}@{GITOPS_REF}") / binding_path(agent)
     try:
         document = resolver.parse_yaml_mapping(raw, path=label)
-        binding = resolver.parse_release_binding(document, path=label, agent=AGENT, environment=ENVIRONMENT)
+        binding = resolver.parse_release_binding(document, path=label, agent=agent, environment=ENVIRONMENT)
     except resolver.ResolverError as exc:
         raise BindingUnobservable(str(exc)) from exc
     return binding
@@ -243,6 +269,113 @@ def _mirrored_mismatch(relpath: Path, exc: resolver.ResolverError) -> int:
         f"Re-pin the mirrored fields in mctl-gitops too; see {RUNBOOK}."
     )
     return EXIT_MISMATCH
+
+
+# ---------------------------------------------------------------------------
+# Production promotion gate (mctlhq/mctl-agents#470)
+# ---------------------------------------------------------------------------
+VERDICT_MATCH = "match"
+VERDICT_MISSING = "missing"
+VERDICT_MISMATCH = "mismatch"
+VERDICT_UNOBSERVED = "unobservable"
+
+
+@dataclass(frozen=True)
+class PromotionVerdict:
+    """Whether one agent's released agent.yaml may be promoted to
+    production. Only `VERDICT_MATCH` promotes; every other status is a
+    refusal, and `reason` says which and why."""
+
+    agent: str
+    status: str
+    reason: str
+
+    @property
+    def promote(self) -> bool:
+        return self.status == VERDICT_MATCH
+
+
+def evaluate_promotion(
+    agent: str, raw_definition: bytes, transport: httpx.BaseTransport | None = None
+) -> PromotionVerdict:
+    """Compare the agent.yaml bytes being released with `agent`'s binding on
+    mctl-gitops `main`, using the same checks as `check()`.
+
+    - the binding's spec.sourceManifest.contentHash must equal
+      `resolver.definition_content_hash(raw_definition)`;
+    - a v1alpha2 AgentDefinition must also pass the resolver's mirrored-field
+      checks and its profile-compatibility range, exactly as `check()` runs
+      them for issue-investigator;
+    - a v1alpha1 manifest has no executionProfileRef to mirror, so it gets
+      the hash, the definition name, and the profile pin;
+    - the profile the binding pins (name and version — the binding schema
+      requires both) must exist in the catalog at that spec.version.
+
+    A binding or profile that cannot be read or validated is
+    `VERDICT_UNOBSERVED`, never a match. A 404 on the binding is
+    `VERDICT_MISSING`. Both refuse.
+    """
+    local_hash = resolver.definition_content_hash(raw_definition)
+
+    def refuse(status: str, reason: str) -> PromotionVerdict:
+        return PromotionVerdict(agent, status, reason)
+
+    try:
+        binding = parse_binding(fetch_binding(transport, agent=agent), agent=agent)
+    except BindingMissing:
+        return refuse(
+            VERDICT_MISSING,
+            f"no {ENVIRONMENT} binding for {agent} at {GITOPS_REPO}@{GITOPS_REF}:{binding_path(agent)}",
+        )
+    except BindingUnobservable as exc:
+        return refuse(VERDICT_UNOBSERVED, f"binding could not be read, and unknown is not a match: {exc}")
+
+    revision = binding.release_revision
+    if binding.definition_content_hash != local_hash:
+        return refuse(
+            VERDICT_MISMATCH,
+            f"stale binding: bindingRevision {revision} pins {binding.definition_content_hash}, "
+            f"the released agent.yaml is {local_hash}",
+        )
+
+    definition_path = resolver.DEFINITIONS_DIR / agent / "agent.yaml"
+    definition: resolver.AgentDefinition | None = None
+    try:
+        document = resolver.parse_yaml_mapping(raw_definition, path=definition_path)
+        if document.get("apiVersion") == resolver.SUPPORTED_DEFINITION_API_VERSION:
+            definition = resolver.parse_definition(raw_definition, path=definition_path)
+            resolver.check_binding_against_definition(binding, definition)
+        else:
+            metadata = document.get("metadata")
+            name = metadata.get("name") if isinstance(metadata, dict) else None
+            if binding.definition_name != name:
+                raise resolver.ResolverError(
+                    f"release binding definition.name {binding.definition_name!r} does not match "
+                    f"agent.yaml metadata.name {name!r}"
+                )
+    except resolver.ResolverError as exc:
+        return refuse(VERDICT_MISMATCH, f"binding disagrees with the released agent.yaml: {exc}")
+
+    try:
+        profile_version = parse_profile_version(fetch_profile(binding.profile_name, transport), binding.profile_name)
+    except BindingUnobservable as exc:
+        return refuse(
+            VERDICT_UNOBSERVED,
+            f"execution profile {binding.profile_name!r} could not be read, and unknown is not a match: {exc}",
+        )
+    try:
+        resolver.check_binding_profile_version(binding, profile_version)
+        if definition is not None:
+            resolver.check_profile_compatibility(definition, profile_version)
+    except resolver.ResolverError as exc:
+        return refuse(VERDICT_MISMATCH, f"binding disagrees with the catalog profile: {exc}")
+
+    return PromotionVerdict(
+        agent,
+        VERDICT_MATCH,
+        f"matches {GITOPS_REPO}@{GITOPS_REF} bindingRevision {revision} ({local_hash}, "
+        f"profile {binding.profile_name}@{profile_version})",
+    )
 
 
 if __name__ == "__main__":

@@ -219,7 +219,7 @@ class TestPerAgentIsolation:
             if agent in explode:
                 raise explode[agent]
             published.append(agent)
-            return True
+            return publish_agent_release.Outcome(agent, publish_agent_release.PROMOTED, "ok")
 
         monkeypatch.setattr(publish_agent_release, "publish", fake_publish)
         monkeypatch.setattr(sys, "argv", ["publish_agent_release.py", "1.33.0"])
@@ -281,7 +281,7 @@ class TestPerAgentIsolation:
 
         def fake_publish(agent, version, git_sha, tree, *, dry_run):
             seen.append(agent)
-            return True
+            return publish_agent_release.Outcome(agent, publish_agent_release.PROMOTED, "ok")
 
         monkeypatch.setattr(publish_agent_release, "publish", fake_publish)
         monkeypatch.setattr(sys, "argv", ["publish_agent_release.py", "1.33.0"])

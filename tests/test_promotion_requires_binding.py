@@ -1,0 +1,353 @@
+"""Production promotion requires a matching gitops release binding
+(mctlhq/mctl-agents#470).
+
+`tools/publish_agent_release.py` used to promote every agent.yaml in a tag to
+`production` right after publishing it, so a merged manifest activated
+itself. These tests pin the gate in both directions: a binding that pins the
+released bytes promotes exactly as before, and every other state — no
+binding, a stale one, one that cannot be read — refuses that agent's
+promotion without touching the others.
+
+mctl-api is faked at `_request`; mctl-gitops is an `httpx.MockTransport`, so
+the suite stays offline.
+"""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import sys
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+import yaml
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_TOOL = _REPO_ROOT / "tools" / "publish_agent_release.py"
+_spec = importlib.util.spec_from_file_location("publish_agent_release", _TOOL)
+assert _spec and _spec.loader
+publish_agent_release = importlib.util.module_from_spec(_spec)
+sys.modules["publish_agent_release"] = publish_agent_release
+_spec.loader.exec_module(publish_agent_release)
+gate = publish_agent_release.check_binding_hash
+
+_VERSION = "9.9.9"
+_MANIFESTS = _REPO_ROOT / "agents" / "_manifests"
+# One v1alpha2 AgentDefinition (full resolver cross-checks) and one v1alpha1
+# manifest (hash, name and profile pin only).
+_V2 = "issue-investigator"
+_V1 = "shepherd"
+_PROFILES = {_V2: ("issue-investigator-default", "1.5.1"), _V1: ("shepherd-default", "1.0.0")}
+
+
+def _raw(agent: str) -> bytes:
+    return (_MANIFESTS / agent / "agent.yaml").read_bytes()
+
+
+def _sha256(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _binding(agent: str, *, content_hash: str | None = None, **spec_overrides: Any) -> bytes:
+    profile_name, profile_version = _PROFILES[agent]
+    spec: dict[str, Any] = {
+        "sourceManifest": {
+            "repo": "mctlhq/mctl-agents",
+            "path": f"agents/_manifests/{agent}/agent.yaml",
+            "contentHash": _sha256(_raw(agent)) if content_hash is None else content_hash,
+        },
+        "bindingSource": "compatibility-fixture",
+        "promotable": False,
+        "registryLifecycle": {"definition": "published", "profile": "published"},
+        "definition": {"name": agent, "version": "1", "profileCompatibility": ">=1.0.0 <2.0.0"},
+        "profile": {"name": profile_name, "version": profile_version},
+        "bindingRevision": 3,
+    }
+    spec.update(spec_overrides)
+    doc = {
+        "apiVersion": "agents.mctl.ai/v1alpha2",
+        "kind": "ReleaseBindingIntent",
+        "metadata": {"agent": agent, "environment": "shadow"},
+        "spec": spec,
+    }
+    return yaml.safe_dump(doc, sort_keys=False).encode()
+
+
+def _profile(name: str, version: str) -> bytes:
+    return yaml.safe_dump({
+        "apiVersion": "agents.mctl.ai/v1alpha2",
+        "kind": "ExecutionProfile",
+        "metadata": {"name": name},
+        "spec": {"version": version},
+    }).encode()
+
+
+Responder = Callable[[httpx.Request], httpx.Response]
+
+
+def _gitops(bindings: dict[str, bytes | Responder], profiles: dict[str, bytes | Responder] | None = None):
+    """Serve bindings by agent and profiles by name; anything else is a 404,
+    which is what GitHub's contents API answers for a path that is absent."""
+    if profiles is None:
+        profiles = {name: _profile(name, version) for name, version in _PROFILES.values()}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        assert request.url.params["ref"] == "main"
+        if path.endswith("/profile.yaml"):
+            entry = profiles.get(path.rsplit("/", 2)[-2])
+        else:
+            entry = bindings.get(path.rsplit("/", 1)[-1].removesuffix(".yaml"))
+        if entry is None:
+            return httpx.Response(404, json={"message": "Not Found"})
+        if callable(entry):
+            return entry(request)
+        return httpx.Response(200, content=entry)
+
+    return httpx.MockTransport(handler)
+
+
+class _Registry:
+    """A fake mctl-api that records every call."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict | None]] = []
+
+    def __call__(self, method: str, path: str, payload: dict | None = None) -> tuple[int, str]:
+        self.calls.append((method, path, payload))
+        return 201, "{}"
+
+    def published(self) -> list[str]:
+        return [p.split("/")[4] for _, p, _ in self.calls if p.endswith("/versions")]
+
+    def promoted(self) -> list[str]:
+        return [p.split("/")[4] for _, p, _ in self.calls if p.endswith("/releases")]
+
+
+@pytest.fixture
+def registry(monkeypatch) -> _Registry:
+    fake = _Registry()
+    monkeypatch.setattr(publish_agent_release, "_request", fake)
+    monkeypatch.setattr(
+        publish_agent_release, "_read_at_tag", lambda tag, rel: (_REPO_ROOT / rel).read_bytes()
+    )
+    # The prompt surface is not what is under test here.
+    monkeypatch.setattr(publish_agent_release, "prompt_hash", lambda *a: "sha256:" + "a" * 64)
+    for name in ("GITHUB_ACTIONS", "GITHUB_STEP_SUMMARY", "GITHUB_TOKEN", "GH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    return fake
+
+
+def _publish(agent: str, transport: httpx.BaseTransport, *, dry_run: bool = False):
+    return publish_agent_release.publish(
+        agent, _VERSION, "cafe" * 10, [], dry_run=dry_run, gitops_transport=transport
+    )
+
+
+# ---------------------------------------------------------------------------
+# Green on a converged input: promotion as before
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("agent", [_V2, _V1])
+def test_a_matching_binding_is_promoted(agent, registry):
+    outcome = _publish(agent, _gitops({agent: _binding(agent)}))
+
+    assert outcome.state == publish_agent_release.PROMOTED
+    assert not outcome.fails_release
+    assert registry.published() == [agent]
+    assert registry.promoted() == [agent]
+    (release,) = [payload for _, path, payload in registry.calls if path.endswith("/releases")]
+    assert release == {"version": _VERSION, "environment": "production"}
+
+
+def test_the_gate_hashes_the_released_bytes_as_the_resolver_does():
+    from orchestrator import resolver
+
+    assert resolver.definition_content_hash(_raw(_V2)) == resolver.load_definition(_V2).content_hash
+
+
+# ---------------------------------------------------------------------------
+# Red: every refusal leaves production alone
+# ---------------------------------------------------------------------------
+def _refused(outcome, registry, agent: str, status: str) -> None:
+    assert outcome.state == publish_agent_release.REFUSED
+    assert outcome.verdict is not None
+    assert outcome.verdict.status == status
+    assert registry.promoted() == []
+    # Publishing an immutable, inactive version still happens, so the
+    # release can be promoted by hand once the binding is re-pinned.
+    assert registry.published() == [agent]
+
+
+def test_no_binding_refuses_promotion(registry):
+    outcome = _publish(_V1, _gitops({}))
+    _refused(outcome, registry, _V1, gate.VERDICT_MISSING)
+    assert "no shadow binding" in outcome.detail
+    # Expected state for an agent nobody has bound yet: refused, not a red run.
+    assert not outcome.fails_release
+
+
+@pytest.mark.parametrize("agent", [_V2, _V1])
+def test_a_stale_binding_refuses_promotion(agent, registry):
+    stale = "sha256:" + "0" * 64
+    outcome = _publish(agent, _gitops({agent: _binding(agent, content_hash=stale)}))
+    _refused(outcome, registry, agent, gate.VERDICT_MISMATCH)
+    assert stale in outcome.detail
+    assert _sha256(_raw(agent)) in outcome.detail
+    assert outcome.fails_release
+
+
+def _definition(name: str, compatibility: str = ">=1.0.0 <2.0.0") -> dict:
+    return {"definition": {"name": name, "version": "1", "profileCompatibility": compatibility}}
+
+
+_MISMATCHED = {
+    "definition.name": (_V2, _definition("other")),
+    "v1alpha1 definition.name": (_V1, _definition("other")),
+    "compatibility mirror": (_V2, _definition(_V2, ">=1.0.0 <3.0.0")),
+    "profile.name": (_V2, {"profile": {"name": "shepherd-default", "version": "1.0.0"}}),
+    "profile.version stale vs catalog": (_V1, {"profile": {"name": "shepherd-default", "version": "1.1.0"}}),
+}
+
+
+@pytest.mark.parametrize("case", list(_MISMATCHED))
+def test_a_matching_hash_with_a_mismatched_version_or_profile_refuses(case, registry):
+    agent, overrides = _MISMATCHED[case]
+    outcome = _publish(agent, _gitops({agent: _binding(agent, **overrides)}))
+    _refused(outcome, registry, agent, gate.VERDICT_MISMATCH)
+    assert outcome.fails_release
+
+
+def _raise(exc: type[httpx.HTTPError]) -> Responder:
+    def responder(request: httpx.Request) -> httpx.Response:
+        raise exc("boom", request=request)
+
+    return responder
+
+
+_UNOBSERVABLE: dict[str, tuple[dict, dict | None]] = {
+    "malformed yaml": ({_V2: b"spec: [unclosed\n  - : :"}, None),
+    "empty 200": ({_V2: b""}, None),
+    "not a binding": ({_V2: b"apiVersion: v1\nkind: ConfigMap\n"}, None),
+    "binding for another agent": ({_V2: _binding(_V1)}, None),
+    "500": ({_V2: lambda r: httpx.Response(500, text="oops")}, None),
+    "403 rate limit": ({_V2: lambda r: httpx.Response(403, text="rate limited")}, None),
+    "connect error": ({_V2: _raise(httpx.ConnectError)}, None),
+    "timeout": ({_V2: _raise(httpx.ReadTimeout)}, None),
+    "profile missing": ({_V2: _binding(_V2)}, {}),
+    "profile 500": ({_V2: _binding(_V2)}, {"issue-investigator-default": lambda r: httpx.Response(500)}),
+    "profile malformed": ({_V2: _binding(_V2)}, {"issue-investigator-default": b"spec: [unclosed"}),
+}
+
+
+@pytest.mark.parametrize("case", list(_UNOBSERVABLE))
+def test_an_unreadable_binding_source_refuses_and_is_not_skipped(case, registry):
+    bindings, profiles = _UNOBSERVABLE[case]
+    outcome = _publish(_V2, _gitops(bindings, profiles))
+    _refused(outcome, registry, _V2, gate.VERDICT_UNOBSERVED)
+    assert "unknown is not a match" in outcome.detail
+    # Unknown never passes quietly: it fails the release step.
+    assert outcome.fails_release
+
+
+def test_the_gate_is_decided_before_any_registry_write(registry, monkeypatch):
+    """A gate that blows up must leave no half-done agent: nothing published,
+    nothing promoted, and the agent recorded as failed by main()."""
+
+    def explode(*a, **k):
+        raise RuntimeError("gate crashed")
+
+    monkeypatch.setattr(gate, "evaluate_promotion", explode)
+    with pytest.raises(RuntimeError):
+        _publish(_V2, _gitops({_V2: _binding(_V2)}))
+    assert registry.calls == []
+
+
+def test_dry_run_reports_the_verdict_and_writes_nothing(registry, capsys):
+    outcome = _publish(_V1, _gitops({}), dry_run=True)
+    assert outcome.state == publish_agent_release.REFUSED
+    assert registry.calls == []
+    assert "would REFUSE promoting shepherd" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# A mixed release: only the bound agents are promoted
+# ---------------------------------------------------------------------------
+def _run_main(monkeypatch, transport: httpx.BaseTransport, agents: list[str]) -> int:
+    real_publish = publish_agent_release.publish
+    monkeypatch.setattr(publish_agent_release, "_git", lambda *a: "cafe1234cafe")
+    monkeypatch.setattr(
+        publish_agent_release, "_tree_paths", lambda tag: [f"agents/_manifests/{a}/agent.yaml" for a in agents]
+    )
+    monkeypatch.setattr(
+        publish_agent_release,
+        "publish",
+        lambda *a, **k: real_publish(*a, **k, gitops_transport=transport),
+    )
+    monkeypatch.setattr(sys, "argv", ["publish_agent_release.py", _VERSION])
+    return publish_agent_release.main()
+
+
+def test_a_mixed_release_promotes_only_the_matching_agents(registry, monkeypatch, tmp_path, capsys):
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    transport = _gitops({
+        _V2: _binding(_V2),  # matches
+        _V1: _binding(_V1, content_hash="sha256:" + "1" * 64),  # stale
+        # mentor: no binding at all
+    })
+
+    code = _run_main(monkeypatch, transport, ["issue-investigator", "mentor", "shepherd"])
+
+    assert registry.promoted() == ["issue-investigator"]
+    assert registry.published() == ["issue-investigator", "mentor", "shepherd"]
+    # The stale binding is the blocking refusal; the absent one is a warning.
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "failed: shepherd" in captured.err
+    assert "issue-investigator: promoted" in captured.out
+    assert "mentor: refused — missing" in captured.out
+    assert "shepherd: refused — mismatch" in captured.out
+    assert "::warning::mentor refused" in captured.out
+    assert "::error::shepherd refused" in captured.out
+    table = summary.read_text()
+    assert "| `issue-investigator` | promoted |" in table
+    assert "| `mentor` | refused |" in table
+    assert "| `shepherd` | refused |" in table
+
+
+def test_only_absent_bindings_keep_the_release_green(registry, monkeypatch, capsys):
+    code = _run_main(monkeypatch, _gitops({_V2: _binding(_V2)}), ["issue-investigator", "mentor"])
+    assert code == 0
+    assert registry.promoted() == ["issue-investigator"]
+
+
+def test_a_crashing_gate_fails_the_agent_without_stopping_the_others(registry, monkeypatch, capsys):
+    real = gate.evaluate_promotion
+
+    def flaky(agent, raw, transport=None):
+        if agent == "mentor":
+            raise RuntimeError("gate crashed")
+        return real(agent, raw, transport)
+
+    monkeypatch.setattr(gate, "evaluate_promotion", flaky)
+    code = _run_main(monkeypatch, _gitops({_V2: _binding(_V2)}), ["issue-investigator", "mentor"])
+    assert code == 1
+    assert registry.promoted() == ["issue-investigator"]
+    assert "mentor" not in registry.published()
+
+
+# ---------------------------------------------------------------------------
+# Wiring
+# ---------------------------------------------------------------------------
+def test_the_release_job_runs_the_gated_tool_with_the_locked_environment():
+    """The gate imports orchestrator.resolver, which a bare
+    `pip install httpx pyyaml` cannot satisfy."""
+    workflow = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "release-please.yml").read_text())
+    steps = workflow["jobs"]["release-please"]["steps"]
+    (refresh,) = [s for s in steps if s.get("name") == "Refresh agent registry"]
+    assert "uv run --locked python tools/publish_agent_release.py" in refresh["run"]
+    assert "pip install" not in refresh["run"]
+    assert refresh["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
