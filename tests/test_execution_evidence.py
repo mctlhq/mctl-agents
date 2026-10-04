@@ -1618,21 +1618,30 @@ def test_an_unhashable_leaf_fails_as_an_evidence_error_not_a_type_error(override
 # -- review round 5 (PR #575) -----------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "block,overrides",
-    (
-        ("versions", {"environment": ["shadow"]}),
-        ("versions", {"definition_version": ["1"]}),
-        ("versions", {"profile_version": ["3"]}),
-        ("versions", {"profile_content_hash": ["sha256:" + "f3" * 32]}),
-        ("versions", {"release_revision": "7"}),
-        ("versions", {"release_revision": True}),
-        ("tool_call", {"name": ["merge"]}),
-        ("provenance", {"supersedes": ["ev-0"]}),
-    ),
-)
-def test_validate_rejects_a_non_string_optional_leaf_as_an_evidence_error(block, overrides):
-    sealed = _seal(versions=_versions(), tool_calls=[_tool_call()], provenance=_provenance())
+def _non_string_leaf_cases():
+    # Every field of every Amendment 2 block, generated rather than listed,
+    # so a name dropped from a _check_string_fields tuple always fails here.
+    # work_item is the kind with the fewest required subject leaves, so its
+    # repository/revision are guarded only by the string-field check.
+    blocks = {
+        "versions": (ee.VersionPins, "versions"),
+        "subject": (ee.SubjectRef, "subject"),
+        "tool_call": (ee.ToolCallRef, "tool_calls"),
+        "provenance": (ee.Provenance, "provenance"),
+    }
+    for block, (cls, _) in blocks.items():
+        for field in dataclasses.fields(cls):
+            yield pytest.param(block, {field.name: [field.name]}, id=f"{block}.{field.name}")
+    yield pytest.param("versions", {"release_revision": "7"}, id="versions.release_revision-str")
+    yield pytest.param("versions", {"release_revision": True}, id="versions.release_revision-bool")
+
+
+@pytest.mark.parametrize("block,overrides", tuple(_non_string_leaf_cases()))
+def test_validate_rejects_a_non_string_leaf_as_an_evidence_error(block, overrides):
+    sealed = _seal(
+        versions=_versions(), tool_calls=[_tool_call()], provenance=_provenance(),
+        subject=_subject(kind="work_item", ref="wi-1", repository="mctlhq/mctl-agents", revision="v1"),
+    )
     if block == "tool_call":
         forged = dataclasses.replace(sealed, tool_calls=(dataclasses.replace(sealed.tool_calls[0], **overrides),))
     else:
