@@ -849,12 +849,25 @@ AMENDMENT_2_BLOCKS = frozenset({"versions", "subject", "tool_calls", "provenance
 #: The only required Amendment 2 leaves a legitimate value can lose to
 #: `_safe()`: free-form, pattern-bounded strings that may contain a
 #: credential shape (a branch named after a token, say). `subject.ref` is
-#: free-form only for non-numbered kinds; a `pull_request`/`issue` ref is
-#: the leaf `subject.number`, a short decimal `_safe()` can never drop.
+#: redactable ONLY for kinds outside `NUMBERED_SUBJECT_KINDS`: a
+#: `pull_request`/`issue` ref is a short decimal `_safe()` can never drop.
 #: Every other required leaf is a closed vocabulary, a hash, a git SHA or a
-#: timestamp, and is never excused. `_check_required_leaves` consults this
-#: set directly — it is the rule, not documentation of one.
+#: timestamp, and is never excused. `_required_leaves` derives each row's
+#: `redactable` flag from this set, so the set is the rule.
 REDACTABLE_REQUIRED_LEAVES = frozenset({"versions.agent", "subject.ref", "subject.repository"})
+
+
+@dataclass(frozen=True)
+class _RequiredLeaf:
+    """One row of the required-leaf table: the contract leaf name, the gap
+    block `_safe()` would name for it, its value, whether a redaction gap
+    on that block may excuse a blank, and the error message."""
+
+    leaf: str
+    gap_block: str
+    value: Any
+    redactable: bool
+    message: str
 
 
 def _required_leaves(
@@ -863,50 +876,45 @@ def _required_leaves(
     subject: SubjectRef | None = None,
     tool_calls: Sequence[ToolCallRef] = (),
     provenance: Provenance | None = None,
-) -> list[tuple[str, str, str]]:
-    """The single table of required Amendment 2 leaves: `(leaf, value,
-    message)` for every leaf that must be non-blank given the blocks
+) -> list[_RequiredLeaf]:
+    """The single table of required Amendment 2 leaves for the blocks
     present. Drives both seal()'s pre-redaction presence check and
     validate()'s post-redaction one, so the two can never disagree."""
-    leaves: list[tuple[str, str, str]] = []
+    rows: list[_RequiredLeaf] = []
+
+    def add(leaf: str, gap_block: str, value: Any, message: str, *, redactable: bool = True) -> None:
+        rows.append(_RequiredLeaf(
+            leaf=leaf, gap_block=gap_block, value=value,
+            redactable=redactable and leaf in REDACTABLE_REQUIRED_LEAVES, message=message,
+        ))
+
     if versions is not None:
-        leaves.append((
-            "versions.agent", versions.agent, "versions.agent is required when the versions block is present",
-        ))
-        leaves.append((
-            "versions.definition_content_hash", versions.definition_content_hash,
+        add("versions.agent", "versions", versions.agent,
+            "versions.agent is required when the versions block is present")
+        add("versions.definition_content_hash", "versions", versions.definition_content_hash,
             "versions.definition_content_hash is required when the versions block is present: "
-            "definition_version alone names no bytes (ADR 007 sec. 4)",
-        ))
+            "definition_version alone names no bytes (ADR 007 sec. 4)")
     if subject is not None:
-        leaves.append(("subject.kind", subject.kind, "subject.kind is required when the subject block is present"))
-        ref_leaf = "subject.number" if subject.kind in NUMBERED_SUBJECT_KINDS else "subject.ref"
-        leaves.append((ref_leaf, subject.ref, "subject.ref is required when the subject block is present"))
-        if subject.kind in REPOSITORY_SUBJECT_KINDS:
-            leaves.append((
-                "subject.repository", subject.repository,
-                f"subject.repository is required for a {subject.kind} subject",
-            ))
-        if subject.kind in SHA_BOUND_SUBJECT_KINDS:
-            leaves.append((
-                "subject.revision", subject.revision,
+        add("subject.kind", "subject", subject.kind, "subject.kind is required when the subject block is present")
+        add("subject.ref", "subject", subject.ref, "subject.ref is required when the subject block is present",
+            redactable=not (isinstance(subject.kind, str) and subject.kind in NUMBERED_SUBJECT_KINDS))
+        if isinstance(subject.kind, str) and subject.kind in REPOSITORY_SUBJECT_KINDS:
+            add("subject.repository", "subject", subject.repository,
+                f"subject.repository is required for a {subject.kind} subject")
+        if isinstance(subject.kind, str) and subject.kind in SHA_BOUND_SUBJECT_KINDS:
+            add("subject.revision", "subject", subject.revision,
                 f"subject.revision is required for a {subject.kind} subject: evidence about a moving "
-                "pointer must name the exact git SHA it observed",
-            ))
+                "pointer must name the exact git SHA it observed")
     for call in tool_calls:
-        leaves.append(("tool_call.kind", call.kind, "tool_call.kind is required"))
-        leaves.append(("tool_call.action_digest", call.action_digest, "tool_call.action_digest is required"))
-        leaves.append(("tool_call.status", call.status, "tool_call.status is required"))
+        add("tool_call.kind", "tool_calls", call.kind, "tool_call.kind is required")
+        add("tool_call.action_digest", "tool_calls", call.action_digest, "tool_call.action_digest is required")
+        add("tool_call.status", "tool_calls", call.status, "tool_call.status is required")
     if provenance is not None:
-        leaves.append((
-            "provenance.authority", provenance.authority,
-            "provenance.authority is required when the provenance block is present",
-        ))
-        leaves.append((
-            "provenance.observed_at", provenance.observed_at,
-            "provenance.observed_at is required when the provenance block is present",
-        ))
-    return leaves
+        add("provenance.authority", "provenance", provenance.authority,
+            "provenance.authority is required when the provenance block is present")
+        add("provenance.observed_at", "provenance", provenance.observed_at,
+            "provenance.observed_at is required when the provenance block is present")
+    return rows
 
 
 def _check_required_leaves(
@@ -918,19 +926,21 @@ def _check_required_leaves(
     redacted_blocks: Container[str] = frozenset(),
     skip: Container[str] = frozenset(),
 ) -> None:
-    """Raise for the first blank required leaf, unless it is in
-    `REDACTABLE_REQUIRED_LEAVES` and its block is in `redacted_blocks` (a
-    required `redacted_out` gap names it). seal() calls this on the
+    """Raise `ExecutionEvidenceError` for the first non-string or blank
+    required leaf, unless the row is `redactable` and a required
+    `redacted_out` gap names its `gap_block`. seal() calls this on the
     caller's blocks before `_safe()` with no redacted blocks, so a leaf the
-    caller never supplied is never excused by a sibling's redaction."""
-    for leaf, value, message in _required_leaves(
-        versions=versions, subject=subject, tool_calls=tool_calls, provenance=provenance
-    ):
-        if value or leaf in skip:
+    caller never supplied is never excused by a sibling's redaction. The
+    type check comes first, so an unhashable value (a list `kind` out of
+    YAML) fails as this error, not as a `TypeError` from a set lookup."""
+    for row in _required_leaves(versions=versions, subject=subject, tool_calls=tool_calls, provenance=provenance):
+        if not isinstance(row.value, str):
+            raise ExecutionEvidenceError(f"{row.leaf} must be a string, got {type(row.value).__name__}")
+        if row.value or row.leaf in skip:
             continue
-        if leaf in REDACTABLE_REQUIRED_LEAVES and leaf.split(".", 1)[0] in redacted_blocks:
+        if row.redactable and row.gap_block in redacted_blocks:
             continue
-        raise ExecutionEvidenceError(message)
+        raise ExecutionEvidenceError(row.message)
 
 
 def _is_block_required(block: str, requirements: Requirements) -> bool:
@@ -1947,10 +1957,17 @@ def resolve_current(
             superseded.add(target_id)
     live = [e for e in pool if e.evidence_id not in superseded]
     if not live:
+        if pool:
+            # Every pool member is superseded by another: only a forged
+            # supersedes cycle can do that (supersedes is hashed). An
+            # unknown, never resolved arbitrarily.
+            return CurrentEvidence(state="ambiguous")
         # Evidence for this subject at another revision is stale, not absent:
         # "re-run for this SHA" and "the pipeline never ran" are different
-        # decisions for the reader.
-        return CurrentEvidence(state="stale_revision" if same_subject else "no_evidence")
+        # decisions for the reader. no_evidence means no USABLE evidence: a
+        # redacted-subject envelope is excluded above and answers it too.
+        other_revisions = any(e.subject is not None and e.subject.revision != revision for e in same_subject)
+        return CurrentEvidence(state="stale_revision" if other_revisions else "no_evidence")
 
     def rank(e: ExecutionEvidence) -> tuple[int, str]:
         # validate() guarantees provenance on every subject-bound envelope;

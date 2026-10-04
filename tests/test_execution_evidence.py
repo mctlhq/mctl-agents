@@ -1488,7 +1488,6 @@ def _fully_populated(subject: ee.SubjectRef) -> ee.ExecutionEvidence:
 
 def _blank_leaf(evidence: ee.ExecutionEvidence, leaf: str) -> ee.ExecutionEvidence:
     block, field_name = leaf.split(".", 1)
-    field_name = "ref" if field_name == "number" else field_name
     if block == "tool_call":
         return dataclasses.replace(
             evidence, tool_calls=(dataclasses.replace(evidence.tool_calls[0], **{field_name: ""}),)
@@ -1496,34 +1495,37 @@ def _blank_leaf(evidence: ee.ExecutionEvidence, leaf: str) -> ee.ExecutionEviden
     return dataclasses.replace(evidence, **{block: dataclasses.replace(getattr(evidence, block), **{field_name: ""})})
 
 
-_GAP_BLOCK = {"tool_call": "tool_calls"}
-
-
 @pytest.mark.parametrize(
     "subject",
-    (_subject(), _subject(kind="branch", ref="feat/x"), _subject(kind="release", ref="1.2.0")),
-    ids=("pull_request", "branch", "release"),
+    (
+        _subject(), _subject(kind="branch", ref="feat/x"), _subject(kind="release", ref="1.2.0"),
+        _subject(kind="issue", ref="199", revision=""), _subject(kind="work_item", ref="wi-1", revision=""),
+    ),
+    ids=("pull_request", "branch", "release", "issue", "work_item"),
 )
 def test_redactable_required_leaves_is_exactly_the_set_a_redaction_gap_excuses(subject):
     sealed = _fully_populated(subject)
-    leaves = [leaf for leaf, _, _ in ee._required_leaves(
+    rows = ee._required_leaves(
         versions=sealed.versions, subject=sealed.subject, tool_calls=sealed.tool_calls, provenance=sealed.provenance,
-    )]
+    )
     excused = set()
-    for leaf in leaves:
-        blanked = _blank_leaf(sealed, leaf)
+    for row in rows:
+        blanked = _blank_leaf(sealed, row.leaf)
         with pytest.raises(ee.ExecutionEvidenceError):
             blanked.validate()  # never excused without a gap
-        block = leaf.split(".", 1)[0]
         gapped = dataclasses.replace(
-            blanked, gaps=(ee.Gap(block=_GAP_BLOCK.get(block, block), code="redacted_out", required=True),)
+            blanked, gaps=(ee.Gap(block=row.gap_block, code="redacted_out", required=True),)
         )
         try:
             gapped.validate()
-            excused.add(leaf)
+            excused.add(row.leaf)
         except ee.ExecutionEvidenceError:
             pass
-    assert excused == ee.REDACTABLE_REQUIRED_LEAVES & set(leaves)
+    expected = ee.REDACTABLE_REQUIRED_LEAVES & {r.leaf for r in rows}
+    if subject.kind in ee.NUMBERED_SUBJECT_KINDS:
+        expected -= {"subject.ref"}
+    assert excused == expected
+    assert {r.gap_block for r in rows} <= ee.BLOCK_NAMES
 
 
 def test_a_numbered_ref_is_never_excused_by_a_declared_redaction_gap():
@@ -1554,3 +1556,60 @@ def test_resolve_current_never_pools_an_envelope_whose_subject_was_redacted():
     result = ee.resolve_current([redacted], kind="work_item", repository="", ref="wi-1", revision="")
     assert result.state == "no_evidence"
     assert result.evidence is None
+
+
+# -- review round 4 (PR #575) -----------------------------------------------
+
+
+def test_resolve_current_pools_an_envelope_redacted_outside_the_subject_block():
+    # versions.agent redacted; the subject block is intact and identifying.
+    ev = _seal(versions=_versions(agent="sk-" + "a" * 20), subject=_subject(), provenance=_provenance())
+    assert any(g.block == "versions" and g.code == "redacted_out" for g in ev.gaps)
+    assert _resolve([ev]).evidence == ev
+
+
+def test_resolve_current_pools_an_envelope_with_a_non_redaction_subject_gap():
+    ev = _seal(
+        subject=_subject(), provenance=_provenance(),
+        gaps=[ee.Gap(block="subject", code="observation_failed", required=True)],
+    )
+    assert _resolve([ev]).evidence == ev
+
+
+def test_resolve_current_reports_a_fully_superseded_pool_as_ambiguous():
+    # Only a forged supersedes cycle can supersede every pool member;
+    # from_dict does not recompute content_hash, so simulate the pair.
+    a = _pr_evidence(observed_at="2026-10-04T10:00:00Z")
+    b = _pr_evidence(observed_at="2026-10-04T11:00:00Z", supersedes=a.evidence_id)
+    a_cycle = dataclasses.replace(a, provenance=_provenance(
+        observed_at="2026-10-04T10:00:00Z", supersedes=b.evidence_id,
+    ))
+    result = _resolve([a_cycle, b])
+    assert result.state == "ambiguous"
+    assert result.evidence is None
+
+
+def test_stale_revision_requires_evidence_at_another_revision():
+    other_revision = _seal(
+        subject=_subject(kind="branch", ref="main", revision=_SHA2), provenance=_provenance(),
+    )
+    at_sha2 = ee.resolve_current(
+        [other_revision], kind="branch", repository="mctlhq/mctl-agents", ref="main", revision=_SHA1,
+    )
+    assert at_sha2.state == "stale_revision"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"subject": ee.SubjectRef(kind=["pull_request"], repository="mctlhq/mctl-agents", ref="1", revision=_SHA1),
+         "provenance": _provenance()},
+        {"tool_calls": [ee.ToolCallRef(kind=["github.pull_request.merge"], action_digest="sha256:" + "5e" * 32,
+                                       status="succeeded")]},
+        {"provenance": ee.Provenance(authority=["observed"], observed_at="2026-10-04T10:00:00Z")},
+    ),
+    ids=("subject.kind", "tool_call.kind", "provenance.authority"),
+)
+def test_an_unhashable_leaf_fails_as_an_evidence_error_not_a_type_error(overrides):
+    with pytest.raises(ee.ExecutionEvidenceError, match="must be a string"):
+        _seal(**overrides)

@@ -676,7 +676,9 @@ pattern-bounded strings, and a branch named after a token can trip the
 credential screen. One table, `_required_leaves`, lists every required
 leaf. It drives both checks, and `_check_required_leaves` consults
 `REDACTABLE_REQUIRED_LEAVES` directly, so the set is the rule rather than
-a description of it.
+a description of it. Each row carries the gap block `_safe()` would
+name (`tool_calls` for a `tool_call.*` leaf), and a non-string leaf value
+fails as `ExecutionEvidenceError` before any vocabulary lookup.
 `validate()` tolerates a blank one of those only when a `redacted_out` gap
 names its block, so `seal()` degrades to an explicit gap instead of losing
 the envelope. Every other required leaf is a closed vocabulary, a
@@ -721,8 +723,13 @@ which Tier B must reproduce and test against:
 3. A pool member named by another pool member's `provenance.supersedes` is
    dropped — but only when the superseding envelope's authority is equal
    or stronger. A link to an envelope outside the pool removes nothing.
-4. Empty → `stale_revision` when the subject key has (unredacted)
-   evidence at other revisions, else `no_evidence`. "Re-run for this SHA"
+4. Empty pool → `stale_revision` when the subject key has (unredacted)
+   evidence at other revisions, else `no_evidence`. `no_evidence` means
+   no *usable* evidence: a reader must not infer from it that no run
+   happened, because an envelope whose subject was redacted answers it too.
+   A non-empty pool whose every member is superseded (only a forged
+   `supersedes` cycle can do that, since `supersedes` is hashed) →
+   `ambiguous`. "Re-run for this SHA"
    and "the pipeline never ran" are different decisions for a reader.
    Otherwise the highest `(authority rank,
    observed_at)` wins: a newer assertion never displaces an older
