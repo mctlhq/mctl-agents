@@ -12,9 +12,9 @@ the retryable-vs-404 distinction (mctlhq/mctl-agents#333, ADR 013).
 
 The request lives at
 `platform-gitops/agents-state/<service>/proposals/<slug>/human-input/request.json`.
-The producer that writes and seals it (the investigator's agent-container
-side) does not exist yet — it lands with mctl-gitops#1277; until then this
-path is only ever read. This activity returns its raw text; parsing
+The producer that writes and seals it is the investigator
+(`orchestrator/run_issue_investigator.py:_seal_draft`, mctl-agents#473),
+active when the profile grants `human.request_input`. This activity returns its raw text; parsing
 (`orchestrator.human_input.HumanInputRequest.from_dict`) happens in
 workflow code, which is pure.
 """

@@ -5144,7 +5144,10 @@ def test_investigate_passes_the_correlation_inputs_to_run_agent(tmp_path, monkey
 
     run_kwargs = seen["run_agent_kwargs"]
     assert run_kwargs["issue_url"] == issue.ref.url
-    assert set(run_kwargs) == {"issue_url", "temporal_workflow_id", "temporal_run_id", "argo_workflow_name"}
+    assert set(run_kwargs) == {
+        "issue_url", "temporal_workflow_id", "temporal_run_id", "argo_workflow_name",
+        "human_input_answers",
+    }
     assert seen["assemble_kwargs"]["argo_workflow_name"] == run_kwargs["argo_workflow_name"]
 
 

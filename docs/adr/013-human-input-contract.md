@@ -2,8 +2,10 @@
 
 - Status: accepted (mctlhq/mctl-agents#333)
 - Owner: `orchestrator/human_input.py` (contract), `DevLoopWorkflow` (consumer)
-- Producer: the investigator's agent-container side — not built yet, lands
-  with mctl-gitops#1277. Until then the request path is only ever read.
+- Producer: `orchestrator/run_issue_investigator.py` (`_seal_draft`,
+  mctlhq/mctl-agents#473). The model writes a draft; the orchestrator seals it
+  and writes `human-input/request.json`. Gated on the `human.request_input`
+  grant (mctl-gitops#1277).
 
 ## Decision
 
