@@ -189,16 +189,27 @@ def test_no_binding_refuses_promotion(registry):
     assert "mentor" in publish_agent_release.UNBOUND_AGENTS
     outcome = _publish("mentor", _gitops({}))
     _refused(outcome, registry, "mentor", gate.VERDICT_MISSING)
+    # The log says what the refusal costs, not only where the binding is not.
+    assert "keeps resolving its previously promoted production version" in outcome.detail
     assert "no release binding for mentor" in outcome.detail
     assert "releases/shadow/mentor.yaml" in outcome.detail
     # Expected state for an agent nobody has bound yet: refused, not a red run.
     assert not outcome.fails_release
 
 
-def test_every_unbound_agent_names_a_real_manifest():
-    """A typo or rename would silently void the allowance."""
+# The agents with a binding in the mctl-gitops catalog today. Kept here, not
+# in the tool: it only exists to force a decision at PR time.
+_BOUND_AGENTS = frozenset({"implementer", "issue-investigator", "shepherd"})
+
+
+def test_every_manifest_is_classified_as_bound_or_unbound():
+    """A typo or rename in UNBOUND_AGENTS would void the allowance silently,
+    and a new manifest with no binding would first fail the next release in
+    a step that cannot be re-run. Either add its gitops binding (and the name
+    to _BOUND_AGENTS) or list it in UNBOUND_AGENTS."""
     real = {p.parent.name for p in _MANIFESTS.glob("*/agent.yaml")}
-    assert publish_agent_release.UNBOUND_AGENTS <= real
+    assert real == _BOUND_AGENTS | publish_agent_release.UNBOUND_AGENTS
+    assert not (_BOUND_AGENTS & publish_agent_release.UNBOUND_AGENTS)
 
 
 def test_every_refusal_points_at_the_runbook(registry):
@@ -256,15 +267,27 @@ _MISMATCHED = {
     "compatibility mirror": (_V2, _definition(_V2, ">=1.0.0 <3.0.0")),
     "profile.name": (_V2, {"profile": {"name": "shepherd-default", "version": "1.0.0"}}),
     "profile.version stale vs catalog": (_V1, {"profile": {"name": "shepherd-default", "version": "1.1.0"}}),
+    # Mirror and catalog both agree with the binding; only the definition's
+    # own range rejects the profile version, so only check_profile_compatibility
+    # can refuse it.
+    "profile version outside the definition's range": (
+        _V2, {"profile": {"name": "issue-investigator-default", "version": "2.5.0"}},
+    ),
 }
+_CATALOG_OVERRIDES = {"profile version outside the definition's range": {"issue-investigator-default": "2.5.0"}}
 
 
 @pytest.mark.parametrize("case", list(_MISMATCHED))
 def test_a_matching_hash_with_a_mismatched_version_or_profile_refuses(case, registry):
     agent, overrides = _MISMATCHED[case]
-    outcome = _publish(agent, _gitops({agent: _binding(agent, **overrides)}))
+    catalog = {name: version for name, version in _PROFILES.values()}
+    catalog.update(_CATALOG_OVERRIDES.get(case, {}))
+    profiles = {name: _profile(name, version) for name, version in catalog.items()}
+    outcome = _publish(agent, _gitops({agent: _binding(agent, **overrides)}, profiles))
     _refused(outcome, registry, agent, gate.VERDICT_MISMATCH)
     assert outcome.fails_release
+    if case in _CATALOG_OVERRIDES:
+        assert "compatibility mismatch" in outcome.detail
 
 
 def _raise(exc: type[httpx.HTTPError]) -> Responder:
@@ -313,8 +336,13 @@ def _flaky(failures: list[Responder], then: bytes) -> tuple[Responder, list[int]
 
 @pytest.mark.parametrize(
     "failure",
-    [lambda r: httpx.Response(502), _raise(httpx.ConnectError), _raise(httpx.ReadTimeout)],
-    ids=["502", "connect error", "timeout"],
+    [
+        lambda r: httpx.Response(502),
+        lambda r: httpx.Response(429, headers={"Retry-After": "1"}),
+        _raise(httpx.ConnectError),
+        _raise(httpx.ReadTimeout),
+    ],
+    ids=["502", "429 secondary rate limit", "connect error", "timeout"],
 )
 def test_a_transient_failure_is_retried_before_refusing(failure, registry):
     responder, seen = _flaky([failure, failure], _binding(_V2))

@@ -78,7 +78,9 @@ TIMEOUT_S = 20.0
 # Transport errors and 5xx are retried: the release reads two files per
 # agent, and one GitHub blip must not cost a manual promotion — a workflow
 # re-run cannot redo it, because release-please reports release_created only
-# once. 404 and 403 (rate limit) are answers, not blips, and are not retried.
+# once. 429 (GitHub's secondary rate limit, which it documents as
+# retryable) is retried too. 404 and 403 (the primary rate limit) are
+# answers, not blips, and are not retried.
 FETCH_ATTEMPTS = 3
 RETRY_BACKOFF_S = 2.0
 
@@ -146,7 +148,8 @@ def _fetch(url: str, transport: httpx.BaseTransport | None) -> bytes:
             except httpx.HTTPError as exc:
                 raise BindingUnobservable(f"could not fetch {url}: {exc!r}") from exc
             else:
-                if response.status_code < 500 or attempt == FETCH_ATTEMPTS:
+                retryable = response.status_code >= 500 or response.status_code == 429
+                if not retryable or attempt == FETCH_ATTEMPTS:
                     break
             time.sleep(RETRY_BACKOFF_S * attempt)
     finally:
@@ -155,7 +158,7 @@ def _fetch(url: str, transport: httpx.BaseTransport | None) -> bytes:
     if response is None:  # unreachable: every attempt without one raised
         raise BindingUnobservable(f"could not fetch {url}: no response")
     # 404 is the contents API's documented "no such path on this ref". Every
-    # other non-200 (403 rate limit, 5xx) says nothing about the binding.
+    # other non-200 (403/429 rate limits, 5xx) says nothing about the binding.
     if response.status_code == 404:
         raise BindingMissing(f"no file at {url} on {GITOPS_REF} (HTTP 404)")
     if response.status_code != 200:

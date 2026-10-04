@@ -403,7 +403,14 @@ def publish(
             f"  REFUSED promoting {agent}@{version} to {ENVIRONMENT} ({verdict.status}): {verdict.reason}",
             file=sys.stderr,
         )
-        return Outcome(agent, REFUSED, f"{verdict.status}: {verdict.reason}", verdict)
+        # Say what the refusal costs, not only where the binding is not: the
+        # workflows pin the image of the version they resolve, which overrides
+        # the CWFT default release-deploy just bumped (claude P3 on #574).
+        cost = (
+            f"{agent} keeps resolving its previously promoted {ENVIRONMENT} version, "
+            "and that version's image, until a matching binding lands"
+        )
+        return Outcome(agent, REFUSED, f"{verdict.status}: {verdict.reason} — {cost}", verdict)
 
     # No 409 allowance here, deliberately, unlike /versions above: promotion
     # is idempotent server-side — PromoteRelease returns 200 for a version
