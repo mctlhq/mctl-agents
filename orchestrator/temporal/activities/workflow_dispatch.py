@@ -3,7 +3,11 @@
 mctl-agents#559. The dispatch API answers 204 with no run id, so "done" means
 a `workflow_dispatch` run of the workflow was OBSERVED, created at or after the
 fire's `not_before` minus `SKEW_SLACK`. Every attempt (first or retry) checks
-for such a run BEFORE dispatching, so retries cannot double-dispatch.
+for such a run BEFORE dispatching. An accepted dispatch is recorded in the
+heartbeat details (`DISPATCHED_MARK`), so a retry after a post-dispatch
+failure observes again instead of dispatching a second time. Heartbeats are
+sent between every HTTP call, so no stretch without one exceeds a single
+`REQUEST_TIMEOUT_SECONDS` budget.
 
 An unreadable runs listing is never read as "no run", and a non-2xx dispatch
 is never read as success.
@@ -34,16 +38,18 @@ SKEW_SLACK = timedelta(seconds=60)
 ALERT_LABEL = "scheduled-dispatch-failed"
 ALERT_LABEL_COLOR = "d73a4a"
 
-NON_RETRYABLE_TYPES = ("NoGitHubToken", "DispatchRejected", "RunNotObserved", "AlertReportRejected")
+DISPATCHED_MARK = "dispatched"
 
 
 class NoGitHubToken(ApplicationError):
+    # Retryable, like the same condition in activities/proposals.py: the token
+    # file is rewritten by the rotate-github-app-tokens cron, so an empty read
+    # can be a transient gap that the next attempt heals.
     def __init__(self) -> None:
         super().__init__(
             "no GitHub token available (GITHUB_TOKEN_FILE unreadable and GITHUB_TOKEN unset); "
             "refusing an unauthenticated request",
             type="NoGitHubToken",
-            non_retryable=True,
         )
 
 
@@ -163,8 +169,18 @@ async def _find_run(
         raise RunsListingUnreadable(f"runs listing malformed: {exc}") from exc
 
 
+def _prior_dispatch() -> bool:
+    """True when an earlier attempt of THIS activity already had a dispatch accepted."""
+    try:
+        details = activity.info().heartbeat_details
+    except RuntimeError:  # not running inside an activity (direct unit-test call)
+        return False
+    return bool(details) and details[0] == DISPATCHED_MARK
+
+
 @activity.defn
 async def dispatch_and_observe(inp: DispatchInput) -> DispatchResult:
+    already_dispatched = _prior_dispatch()
     token = await _token()
     since = _parse_utc(inp.not_before) - SKEW_SLACK
     async with httpx.AsyncClient(
@@ -176,18 +192,16 @@ async def dispatch_and_observe(inp: DispatchInput) -> DispatchResult:
                 "dispatch %s/%s already satisfied by run %s", inp.repo, inp.workflow_file, existing.run_id
             )
             return existing
+        activity.heartbeat(DISPATCHED_MARK if already_dispatched else None)
 
-        try:
-            resp = await client.post(
-                f"/repos/{inp.repo}/actions/workflows/{inp.workflow_file}/dispatches",
-                json={"ref": inp.ref},
+        if already_dispatched:
+            activity.logger.info(
+                "dispatch %s/%s was accepted on an earlier attempt; observing only", inp.repo, inp.workflow_file
             )
-        except httpx.HTTPError as exc:
-            raise DispatchFailed(f"dispatch transport error: {exc}") from exc
-        if not 200 <= resp.status_code < 300:
-            if resp.status_code == 429 or resp.status_code >= 500:
-                raise DispatchFailed(f"dispatch returned HTTP {resp.status_code}")
-            raise DispatchRejected(f"dispatch returned HTTP {resp.status_code}: {resp.text[:300]}")
+        else:
+            await _post_dispatch(client, inp)
+            # Recorded before anything else can fail: a retry must observe, not re-dispatch.
+            activity.heartbeat(DISPATCHED_MARK)
 
         deadline = time.monotonic() + OBSERVE_TIMEOUT
         while True:
@@ -198,13 +212,27 @@ async def dispatch_and_observe(inp: DispatchInput) -> DispatchResult:
                     "dispatched %s %s: run %s %s", inp.repo, inp.workflow_file, result.run_id, result.html_url
                 )
                 return result
+            activity.heartbeat(DISPATCHED_MARK)
             if time.monotonic() >= deadline:
                 raise RunNotObserved(
                     f"dispatch of {inp.repo} {inp.workflow_file} was accepted but no "
                     f"workflow_dispatch run appeared within {int(OBSERVE_TIMEOUT)}s"
                 )
-            activity.heartbeat()
             await asyncio.sleep(POLL_INTERVAL)
+
+
+async def _post_dispatch(client: httpx.AsyncClient, inp: DispatchInput) -> None:
+    try:
+        resp = await client.post(
+            f"/repos/{inp.repo}/actions/workflows/{inp.workflow_file}/dispatches",
+            json={"ref": inp.ref},
+        )
+    except httpx.HTTPError as exc:
+        raise DispatchFailed(f"dispatch transport error: {exc}") from exc
+    if not 200 <= resp.status_code < 300:
+        if resp.status_code == 429 or resp.status_code >= 500:
+            raise DispatchFailed(f"dispatch returned HTTP {resp.status_code}")
+        raise DispatchRejected(f"dispatch returned HTTP {resp.status_code}: {resp.text[:300]}")
 
 
 def _check(resp: httpx.Response, what: str, ok: tuple[int, ...] = (200, 201)) -> None:
@@ -230,7 +258,7 @@ async def report_dispatch_failure(rep: FailureReport) -> FailureReportResult:
         f"Scheduled dispatch of `{rep.workflow_file}` failed.\n\n"
         f"- Temporal workflow id: `{rep.workflow_id}`\n"
         f"- Error type: `{rep.error_type}`\n"
-        f"- Message: {rep.message}\n"
+        f"- Message:\n\n```\n{rep.message}\n```\n"
         f"- Reported at: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%SZ')}\n"
     )
     async with httpx.AsyncClient(

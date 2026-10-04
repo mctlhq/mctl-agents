@@ -31,8 +31,8 @@ DISPATCH_TIMEOUT = timedelta(minutes=8)
 DISPATCH_HEARTBEAT_TIMEOUT = timedelta(minutes=1)
 REPORT_TIMEOUT = timedelta(minutes=2)
 
-DISPATCH_NON_RETRYABLE = ["NoGitHubToken", "DispatchRejected", "RunNotObserved"]
-REPORT_NON_RETRYABLE = ["NoGitHubToken", "AlertReportRejected"]
+DISPATCH_NON_RETRYABLE = ["DispatchRejected", "RunNotObserved"]
+REPORT_NON_RETRYABLE = ["AlertReportRejected"]
 DISPATCH_RETRY_POLICY = RetryPolicy(maximum_attempts=3, non_retryable_error_types=DISPATCH_NON_RETRYABLE)
 REPORT_RETRY_POLICY = RetryPolicy(maximum_attempts=3, non_retryable_error_types=REPORT_NON_RETRYABLE)
 

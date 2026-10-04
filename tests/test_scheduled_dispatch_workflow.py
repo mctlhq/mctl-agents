@@ -89,7 +89,7 @@ async def test_retryable_error_stops_at_three_attempts_with_same_not_before(env)
 
 @pytest.mark.parametrize(
     "report_error,attempts",
-    [(("AlertReportRejected", False), 1), (("NoGitHubToken", False), 1), (("AlertReportFailed", False), 3)],
+    [(("AlertReportRejected", False), 1), (("NoGitHubToken", False), 3), (("AlertReportFailed", False), 3)],
 )
 async def test_report_retry_policy_and_original_error_survives(env, report_error, attempts):
     seen, acts = _acts(dispatch_error=("RunNotObserved", True), report_error=report_error)

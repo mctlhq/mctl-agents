@@ -27,8 +27,9 @@ TITLE = "Scheduled dispatch failed: weekly-refresh.yml"
 def _fast(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("GITHUB_TOKEN", "tok")
     monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
-    monkeypatch.setattr(act, "POLL_INTERVAL", 0.0)
-    monkeypatch.setattr(act, "OBSERVE_TIMEOUT", 0.05)
+    monkeypatch.setattr(act, "POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(act, "OBSERVE_TIMEOUT", 1.0)
+    monkeypatch.setattr(act, "_prior_dispatch", lambda: False)
     monkeypatch.setattr(act.activity, "heartbeat", lambda *a, **k: None)
 
 
@@ -149,7 +150,41 @@ def test_empty_token_makes_no_request(monkeypatch):
     with pytest.raises(act.NoGitHubToken) as ei:
         _dispatch(monkeypatch, lambda r: _runs())
     assert ei.value.calls == []
-    assert ei.value.non_retryable
+    assert not ei.value.non_retryable  # a token-file rotation gap heals on retry
+
+
+def test_retry_after_accepted_dispatch_observes_without_posting(monkeypatch):
+    # An earlier attempt had its dispatch accepted (heartbeat details), then
+    # failed while observing. The retry must not POST a second dispatch.
+    monkeypatch.setattr(act, "_prior_dispatch", lambda: True)
+    state = {"gets": 0}
+
+    def h(r):
+        state["gets"] += 1
+        return _runs() if state["gets"] < 2 else _runs(9)
+
+    res, calls = _dispatch(monkeypatch, h)
+    assert res == act.DispatchResult(dispatched=True, run_id=9, html_url="u/9")
+    assert _posts(calls) == []
+
+
+def test_accepted_dispatch_is_recorded_before_observing(monkeypatch):
+    beats: list[tuple] = []
+    monkeypatch.setattr(act.activity, "heartbeat", lambda *a: beats.append(a))
+    state = {"gets": 0}
+
+    def h(r):
+        if r.method == "POST":
+            assert act.DISPATCHED_MARK not in [b[0] for b in beats if b]
+            return httpx.Response(204)
+        state["gets"] += 1
+        if state["gets"] == 1:
+            return _runs()
+        assert (act.DISPATCHED_MARK,) in beats  # recorded before the first observe call
+        return httpx.Response(500)
+
+    with pytest.raises(act.RunsListingUnreadable):
+        _dispatch(monkeypatch, h)
 
 
 def test_request_filters(monkeypatch):
