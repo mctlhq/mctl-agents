@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.65.0](https://github.com/mctlhq/mctl-agents/compare/1.64.1...1.65.0) (2026-10-04)
+
+
+### Features
+
+* **agents:** issue-559-temporal-schedule-that-dispatches-portfo ([d7fb4b2](https://github.com/mctlhq/mctl-agents/commit/d7fb4b2ba49af8d6b4f6f9c4adeba137c25f1654))
+* **agents:** issue-559-temporal-schedule-that-dispatches-portfo ([307d608](https://github.com/mctlhq/mctl-agents/commit/307d608ebffceb20e675ec7ae56a86ad6c58b019))
+
+
+### Bug Fixes
+
+* **agents:** make the weekly dispatch retry-safe and alertable ([f9095bd](https://github.com/mctlhq/mctl-agents/commit/f9095bdfc105450f04de4271fdcd884ef52b3e39))
+* **agents:** move the portfolio weekly dispatch to Sunday 10:01 UTC ([6f127d5](https://github.com/mctlhq/mctl-agents/commit/6f127d597a02dfa88abd613f8a6c65dadc26300f))
+
 ## [1.64.1](https://github.com/mctlhq/mctl-agents/compare/1.64.0...1.64.1) (2026-10-01)
 
 
