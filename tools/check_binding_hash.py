@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,6 +75,12 @@ BINDING_URL = f"{CONTENTS_API}/{BINDING_PATH}"
 PROFILES_PATH = "platform-gitops/agent-platform/execution-profiles"
 RUNBOOK = "docs/runbooks/agent-yaml-binding-repin.md"
 TIMEOUT_S = 20.0
+# Transport errors and 5xx are retried: the release reads two files per
+# agent, and one GitHub blip must not cost a manual promotion — a workflow
+# re-run cannot redo it, because release-please reports release_created only
+# once. 404 and 403 (rate limit) are answers, not blips, and are not retried.
+FETCH_ATTEMPTS = 3
+RETRY_BACKOFF_S = 2.0
 
 EXIT_MATCH = 0
 EXIT_MISMATCH = 1
@@ -121,11 +128,24 @@ def _fetch(url: str, transport: httpx.BaseTransport | None) -> bytes:
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    try:
-        with httpx.Client(transport=transport, timeout=TIMEOUT_S, follow_redirects=True) as client:
-            response = client.get(url, params={"ref": GITOPS_REF}, headers=headers)
-    except httpx.HTTPError as exc:
-        raise BindingUnobservable(f"could not fetch {url}: {exc!r}") from exc
+    response: httpx.Response | None = None
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            with httpx.Client(transport=transport, timeout=TIMEOUT_S, follow_redirects=True) as client:
+                response = client.get(url, params={"ref": GITOPS_REF}, headers=headers)
+        except httpx.TransportError as exc:
+            if attempt == FETCH_ATTEMPTS:
+                raise BindingUnobservable(
+                    f"could not fetch {url} after {attempt} attempts: {exc!r}"
+                ) from exc
+        except httpx.HTTPError as exc:
+            raise BindingUnobservable(f"could not fetch {url}: {exc!r}") from exc
+        else:
+            if response.status_code < 500 or attempt == FETCH_ATTEMPTS:
+                break
+        time.sleep(RETRY_BACKOFF_S * attempt)
+    if response is None:  # unreachable: every attempt without one raised
+        raise BindingUnobservable(f"could not fetch {url}: no response")
     # 404 is the contents API's documented "no such path on this ref". Every
     # other non-200 (403 rate limit, 5xx) says nothing about the binding.
     if response.status_code == 404:
@@ -278,6 +298,9 @@ VERDICT_MATCH = "match"
 VERDICT_MISSING = "missing"
 VERDICT_MISMATCH = "mismatch"
 VERDICT_UNOBSERVED = "unobservable"
+# The manifest format the non-resolver agents still use. It has no
+# executionProfileRef, so only the hash, the name and the profile pin apply.
+LEGACY_DEFINITION_API_VERSION = "agents.mctl.ai/v1alpha1"
 
 
 @dataclass(frozen=True)
@@ -325,7 +348,9 @@ def evaluate_promotion(
     except BindingMissing:
         return refuse(
             VERDICT_MISSING,
-            f"no {ENVIRONMENT} binding for {agent} at {GITOPS_REPO}@{GITOPS_REF}:{binding_path(agent)}",
+            f"no release binding for {agent} at {GITOPS_REPO}@{GITOPS_REF}:{binding_path(agent)} "
+            f"(releases/{ENVIRONMENT}/ is the only binding catalog, the one the resolver reads; "
+            "there is no releases/production/)",
         )
     except BindingUnobservable as exc:
         return refuse(VERDICT_UNOBSERVED, f"binding could not be read, and unknown is not a match: {exc}")
@@ -338,12 +363,24 @@ def evaluate_promotion(
             f"the released agent.yaml is {local_hash}",
         )
 
+    # First: does the released agent.yaml resolve at all? A fault here lives
+    # in this repository, not in the binding, and the reason says so.
     definition_path = resolver.DEFINITIONS_DIR / agent / "agent.yaml"
     definition: resolver.AgentDefinition | None = None
     try:
         document = resolver.parse_yaml_mapping(raw_definition, path=definition_path)
-        if document.get("apiVersion") == resolver.SUPPORTED_DEFINITION_API_VERSION:
+        api_version = document.get("apiVersion")
+        if api_version == resolver.SUPPORTED_DEFINITION_API_VERSION:
             definition = resolver.parse_definition(raw_definition, path=definition_path)
+        elif api_version != LEGACY_DEFINITION_API_VERSION:
+            # Strict by default: a new or mistyped apiVersion must not fall
+            # into the lenient v1alpha1 path below.
+            raise resolver.ResolverError(f"{definition_path}: unsupported apiVersion {api_version!r}")
+    except resolver.ResolverError as exc:
+        return refuse(VERDICT_MISMATCH, f"the released agent.yaml does not resolve: {exc}")
+
+    try:
+        if definition is not None:
             resolver.check_binding_against_definition(binding, definition)
         else:
             metadata = document.get("metadata")

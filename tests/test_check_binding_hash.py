@@ -34,6 +34,12 @@ _spec.loader.exec_module(check_binding_hash)
 _AGENT_YAML = _REPO_ROOT / "agents" / "_manifests" / "issue-investigator" / "agent.yaml"
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_backoff(monkeypatch):
+    """Retries are exercised, their sleeps are not."""
+    monkeypatch.setattr(check_binding_hash, "RETRY_BACKOFF_S", 0.0)
+
+
 def _sha256(raw: bytes) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 

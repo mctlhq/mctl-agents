@@ -140,6 +140,11 @@ def registry(monkeypatch) -> _Registry:
     return fake
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_backoff(monkeypatch):
+    monkeypatch.setattr(gate, "RETRY_BACKOFF_S", 0.0)
+
+
 def _publish(agent: str, transport: httpx.BaseTransport, *, dry_run: bool = False):
     return publish_agent_release.publish(
         agent, _VERSION, "cafe" * 10, [], dry_run=dry_run, gitops_transport=transport
@@ -181,11 +186,23 @@ def _refused(outcome, registry, agent: str, status: str) -> None:
 
 
 def test_no_binding_refuses_promotion(registry):
-    outcome = _publish(_V1, _gitops({}))
-    _refused(outcome, registry, _V1, gate.VERDICT_MISSING)
-    assert "no shadow binding" in outcome.detail
+    assert "mentor" in publish_agent_release.UNBOUND_AGENTS
+    outcome = _publish("mentor", _gitops({}))
+    _refused(outcome, registry, "mentor", gate.VERDICT_MISSING)
+    assert "no release binding for mentor" in outcome.detail
+    assert "releases/shadow/mentor.yaml" in outcome.detail
     # Expected state for an agent nobody has bound yet: refused, not a red run.
     assert not outcome.fails_release
+
+
+def test_a_vanished_binding_for_a_bound_agent_fails_the_release(registry):
+    """claude P2 on #574: a 404 is quiet only for the agents known to be
+    unbound. shepherd has a binding today; if it disappears, production must
+    not silently stay behind on a green run."""
+    assert _V1 not in publish_agent_release.UNBOUND_AGENTS
+    outcome = _publish(_V1, _gitops({}))
+    _refused(outcome, registry, _V1, gate.VERDICT_MISSING)
+    assert outcome.fails_release
 
 
 @pytest.mark.parametrize("agent", [_V2, _V1])
@@ -249,6 +266,62 @@ def test_an_unreadable_binding_source_refuses_and_is_not_skipped(case, registry)
     assert "unknown is not a match" in outcome.detail
     # Unknown never passes quietly: it fails the release step.
     assert outcome.fails_release
+
+
+def _flaky(failures: list[Responder], then: bytes) -> tuple[Responder, list[int]]:
+    seen: list[int] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        seen.append(1)
+        if len(seen) <= len(failures):
+            return failures[len(seen) - 1](request)
+        return httpx.Response(200, content=then)
+
+    return responder, seen
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [lambda r: httpx.Response(502), _raise(httpx.ConnectError), _raise(httpx.ReadTimeout)],
+    ids=["502", "connect error", "timeout"],
+)
+def test_a_transient_failure_is_retried_before_refusing(failure, registry):
+    responder, seen = _flaky([failure, failure], _binding(_V2))
+    outcome = _publish(_V2, _gitops({_V2: responder}))
+    assert outcome.state == publish_agent_release.PROMOTED
+    assert len(seen) == gate.FETCH_ATTEMPTS
+
+
+def test_a_persistent_failure_still_refuses_after_the_retries(registry):
+    responder, seen = _flaky([lambda r: httpx.Response(503)] * 5, _binding(_V2))
+    outcome = _publish(_V2, _gitops({_V2: responder}))
+    _refused(outcome, registry, _V2, gate.VERDICT_UNOBSERVED)
+    assert len(seen) == gate.FETCH_ATTEMPTS
+
+
+@pytest.mark.parametrize("status", [404, 403])
+def test_answers_are_not_retried(status, registry):
+    responder, seen = _flaky([lambda r: httpx.Response(status)] * 5, _binding(_V2))
+    _publish(_V2, _gitops({_V2: responder}))
+    assert len(seen) == 1
+
+
+def test_an_unknown_api_version_takes_the_strict_path_and_refuses(registry, monkeypatch):
+    raw = _raw(_V1).replace(b"agents.mctl.ai/v1alpha1", b"agents.mctl.ai/v1alpha3")
+    monkeypatch.setattr(publish_agent_release, "_read_at_tag", lambda tag, rel: raw)
+    outcome = _publish(_V1, _gitops({_V1: _binding(_V1, content_hash=_sha256(raw))}))
+    _refused(outcome, registry, _V1, gate.VERDICT_MISMATCH)
+    assert "the released agent.yaml does not resolve" in outcome.detail
+    assert "v1alpha3" in outcome.detail
+
+
+def test_an_unresolvable_released_definition_is_named_as_such(registry, monkeypatch):
+    raw = _raw(_V2).replace(b"kind: AgentDefinition", b"kind: Something")
+    monkeypatch.setattr(publish_agent_release, "_read_at_tag", lambda tag, rel: raw)
+    outcome = _publish(_V2, _gitops({_V2: _binding(_V2, content_hash=_sha256(raw))}))
+    _refused(outcome, registry, _V2, gate.VERDICT_MISMATCH)
+    assert "the released agent.yaml does not resolve" in outcome.detail
+    assert "binding disagrees" not in outcome.detail
 
 
 def test_the_gate_is_decided_before_any_registry_write(registry, monkeypatch):

@@ -35,9 +35,10 @@ leaves a half-done agent behind.
 Exit status: 1 if any agent failed, or was refused because its binding is
 stale, mismatched or unreadable — those name a binding someone meant to
 match. A refusal for an absent binding (HTTP 404, the contents API's
-documented absence signal) is a warning, not a failure: it is the expected
-state of an agent nobody has bound yet, and a release that is red every
-time is one nobody reads. Every agent's outcome is printed, and written to
+documented absence signal) is a warning, not a failure, ONLY for the agents
+listed in UNBOUND_AGENTS: it is the expected state of an agent nobody has
+bound yet, and a release that is red every time is one nobody reads. A 404
+for any other agent means its binding disappeared, and fails the step. Every agent's outcome is printed, and written to
 $GITHUB_STEP_SUMMARY when it is set.
 
 ## prompt_hash
@@ -98,6 +99,15 @@ class PublishError(RuntimeError):
     pass
 
 
+# Agents that have no release binding in the mctl-gitops catalog yet. For
+# these, and only these, a 404 is the expected state: their promotion is
+# refused with a warning and the step stays green. For every other agent a
+# 404 means a binding that existed was deleted or renamed, and that fails the
+# step. Shrink this set in the same change that adds a binding (claude P2 on
+# #574) — an agent left here after it is bound only loses the loud failure
+# for a later deletion, never its gate.
+UNBOUND_AGENTS = frozenset({"incident-responder", "mentor", "service-agent"})
+
 PROMOTED = "promoted"
 REFUSED = "refused"
 FAILED = "failed"
@@ -118,8 +128,11 @@ class Outcome:
         if self.state == FAILED:
             return True
         if self.state == REFUSED:
-            # Only an absent binding is a quiet refusal; see the docstring.
-            return self.verdict is None or self.verdict.status != check_binding_hash.VERDICT_MISSING
+            # Only an absent binding for a known-unbound agent is a quiet
+            # refusal; see the docstring and UNBOUND_AGENTS.
+            if self.verdict is None or self.verdict.status != check_binding_hash.VERDICT_MISSING:
+                return True
+            return self.agent not in UNBOUND_AGENTS
         return False
 
 

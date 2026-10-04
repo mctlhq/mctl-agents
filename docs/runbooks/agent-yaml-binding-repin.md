@@ -169,9 +169,15 @@ published, so it stays inactive until someone promotes it. Each agent's outcome
 (promoted, or refused with the reason) is in the "Refresh agent registry" log and the
 job summary.
 
-- **Refused: missing**: the agent has no binding. This is a warning, and the step stays
-  green. Production keeps the version it had. To activate the release, add a binding
-  in mctl-gitops and then promote the published version with `mctl_promote_agent`.
+- **Refused: missing**: the agent has no binding. For the agents in
+  `UNBOUND_AGENTS` (`tools/publish_agent_release.py`) this is a warning, and the step
+  stays green. For any other agent it means a binding was deleted or renamed, and the
+  step fails. Either way, production keeps the version it had. To activate the
+  release, add the binding in mctl-gitops, remove the agent from `UNBOUND_AGENTS` in
+  the same mctl-agents change that follows it, and promote the published version with
+  `mctl_promote_agent`.
 - **Refused: mismatch or unobservable**: a binding exists but is stale or disagrees
   with the release, or it (or its profile) could not be read. This fails the step.
-  Re-pin as described above, or retry once the read works, and then promote by hand.
+  Reads are retried three times on connect errors, timeouts and 5xx; 403 and 404 are
+  not retried. Re-pin as described above, or wait until the read works, and then
+  promote by hand: re-running the workflow does not repeat this step.
