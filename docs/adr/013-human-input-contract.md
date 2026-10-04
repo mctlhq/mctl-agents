@@ -45,8 +45,22 @@ signal validates.
   run id that is not this run's, or a `created_at` predating this
   execution's start (minus `HUMAN_INPUT_PRIOR_RUN_SLACK`) is skipped as
   another execution's leftover. A re-asking investigator overwrites
-  `request.json`; the durable answered-marker (producer-side) is tracked
-  in mctlhq/mctl-agents#451.
+  `request.json`.
+- **Durable answered-marker (producer-side, mctlhq/mctl-agents#473).** Every
+  continuation run, i.e. one invoked with `--human-input-responses`, writes
+  `human-input/answered.json`: a JSON array of
+  `{request_id, request_hash, received_at}` covering every answer it was
+  given, rewritten in full on each continuation, including one that also
+  seals a new question. It carries ids, hashes and timestamps only, never
+  `value`, so the "No transcripts" invariant holds for it. The same run drops
+  a carried-forward `request.json` whose `request_id` was answered. The
+  consumer does not read the marker; it skips a resolved `question_hash`
+  on its own. The marker exists for later executions and human readers of
+  gitops. `work_item_id` in a sealed request is the resolved work item
+  when one resolved, else `--work-item-id`, else the canonical issue key.
+  The continuation params do not forward `work_item_id`, so rounds 2+ of
+  one loop may seal the canonical issue key where round 1 sealed a `wi_`
+  id. This affects provenance only: nothing validates the field.
 - **No transcripts.** Logs and the `human_input_state` query expose
   hashes, ids, timestamps and counters — never `question`, `reason` or
   `value`.
@@ -56,8 +70,9 @@ signal validates.
 Accepted answers accumulate; every continuation investigate submit carries
 the full set as the `human_input_responses` JSON array (request_id,
 request_hash, value, respondent, surface, received_at per entry), so a
-later round never has to re-ask an earlier question. Pinning that
-parameter against the CWFT definition is producer-side work (#451).
+later round never has to re-ask an earlier question. The investigator
+accepts it as `--human-input-responses` (#473); the CWFT must declare and
+forward the parameter (see `docs/runbooks/human-input-e2e.md`).
 
 ## Numbering note
 

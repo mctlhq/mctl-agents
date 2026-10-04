@@ -1547,6 +1547,10 @@ _HUMAN_ANSWER_KEYS = frozenset(
 )
 
 
+_HUMAN_REQUEST_ID_RE = re.compile(r"hir-[0-9a-f]{16}")
+_HUMAN_REQUEST_HASH_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
 def _parse_human_input_responses(raw: str | None) -> list[dict]:
     """Validate `--human-input-responses`: a JSON array of at most
     MAX_CLARIFICATION_ROUNDS answers, each with exactly the keys the
@@ -1572,10 +1576,13 @@ def _parse_human_input_responses(raw: str | None) -> list[dict]:
         for key in ("request_id", "request_hash", "respondent", "surface", "received_at"):
             if not isinstance(entry[key], str) or not entry[key]:
                 raise bad(f"entry {index}: {key} must be a non-empty string")
-        if not entry["request_id"].startswith("hir-"):
-            raise bad(f"entry {index}: request_id must start with 'hir-'")
-        if not entry["request_hash"].startswith("sha256:"):
-            raise bad(f"entry {index}: request_hash must start with 'sha256:'")
+        # The full shapes `seal_request` derives, not just the prefixes: the
+        # id is interpolated into the <human_answers> fence, so nothing but
+        # `hir-` + 16 hex may reach it.
+        if not _HUMAN_REQUEST_ID_RE.fullmatch(entry["request_id"]):
+            raise bad(f"entry {index}: request_id must be 'hir-' followed by 16 hex digits")
+        if not _HUMAN_REQUEST_HASH_RE.fullmatch(entry["request_hash"]):
+            raise bad(f"entry {index}: request_hash must be 'sha256:' followed by 64 hex digits")
         try:
             human_input._parse_iso(entry["received_at"], where="received_at")
         except human_input.HumanInputError:
@@ -1618,7 +1625,8 @@ def _human_input_answers_block(answers: list[dict]) -> str:
     if not answers:
         return ""
     rendered = "\n".join(
-        f"- request {a['request_id']}: {_neutralize_prompt_tags(json.dumps(a['value']))}"
+        f"- request {_neutralize_prompt_tags(str(a['request_id']))}: "
+        f"{_neutralize_prompt_tags(json.dumps(a['value']))}"
         for a in answers
     )
     return (
@@ -1695,8 +1703,8 @@ def _seal_draft(
         print(f"warn: human-input draft discarded reason={why}")
         return None, why
 
-    if failure:
-        return reject(failure)
+    if failure or raw is None:
+        return reject(failure or "not-a-regular-file")
     if len(raw) > HUMAN_INPUT_DRAFT_MAX_BYTES:
         return reject("oversize")
     if correlation is None:
@@ -1709,7 +1717,15 @@ def _seal_draft(
         return reject("round-limit")
     try:
         draft = json.loads(raw)
-        if not isinstance(draft, dict) or set(draft) != {"question", "reason", "response"}:
+        # Shape AND types, before anything is built from it: the draft is
+        # model output, so a wrong-typed field is a rejection, never a crash.
+        if (
+            not isinstance(draft, dict)
+            or set(draft) != {"question", "reason", "response"}
+            or not isinstance(draft["question"], str)
+            or not isinstance(draft["reason"], str)
+            or not isinstance(draft["response"], dict)
+        ):
             return reject("malformed")
         moment = now or datetime.now(UTC)
         created_at = moment.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -1734,7 +1750,9 @@ def _seal_draft(
         # Round-trips through the read path, so what is published is exactly
         # what the workflow will accept.
         human_input.HumanInputRequest.from_dict(request.to_dict())
-    except (ValueError, human_input.HumanInputError):
+    except (ValueError, RecursionError, human_input.HumanInputError):
+        # ValueError covers bad JSON and undecodable bytes; RecursionError a
+        # deeply nested document, which json.loads does not turn into one.
         return reject("malformed")
     human_dir.mkdir()
     (human_dir / HUMAN_INPUT_REQUEST).write_text(
@@ -1748,38 +1766,46 @@ def _apply_human_input_continuation(
     staging: Path, answers: list[dict], sealed: Any
 ) -> None:
     """After carry-forward: drop a carried `request.json` that one of
-    `answers` resolved, and (unless this run sealed a new request) record the
-    answered ids in `answered.json`. Ids, hashes and timestamps only."""
-    # A newly sealed request is in staging already and wins the carry-forward
-    # collision, so there is nothing to drop or record.
-    if not answers or sealed is not None:
+    `answers` resolved, and record every answered id in `answered.json`.
+    Ids, hashes and timestamps only.
+
+    `human-input` may have been carried forward from the previously
+    published proposal, and `_carry_forward` copies symlinks AS symlinks, so
+    it is sanitized before anything is read or written through it."""
+    if not answers:
         return
     human_dir = staging / HUMAN_INPUT_DIRNAME
+    # First, before any path below it is touched: a symlinked or non-dir
+    # `human-input` is removed (never followed), as `_seal_draft` does.
+    if human_dir.is_symlink() or (human_dir.exists() and not human_dir.is_dir()):
+        _remove_rejected(human_dir)
+    human_dir.mkdir(exist_ok=True)
     answered_ids = {a["request_id"] for a in answers}
     carried = human_dir / HUMAN_INPUT_REQUEST
-    if _is_plain_file(carried):
+    # A request this run sealed is in staging already and won the
+    # carry-forward collision; only a carried, answered one is dropped.
+    if sealed is None and _is_plain_file(carried):
         try:
             carried_id = json.loads(carried.read_text(encoding="utf-8")).get("request_id")
         except (OSError, ValueError, AttributeError):
             carried_id = None
         if carried_id in answered_ids:
             carried.unlink()
-    if human_dir.is_symlink() or (human_dir.exists() and not human_dir.is_dir()):
-        _remove_rejected(human_dir)
-    human_dir.mkdir(exist_ok=True)
+    # Written even when this run sealed a new question, so the marker never
+    # omits a round that was answered. Replaced, never written through: a
+    # carried marker may be a symlink.
     marker = human_dir / HUMAN_INPUT_ANSWERED
-    if marker.is_symlink():
-        marker.unlink()
-    marker.write_text(
-        json.dumps(
-            [
-                {k: a[k] for k in ("request_id", "request_hash", "received_at")}
-                for a in answers
-            ],
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
+    if marker.is_symlink() or marker.exists():
+        _remove_rejected(marker)
+    payload = json.dumps(
+        [{k: a[k] for k in ("request_id", "request_hash", "received_at")} for a in answers],
+        sort_keys=True,
+    ).encode("utf-8")
+    fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
 
 
 def _build_prompt(
@@ -2063,17 +2089,6 @@ async def _run_agent(
         )
         plan.log()
         human_input_granted = plan_grants_human_input(plan)
-        if human_input_granted and issue_url:
-            human_input_correlation = context_assembly.build_execution_correlation(
-                resolver_mode="declarative",
-                issue_url=issue_url,
-                target_repository_sha=target_repository_sha,
-                plan=plan,
-                temporal_workflow_id=temporal_workflow_id,
-                temporal_run_id=temporal_run_id,
-                argo_workflow_name=argo_workflow_name,
-            )
-        prompt += _human_input_ask_block(human_input_granted, len(human_input_answers or []))
         if capability_mode == "discovery":
             # mctlhq/mctl-agents#242 slice 3, ADR 017: the capability
             # discovery/gateway construction site. capability_gateway is the
@@ -2108,6 +2123,12 @@ async def _run_agent(
                 # Named here rather than surfacing as a URL-regex ValueError
                 # from deep inside correlation building.
                 raise SystemExit("discovery mode requires _run_agent(issue_url=...); none was passed")
+        # Built ONCE (mctlhq/mctl-agents#473 task 4): the gateway needs it in
+        # discovery mode, and a plan granting `human.request_input` needs it
+        # to seal a draft. Without an issue_url there is nothing to correlate
+        # (discovery refused that above), so the grant is inert.
+        correlation = None
+        if issue_url and (capability_mode == "discovery" or human_input_granted):
             correlation = context_assembly.build_execution_correlation(
                 resolver_mode="declarative",
                 issue_url=issue_url,
@@ -2117,6 +2138,16 @@ async def _run_agent(
                 temporal_run_id=temporal_run_id,
                 argo_workflow_name=argo_workflow_name,
             )
+        if human_input_granted and correlation is not None:
+            human_input_correlation = correlation
+        # The invitation and the sealing capability stay in lockstep: the
+        # model is only told it may ask when a draft could actually be sealed.
+        prompt += _human_input_ask_block(
+            human_input_correlation is not None, len(human_input_answers or [])
+        )
+        if capability_mode == "discovery":
+            if correlation is None:  # unreachable: issue_url was required above
+                raise SystemExit("discovery mode could not build its execution correlation")
             # The plan's tools, unfiltered: both halves of the two-fact
             # conjunction the builder applies to mcp__mctl__* (profile grants
             # it, MCP configured here) were already enforced by the discovery
@@ -3487,7 +3518,12 @@ def _investigate(
         sealed_request, draft_rejection = _seal_draft(
             staging,
             correlation=agent_correlation if isinstance(agent_correlation, ExecutionCorrelation) else None,
-            work_item_id=work_item_id or "",
+            # The resolved work item first, like every other identity site
+            # here; the raw --work-item-id only when nothing resolved.
+            work_item_id=(
+                work_context_ref.work_item_id if work_context_ref is not None
+                else (work_item_id or "")
+            ),
             issue_author=issue.author,
             prior_answers=human_answers,
             issue_url=issue.ref.url,

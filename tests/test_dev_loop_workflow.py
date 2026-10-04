@@ -13,6 +13,7 @@ import dataclasses
 import json as _json
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC as _UTC
 from datetime import datetime as _datetime
 from datetime import timedelta
@@ -271,6 +272,13 @@ def _fake_activities(
     gate_results: list[GatedActionResult] | None = None,
     gate_calls: list[GatedActionInput] | None = None,
     mint_raises: bool = False,
+    # mctlhq/mctl-agents#473: the end-to-end test runs the REAL investigator
+    # inside the fake investigate CWFT (`investigate_hook(params)`, awaited
+    # before the fake returns) and serves `find_human_input_request` from
+    # what that run published (`human_input_reader()`), instead of a canned
+    # `human_input_requests` sequence. Both None for every other test.
+    investigate_hook: Callable[[dict], Awaitable[None]] | None = None,
+    human_input_reader: Callable[[], str | None] | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -325,6 +333,8 @@ def _fake_activities(
             assert input.params.get("issue_url")
             if investigate_params_log is not None:
                 investigate_params_log.append(dict(input.params))
+            if investigate_hook is not None:
+                await investigate_hook(dict(input.params))
             investigate_ran.set()
             return WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase=investigate_phase)
         if input.operation == "mctl-agents-shepherd":
@@ -390,6 +400,8 @@ def _fake_activities(
 
     @activity.defn(name="find_human_input_request")
     async def fake_find_human_input_request(service: str, slug: str) -> str | None:
+        if human_input_reader is not None:
+            return human_input_reader()
         i = min(_human_input_index["i"], len(_human_input_sequence) - 1)
         _human_input_index["i"] += 1
         return _human_input_sequence[i]
