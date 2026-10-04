@@ -323,6 +323,18 @@ def prompt_hash(manifest: dict[str, Any], agent: str, tag: str, tree: list[str])
     return f"sha256:{digest.hexdigest()}"
 
 
+def _refused_detail(agent: str, verdict: check_binding_hash.PromotionVerdict) -> str:
+    """The refusal plus what it costs, not only where the binding is not
+    (claude P3 on #574). Workflows pin the image of the version they resolve,
+    which overrides the CWFT default release-deploy just bumped; an agent that
+    was never promoted resolves nothing and falls back to that default."""
+    cost = (
+        f"{agent} is not released to {ENVIRONMENT} by this tag: anything resolving it keeps "
+        "the version promoted before, or the CWFT's default image if it was never promoted"
+    )
+    return f"{verdict.status}: {verdict.reason} — {cost}"
+
+
 def publish(
     agent: str,
     version: str,
@@ -363,7 +375,7 @@ def publish(
             print(f"  would promote {agent}@{version} to {ENVIRONMENT}: {verdict.reason}")
             return Outcome(agent, PROMOTED, f"(dry run) {verdict.reason}", verdict)
         print(f"  would REFUSE promoting {agent}@{version} ({verdict.status}): {verdict.reason}")
-        return Outcome(agent, REFUSED, f"(dry run) {verdict.status}: {verdict.reason}", verdict)
+        return Outcome(agent, REFUSED, f"(dry run) {_refused_detail(agent, verdict)}", verdict)
 
     status, body = _request("POST", f"/api/v1/agents/{agent}/versions", payload)
     if status == 404:
@@ -403,14 +415,7 @@ def publish(
             f"  REFUSED promoting {agent}@{version} to {ENVIRONMENT} ({verdict.status}): {verdict.reason}",
             file=sys.stderr,
         )
-        # Say what the refusal costs, not only where the binding is not: the
-        # workflows pin the image of the version they resolve, which overrides
-        # the CWFT default release-deploy just bumped (claude P3 on #574).
-        cost = (
-            f"{agent} keeps resolving its previously promoted {ENVIRONMENT} version, "
-            "and that version's image, until a matching binding lands"
-        )
-        return Outcome(agent, REFUSED, f"{verdict.status}: {verdict.reason} — {cost}", verdict)
+        return Outcome(agent, REFUSED, _refused_detail(agent, verdict), verdict)
 
     # No 409 allowance here, deliberately, unlike /versions above: promotion
     # is idempotent server-side — PromoteRelease returns 200 for a version

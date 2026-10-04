@@ -83,6 +83,10 @@ TIMEOUT_S = 20.0
 # answers, not blips, and are not retried.
 FETCH_ATTEMPTS = 3
 RETRY_BACKOFF_S = 2.0
+# A 429's Retry-After (normally 60s) is honoured up to this cap, so one hint
+# cannot stall the release step. A window longer than the cap still refuses
+# as unobservable: wait it out and promote by hand, do not re-pin.
+RETRY_AFTER_CAP_S = 60.0
 
 EXIT_MATCH = 0
 EXIT_MISMATCH = 1
@@ -151,6 +155,9 @@ def _fetch(url: str, transport: httpx.BaseTransport | None) -> bytes:
                 retryable = response.status_code >= 500 or response.status_code == 429
                 if not retryable or attempt == FETCH_ATTEMPTS:
                     break
+                if response.status_code == 429:
+                    time.sleep(_retry_after(response, default=RETRY_BACKOFF_S * attempt))
+                    continue
             time.sleep(RETRY_BACKOFF_S * attempt)
     finally:
         if transport is None:
@@ -168,6 +175,16 @@ def _fetch(url: str, transport: httpx.BaseTransport | None) -> bytes:
     # An empty 200 needs no case of its own: it parses to no mapping, which
     # `parse_binding` and `parse_profile_version` already refuse.
     return response.content
+
+
+def _retry_after(response: httpx.Response, *, default: float) -> float:
+    """Seconds a 429 asks us to wait, capped at RETRY_AFTER_CAP_S. The
+    header may also be an HTTP-date; anything unparseable uses `default`."""
+    try:
+        wait = float(response.headers.get("Retry-After", default))
+    except ValueError:
+        wait = default
+    return max(0.0, min(wait, RETRY_AFTER_CAP_S))
 
 
 def parse_binding(raw: bytes, *, agent: str = AGENT) -> resolver.ReleaseBinding:

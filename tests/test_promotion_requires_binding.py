@@ -190,7 +190,8 @@ def test_no_binding_refuses_promotion(registry):
     outcome = _publish("mentor", _gitops({}))
     _refused(outcome, registry, "mentor", gate.VERDICT_MISSING)
     # The log says what the refusal costs, not only where the binding is not.
-    assert "keeps resolving its previously promoted production version" in outcome.detail
+    assert "is not released to production by this tag" in outcome.detail
+    assert "the CWFT's default image if it was never promoted" in outcome.detail
     assert "no release binding for mentor" in outcome.detail
     assert "releases/shadow/mentor.yaml" in outcome.detail
     # Expected state for an agent nobody has bound yet: refused, not a red run.
@@ -338,7 +339,7 @@ def _flaky(failures: list[Responder], then: bytes) -> tuple[Responder, list[int]
     "failure",
     [
         lambda r: httpx.Response(502),
-        lambda r: httpx.Response(429, headers={"Retry-After": "1"}),
+        lambda r: httpx.Response(429, headers={"Retry-After": "0"}),
         _raise(httpx.ConnectError),
         _raise(httpx.ReadTimeout),
     ],
@@ -401,6 +402,23 @@ def test_dry_run_reports_the_verdict_and_writes_nothing(registry, capsys):
     assert outcome.state == publish_agent_release.REFUSED
     assert registry.calls == []
     assert "would REFUSE promoting shepherd" in capsys.readouterr().out
+    assert "is not released to production by this tag" in outcome.detail
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [("7", 7.0), ("600", 60.0), ("Wed, 21 Oct 2026 07:28:00 GMT", 2.0), (None, 2.0)],
+    ids=["seconds", "capped", "http-date", "absent"],
+)
+def test_a_429_waits_for_retry_after(header, expected, registry, monkeypatch):
+    monkeypatch.setattr(gate, "RETRY_BACKOFF_S", 2.0)
+    slept: list[float] = []
+    monkeypatch.setattr(gate.time, "sleep", slept.append)
+    headers = {"Retry-After": header} if header is not None else {}
+    responder, _ = _flaky([lambda r: httpx.Response(429, headers=headers)], _binding(_V2))
+    outcome = _publish(_V2, _gitops({_V2: responder}))
+    assert outcome.state == publish_agent_release.PROMOTED
+    assert slept == [expected]
 
 
 # ---------------------------------------------------------------------------
