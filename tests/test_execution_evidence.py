@@ -689,7 +689,7 @@ def test_to_log_dict_carries_no_unbounded_text():
     expected_keys = {
         "evidence_id", "content_hash", "completeness", "outcome_code", "primary_execution_kind",
         "policy_decision_count", "snapshot_ref_count", "approval_count",
-        "artifact_count", "gap_count",
+        "artifact_count", "gap_count", "tool_call_count", "subject_kind", "authority",
     }
     assert set(log) == expected_keys
     assert log["primary_execution_kind"] in ee.EXECUTION_REF_KINDS | {""}
@@ -1111,6 +1111,10 @@ def test_validate_rejects_an_envelope_that_supersedes_itself():
 # -- tool calls --------------------------------------------------------------
 
 
+def test_tool_call_kinds_are_the_policy_checkpoint_action_kinds():
+    assert ee.TOOL_CALL_KINDS is pc.ACTION_KINDS
+
+
 def test_tool_call_kinds_cover_every_governed_policy_action_kind():
     action_kind_shape = r"^[a-z_]+(\.[a-z_]+)+$"
     declared = {
@@ -1304,3 +1308,83 @@ def test_resolve_current_over_the_golden_supersession_pair():
     assert result.state == "current"
     assert result.evidence == second
     assert result.state in ee.CURRENT_STATES
+
+
+# -- review round 1 (PR #575) -----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "block,overrides",
+    (
+        (
+            "subject",
+            {"subject": _subject(kind="branch", ref="feat/rotate-" + _CREDENTIAL), "provenance": _provenance()},
+        ),
+        ("subject", {"subject": _subject(revision=_CREDENTIAL), "provenance": _provenance()}),
+        ("tool_calls", {"tool_calls": [_tool_call(action_digest=_CREDENTIAL)]}),
+        ("provenance", {"provenance": _provenance(observed_at=_CREDENTIAL)}),
+        ("provenance", {"provenance": _provenance(authority=_CREDENTIAL)}),
+        ("versions", {"versions": _versions(definition_content_hash=_CREDENTIAL)}),
+    ),
+    ids=("subject.ref", "subject.revision", "tool_call.action_digest", "provenance.observed_at",
+         "provenance.authority", "versions.definition_content_hash"),
+)
+def test_a_redacted_required_leaf_seals_incomplete_instead_of_losing_the_envelope(block, overrides):
+    evidence = _seal(**overrides)
+    assert _CREDENTIAL not in json.dumps(evidence.to_dict())
+    gaps = [g for g in evidence.gaps if g.block == block and g.code == "redacted_out"]
+    assert len(gaps) == 1 and gaps[0].required
+    assert evidence.completeness == ee.INCOMPLETE
+    assert ee.recompute_content_hash(evidence) == evidence.content_hash
+    assert ee.ExecutionEvidence.from_dict(evidence.to_dict()) == evidence
+
+
+def test_a_blank_required_leaf_with_only_a_non_required_redaction_gap_is_rejected():
+    sealed = _seal(subject=_subject(kind="branch", ref="feat/x-" + _CREDENTIAL), provenance=_provenance())
+    doc = sealed.to_dict()
+    doc["gaps"] = [{**g, "required": False} for g in doc["gaps"]]
+    with pytest.raises(ee.ExecutionEvidenceError, match="must be required"):
+        ee.ExecutionEvidence.from_dict(doc)
+
+
+@pytest.mark.parametrize(
+    "kind,repository,ref,revision",
+    (
+        ("pull_request", "mctlhq/mctl-agents", "524", "4f2c9e1"),
+        ("pull_request", "mctlhq/mctl-agents", "524", "A" * 40),
+        ("pr", "mctlhq/mctl-agents", "524", _SHA1),
+        ("PullRequest", "mctlhq/mctl-agents", "524", ""),
+        ("pull_request", "mctl-agents", "524", _SHA1),
+        ("pull_request", "mctlhq/mctl-agents", "#524", _SHA1),
+        ("pull_request", "mctlhq/mctl-agents", 524, _SHA1),
+    ),
+)
+def test_resolve_current_rejects_a_malformed_argument_instead_of_answering_no_evidence(
+    kind, repository, ref, revision
+):
+    with pytest.raises(ee.ExecutionEvidenceError):
+        ee.resolve_current([_pr_evidence()], kind=kind, repository=repository, ref=ref, revision=revision)
+
+
+@pytest.mark.parametrize("repository", ("mctlhq/..", "mctlhq/.", "mctlhq/...", "mctlhq/a..b"))
+def test_subject_repository_rejects_path_fragments(repository):
+    with pytest.raises(ee.ExecutionEvidenceError, match=r"subject\.repository"):
+        _seal(subject=_subject(repository=repository), provenance=_provenance())
+
+
+def test_subject_repository_accepts_a_dot_prefixed_real_name():
+    _seal(subject=_subject(repository="mctlhq/.github"), provenance=_provenance())  # must not raise
+
+
+def test_release_revision_is_bounded_to_a_signed_64_bit_integer():
+    _seal(versions=_versions(release_revision=2**63 - 1))  # must not raise
+    with pytest.raises(ee.ExecutionEvidenceError, match="release_revision"):
+        _seal(versions=_versions(release_revision=2**63))
+
+
+def test_to_log_dict_reports_the_amendment_2_codes():
+    log = _seal(subject=_subject(), provenance=_provenance(), tool_calls=[_tool_call()]).to_log_dict()
+    assert log["tool_call_count"] == 1
+    assert log["subject_kind"] == "pull_request"
+    assert log["authority"] == "observed"
+    assert _seal().to_log_dict()["subject_kind"] == ""

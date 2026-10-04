@@ -85,10 +85,10 @@ rejects unknown keys, and bounded string lengths. Implemented in
 | `approvals` | `ApprovalRef[]` (optional) | caller | `aar_` approvals this execution's actions relied on |
 | `artifacts` | `ArtifactRef[]` (optional) | caller | generated artifacts this execution produced |
 | `gaps` | `Gap[]` | `_safe()` + caller | every block known to be missing, and why |
-| `versions` | `VersionPins \| null` (optional, Amendment 2) | caller | the resolved ADR 007 release pins this execution ran under |
-| `subject` | `SubjectRef \| null` (optional, Amendment 2) | caller | what the evidence is about, bound to the exact revision observed |
-| `tool_calls` | `ToolCallRef[]` (optional, Amendment 2) | caller | consequential tool calls: kind, name, action digest, status |
-| `provenance` | `Provenance \| null` (optional, Amendment 2; required with `subject`) | caller | `authority`, `observed_at`, `supersedes` |
+| `versions` | `VersionPins` (optional, Amendment 2; the key is omitted from `to_dict()` when absent, unlike `usage`'s `null`) | caller | the resolved ADR 007 release pins this execution ran under |
+| `subject` | `SubjectRef` (optional, Amendment 2; omitted when absent) | caller | what the evidence is about, bound to the exact revision observed |
+| `tool_calls` | `ToolCallRef[]` (optional, Amendment 2; omitted when empty) | caller | consequential tool calls: kind, name, action digest, status |
+| `provenance` | `Provenance` (optional, Amendment 2; omitted when absent; required with `subject`) | caller | `authority`, `observed_at`, `supersedes` |
 
 **`ExecutionJoin`** — `execution_id` (`we_`-validated), `work_item_id`,
 `trace_id`, `runtime_execution_id` (`ex-`-validated, Amendment 1: two typed
@@ -373,6 +373,7 @@ tests/fixtures/evidence/shepherd-evidence.json          # new fixture (both iden
 ```
 docs/adr/018-execution-evidence-envelope-contract.md    # this amendment; sec. 1 table rows added
 orchestrator/execution_evidence.py                      # four optional blocks, observation_failed, resolve_current
+orchestrator/policy_checkpoint.py                       # ACTION_KINDS: the governed action kinds as one frozenset
 tests/test_execution_evidence.py                        # T16 + extensions to T3, T5, T10
 tests/fixtures/evidence/shepherd-pr-evidence.json              # new fixture (all four blocks)
 tests/fixtures/evidence/shepherd-pr-superseding-evidence.json  # new fixture (supersedes the above)
@@ -600,14 +601,14 @@ every pre-amendment block already follows, which keeps redaction
 | `profile_name` | optional slug | the `ExecutionProfile` name |
 | `profile_version` | optional version token | the profile registry version |
 | `profile_content_hash` | optional `sha256:` + 64 hex | the profile bytes read |
-| `release_revision` | optional int ≥ 0 | the `ReleaseBinding` revision |
+| `release_revision` | optional int, `0 ≤ n ≤ 2^63-1` (Tier B stores a signed 64-bit integer) | the `ReleaseBinding` revision |
 
 **`subject: SubjectRef`** — what the evidence is about, bound to a version:
 
 | Field | Validation | Meaning |
 | --- | --- | --- |
 | `kind` | required; closed `SUBJECT_KINDS` = `pull_request`, `issue`, `branch`, `release`, `work_item` | subject class |
-| `repository` | `owner/name`; required for `pull_request`, `issue`, `branch`, `release` | the GitHub repository |
+| `repository` | `owner/name`; required for `pull_request`, `issue`, `branch`, `release`; the name half may not be all dots or contain `..` (`.github` is fine) | the GitHub repository |
 | `ref` | required; the number for `pull_request`/`issue` (`[1-9][0-9]{0,9}`), otherwise `[A-Za-z0-9][A-Za-z0-9._/+-]*` ≤256 with no `..`, `//` or trailing `/` | PR/issue number, branch, tag or work item id |
 | `revision` | **required full lowercase git SHA (40 or 64 hex) for `SHA_BOUND_SUBJECT_KINDS` = `pull_request`, `branch`, `release`**; optional version token otherwise | the exact version observed |
 
@@ -624,7 +625,7 @@ most `MAX_TOOL_CALLS` = 256:
 
 | Field | Validation | Meaning |
 | --- | --- | --- |
-| `kind` | required; closed `TOOL_CALL_KINDS` = every governed `policy_checkpoint` action kind (imported, not retyped; T16 asserts the two sets are equal) | the action class |
+| `kind` | required; closed `TOOL_CALL_KINDS` = `policy_checkpoint.ACTION_KINDS` itself (one frozenset, reused the way `VERDICTS`/`UNDECIDED_CODES` are) | the action class |
 | `name` | optional `[A-Za-z0-9][A-Za-z0-9_.:-]*` ≤128 | the tool / operation name (`ActionRequest.operation`) |
 | `action_digest` | required; `sha256:` + 64 hex | `ActionRequest.action_digest()` — the same value `PolicyDecisionRef.action_digest` and an `aar_` `intent_hash` bind, so the three join without carrying arguments |
 | `status` | required; closed `succeeded`, `failed`, `refused`, `unknown` | the observed result; `unknown` = the result could not be observed, never folded into `failed` |
@@ -662,6 +663,18 @@ some caller already sealed. Vocabulary:
 | The execution did not produce it | `Gap(code="not_produced", ...)` (unchanged) |
 | A tool call ran but its result is unknown | `ToolCallRef(status="unknown")` |
 
+**Redaction inside a new block.** `_safe()` runs over the new blocks like
+every other one. A dropped leaf becomes `""` plus a `redacted_out` gap,
+and **for the four Amendment 2 blocks that gap is always `required=True`**
+(`AMENDMENT_2_BLOCKS` in `_is_block_required`): each block binds
+identity or trust, so a partly dropped one must leave the envelope
+`INCOMPLETE`. `validate()` then tolerates a blank *required* leaf (for
+example `subject.ref` on a branch whose name trips the credential screen)
+only when such a gap names that block, so `seal()` degrades to an
+explicit gap and never loses the whole envelope. A blank required leaf
+with no redaction gap was never supplied and is still rejected, and so is
+a non-required `redacted_out` gap on a new block (seal never writes one).
+
 `Requirements` gains `versions`, `subject`, `tool_calls` and `provenance`
 flags, all `False` by default, so `DEFAULT_REQUIREMENTS` — and every
 envelope sealed under it — is unchanged.
@@ -672,6 +685,10 @@ One rule, implemented as the pure function
 `resolve_current(candidates, *, kind, repository, ref, revision)` in Tier A,
 which Tier B must reproduce and test against:
 
+0. Every argument is validated with the `subject` rules (a blank
+   `revision` excepted). A malformed one, such as an abbreviated or uppercase
+   SHA or a `kind` outside `SUBJECT_KINDS`, raises
+   `ExecutionEvidenceError`. It is a caller bug, never `no_evidence`.
 1. `revision` (the subject's live revision, which the *reader* has just
    observed) blank → `unknown_revision`. Never `no_evidence`.
 2. Pool = candidates with exactly this `subject.key` **and** this
@@ -766,8 +783,11 @@ producer emits the new blocks:
    `_check_tool_call`, `_check_provenance` (closed `authority`;
    `observed_at` shape; `supersedes` = `^ev-[0-9a-f]{16}$` and ≠ own id),
    "`subject` requires `provenance`", `MAX_TOOL_CALLS`, and
-   "`observation_failed` gaps must be `required: true`". Violations answer
-   `400 evidence_invalid`.
+   "`observation_failed` gaps must be `required: true`", "a `redacted_out`
+   gap on an Amendment 2 block must be `required: true`, and only such a
+   gap excuses a blank required leaf in that block", the `subject.repository`
+   path-fragment rule, and `release_revision` within signed 64-bit range.
+   Violations answer `400 evidence_invalid`.
 3. **Conformance.** Copy `shepherd-pr-evidence.json` and
    `shepherd-pr-superseding-evidence.json` into
    `internal/evidence/testdata/` and assert their literal hashes; the
@@ -783,7 +803,9 @@ producer emits the new blocks:
    '^ev-[0-9a-f]{16}$'`; `supersedes <> id`; `subject_kind = '' OR
    (authority <> '' AND observed_at IS NOT NULL)`; `subject_kind NOT IN
    ('pull_request','branch','release') OR subject_revision ~
-   '^[0-9a-f]{40}([0-9a-f]{24})?$'`. `versions` and `tool_calls` stay in the
+   '^[0-9a-f]{40}([0-9a-f]{24})?$'` (or `''` when a `redacted_out` gap
+   excused it, which leaves the row out of every current pool). `versions`
+   and `tool_calls` stay in the
    verbatim envelope only — no columns, no second copy.
 5. **Index.** `(subject_kind, subject_repository, subject_ref,
    subject_revision, observed_at DESC) WHERE subject_kind <> ''` and
@@ -800,7 +822,9 @@ producer emits the new blocks:
    `subject_revision` filters to `GET /api/v1/evidence` and
    `GET /api/v1/work-items/{id}/evidence`.
 8. **Current read.** `GET /api/v1/evidence/current?subject_kind=&repository=&ref=&revision=`
-   implementing `resolve_current` exactly, answering `{state, evidence}`
+   implementing `resolve_current` exactly, including the argument
+   validation (a malformed parameter answers `400`, never `no_evidence`),
+   and answering `{state, evidence}`
    with `state` ∈ `current`, `no_evidence`, `unknown_revision`
    (missing `revision`), `ambiguous`. It loads the complete pool; a pool
    larger than the server cap, or any read error, is a `5xx`/typed error —
@@ -811,6 +835,9 @@ producer emits the new blocks:
    a deliberate mutation (reverting it), per the workspace detector rule.
 
 ### What this amendment does not change
+
+`to_log_dict()` gains `tool_call_count`, `subject_kind` and `authority`:
+a count and two closed-vocabulary codes, never ids.
 
 The hash rule, the redaction-before-hash rule, the derived `completeness`
 mechanism, the boundary table (evidence still grants nothing; persistence
