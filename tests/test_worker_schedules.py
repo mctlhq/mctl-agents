@@ -474,7 +474,7 @@ class TestIntakeCadence:
             "they race the shared mctl-gitops-main-writes mutex on every such tick"
         )
 
-    async def test_the_weekly_dispatch_fires_sunday_0901_utc(self):
+    async def test_the_weekly_dispatch_fires_sunday_1001_utc(self):
         client = _FakeClient(existing=None)
         await setup_schedules(client)
 
@@ -486,7 +486,7 @@ class TestIntakeCadence:
         period = interval.every
         n = (reference - epoch - interval.offset) // period + 1
         fire = epoch + interval.offset + n * period
-        assert (fire.weekday(), fire.hour, fire.minute) == (6, 9, 1)
+        assert (fire.weekday(), fire.hour, fire.minute) == (6, 10, 1)
         assert fire > reference
 
     async def test_no_schedule_lands_on_an_argo_cron_minute(self):

@@ -428,7 +428,7 @@ async def setup_schedules(client: Client) -> None:
 
     # Weekly GitHub workflow dispatches (mctl-agents#559). The interval is
     # derived in scheduled_dispatch.py (weekly, epoch-Thursday offset). The
-    # portfolio target fires Sunday 09:01 UTC: minute :01 is not an Argo cron
+    # portfolio target fires Sunday 10:01 UTC: minute :01 is not an Argo cron
     # minute ({0, 15, 30}) and no other Temporal schedule fires at :01.
     for target in WEEKLY_DISPATCH_TARGETS:
         dispatch_schedule = Schedule(

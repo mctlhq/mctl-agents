@@ -60,14 +60,14 @@ class DispatchTarget:
 
 
 WEEKLY_DISPATCH_TARGETS: tuple[DispatchTarget, ...] = (
-    # Sunday 09:01 UTC (11:01 CEST). :01 because :00 is a forbidden Argo cron
+    # Sunday 10:01 UTC (12:01 CEST, owner's slot 2026-10-04). :01 because :00 is a forbidden Argo cron
     # minute; it also clears every Temporal schedule minute.
     DispatchTarget(
         repo="mctlhq/portfolio",
         workflow_file="weekly-refresh.yml",
         ref="main",
         weekday=6,
-        hour=9,
+        hour=10,
         minute=1,
     ),
 )
