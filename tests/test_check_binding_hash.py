@@ -6,7 +6,9 @@ when agent.yaml matches the binding, red on a one-byte edit, and red — never
 green — whenever the binding cannot be observed. Every test here mocks the
 fetch with an `httpx.MockTransport`, so the suite stays deterministic and
 offline; the live comparison runs only as the `binding hash` CI job and the
-release workflow's `binding gate` job.
+release workflow's `binding gate` job, both through
+tools/check_agent_bindings.py, which runs `check()` for issue-investigator
+and `evaluate_promotion` for every manifest (tests/test_check_agent_bindings.py).
 """
 from __future__ import annotations
 
@@ -408,7 +410,9 @@ def test_release_please_cannot_start_before_the_binding_gate():
     jobs = _workflow("release-please.yml")["jobs"]
     assert jobs["release-please"]["needs"] in ("binding-gate", ["binding-gate"])
     gate_steps = " ".join(str(step.get("run", "")) for step in jobs["binding-gate"]["steps"])
-    assert "tools/check_binding_hash.py" in gate_steps
+    # Every agent's binding, not issue-investigator's alone (#582).
+    assert "tools/check_agent_bindings.py" in gate_steps
+    assert "tools/check_binding_hash.py" not in gate_steps
     release_steps = [step.get("name", "") for step in jobs["release-please"]["steps"]]
     assert "Dispatch centralized release-deploy" in release_steps
     assert "Refresh agent registry" in release_steps
@@ -416,7 +420,10 @@ def test_release_please_cannot_start_before_the_binding_gate():
 
 def test_the_pr_validation_runs_the_live_comparison():
     job = _workflow("pr-validation.yml")["jobs"]["binding-hash"]
-    assert any("tools/check_binding_hash.py" in str(step.get("run", "")) for step in job["steps"])
+    runs = " ".join(str(step.get("run", "")) for step in job["steps"])
+    # Every agent's binding, not issue-investigator's alone (#582).
+    assert "tools/check_agent_bindings.py" in runs
+    assert "tools/check_binding_hash.py" not in runs
 
 
 def test_the_release_gate_takes_only_manifests_from_the_release_commit():
@@ -429,3 +436,16 @@ def test_the_release_gate_takes_only_manifests_from_the_release_commit():
     assert "--detach" not in run
     assert "select(. != null)" in run
     assert 'git cat-file -e "${sha}:agents/_manifests/issue-investigator/agent.yaml"' in run
+
+
+def test_the_release_gate_checks_exactly_the_release_commits_manifests():
+    """The tool lists agents from disk, so the directory has to BE the
+    release commit's: removed first (a manifest that commit dropped must not
+    be checked), then checked out whole (one it adds must be), and only then
+    read (#582)."""
+    steps = _workflow("release-please.yml")["jobs"]["binding-gate"]["steps"]
+    run = " ".join(str(step.get("run", "")) for step in steps)
+    removed = run.index("rm -rf agents/_manifests")
+    checked_out = run.index('git checkout --quiet "$sha" -- agents/_manifests')
+    checked = run.index("tools/check_agent_bindings.py")
+    assert removed < checked_out < checked

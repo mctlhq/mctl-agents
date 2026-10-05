@@ -13,36 +13,75 @@ investigation fails.
 So any byte change to `agent.yaml`, comments and whitespace included, needs a matching
 re-pin in mctl-gitops.
 
+The other five agents (`implementer`, `incident-responder`, `mentor`, `service-agent`,
+`shepherd`) are not resolved declaratively at run time, but each has a binding in the same
+catalog (`releases/shadow/<agent>.yaml`), and a release promotes an agent to production
+only when that binding pins its `agent.yaml` (mctlhq/mctl-agents#470, see the last
+section). So a byte change to any `agent.yaml` needs a re-pin of that agent's binding
+before the release.
+
 ## What checks the pair
 
-`tools/check_binding_hash.py` compares the local `agent.yaml` hash with the binding on
-mctl-gitops `main`. It reuses the resolver's own hashing and binding parser. It runs in
-two places:
+`tools/check_agent_bindings.py` compares every `agents/_manifests/*/agent.yaml` with its
+binding on mctl-gitops `main` (mctlhq/mctl-agents#582). It has two parts, and it reports
+each agent on its own line whatever the others did:
+
+- **Every manifest** goes through `check_binding_hash.evaluate_promotion`, the function
+  the release calls before it promotes an agent: the hash, the mirrored fields, and the
+  pinned profile's version. A manifest directory with no binding at all is reported as
+  `missing`. An agent listed in `UNBOUND_AGENTS` (`tools/publish_agent_release.py`, empty
+  today) is the one exception: its missing binding is a warning, exactly as in the
+  release.
+- **`issue-investigator` also keeps `check_binding_hash.check()`**, the stricter check
+  that loads the definition through the resolver's `load_definition`, as a declarative
+  investigation does. It is reported as `issue-investigator (resolver check)`.
+
+Both parts reuse the resolver's own hashing and binding parser. The tool runs in two
+places:
 
 - **The `binding hash` job in `pr-validation.yml`**, on every PR and every push to `main`.
-  It tells the author at PR time that the binding needs a re-pin.
+  It tells the author at PR time that a binding needs a re-pin, or that a new manifest
+  has no binding yet.
 - **The `binding gate` job in `release-please.yml`.** The `release-please` job
   `needs` it, and that job does everything a release does: it creates the tag, dispatches
   `release-deploy` (which builds the image and bumps `agent_image` in every
   `cwft-mctl-agents-*.yaml`), and publishes and promotes the agents in the registry. If the
   gate fails, none of that happens, and production stays on the previous, matching release.
   The gate only runs when a merged release PR is still labelled `autorelease: pending`, that
-  is, when the run is about to cut a release. It checks `agent.yaml` at that PR's merge
-  commit, which is the commit that gets tagged.
+  is, when the run is about to cut a release. It checks the manifests at that PR's merge
+  commit, which is the commit that gets tagged: the job replaces `agents/_manifests` with
+  that commit's, so an agent the release adds is checked and one it drops is not.
 
-Exit codes: `0` means the binding matches. `1` means it does not: the hashes differ, a
-mirrored field differs, the binding's `spec.profile.version` is not the catalog profile's,
-or the local `agent.yaml` does not resolve. `2` means the binding, or the execution profile
-it names, could not be read or validated: a network error, a non-200 response, malformed
-YAML, a missing or invalid `contentHash`, or a profile with the wrong `apiVersion`, `kind`
-or `metadata.name`, or a missing or unparseable `spec.version`. Code `2` is never treated as
-a match. Re-run it once the read works.
+Both jobs write one line per agent to the log and a table to the job summary.
+
+Exit codes: `0` means every binding matches. `1` means at least one was observed and is
+wrong: the hashes differ, a mirrored field differs, the binding's `spec.profile.version` is
+not the catalog profile's, an `agent.yaml` does not resolve, or a manifest has no binding
+(HTTP 404 on the binding's path, and the agent is not in `UNBOUND_AGENTS`). `2` means
+nothing was observed to be wrong, but a binding, or the execution profile it names, could
+not be read or validated: a network error, a non-200 response other than that 404, malformed
+YAML, a missing or invalid `contentHash`, or a profile that is absent or has the wrong
+`apiVersion`, `kind` or `metadata.name`, or a missing or unparseable `spec.version`. Code `2`
+is never treated as a match. Re-run it once the read works.
+
+When one agent mismatches and another could not be read, the exit code is `1`: an observed
+mismatch is not masked by a failed read elsewhere, because it needs a re-pin that no re-run
+supplies. Each agent's line still shows its own status, so read them all.
+
+`tools/check_binding_hash.py` run directly still checks `issue-investigator` alone, with
+the same codes, except that it reports a 404 on the binding as `2`.
 
 ## Procedure for a legitimate change
 
-1. **Open the mctl-agents PR** that changes `agent.yaml`. The `binding hash` job and the
-   real-catalog resolver tests in `tests` turn red. That is expected; review everything
-   else as usual.
+1. **Open the mctl-agents PR** that changes `agent.yaml`. The `binding hash` job turns red
+   and names the agent; for `issue-investigator` the real-catalog resolver tests in `tests`
+   turn red too. That is expected; review everything else as usual.
+
+   The steps below are written for `issue-investigator`. For another agent they are the
+   same with its name in the paths, and without the production window of steps 4 to 6:
+   nothing hashes those manifests at run time, so merging their re-pin early breaks no
+   running workflow. Their re-pin only has to be on mctl-gitops `main` before the release
+   PR merges.
 2. **Prepare the mctl-gitops re-pin PR, but do not merge it yet.** Take the hash of the
    PR's final `agent.yaml`:
 
@@ -120,9 +159,17 @@ mctl-gitops and a resolver change here, and the owner has to decide on it.
 Telegram reports "release stopped by the binding gate", and no tag, image or promotion
 exists.
 
+The job summary of the stopped run says which agent, and whether it is a `mismatch`,
+`missing` or `unobservable`.
+
 - **If the change was intended:** do steps 2 and 4 above, then re-run the failed workflow
   run with `gh run rerun <run-id> --failed`. The release PR is still labelled
   `autorelease: pending`, so the re-run cuts the release.
+- **If an agent is `missing`:** its manifest is in the release commit and no
+  `releases/shadow/<agent>.yaml` exists on mctl-gitops `main`. Add the binding (or restore
+  it, if it was deleted or renamed) and re-run. Listing the agent in `UNBOUND_AGENTS` at
+  this point is too late for this release: "Refresh agent registry" runs the tagged
+  commit's copy of that list, not the one on `main`.
 - **If it was not intended:** revert the `agent.yaml` change on `main`. The next push
   re-runs the gate.
 - **If the error is `ambiguous version` (binding `spec.profile.version` vs the catalog
@@ -151,16 +198,23 @@ ahead of time:
 - **a `promptSources` path in `agent.yaml` that is missing from the image.** The gate
   covers the binding-vs-definition pair, not every `ResolverError` a release can
   introduce; the `tests` job catches this one at PR time, but not in front of the release.
-- **any agent other than `issue-investigator`, or any environment other than `shadow`.**
-  The tool checks exactly that one binding, because today only the investigate CWFT sets
-  a declarative resolver mode. `release-deploy` bumps `agent_image` in every
-  `cwft-mctl-agents-*.yaml`, so when another CWFT goes declarative, extend
-  `tools/check_binding_hash.py` to cover its binding in the same change.
+- **any environment other than `shadow`.** `releases/shadow/` is the only binding catalog,
+  and the one the resolver reads.
+- **the run-time resolver path of any agent other than `issue-investigator`.** Every
+  agent's binding is compared with its manifest, but only `issue-investigator` gets
+  `check()`, which loads the definition as the declarative resolver does, because today
+  only the investigate CWFT sets a declarative resolver mode. `release-deploy` bumps
+  `agent_image` in every `cwft-mctl-agents-*.yaml`, so when another CWFT goes declarative,
+  extend `check()` to that agent in the same change.
+- **a binding in mctl-gitops for an agent that has no manifest here.** The tool starts
+  from the manifests; it does not list the catalog.
 
 ## Production promotion of every agent (mctlhq/mctl-agents#470)
 
-Separately from the release-blocking gate above, `tools/publish_agent_release.py`
-promotes an agent to `production` only when
+The release-blocking gate above asks this question for every agent before the tag. The
+step that acts on the answer is still this one, after the tag, and it reads mctl-gitops
+again, so a refusal here means the binding changed, or could not be read, between the
+two. `tools/publish_agent_release.py` promotes an agent to `production` only when
 `check_binding_hash.evaluate_promotion` finds its binding on mctl-gitops `main`
 (`releases/shadow/<agent>.yaml`, the same catalog the resolver reads) pinning the
 exact `agent.yaml` in the tag, with the profile it pins present at that version. This

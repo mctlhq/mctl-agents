@@ -43,6 +43,12 @@ tools/publish_agent_release.py asks before it promotes an agent to
 production. It reuses every piece above — the fetch, the resolver's parser,
 the resolver's hash and cross-checks — and returns a verdict instead of an
 exit code, so one refused agent does not decide the others.
+
+mctlhq/mctl-agents#582: CI no longer runs this file directly.
+tools/check_agent_bindings.py is what the `binding hash` job and the release
+`binding gate` run: `check()` for issue-investigator as before, plus
+`evaluate_promotion` for every manifest, so the other agents' bindings are
+checked before the tag too. Running this file checks issue-investigator only.
 """
 from __future__ import annotations
 
