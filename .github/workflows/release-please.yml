@@ -320,9 +320,14 @@ jobs:
             -d "{\"role\":\"mctl-agents-release\",\"jwt\":\"$JWT\"}" \
             | python3 -c 'import sys,json; print(json.load(sys.stdin)["auth"]["client_token"])')
 
+          # The registry-publisher token, not the admin service token the
+          # agent pods run with (#470): mctl-api confines this principal to
+          # the three publication routes this tool calls, and it lives on a
+          # Vault path the agent pods never extract. So an agent cannot
+          # publish or promote a definition with its own credentials.
           MCTL_TOKEN=$(curl -sf -H "X-Vault-Token: $VAULT_TOKEN" \
-            "$VAULT_ADDR/v1/secret/data/platform/mctl-agents" \
-            | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["data"]["mctl-token"])')
+            "$VAULT_ADDR/v1/secret/data/platform/mctl-api/registry-publisher" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["data"]["token"])')
           echo "::add-mask::$MCTL_TOKEN"
 
           uv sync --locked --quiet
