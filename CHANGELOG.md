@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.68.3](https://github.com/mctlhq/mctl-agents/compare/1.68.2...1.68.3) (2026-10-05)
+
+
+### Bug Fixes
+
+* **release:** publish with the registry-publisher token ([ad0aad8](https://github.com/mctlhq/mctl-agents/commit/ad0aad8ce890eb09f6d2ee8f784eae95ffdf1e9a))
+* **release:** publish with the registry-publisher token ([aeb334c](https://github.com/mctlhq/mctl-agents/commit/aeb334cd34c0fe56b028ace0f18ebdad8e192f82)), closes [#470](https://github.com/mctlhq/mctl-agents/issues/470)
+
 ## [1.68.2](https://github.com/mctlhq/mctl-agents/compare/1.68.1...1.68.2) (2026-10-05)
 
 
