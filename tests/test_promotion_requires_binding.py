@@ -39,7 +39,19 @@ _MANIFESTS = _REPO_ROOT / "agents" / "_manifests"
 # manifest (hash, name and profile pin only).
 _V2 = "issue-investigator"
 _V1 = "shepherd"
-_PROFILES = {_V2: ("issue-investigator-default", "1.5.1"), _V1: ("shepherd-default", "1.0.0")}
+# Every agent with a binding in the mctl-gitops catalog: all six shipped
+# agents since mctl-gitops#1683. Kept here, not in the tool: it only exists to
+# force a decision at PR time, when a manifest is added or removed.
+_BOUND_AGENTS = frozenset(
+    {"implementer", "incident-responder", "issue-investigator", "mentor", "service-agent", "shepherd"}
+)
+# The profile each fake binding pins. Only issue-investigator's has to agree
+# with its agent.yaml; a v1alpha1 manifest names no profile of its own.
+_PROFILES = {agent: (f"{agent}-default", "1.0.0") for agent in _BOUND_AGENTS}
+_PROFILES[_V2] = ("issue-investigator-default", "1.5.1")
+# Not a manifest in this repository: the stand-in for an agent deliberately
+# shipped without a binding, since no real agent is in that state today.
+_UNBOUND = "unbound-fixture"
 
 
 def _raw(agent: str) -> bytes:
@@ -148,6 +160,23 @@ def _no_retry_backoff(monkeypatch):
     monkeypatch.setattr(gate.time, "sleep", lambda seconds: None)
 
 
+@pytest.fixture
+def unbound_agent(registry, monkeypatch) -> str:
+    """List a synthetic agent in UNBOUND_AGENTS and give it a manifest in the
+    tag. The real set is empty, so the quiet refusal it exists for is
+    exercised with a name no shipped agent has."""
+    raw = _raw(_V1).replace(b"name: shepherd", f"name: {_UNBOUND}".encode())
+    assert raw != _raw(_V1)
+    relpath = f"agents/_manifests/{_UNBOUND}/agent.yaml"
+    monkeypatch.setattr(
+        publish_agent_release,
+        "_read_at_tag",
+        lambda tag, rel: raw if rel == relpath else (_REPO_ROOT / rel).read_bytes(),
+    )
+    monkeypatch.setattr(publish_agent_release, "UNBOUND_AGENTS", frozenset({_UNBOUND}))
+    return _UNBOUND
+
+
 def _publish(agent: str, transport: httpx.BaseTransport, *, dry_run: bool = False):
     return publish_agent_release.publish(
         agent, _VERSION, "cafe" * 10, [], dry_run=dry_run, gitops_transport=transport
@@ -157,7 +186,7 @@ def _publish(agent: str, transport: httpx.BaseTransport, *, dry_run: bool = Fals
 # ---------------------------------------------------------------------------
 # Green on a converged input: promotion as before
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("agent", [_V2, _V1])
+@pytest.mark.parametrize("agent", sorted(_BOUND_AGENTS))
 def test_a_matching_binding_is_promoted(agent, registry):
     outcome = _publish(agent, _gitops({agent: _binding(agent)}))
 
@@ -188,36 +217,50 @@ def _refused(outcome, registry, agent: str, status: str) -> None:
     assert registry.published() == [agent]
 
 
-def test_no_binding_refuses_promotion(registry):
-    assert "mentor" in publish_agent_release.UNBOUND_AGENTS
-    outcome = _publish("mentor", _gitops({}))
-    _refused(outcome, registry, "mentor", gate.VERDICT_MISSING)
+def test_no_binding_for_a_listed_unbound_agent_is_a_quiet_refusal(registry, unbound_agent):
+    outcome = _publish(unbound_agent, _gitops({}))
+    _refused(outcome, registry, unbound_agent, gate.VERDICT_MISSING)
     # The log says what the refusal costs, not only where the binding is not.
     assert "is not released to production by this tag" in outcome.detail
     assert "the CWFT's default image if it was never promoted" in outcome.detail
-    assert "no release binding for mentor" in outcome.detail
-    assert "releases/shadow/mentor.yaml" in outcome.detail
-    # Expected state for an agent nobody has bound yet: refused, not a red run.
+    assert f"no release binding for {unbound_agent}" in outcome.detail
+    assert f"releases/shadow/{unbound_agent}.yaml" in outcome.detail
+    # Expected state for an agent listed as unbound: refused, not a red run.
     assert not outcome.fails_release
 
 
-# The agents with a binding in the mctl-gitops catalog today. Kept here, not
-# in the tool: it only exists to force a decision at PR time.
-_BOUND_AGENTS = frozenset({"implementer", "issue-investigator", "shepherd"})
+def test_listing_an_agent_as_unbound_quiets_only_its_missing_binding(registry, unbound_agent):
+    """The allowance is for an absent binding. A binding that exists and is
+    stale names something someone meant to match, listed or not."""
+    stale = _binding(_V1, content_hash="sha256:" + "0" * 64, definition={
+        "name": unbound_agent, "version": "1", "profileCompatibility": ">=1.0.0 <2.0.0",
+    })
+    stale = stale.replace(b"agent: shepherd", f"agent: {unbound_agent}".encode())
+    outcome = _publish(unbound_agent, _gitops({unbound_agent: stale}))
+    _refused(outcome, registry, unbound_agent, gate.VERDICT_MISMATCH)
+    assert outcome.fails_release
 
 
-def test_every_manifest_is_classified_as_bound_or_unbound():
-    """A typo or rename in UNBOUND_AGENTS would void the allowance silently,
-    and a new manifest with no binding would first fail the next release in
-    a step that cannot be re-run. Either add its gitops binding (and the name
-    to _BOUND_AGENTS) or list it in UNBOUND_AGENTS."""
+def test_no_shipped_agent_is_listed_as_unbound():
+    """Every shipped agent has a binding since mctl-gitops#1683, so the real
+    set is empty and a missing binding is loud for all of them. Listing an
+    agent again is a decision: change this test in the same commit."""
+    assert publish_agent_release.UNBOUND_AGENTS == frozenset()
+
+
+def test_every_manifest_is_classified_as_bound():
+    """A new manifest with no binding would first fail the next release in a
+    step that cannot be re-run. Either add its gitops binding (and the name to
+    _BOUND_AGENTS) or list it in UNBOUND_AGENTS; a name in UNBOUND_AGENTS that
+    is no manifest directory is a typo or a rename, and voids the allowance."""
     real = {p.parent.name for p in _MANIFESTS.glob("*/agent.yaml")}
     assert real == _BOUND_AGENTS | publish_agent_release.UNBOUND_AGENTS
     assert not (_BOUND_AGENTS & publish_agent_release.UNBOUND_AGENTS)
+    assert real == _BOUND_AGENTS
 
 
 def test_every_refusal_points_at_the_runbook(registry):
-    outcome = _publish("mentor", _gitops({}))
+    outcome = _publish(_V1, _gitops({}))
     assert gate.RUNBOOK in outcome.detail
 
 
@@ -241,13 +284,14 @@ def test_an_injected_transport_survives_the_retries(registry):
     assert len(seen) == gate.FETCH_ATTEMPTS
 
 
-def test_a_vanished_binding_for_a_bound_agent_fails_the_release(registry):
-    """claude P2 on #574: a 404 is quiet only for the agents known to be
-    unbound. shepherd has a binding today; if it disappears, production must
-    not silently stay behind on a green run."""
-    assert _V1 not in publish_agent_release.UNBOUND_AGENTS
-    outcome = _publish(_V1, _gitops({}))
-    _refused(outcome, registry, _V1, gate.VERDICT_MISSING)
+@pytest.mark.parametrize("agent", sorted(_BOUND_AGENTS))
+def test_a_missing_binding_fails_the_release_for_every_shipped_agent(agent, registry):
+    """claude P2 on #574: a 404 is quiet only for an agent listed as unbound,
+    and none is. If a binding disappears, production must not silently stay
+    behind on a green run."""
+    outcome = _publish(agent, _gitops({}))
+    _refused(outcome, registry, agent, gate.VERDICT_MISSING)
+    assert f"no release binding for {agent}" in outcome.detail
     assert outcome.fails_release
 
 
@@ -455,39 +499,65 @@ def _run_main(monkeypatch, transport: httpx.BaseTransport, agents: list[str]) ->
     return publish_agent_release.main()
 
 
-def test_a_mixed_release_promotes_only_the_matching_agents(registry, monkeypatch, tmp_path, capsys):
+def test_a_mixed_release_promotes_only_the_matching_agents(
+    registry, unbound_agent, monkeypatch, tmp_path, capsys
+):
     summary = tmp_path / "summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     transport = _gitops({
         _V2: _binding(_V2),  # matches
         _V1: _binding(_V1, content_hash="sha256:" + "1" * 64),  # stale
-        # mentor: no binding at all
+        # mentor and the listed-unbound agent: no binding at all
     })
+    agents = ["issue-investigator", "mentor", "shepherd", unbound_agent]
 
-    code = _run_main(monkeypatch, transport, ["issue-investigator", "mentor", "shepherd"])
+    code = _run_main(monkeypatch, transport, agents)
 
     assert registry.promoted() == ["issue-investigator"]
-    assert registry.published() == ["issue-investigator", "mentor", "shepherd"]
-    # The stale binding is the blocking refusal; the absent one is a warning.
+    assert registry.published() == agents
+    # A stale binding and a shipped agent's absent one both block; only the
+    # listed agent's absent binding is a warning.
     assert code == 1
     captured = capsys.readouterr()
-    assert "failed: shepherd" in captured.err
+    assert "failed: mentor, shepherd" in captured.err
     assert "issue-investigator: promoted" in captured.out
     assert "mentor: refused — missing" in captured.out
     assert "shepherd: refused — mismatch" in captured.out
-    assert "::warning::mentor refused" in captured.out
+    assert f"{unbound_agent}: refused — missing" in captured.out
+    assert "::error::mentor refused" in captured.out
     assert "::error::shepherd refused" in captured.out
+    assert f"::warning::{unbound_agent} refused" in captured.out
     table = summary.read_text()
     assert "| `issue-investigator` | promoted |" in table
     assert "| `mentor` | refused |" in table
     assert "| `shepherd` | refused |" in table
+    assert f"| `{unbound_agent}` | refused |" in table
 
 
-def test_only_absent_bindings_keep_the_release_green(registry, monkeypatch, capsys):
-    code = _run_main(monkeypatch, _gitops({_V2: _binding(_V2)}), ["issue-investigator", "mentor"])
+def test_only_a_listed_agents_absent_binding_keeps_the_release_green(registry, unbound_agent, monkeypatch):
+    code = _run_main(monkeypatch, _gitops({_V2: _binding(_V2)}), ["issue-investigator", unbound_agent])
     assert code == 0
     assert registry.promoted() == ["issue-investigator"]
+
+
+def test_one_missing_binding_fails_the_release_but_not_the_other_agents(registry, monkeypatch, capsys):
+    """With nothing listed as unbound, one shipped agent's absent binding is a
+    red step. The five that match are still published and promoted first."""
+    agents = sorted(_BOUND_AGENTS)
+    bound = [a for a in agents if a != "mentor"]
+    code = _run_main(monkeypatch, _gitops({a: _binding(a) for a in bound}), agents)
+    assert code == 1
+    assert registry.published() == agents
+    assert registry.promoted() == bound
+    assert "failed: mentor\n" in capsys.readouterr().err
+
+
+def test_a_release_with_every_binding_matching_promotes_all_six(registry, monkeypatch):
+    agents = sorted(_BOUND_AGENTS)
+    code = _run_main(monkeypatch, _gitops({a: _binding(a) for a in agents}), agents)
+    assert code == 0
+    assert registry.promoted() == agents
 
 
 def test_a_crashing_gate_fails_the_agent_without_stopping_the_others(registry, monkeypatch, capsys):

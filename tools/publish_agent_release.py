@@ -32,15 +32,20 @@ promoted by hand (`mctl_promote_agent`) without re-publishing. The gate is
 evaluated BEFORE any registry write, so an outage reading mctl-gitops never
 leaves a half-done agent behind.
 
-Exit status: 1 if any agent failed, or was refused because its binding is
-stale, mismatched or unreadable — those name a binding someone meant to
-match. A refusal for an absent binding (HTTP 404, the contents API's
-documented absence signal) is a warning, not a failure, ONLY for the agents
-listed in UNBOUND_AGENTS: it is the expected state of an agent nobody has
-bound yet, and a release that is red every time is one nobody reads. A 404
-for any other agent means its binding disappeared, and fails the step.
-Every agent's outcome is printed, and written to $GITHUB_STEP_SUMMARY when
-it is set.
+Exit status: 1 if any agent failed or was refused, whatever the reason: a
+stale, mismatched or unreadable binding names a binding someone meant to
+match, and an absent one (HTTP 404, the contents API's documented absence
+signal) means a binding that existed was deleted or renamed, or a manifest
+was added without one. One refused agent does not stop the others: each is
+published and gated on its own, and the step fails only after all of them
+have been handled.
+
+The single exception is an agent listed in UNBOUND_AGENTS, for which an
+absent binding is a warning and the step stays green: the expected state of
+an agent deliberately shipped before anyone bound it. That set is empty
+since mctl-gitops#1683 gave every shipped agent a binding, so today every
+refusal fails the step. Every agent's outcome is printed, and written to
+$GITHUB_STEP_SUMMARY when it is set.
 
 ## prompt_hash
 
@@ -100,16 +105,22 @@ class PublishError(RuntimeError):
     pass
 
 
-# Agents that have no release binding in the mctl-gitops catalog yet. For
-# these, and only these, a 404 is the expected state: their promotion is
-# refused with a warning and the step stays green. For every other agent a
-# 404 means a binding that existed was deleted or renamed, and that fails the
-# step. Shrink this set in the same change that adds a binding (claude P2 on
-# #574) — an agent left here after it is bound only loses the loud failure
-# for a later deletion, never its gate. A test pins every name to a real
-# manifest directory; the other half — that none of these is bound — needs
-# mctl-gitops and is checked by nothing offline.
-UNBOUND_AGENTS = frozenset({"incident-responder", "mentor", "service-agent"})
+# Agents deliberately shipped without a release binding in the mctl-gitops
+# catalog. For these, and only these, a 404 is the expected state: their
+# promotion is refused with a warning and the step stays green, because a
+# release that is red every time is one nobody reads. For every other agent
+# a 404 means a binding was deleted or renamed, or a manifest was added
+# without one, and that fails the step.
+#
+# Empty since mctl-gitops#1683 bound incident-responder, mentor and
+# service-agent: all six shipped agents have a binding, so a missing one is a
+# loud refusal for any of them. The mechanism stays for the next agent that
+# has to ship ahead of its binding — list it here in the change that adds its
+# manifest, and remove it in the change that follows its binding (claude P2
+# on #574). An agent left here after it is bound only loses the loud failure
+# for a later deletion, never its gate. A test pins this set against the real
+# manifest directories.
+UNBOUND_AGENTS: frozenset[str] = frozenset()
 
 PROMOTED = "promoted"
 REFUSED = "refused"
@@ -131,8 +142,9 @@ class Outcome:
         if self.state == FAILED:
             return True
         if self.state == REFUSED:
-            # Only an absent binding for a known-unbound agent is a quiet
-            # refusal; see the docstring and UNBOUND_AGENTS.
+            # Only an absent binding for an agent listed in UNBOUND_AGENTS
+            # is a quiet refusal; see the docstring. With that set empty,
+            # every refusal fails the step.
             if self.verdict is None or self.verdict.status != check_binding_hash.VERDICT_MISSING:
                 return True
             return self.agent not in UNBOUND_AGENTS

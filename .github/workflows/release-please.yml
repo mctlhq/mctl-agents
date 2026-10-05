@@ -267,9 +267,11 @@ jobs:
       # Publishes every agent in the tag, but PROMOTES to production only
       # the agents whose mctl-gitops release binding pins this tag's exact
       # agent.yaml (mctlhq/mctl-agents#470). A missing, stale or unreadable
-      # binding refuses that agent's promotion; the per-agent outcome lands
-      # in the log and the job summary. See the tool's docstring for which
-      # refusals fail this step.
+      # binding refuses that agent's promotion and fails this step, after
+      # every other agent has been published and promoted on its own; the
+      # per-agent outcome lands in the log and the job summary. The one
+      # quiet refusal is a missing binding for an agent listed in the
+      # tool's UNBOUND_AGENTS, which is empty since mctl-gitops#1683.
       - name: Refresh agent registry
         if: ${{ steps.release.outputs.release_created == 'true' }}
         env:

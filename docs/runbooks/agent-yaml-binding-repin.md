@@ -169,13 +169,18 @@ published, so it stays inactive until someone promotes it. Each agent's outcome
 (promoted, or refused with the reason) is in the "Refresh agent registry" log and the
 job summary.
 
-- **Refused: missing**: the agent has no binding. For the agents in
-  `UNBOUND_AGENTS` (`tools/publish_agent_release.py`) this is a warning, and the step
-  stays green. For any other agent it means a binding was deleted or renamed, and the
-  step fails. Either way, production keeps the version it had. To activate the
-  release, add the binding in mctl-gitops, remove the agent from `UNBOUND_AGENTS` in
-  the same mctl-agents change that follows it, and promote the published version with
-  `mctl_promote_agent`.
+- **Refused: missing**: the agent has no binding. This fails the step: every shipped
+  agent has a binding since mctl-gitops#1683, so a 404 means one was deleted or
+  renamed, or a manifest was added without one. The other agents in the release are
+  still published and promoted, and production keeps the version it had for this one.
+  To activate the release, add (or restore) the binding in mctl-gitops and promote the
+  published version with `mctl_promote_agent`.
+
+  The one exception is an agent listed in `UNBOUND_AGENTS`
+  (`tools/publish_agent_release.py`), for which a missing binding is a warning and the
+  step stays green. The set is empty today. It exists for an agent that has to ship
+  ahead of its binding: list it there in the change that adds its manifest, and remove
+  it in the mctl-agents change that follows its binding.
 - **Refused: mismatch or unobservable**: a binding exists but is stale or disagrees
   with the release, or it (or its profile) could not be read. This fails the step.
   Reads are retried three times on connect errors, timeouts, 5xx and 429 (the
