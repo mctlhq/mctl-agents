@@ -50,7 +50,11 @@ jobs:
   binding-gate:
     name: binding gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Sized for one release commit in the degraded case: 14 sequential reads
+    # (two for the resolver check, two per manifest), each waiting out a 429's
+    # Retry-After (up to 60s) before both of its retries, is 28 min. See the
+    # binding-hash job in pr-validation.yml; the same test pins both.
+    timeout-minutes: 40
     permissions:
       contents: read
       pull-requests: read

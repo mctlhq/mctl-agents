@@ -28,7 +28,9 @@ This runs the release's own question ahead of time, for every
   declarative investigation takes at run time.
 
 Every agent is evaluated and reported; one bad agent does not hide the
-others. The manifest set is read from disk at call time, so the release
+others. Each line is printed, and appended to the job summary, as soon as
+that agent has been checked, so a run cancelled by the job timeout still
+shows how far it got. The manifest set is read from disk at call time, so the release
 gate, which replaces `agents/_manifests` with the release commit's, checks
 the agents of that commit, including one this checkout does not have.
 
@@ -107,9 +109,16 @@ class Row:
 
 
 def manifest_agents() -> list[str]:
-    """Every agent with a manifest on disk, as the release lists them from
-    the tag: a directory under agents/_manifests holding an agent.yaml."""
-    return sorted(p.parent.name for p in resolver.DEFINITIONS_DIR.glob("*/agent.yaml") if p.is_file())
+    """Every agent the release would publish from this tree.
+
+    The same rule as `publish_agent_release.main` applies to the tag: any
+    file named agent.yaml under agents/_manifests, at any depth, names the
+    agent after its first path component. A nested
+    `<agent>/sub/agent.yaml` therefore lists `<agent>` here as it does
+    there, and `evaluate` then fails on the missing `<agent>/agent.yaml`
+    before the tag instead of the release failing on it after."""
+    root = resolver.DEFINITIONS_DIR
+    return sorted({p.relative_to(root).parts[0] for p in root.rglob("agent.yaml") if p.is_file()})
 
 
 def evaluate(agent: str, transport: httpx.BaseTransport | None = None) -> Row:
@@ -143,46 +152,64 @@ def exit_status(rows: list[Row]) -> int:
 def check_all(transport: httpx.BaseTransport | None = None, *, label: str = "") -> int:
     where = f" ({label})" if label else ""
     target = f"{check_binding_hash.GITOPS_REPO}@{check_binding_hash.GITOPS_REF}"
+    agents = manifest_agents()
+    in_actions = bool(os.environ.get("GITHUB_ACTIONS"))
+    rows: list[Row] = []
+
+    # Everything is reported as it is produced, never collected first: the
+    # reads are sequential and a rate-limited run can outlast the job, and a
+    # cancelled job must still show which agents were checked and how far it
+    # got (claude P2 on #584).
+    print(f"binding check{where}: {len(agents)} manifest(s) against {target}", flush=True)
+    _summary(
+        f"### Agent bindings{where} against {target}",
+        "",
+        "| agent | status | fails | detail |",
+        "|---|---|---|---|",
+    )
+
+    def report(row: Row, *, annotate: bool = True) -> None:
+        rows.append(row)
+        quiet = row.status != VERDICT_MATCH and not row.fails
+        suffix = " (listed in UNBOUND_AGENTS: not a failure)" if quiet else ""
+        print(f"  {row.label}: {row.status}{suffix} — {row.reason}", flush=True)
+        if in_actions and annotate and row.status != VERDICT_MATCH:
+            level = "error" if row.fails else "warning"
+            # Annotations are one line.
+            print(f"::{level}::{row.label} {row.status}: {row.reason}".replace("\n", " "), flush=True)
+        detail = row.reason.replace("|", "\\|").replace("\n", " ")
+        _summary(f"| `{row.label}` | {row.status} | {'yes' if row.fails else 'no'} | {detail} |")
 
     # Always, whatever the directory listing says: a deleted or unreadable
-    # issue-investigator manifest must fail here as it did before.
+    # issue-investigator manifest must fail here as it did before. check()
+    # annotates its own failure, with the detail, so this row does not add a
+    # second annotation for the same fault.
     resolver_rc = check_binding_hash.check(transport)
-    rows = [
+    report(
         Row(
             RESOLVER_CHECK_LABEL,
             _RC_STATUS.get(resolver_rc, VERDICT_UNOBSERVED),
-            f"check_binding_hash.check() exit {resolver_rc}; its own message is above",
+            f"check_binding_hash.check() exit {resolver_rc}; its own message is in this log",
             resolver_rc != EXIT_MATCH,
-        )
-    ]
-
-    agents = manifest_agents()
-    rows.extend(evaluate(agent, transport) for agent in agents)
-    code = exit_status(rows)
+        ),
+        annotate=False,
+    )
+    for agent in agents:
+        report(evaluate(agent, transport))
     if not agents:
         # No manifest is not "no drift": the release publishes at least one
         # agent, so an empty listing means this did not look in the right
         # place. An observed mismatch above still outranks it.
-        rows.append(
+        report(
             Row(
                 "agents/_manifests",
                 VERDICT_UNOBSERVED,
-                f"no */agent.yaml under {resolver.DEFINITIONS_DIR}, so no binding was checked",
+                f"no agent.yaml under {resolver.DEFINITIONS_DIR}, so no binding was checked",
                 True,
             )
         )
-        code = exit_status(rows)
 
-    print(f"binding check{where}: {len(agents)} manifest(s) against {target}")
-    in_actions = bool(os.environ.get("GITHUB_ACTIONS"))
-    for row in rows:
-        quiet = row.status != VERDICT_MATCH and not row.fails
-        suffix = " (listed in UNBOUND_AGENTS: not a failure)" if quiet else ""
-        print(f"  {row.label}: {row.status}{suffix} — {row.reason}")
-        if in_actions and row.status != VERDICT_MATCH:
-            level = "error" if row.fails else "warning"
-            # Annotations are one line.
-            print(f"::{level}::{row.label} {row.status}: {row.reason}".replace("\n", " "))
+    code = exit_status(rows)
     result = {
         EXIT_MATCH: "every manifest matches its binding",
         EXIT_MISMATCH: "at least one binding is missing or does not match; re-pin or add it "
@@ -190,28 +217,19 @@ def check_all(transport: httpx.BaseTransport | None = None, *, label: str = "") 
         EXIT_UNOBSERVED: "nothing was observed to be wrong, but not everything could be read, "
         "and unknown is not a match; re-run once the read works",
     }[code]
-    print(f"result{where}: exit {code}: {result}")
-    _write_summary(rows, code, result, where, target)
+    print(f"result{where}: exit {code}: {result}", flush=True)
+    # After the table. A summary that ends without this line is a run that
+    # did not finish, and its rows are only the agents it reached.
+    _summary("", f"Exit {code}: {result}.", "")
     return code
 
 
-def _write_summary(rows: list[Row], code: int, result: str, where: str, target: str) -> None:
+def _summary(*lines: str) -> None:
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary:
         return
-    lines = [
-        f"### Agent bindings{where} against {target}",
-        "",
-        f"Exit {code}: {result}.",
-        "",
-        "| agent | status | fails | detail |",
-        "|---|---|---|---|",
-    ]
-    for row in rows:
-        detail = row.reason.replace("|", "\\|").replace("\n", " ")
-        lines.append(f"| `{row.label}` | {row.status} | {'yes' if row.fails else 'no'} | {detail} |")
     with open(summary, "a", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n\n")
+        fh.write("\n".join(lines) + "\n")
 
 
 def main(argv: list[str] | None = None) -> int:

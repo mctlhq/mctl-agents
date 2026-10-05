@@ -246,7 +246,15 @@ jobs:
   binding-hash:
     name: binding hash
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Sized for the degraded case, not the usual 15 seconds. The tool makes
+    # two reads for the resolver check and two per manifest (14 today), one
+    # after another, and a read that keeps getting 429 waits out Retry-After
+    # (up to 60s) before each of its two retries: 14 x 2 x 60s = 28 min.
+    # Cut off earlier, that run ends as a bare timeout and not as the exit 2
+    # it should be. The tool prints each agent as it goes, so a slow run
+    # shows progress. A test ties this number to the tool's constants and to
+    # the number of manifests (claude P2 on #584).
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

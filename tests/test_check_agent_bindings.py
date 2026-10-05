@@ -333,7 +333,7 @@ def test_no_manifest_at_all_is_not_a_pass(tmp_path, monkeypatch, capsys):
 
     assert tool.check_all(_gitops({})) == gate.EXIT_UNOBSERVED
     out = capsys.readouterr().out
-    assert "no */agent.yaml under" in out
+    assert "no agent.yaml under" in out
     assert "0 manifest(s)" in out
 
 
@@ -403,9 +403,100 @@ def test_a_deleted_issue_investigator_manifest_fails_through_the_resolver_check(
     assert "does not resolve locally" in captured.err
 
 
+def test_a_nested_manifest_is_listed_as_the_release_lists_it(manifests, capsys):
+    """publish_agent_release.main names an agent after the first path
+    component of any agent.yaml under agents/_manifests. A nested one is in
+    the release's set, so it has to be in this one, and fail here."""
+    nested = manifests / "nested-agent" / "deeper"
+    nested.mkdir(parents=True)
+    (nested / "agent.yaml").write_bytes((_REAL_MANIFESTS / "shepherd" / "agent.yaml").read_bytes())
+
+    assert tool.manifest_agents() == sorted([*_AGENTS, "nested-agent"])
+    assert tool.check_all(_gitops(_pinned())) == gate.EXIT_UNOBSERVED
+    rows = _status(capsys.readouterr().out)
+    assert rows["nested-agent"] == "unobservable"
+    assert all(rows[a] == "match" for a in _AGENTS)
+
+
+def test_the_listing_is_the_releases_listing(manifests):
+    """One rule, two implementations (a working tree here, a tag's tree
+    there): hold them to the same answer on the same paths."""
+    (manifests / "nested-agent" / "deeper").mkdir(parents=True)
+    (manifests / "nested-agent" / "deeper" / "agent.yaml").write_bytes(b"x")
+    (manifests / "README.md").write_bytes(b"not an agent")
+    (manifests / "no-manifest-here").mkdir()
+    tree = [f"agents/_manifests/{p.relative_to(manifests).as_posix()}" for p in manifests.rglob("*") if p.is_file()]
+    prefix = "agents/_manifests/"
+    # Copied from publish_agent_release.main, which computes it inline.
+    in_tag = sorted({
+        p[len(prefix):].split("/", 1)[0] for p in tree if p.startswith(prefix) and p.endswith("/agent.yaml")
+    })
+
+    assert tool.manifest_agents() == in_tag
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+def test_each_agent_is_reported_before_the_next_is_read(manifests, tmp_path, monkeypatch, capsys):
+    """The reads are sequential and can outlast the job. A run cancelled
+    part-way (GitHub sends SIGINT) must leave behind every line it had
+    earned, in the log and in the job summary, not an empty step."""
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    real = gate.evaluate_promotion
+
+    def cancelled_at_mentor(agent, raw, transport=None):
+        if agent == "mentor":
+            raise KeyboardInterrupt
+        return real(agent, raw, transport)
+
+    monkeypatch.setattr(gate, "evaluate_promotion", cancelled_at_mentor)
+
+    with pytest.raises(KeyboardInterrupt):
+        tool.check_all(_gitops(_pinned()))
+
+    done = [a for a in _AGENTS if a < "mentor"]
+    assert len(done) == 3
+    out = capsys.readouterr().out
+    assert "6 manifest(s)" in out
+    assert _status(out) == {tool.RESOLVER_CHECK_LABEL: "match", **dict.fromkeys(done, "match")}
+    text = summary.read_text()
+    for agent in done:
+        assert f"| `{agent}` | match | no |" in text
+    # No verdict was reached, and the summary does not claim one.
+    assert "Exit " not in text
+    assert "result" not in out
+
+
+def test_the_job_timeouts_cover_the_retry_budget_of_every_read():
+    """Two reads for the resolver check and two per manifest, each allowed
+    to wait out a 429's Retry-After before every retry. A job timeout below
+    that turns the documented exit 2 into a bare cancellation; adding a
+    manifest or raising the retry budget has to move the timeouts too."""
+    reads = 2 + 2 * len(_AGENTS)
+    budget_minutes = reads * (gate.FETCH_ATTEMPTS - 1) * gate.RETRY_AFTER_MAX_S / 60
+    assert budget_minutes == 28
+    workflows = _REPO_ROOT / ".github" / "workflows"
+    pr_job = yaml.safe_load((workflows / "pr-validation.yml").read_text())["jobs"]["binding-hash"]
+    gate_job = yaml.safe_load((workflows / "release-please.yml").read_text())["jobs"]["binding-gate"]
+    # Five minutes on top for the checkout and `uv sync`.
+    assert pr_job["timeout-minutes"] >= budget_minutes + 5
+    assert gate_job["timeout-minutes"] >= budget_minutes + 5
+
+
+def test_the_resolver_check_is_not_annotated_twice(manifests, monkeypatch, capsys):
+    """check() annotates its own failure, with the detail. The row still
+    prints and still decides the exit code."""
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setattr(gate, "check", lambda transport=None: gate.EXIT_MISMATCH)
+
+    assert tool.check_all(_gitops(_pinned())) == gate.EXIT_MISMATCH
+    out = capsys.readouterr().out
+    assert f"  {tool.RESOLVER_CHECK_LABEL}: mismatch" in out
+    assert "::error::" not in out
+
+
 def test_the_job_summary_lists_every_agent(manifests, tmp_path, monkeypatch):
     summary = tmp_path / "summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
