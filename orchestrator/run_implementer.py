@@ -139,7 +139,7 @@ from config.settings import (
     SERVICE_AGENT_MODEL,
     SERVICES,
 )
-from orchestrator import policy_checkpoint, tracing, usage_ledger
+from orchestrator import evidence_producer, policy_checkpoint, tracing, usage_ledger
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.exec_budget import CommandBudgetLedger
 from orchestrator.execution_identity import (
@@ -2586,7 +2586,60 @@ def _checkout_existing_branch(repo_dir: Path, branch: str) -> None:
     _run(["git", "checkout", branch], cwd=repo_dir)
 
 
+def _note_implement_evidence(
+    evidence: evidence_producer.RunEvidence, result: ImplementResult, *, success_reason: str
+) -> None:
+    """Map an `ImplementResult` onto ADR 018's closed outcome vocabulary,
+    and name the PR it acted on (its head is read at seal time)."""
+    error = result.error or ""
+    if result.rate_limited:
+        evidence.set_outcome("failed", "rate-limited")
+    elif result.budget_terminal:
+        evidence.set_outcome("abandoned", "verification-budget-exhausted")
+    elif result.budget_handback:
+        evidence.set_outcome("abandoned", "verification-budget-handback")
+    elif result.stale_source:
+        evidence.set_outcome("refused", "stale-source")
+    elif result.blocked:
+        evidence.set_outcome("refused", f"blocked-{result.blocked}")
+    elif error.startswith(REFUSAL_ERROR_PREFIX):
+        evidence.set_outcome("refused", "deliberate-no-op")
+    elif error.startswith(CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX):
+        evidence.set_outcome("refused", "ci-evidence-insufficient")
+    elif error.startswith((POLICY_REFUSED_ERROR_PREFIX, POLICY_UNDECIDED_ERROR_PREFIX)):
+        evidence.set_outcome("refused", "policy-refused")
+    elif error.startswith(VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX):
+        evidence.set_outcome("failed", "verification-budget-exhausted")
+    elif error:
+        evidence.set_outcome("failed", "implementer-error")
+    elif result.skipped_reason:
+        evidence.set_outcome("refused", "skipped")
+    elif result.pr_url:
+        evidence.set_outcome("succeeded", success_reason)
+    else:
+        evidence.set_outcome("failed", "no-pr")
+    if result.pr_url:
+        evidence.note_subject_pr_url(result.pr_url)
+
+
 def review_feedback_one(
+    ref: ProposalRef,
+    bundle: dict,
+    dry_run: bool = False,
+    branch: str | None = None,
+) -> ImplementResult:
+    """`_review_feedback_one` under the run's execution evidence
+    (mctlhq/mctl-agents#544): sealed and posted however it ends, never
+    fatal. A dry run governs nothing and posts nothing."""
+    with evidence_producer.run(evidence_producer.STAGE_IMPLEMENTER) as evidence:
+        if dry_run:
+            evidence.discard()
+        result = _review_feedback_one(ref, bundle, dry_run=dry_run, branch=branch)
+        _note_implement_evidence(evidence, result, success_reason="review-addressed")
+        return result
+
+
+def _review_feedback_one(
     ref: ProposalRef,
     bundle: dict,
     dry_run: bool = False,
@@ -3802,6 +3855,18 @@ def _push_and_open_pr(
 
 
 def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
+    """`_implement_one` under the run's execution evidence
+    (mctlhq/mctl-agents#544): sealed and posted however it ends, never
+    fatal. A dry run governs nothing and posts nothing."""
+    with evidence_producer.run(evidence_producer.STAGE_IMPLEMENTER) as evidence:
+        if dry_run:
+            evidence.discard()
+        result = _implement_one(ref, dry_run=dry_run)
+        _note_implement_evidence(evidence, result, success_reason="pr-opened")
+        return result
+
+
+def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     """Implement a single accepted proposal. Returns ImplementResult."""
     if ref.status != "accepted":
         return ImplementResult(
@@ -3862,6 +3927,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); minting a local execution context.")
         execution_context = mint_local(executor_type="implementer", workflow_type="implement", agent="implementer")
     print(f"[identity] execution_context={json.dumps(execution_context.to_log_dict())}")
+    evidence_producer.note("note_runtime_context", execution_context)
 
     try:
         existing = _preflight_existing_result(ref)

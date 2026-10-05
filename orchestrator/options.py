@@ -15,6 +15,7 @@ from claude_agent_sdk.types import HookMatcher
 
 from config.settings import MCTL_MCP_URL
 from orchestrator.ci_checks import CI_LOG_MAX_CHECKS
+from orchestrator.evidence_producer import agent_env_without_evidence_token
 from orchestrator.exec_budget import (
     CommandBudgetLedger,
     command_budget,
@@ -980,15 +981,16 @@ def _sibling_add_dirs(service_name: str) -> list[str | Path]:
 def _scrubbed(options: ClaudeAgentOptions) -> ClaudeAgentOptions:
     """Every SDK session's options in this module pass through here.
 
-    Blanks the usage-writer token (mctlhq/.github#50) in the session's env.
+    Blanks the usage-writer token (mctlhq/.github#50) and the evidence-writer
+    token (mctlhq/mctl-agents#544) in the session's env.
     The SDK layers `env` over the inherited environment, so a builder that
-    passed none, or copied `os.environ`, would hand the token to the CLI
-    child and to everything the model runs through Bash; the token is for
-    the usage producer in this process only. A builder cannot opt out:
+    passed none, or copied `os.environ`, would hand the tokens to the CLI
+    child and to everything the model runs through Bash; they are for the
+    usage and evidence producers in this process only. A builder cannot opt out:
     tests/test_usage_ledger.py fails on any `ClaudeAgentOptions(...)` here
     that is not the direct argument of this function.
     """
-    options.env = agent_env_without_writer_token(options.env or os.environ)
+    options.env = agent_env_without_evidence_token(agent_env_without_writer_token(options.env or os.environ))
     return options
 
 

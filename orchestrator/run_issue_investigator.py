@@ -85,7 +85,7 @@ from config.settings import SERVICE_AGENT_MODEL, SERVICES
 # orchestrator.temporal.issue_ref, neither of which pulls in
 # claude_agent_sdk — so, unlike options/mcp_guard/resolver above, it is safe
 # to import at module scope here.
-from orchestrator import context_assembly, human_input, policy_checkpoint, tracing, usage_ledger
+from orchestrator import context_assembly, evidence_producer, human_input, policy_checkpoint, tracing, usage_ledger
 from orchestrator.context_snapshot import (
     MAX_PRIOR_EXECUTION_IDS,
     MAX_WORK_CONTEXT_ID_LENGTH,
@@ -2687,6 +2687,9 @@ def _assemble_context(
             execution_request_id=execution_request_id,
         )
     except Exception as exc:
+        # The snapshot this mode was supposed to seal was not produced: an
+        # explicit gap in the run's evidence, never an empty block.
+        evidence_producer.note("note_unobserved", "snapshot_refs", "not_produced")
         if mode == "on" or fatal or isinstance(exc, context_assembly.IntentUnresolved):
             raise
         print(f"warn: context assembly failed: {type(exc).__name__}: {exc}")
@@ -2696,6 +2699,9 @@ def _assemble_context(
     # applies and `result` is never None — cast, not asserted, so this line
     # is not one `python -O` could strip away.
     result = cast(context_assembly.AssemblyResult, result)
+    evidence_producer.note("expect", "snapshot_refs")
+    evidence_producer.note("note_snapshot", result.snapshot, result.store_ref)
+    evidence_producer.note("note_versions", result.snapshot.execution)
     print(f"[context] context_assembly={json.dumps(result.metrics.to_log_dict(), sort_keys=True)}")
     _emit_context_eval(result)
     return result
@@ -3115,13 +3121,16 @@ def investigate(
 ) -> InvestigateResult:
     """Investigate one GitHub issue and write a `proposed` proposal.
 
-    See `_investigate` for the work. This wrapper owns one thing: when the
-    run attached its own store execution (mctlhq/mctl-agents#455), that
-    execution is advanced to its terminal phase however the run ends."""
-    own_execution = _OwnExecution()
-    result: InvestigateResult | None = None
-    try:
-        result = _investigate(
+    See `_investigate` for the work. This wrapper owns two things, however
+    the run ends: when the run attached its own store execution
+    (mctlhq/mctl-agents#455), that execution is advanced to its terminal
+    phase; and the run's sealed execution evidence is posted
+    (mctlhq/mctl-agents#544, never fatal — see `orchestrator.evidence_producer`)."""
+    with evidence_producer.run(evidence_producer.STAGE_INVESTIGATOR) as evidence:
+        if dry_run:
+            evidence.discard()
+        evidence.expect_execution_request(execution_request_id)
+        result = _investigate_and_finish(
             issue_url,
             state_dir,
             dry_run,
@@ -3137,7 +3146,41 @@ def investigate(
             temporal_run_id=temporal_run_id,
             execution_request_id=execution_request_id,
             human_input_responses=human_input_responses,
+        )
+        _note_investigation_evidence(evidence, result)
+        return result
+
+
+def _note_investigation_evidence(evidence: evidence_producer.RunEvidence, result: InvestigateResult) -> None:
+    """The typed outcome (#542's codes are ADR 018's) and, for a run that
+    published a proposal, the triplet it published, by sha256."""
+    code, reason = result.outcome_code, result.outcome_reason
+    if result.error and code == "succeeded":
+        # An InvestigateResult built with only `error=` reads as the
+        # default `succeeded`; evidence must not.
+        code, reason = "failed", "investigation-error"
+    evidence.set_outcome(code, reason)
+    if result.error or result.skipped_reason or result.context_only:
+        return
+    for name in TRIPLET:
+        evidence.note_artifact_file(result.proposal_dir / name, "proposal")
+
+
+def _investigate_and_finish(
+    issue_url: str,
+    state_dir: Path,
+    dry_run: bool,
+    **kwargs: Any,
+) -> InvestigateResult:
+    own_execution = _OwnExecution()
+    result: InvestigateResult | None = None
+    try:
+        result = _investigate(
+            issue_url,
+            state_dir,
+            dry_run,
             own_execution=own_execution,
+            **kwargs,
         )
         _trace_published(result)
         return result
@@ -3235,8 +3278,10 @@ def _investigate(
             executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
         )
     print(f"[identity] execution_context={json.dumps(execution_context.to_log_dict())}")
+    evidence_producer.note("note_runtime_context", execution_context)
 
     issue = gh_issue_view(issue_url)
+    evidence_producer.note("note_subject_issue", issue.ref.full_repo, issue.ref.number)
     # Correlation for the pod's root span (mctl-agents#195). The `we_`
     # execution id is added below, once the work-item layer has resolved it.
     tracing.annotate(
@@ -3414,6 +3459,9 @@ def _investigate(
                         tracing.annotate(
                             execution_id=work_context_ref.execution_id,
                             work_item_id=work_context_ref.work_item_id,
+                        )
+                        evidence_producer.note(
+                            "note_work_execution", work_context_ref.execution_id, work_context_ref.work_item_id,
                         )
             elif _work_context_rollout.blocks_on_unknown():
                 reason = f"work item {work_item_id!r} could not be resolved: {answer.reason}"

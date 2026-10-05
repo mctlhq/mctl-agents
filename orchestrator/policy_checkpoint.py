@@ -553,7 +553,26 @@ def enforce[T](
     decision = decide(request, policy=policy, approvals=approvals, approval_ref=approval_ref)
     if not decision.permitted:
         raise PolicyRefused(decision)
-    return side_effect()
+    try:
+        result = side_effect()
+    except BaseException:
+        _record_tool_result(decision.action_digest, succeeded=False)
+        raise
+    _record_tool_result(decision.action_digest, succeeded=True)
+    return result
+
+
+def _record_tool_result(action_digest: str, *, succeeded: bool) -> None:
+    """Tell the run's evidence producer (mctlhq/mctl-agents#544) how a
+    permitted side effect ended. Imported lazily, like `orchestrator.tracing`
+    in `emit`, to keep this module's import stdlib-only; a no-op outside a
+    governed run, and it never raises."""
+    try:
+        from orchestrator import evidence_producer
+
+        evidence_producer.record_tool_result(action_digest, succeeded)
+    except Exception:  # noqa: BLE001, S110 — evidence never fails the action
+        pass
 
 
 def decision_record(request: ActionRequest, decision: Decision) -> dict[str, Any]:
@@ -617,6 +636,15 @@ def emit(request: ActionRequest, decision: Decision) -> None:
             decided_at=decision.decided_at,
         )
     except Exception:  # noqa: BLE001, S110 — same rule: tracing never fails the action
+        pass
+    try:
+        # The run's execution evidence (mctlhq/mctl-agents#544, ADR 018):
+        # every decision of a governed run becomes a PolicyDecisionRef. A
+        # no-op outside one (the Temporal worker, a poller).
+        from orchestrator import evidence_producer
+
+        evidence_producer.record_decision(request, decision)
+    except Exception:  # noqa: BLE001, S110 — same rule: evidence never fails the action
         pass
 
 
