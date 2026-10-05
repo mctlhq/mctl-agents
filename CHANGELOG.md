@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.68.2](https://github.com/mctlhq/mctl-agents/compare/1.68.1...1.68.2) (2026-10-05)
+
+
+### Bug Fixes
+
+* **release:** check every agent's binding before the tag ([a486562](https://github.com/mctlhq/mctl-agents/commit/a4865628ed18b2c2fd4e959706a5cb93de58fb50))
+* **release:** check every agent's binding before the tag ([b28944f](https://github.com/mctlhq/mctl-agents/commit/b28944fe8067df36005b90520cccb2d1365cee22)), closes [#582](https://github.com/mctlhq/mctl-agents/issues/582) [#470](https://github.com/mctlhq/mctl-agents/issues/470)
+* **release:** report each agent's binding as it is checked ([36fe1fb](https://github.com/mctlhq/mctl-agents/commit/36fe1fbfa52898b1b23ade5d6ebf621ddf544805)), closes [#582](https://github.com/mctlhq/mctl-agents/issues/582)
+* **shepherd:** require a human to merge agent-definition PRs ([e3c1b1f](https://github.com/mctlhq/mctl-agents/commit/e3c1b1fc0c8f919ccf33172efc83117c63bacd61))
+* **shepherd:** require a human to merge agent-definition PRs ([6c6a08f](https://github.com/mctlhq/mctl-agents/commit/6c6a08f4658722b230124e6035a8077bdadba75e)), closes [#470](https://github.com/mctlhq/mctl-agents/issues/470)
+* **shepherd:** state the definition gate's scope and its reason ([a29f834](https://github.com/mctlhq/mctl-agents/commit/a29f834f996313587013e8f9f96223814135aca9)), closes [#470](https://github.com/mctlhq/mctl-agents/issues/470)
+
 ## [1.68.1](https://github.com/mctlhq/mctl-agents/compare/1.68.0...1.68.1) (2026-10-05)
 
 
