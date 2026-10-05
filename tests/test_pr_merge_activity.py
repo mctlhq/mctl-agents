@@ -62,13 +62,44 @@ def _enable_gate(monkeypatch: pytest.MonkeyPatch, service: str = "mctl-web") -> 
     monkeypatch.setattr(run_shepherd, "SHEPHERD_MERGE_APPROVAL_SERVICES", frozenset({service}))
 
 
-async def test_gate_off_performs_zero_network_calls(env: ActivityEnvironment, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_gate_off_reads_only_the_snapshot_for_an_ordinary_pr(
+    env: ActivityEnvironment, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate off: the one read left is the PR snapshot, which is what says
+    whether the PR changes agent definitions (mctlhq/mctl-agents#470). An
+    ordinary PR ends there as `merge_gate_disabled`, exactly as before: no
+    review or check read, no checkpoint, no merge."""
+    reads: list[tuple] = []
+    pr = make_pr()
+    monkeypatch.setattr(run_shepherd, "_fetch_pr_snapshot", lambda *a, **_kw: (reads.append(a), pr)[1])
+
     def _boom(*_a, **_kw):
-        raise AssertionError("must not read the PR when the gate is off")
+        raise AssertionError("must not go past the snapshot when the gate is off")
+
+    monkeypatch.setattr(run_shepherd, "read_codex_review", _boom)
+    monkeypatch.setattr(act, "read_required_checks", _boom)
+    monkeypatch.setattr(act, "run_gated", _boom)
+    monkeypatch.setattr(run_shepherd, "merge_pr_unchecked", _boom)
+
+    result = await env.run(act.merge_pull_request_gated, _action())
+
+    assert result.code == act.CODE_MERGE_GATE_DISABLED
+    assert not result.ran
+    assert not result.approval_ref
+    assert reads == [("mctlhq/mctl-web", 42)]
+
+
+async def test_gate_off_never_merge_service_performs_zero_network_calls(
+    env: ActivityEnvironment, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*_a, **_kw):
+        raise AssertionError("must not read the PR of a NEVER_MERGE_SERVICES repo")
 
     monkeypatch.setattr(run_shepherd, "_fetch_pr_snapshot", _boom)
 
-    result = await env.run(act.merge_pull_request_gated, _action())
+    result = await env.run(
+        act.merge_pull_request_gated, _action(repo="mctlhq/mctl-academy", service="mctl-academy"),
+    )
 
     assert result.code == act.CODE_MERGE_GATE_DISABLED
     assert not result.ran

@@ -332,6 +332,14 @@ def _mctl_tool_patterns(names: tuple[str, ...], *, prefix: bool) -> tuple[str, .
     return tuple(f"mcp__mctl__{p}{n}{tail}" for n in names for p in ("mctl_", ""))
 
 
+#: The two operations of `GITHUB_PR_MERGE`. Every merge path picks one from
+#: the PR's changed paths (`run_shepherd.merge_operation_for`); the second is
+#: for a PR that touches agent definitions, or whose changed paths could not
+#: be fully read.
+MERGE_OPERATION = "merge"
+MERGE_OPERATION_AGENT_DEFINITION = "merge:agent-definition"
+_MERGE_RULE_IDS = frozenset({"github-pr-merge", "github-pr-merge-agent-definition"})
+
 BUILTIN_POLICY = Policy(
     version="mctl-agents/policy/v1",
     rules=(
@@ -344,8 +352,16 @@ BUILTIN_POLICY = Policy(
         Rule("github-push-new-branch", GITHUB_GIT_PUSH, "push:new-branch", ALLOW),
         Rule("github-push-with-lease", GITHUB_GIT_PUSH, "push:force-with-lease", ALLOW),
         Rule("github-pr-create", GITHUB_PR_CREATE, "create", ALLOW),
+        # A merge of a PR that changes agent definitions is a human decision
+        # (mctlhq/mctl-agents#470, owner decision 2026-10-05; ADR 016
+        # amendment 1). Its own operation, so no setting that relaxes or
+        # tightens the plain `merge` rule below can reach it, and listed
+        # BEFORE that rule so a later widening of the `merge` pattern cannot
+        # shadow it. With no approval store this always blocks.
+        Rule("github-pr-merge-agent-definition", GITHUB_PR_MERGE, MERGE_OPERATION_AGENT_DEFINITION,
+             REQUIRE_APPROVAL),
         # `gh pr merge --merge --match-head-commit`: bound to the reviewed head.
-        Rule("github-pr-merge", GITHUB_PR_MERGE, "merge", ALLOW),
+        Rule("github-pr-merge", GITHUB_PR_MERGE, MERGE_OPERATION, ALLOW),
         # The shepherd's `@claude review` trigger after a fix-up push.
         Rule("github-pr-review-trigger", GITHUB_PR_COMMENT, "comment:review-trigger", ALLOW),
         Rule("github-run-rerun-failed", GITHUB_RUN_RERUN, "rerun:failed", ALLOW),
@@ -390,13 +406,15 @@ MERGE_APPROVAL_ENV = "MCTL_POLICY_MERGE_APPROVAL"
 MERGE_APPROVAL_REQUIRE = "require"
 
 #: `BUILTIN_POLICY` with `github-pr-merge` (ALLOW) replaced by a
-#: REQUIRE_APPROVAL rule of its own, under a distinct policy version: since
+#: REQUIRE_APPROVAL rule of its own (the agent-definition rule is carried
+#: over unchanged: it requires an approval under every variant), under a
+#: distinct policy version: since
 #: `policy_version` is a field of the approval intent hash, a receipt
 #: approved under one rule set can never be spent under the other.
 MERGE_APPROVAL_POLICY = Policy(
     version="mctl-agents/policy/v1-merge-approval",
     rules=tuple(
-        Rule("github-pr-merge-approval", GITHUB_PR_MERGE, "merge", REQUIRE_APPROVAL)
+        Rule("github-pr-merge-approval", GITHUB_PR_MERGE, MERGE_OPERATION, REQUIRE_APPROVAL)
         if rule.rule_id == "github-pr-merge" else rule
         for rule in BUILTIN_POLICY.rules
     ),
@@ -417,11 +435,13 @@ def configured_policy() -> Policy:
     # The raw value is NOT put into the version: it reaches the intent hash,
     # the POLICY_DECISION line and a span attribute, which carry only
     # bounded fields. The DENY rule id already names the misconfiguration.
+    # Both merge operations: "refuse every merge" must hold for an
+    # agent-definition merge too, which has a rule of its own.
     return Policy(
         version="mctl-agents/policy/v1-merge-approval-misconfigured",
         rules=tuple(
-            Rule("github-pr-merge-misconfigured", GITHUB_PR_MERGE, "merge", DENY)
-            if rule.rule_id == "github-pr-merge" else rule
+            Rule(f"{rule.rule_id}-misconfigured", GITHUB_PR_MERGE, rule.operation, DENY)
+            if rule.rule_id in _MERGE_RULE_IDS else rule
             for rule in BUILTIN_POLICY.rules
         ),
     )
