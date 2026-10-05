@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.68.0](https://github.com/mctlhq/mctl-agents/compare/1.67.1...1.68.0) (2026-10-05)
+
+
+### Features
+
+* **evidence:** ADR 018 Amendment 2 subject, versions, authority ([1dd721c](https://github.com/mctlhq/mctl-agents/commit/1dd721c589720a411e00ac48940156d28ddba07f))
+* **evidence:** ADR 018 Amendment 2 subject, versions, authority ([c74d5ee](https://github.com/mctlhq/mctl-agents/commit/c74d5ee1775c75436bbf362d9a7913304c7d78d0)), closes [#199](https://github.com/mctlhq/mctl-agents/issues/199)
+* **evidence:** post sealed execution evidence to mctl-api ([0c05797](https://github.com/mctlhq/mctl-agents/commit/0c05797d456fabcc9e6468e641b19ed9a6467377))
+* **evidence:** post sealed execution evidence to mctl-api ([6ea0f1e](https://github.com/mctlhq/mctl-agents/commit/6ea0f1e85d59fe4728c88cf5a2a72f15f4bda9a0)), closes [#544](https://github.com/mctlhq/mctl-agents/issues/544) [#199](https://github.com/mctlhq/mctl-agents/issues/199)
+
+
+### Bug Fixes
+
+* **evidence:** bound the head read and sanitise proposal names ([88d19ac](https://github.com/mctlhq/mctl-agents/commit/88d19acb572fa74bc827edaca9111138effccc76)), closes [#544](https://github.com/mctlhq/mctl-agents/issues/544)
+* **evidence:** degrade redacted Amendment 2 leaves to gaps ([d1b0fed](https://github.com/mctlhq/mctl-agents/commit/d1b0fed05839a4cd90defe47b8a7aa0bcf824a82)), closes [#199](https://github.com/mctlhq/mctl-agents/issues/199)
+* **evidence:** excuse only free-form leaves; pool unversioned issues ([3985847](https://github.com/mctlhq/mctl-agents/commit/39858475a83de9cf67761d951a03b682d80bf620)), closes [#199](https://github.com/mctlhq/mctl-agents/issues/199)
+* **evidence:** fail closed on forged id collisions in the pool ([9cec864](https://github.com/mctlhq/mctl-agents/commit/9cec8646d8bfb1e17bf5f69e2b931b192cfbe603)), closes [#199](https://github.com/mctlhq/mctl-agents/issues/199)
+* **evidence:** harden Retry-After and keep the newest decisions ([670257d](https://github.com/mctlhq/mctl-agents/commit/670257d76028c12bec9af2445d30a96c599d628f)), closes [#544](https://github.com/mctlhq/mctl-agents/issues/544)
+* **evidence:** keep proposals distinct and bound the envelope ([2483b67](https://github.com/mctlhq/mctl-agents/commit/2483b674323fe38659febaa5491e031f07b8af34)), closes [#544](https://github.com/mctlhq/mctl-agents/issues/544)
+* **evidence:** never record a failed tool call as succeeded ([680d412](https://github.com/mctlhq/mctl-agents/commit/680d41294f8e2787ac4400f2307e57f2be0bc3d9)), closes [#544](https://github.com/mctlhq/mctl-agents/issues/544)
+* **evidence:** pin pool predicate; ambiguous superseded pool ([aefa1eb](https://github.com/mctlhq/mctl-agents/commit/aefa1eb34375cefc79144639c69e956846ea2040)), closes [#199](https://github.com/mctlhq/mctl-agents/issues/199)
+* **evidence:** table-driven required leaves; stale_revision state ([49ca1dc](https://github.com/mctlhq/mctl-agents/commit/49ca1dc57665defb5c4c37d07898c09dafcdd728)), closes [#199](https://github.com/mctlhq/mctl-agents/issues/199)
+* **evidence:** tie on content, not id; freeze AUTHORITY_RANK ([4690b6c](https://github.com/mctlhq/mctl-agents/commit/4690b6c3fbfc8ac7f0923866128d37c2a0eecc39)), closes [#199](https://github.com/mctlhq/mctl-agents/issues/199)
+* **evidence:** type-check every new leaf; sync resolve_current doc ([a0bda0a](https://github.com/mctlhq/mctl-agents/commit/a0bda0afba7915e31b041e7a5b1d5c2e4c98e3d7)), closes [#199](https://github.com/mctlhq/mctl-agents/issues/199)
+
 ## [1.67.1](https://github.com/mctlhq/mctl-agents/compare/1.67.0...1.67.1) (2026-10-04)
 
 

@@ -73,6 +73,21 @@ GITHUB_PR_MERGE = "github.pull_request.merge"
 GITHUB_PR_COMMENT = "github.pull_request.comment"
 GITHUB_RUN_RERUN = "github.actions.run.rerun"
 GITHUB_ISSUE_LABEL = "github.issue.label"
+#: Every governed action kind above, as one closed set. The evidence
+#: contract's `ToolCallRef.kind` vocabulary is this set (ADR 018 Amendment 2),
+#: so a new action kind must be added here to be recordable there.
+ACTION_KINDS = frozenset({
+    GITHUB_ISSUE_COMMENT,
+    MCTL_OPERATION_EXECUTE,
+    MCTL_WORK_ITEM_WRITE,
+    MCP_TOOL_CALL,
+    GITHUB_GIT_PUSH,
+    GITHUB_PR_CREATE,
+    GITHUB_PR_MERGE,
+    GITHUB_PR_COMMENT,
+    GITHUB_RUN_RERUN,
+    GITHUB_ISSUE_LABEL,
+})
 
 # Decision codes. `allowed`/`approved` permit; every other code refuses.
 CODE_ALLOWED = "allowed"
@@ -538,7 +553,26 @@ def enforce[T](
     decision = decide(request, policy=policy, approvals=approvals, approval_ref=approval_ref)
     if not decision.permitted:
         raise PolicyRefused(decision)
-    return side_effect()
+    try:
+        result = side_effect()
+    except BaseException:
+        _record_tool_result(decision.action_digest, succeeded=False)
+        raise
+    _record_tool_result(decision.action_digest, succeeded=True)
+    return result
+
+
+def _record_tool_result(action_digest: str, *, succeeded: bool) -> None:
+    """Tell the run's evidence producer (mctlhq/mctl-agents#544) how a
+    permitted side effect ended. Imported lazily, like `orchestrator.tracing`
+    in `emit`, to keep this module's import stdlib-only; a no-op outside a
+    governed run, and it never raises."""
+    try:
+        from orchestrator import evidence_producer
+
+        evidence_producer.record_tool_result(action_digest, succeeded)
+    except Exception:  # noqa: BLE001, S110 — evidence never fails the action
+        pass
 
 
 def decision_record(request: ActionRequest, decision: Decision) -> dict[str, Any]:
@@ -602,6 +636,15 @@ def emit(request: ActionRequest, decision: Decision) -> None:
             decided_at=decision.decided_at,
         )
     except Exception:  # noqa: BLE001, S110 — same rule: tracing never fails the action
+        pass
+    try:
+        # The run's execution evidence (mctlhq/mctl-agents#544, ADR 018):
+        # every decision of a governed run becomes a PolicyDecisionRef. A
+        # no-op outside one (the Temporal worker, a poller).
+        from orchestrator import evidence_producer
+
+        evidence_producer.record_decision(request, decision)
+    except Exception:  # noqa: BLE001, S110 — same rule: evidence never fails the action
         pass
 
 

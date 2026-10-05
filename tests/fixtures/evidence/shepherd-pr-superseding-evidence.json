@@ -1,0 +1,58 @@
+{
+  "api_version": "evidence.mctl.ai/v1alpha1",
+  "approvals": [],
+  "artifacts": [],
+  "content_hash": "sha256:5a7500c45dd74b8b0d46388115813a3b9576237c5523679d0f254e0994c4b282",
+  "created_at": "2026-10-04T10:05:05Z",
+  "evidence_id": "ev-5a7500c45dd74b8b",
+  "execution": {
+    "execution_id": "we_01J8ZQK7SHEP0000000000000",
+    "runtime_execution_id": "ex-1122334455667788",
+    "trace_id": "dev-loop-mctlhq-mctl-agents-524",
+    "work_item_id": "wi-mctlhq-mctl-agents-524"
+  },
+  "execution_request": null,
+  "gaps": [
+    {
+      "block": "versions",
+      "code": "observation_failed",
+      "required": true
+    }
+  ],
+  "kind": "ExecutionEvidence",
+  "outcome": {
+    "code": "succeeded",
+    "reason_code": "merge-completed"
+  },
+  "policy_decisions": [
+    {
+      "action_digest": "sha256:8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b",
+      "approval_ref": "",
+      "code": "allowed",
+      "policy_version": "mctl-agents/policy/v1",
+      "rule_id": "shepherd-gated-merge",
+      "verdict": "ALLOW"
+    }
+  ],
+  "provenance": {
+    "authority": "observed",
+    "observed_at": "2026-10-04T10:05:00Z",
+    "supersedes": "ev-df6d015f8ddf64ac"
+  },
+  "snapshot_refs": [],
+  "subject": {
+    "kind": "pull_request",
+    "ref": "524",
+    "repository": "mctlhq/mctl-agents",
+    "revision": "4f2c9e1b7a3d5c8e0f6a2b4d6c8e0a1b3c5d7e9f"
+  },
+  "tool_calls": [
+    {
+      "action_digest": "sha256:8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b",
+      "kind": "github.pull_request.merge",
+      "name": "merge_pull_request",
+      "status": "unknown"
+    }
+  ],
+  "usage": null
+}

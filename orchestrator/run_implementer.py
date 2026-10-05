@@ -139,7 +139,7 @@ from config.settings import (
     SERVICE_AGENT_MODEL,
     SERVICES,
 )
-from orchestrator import policy_checkpoint, tracing, usage_ledger
+from orchestrator import evidence_producer, policy_checkpoint, tracing, usage_ledger
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.exec_budget import CommandBudgetLedger
 from orchestrator.execution_identity import (
@@ -2586,7 +2586,61 @@ def _checkout_existing_branch(repo_dir: Path, branch: str) -> None:
     _run(["git", "checkout", branch], cwd=repo_dir)
 
 
+def _note_implement_evidence(
+    evidence: evidence_producer.RunEvidence, result: ImplementResult, *, success_reason: str
+) -> None:
+    """Map an `ImplementResult` onto ADR 018's closed outcome vocabulary,
+    and name the PR it acted on (its head is read at seal time)."""
+    error = result.error or ""
+    if result.rate_limited:
+        evidence.set_outcome("failed", "rate-limited")
+    elif result.budget_terminal:
+        evidence.set_outcome("abandoned", "verification-budget-exhausted")
+    elif result.budget_handback:
+        evidence.set_outcome("abandoned", "verification-budget-handback")
+    elif result.stale_source:
+        evidence.set_outcome("refused", "stale-source")
+    elif result.blocked:
+        evidence.set_outcome("refused", f"blocked-{result.blocked}")
+    elif error.startswith(REFUSAL_ERROR_PREFIX):
+        evidence.set_outcome("refused", "deliberate-no-op")
+    elif error.startswith(CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX):
+        evidence.set_outcome("refused", "ci-evidence-insufficient")
+    elif error.startswith((POLICY_REFUSED_ERROR_PREFIX, POLICY_UNDECIDED_ERROR_PREFIX)):
+        evidence.set_outcome("refused", "policy-refused")
+    elif error.startswith(VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX):
+        evidence.set_outcome("failed", "verification-budget-exhausted")
+    elif error:
+        evidence.set_outcome("failed", "implementer-error")
+    elif result.skipped_reason:
+        evidence.set_outcome("refused", "skipped")
+    elif result.pr_url:
+        evidence.set_outcome("succeeded", success_reason)
+    else:
+        evidence.set_outcome("failed", "no-pr")
+    if result.pr_url:
+        evidence.note_subject_pr_url(result.pr_url)
+    evidence.note_proposal_status(result.ref.service, result.ref.slug, result.ref.status_path)
+
+
 def review_feedback_one(
+    ref: ProposalRef,
+    bundle: dict,
+    dry_run: bool = False,
+    branch: str | None = None,
+) -> ImplementResult:
+    """`_review_feedback_one` under the run's execution evidence
+    (mctlhq/mctl-agents#544): sealed and posted however it ends, never
+    fatal. A dry run governs nothing and posts nothing."""
+    with evidence_producer.run(evidence_producer.STAGE_IMPLEMENTER) as evidence:
+        if dry_run:
+            evidence_producer.note("discard")
+        result = _review_feedback_one(ref, bundle, dry_run=dry_run, branch=branch)
+        evidence_producer.safely(_note_implement_evidence, evidence, result, success_reason="review-addressed")
+        return result
+
+
+def _review_feedback_one(
     ref: ProposalRef,
     bundle: dict,
     dry_run: bool = False,
@@ -2832,6 +2886,7 @@ def review_feedback_one(
         # git runs, and the push's own lease catches it even if the claim
         # check could not (store unreachable, rollout below `enforce`).
         _push_followup(target, branch, old_head, claim_context=claim_ctx, repo=f"mctlhq/{ref.service}")
+        _note_pushed_head(target)
 
         # 8. Read the existing PR URL from `.status.yaml` for the result
         # surface; do NOT rewrite the status — that belongs to the shepherd.
@@ -2986,9 +3041,26 @@ def _has_new_commits(repo_dir: Path, base: str = "origin/HEAD") -> bool:
     return bool(proc.stdout.strip())
 
 
-def _capture_head_sha(repo_dir: Path) -> str:
-    """Return the current HEAD SHA in ``repo_dir`` (no rev parsing here)."""
-    proc = _run(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+def _note_pushed_head(repo_dir: Path) -> None:
+    """Hand the commit this run just pushed to its execution evidence, so the
+    evidence's subject is bound to the revision this run produced rather
+    than to whatever the PR head is at seal time (claude P2 on #577). Read
+    straight from the local clone, which is exactly what the push sent,
+    bounded at 10 s; it runs whatever the Amendment 2 flag says (the seal
+    decides whether `subject` is emitted); never fatal."""
+    try:
+        # Bounded explicitly: the producer's tail budget, not the 300 s
+        # command bound `_run` applies by default.
+        sha = _capture_head_sha(repo_dir, timeout=10)
+    except Exception:  # noqa: BLE001 — evidence bookkeeping must never fail the run
+        return
+    evidence_producer.note("note_pushed_head", sha)
+
+
+def _capture_head_sha(repo_dir: Path, *, timeout: float | None = None) -> str:
+    """Return the current HEAD SHA in ``repo_dir`` (no rev parsing here).
+    ``timeout`` overrides `_run`'s default command bound."""
+    proc = _run(["git", "rev-parse", "HEAD"], cwd=repo_dir, timeout=timeout)
     return proc.stdout.strip()
 
 
@@ -3802,6 +3874,18 @@ def _push_and_open_pr(
 
 
 def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
+    """`_implement_one` under the run's execution evidence
+    (mctlhq/mctl-agents#544): sealed and posted however it ends, never
+    fatal. A dry run governs nothing and posts nothing."""
+    with evidence_producer.run(evidence_producer.STAGE_IMPLEMENTER) as evidence:
+        if dry_run:
+            evidence_producer.note("discard")
+        result = _implement_one(ref, dry_run=dry_run)
+        evidence_producer.safely(_note_implement_evidence, evidence, result, success_reason="pr-opened")
+        return result
+
+
+def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     """Implement a single accepted proposal. Returns ImplementResult."""
     if ref.status != "accepted":
         return ImplementResult(
@@ -3862,6 +3946,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); minting a local execution context.")
         execution_context = mint_local(executor_type="implementer", workflow_type="implement", agent="implementer")
     print(f"[identity] execution_context={json.dumps(execution_context.to_log_dict())}")
+    evidence_producer.note("note_runtime_context", execution_context)
 
     try:
         existing = _preflight_existing_result(ref)
@@ -4266,6 +4351,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
 
         # 7. Push + PR.
         pr_url = _push_and_open_pr(target, ref, claim_context=claim_ctx)
+        _note_pushed_head(target)
 
         # 8. Mark implemented.
         completed_attempt = dict(attempt)

@@ -86,6 +86,13 @@ _AGENT_BY_CATALOG_PROFILE = {
     "issue-investigator-default": "issue-investigator",
     "implementer-default": "implementer",
     "shepherd-default": "shepherd",
+    # mctlhq/mctl-agents#470: mapped ahead of the profiles themselves
+    # (mctlhq/mctl-gitops#1683). CI reads mctl-gitops main unpinned, so the
+    # catalog gaining a profile this table does not know turns every PR here
+    # red; an entry whose profile does not exist yet is never looked up.
+    "incident-responder-default": "incident-responder",
+    "mentor-default": "mentor",
+    "service-agent-default": "service-agent",
 }
 
 # Every build_*_options() builder consults mctl_mcp_config()/_mctl_tool_globs(),
