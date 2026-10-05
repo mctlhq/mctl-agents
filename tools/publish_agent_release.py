@@ -15,6 +15,38 @@ Run it for a released tag:
 `--dry-run` prints what it would publish without writing anything, and
 `--agent NAME` limits it to one manifest.
 
+## Promotion requires a matching binding (mctlhq/mctl-agents#470)
+
+Publishing and promoting are two different acts. Publishing records an
+immutable version row; nothing resolves it until it is promoted. Promotion
+to `production` is what activates an agent, and it used to follow every
+publish unconditionally — so a merged agent.yaml self-activated.
+
+Promotion is now gated per agent on its mctl-gitops release binding
+(`check_binding_hash.evaluate_promotion`): the binding's pinned content hash
+must equal the agent.yaml in this tag, and every field the resolver
+cross-checks must agree. No binding, a stale one, or one that cannot be read
+refuses that agent's promotion; the others go ahead. The version is still
+published, so that once the binding is re-pinned the same release can be
+promoted by hand (`mctl_promote_agent`) without re-publishing. The gate is
+evaluated BEFORE any registry write, so an outage reading mctl-gitops never
+leaves a half-done agent behind.
+
+Exit status: 1 if any agent failed or was refused, whatever the reason: a
+stale, mismatched or unreadable binding names a binding someone meant to
+match, and an absent one (HTTP 404, the contents API's documented absence
+signal) means a binding that existed was deleted or renamed, or a manifest
+was added without one. One refused agent does not stop the others: each is
+published and gated on its own, and the step fails only after all of them
+have been handled.
+
+The single exception is an agent listed in UNBOUND_AGENTS, for which an
+absent binding is a warning and the step stays green: the expected state of
+an agent deliberately shipped before anyone bound it. That set is empty
+since mctl-gitops#1683 gave every shipped agent a binding, so today every
+refusal fails the step. Every agent's outcome is printed, and written to
+$GITHUB_STEP_SUMMARY when it is set.
+
 ## prompt_hash
 
 The registry stores a prompt_hash per version, but nothing in this repo
@@ -46,6 +78,7 @@ import os
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +86,14 @@ import httpx
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Run as a plain script from the release job, and loaded by path in tests:
+# either way tools/ is not a package, so make its sibling importable.
+_TOOLS_DIR = str(Path(__file__).resolve().parent)
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+
+import check_binding_hash  # noqa: E402
+
 MANIFEST_DIR = REPO_ROOT / "agents" / "_manifests"
 IMAGE_REPOSITORY = "ghcr.io/mctlhq/mctl-agents"
 DEFAULT_API = "https://api.mctl.ai"
@@ -62,6 +103,52 @@ TIMEOUT_S = 30
 
 class PublishError(RuntimeError):
     pass
+
+
+# Agents deliberately shipped without a release binding in the mctl-gitops
+# catalog. For these, and only these, a 404 is the expected state: their
+# promotion is refused with a warning and the step stays green, because a
+# release that is red every time is one nobody reads. For every other agent
+# a 404 means a binding was deleted or renamed, or a manifest was added
+# without one, and that fails the step.
+#
+# Empty since mctl-gitops#1683 bound incident-responder, mentor and
+# service-agent: all six shipped agents have a binding, so a missing one is a
+# loud refusal for any of them. The mechanism stays for the next agent that
+# has to ship ahead of its binding — list it here in the change that adds its
+# manifest, and remove it in the change that follows its binding (claude P2
+# on #574). An agent left here after it is bound only loses the loud failure
+# for a later deletion, never its gate. A test pins this set against the real
+# manifest directories.
+UNBOUND_AGENTS: frozenset[str] = frozenset()
+
+PROMOTED = "promoted"
+REFUSED = "refused"
+FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """What happened to one agent. `state` is PROMOTED, REFUSED or FAILED;
+    `verdict` is the promotion gate's, when it got that far."""
+
+    agent: str
+    state: str
+    detail: str
+    verdict: check_binding_hash.PromotionVerdict | None = None
+
+    @property
+    def fails_release(self) -> bool:
+        if self.state == FAILED:
+            return True
+        if self.state == REFUSED:
+            # Only an absent binding for an agent listed in UNBOUND_AGENTS
+            # is a quiet refusal; see the docstring. With that set empty,
+            # every refusal fails the step.
+            if self.verdict is None or self.verdict.status != check_binding_hash.VERDICT_MISSING:
+                return True
+            return self.agent not in UNBOUND_AGENTS
+        return False
 
 
 def _api_base() -> str:
@@ -248,11 +335,36 @@ def prompt_hash(manifest: dict[str, Any], agent: str, tag: str, tree: list[str])
     return f"sha256:{digest.hexdigest()}"
 
 
-def publish(agent: str, version: str, git_sha: str, tree: list[str], *, dry_run: bool) -> bool:
+def _refused_detail(agent: str, verdict: check_binding_hash.PromotionVerdict) -> str:
+    """The refusal plus what it costs, not only where the binding is not
+    (claude P3 on #574). Workflows pin the image of the version they resolve,
+    which overrides the CWFT default release-deploy just bumped; an agent that
+    was never promoted resolves nothing and falls back to that default."""
+    cost = (
+        f"{agent} is not released to {ENVIRONMENT} by this tag: anything resolving it keeps "
+        "the version promoted before, or the CWFT's default image if it was never promoted"
+    )
+    return f"{verdict.status}: {verdict.reason} — {cost}"
+
+
+def publish(
+    agent: str,
+    version: str,
+    git_sha: str,
+    tree: list[str],
+    *,
+    dry_run: bool,
+    gitops_transport: httpx.BaseTransport | None = None,
+) -> Outcome:
     relpath = f"agents/_manifests/{agent}/agent.yaml"
     raw = _read_at_tag(version, relpath)
     if raw is None:
         raise PublishError(f"{agent}: {relpath} is not in {version}'s tree")
+    # Decided before any registry write, from the exact bytes being
+    # released. evaluate_promotion turns every unreadable or invalid input
+    # into a refusal; anything it still raises propagates to main(), which
+    # records the agent as FAILED — never as promoted.
+    verdict = check_binding_hash.evaluate_promotion(agent, raw, gitops_transport)
     manifest = yaml.safe_load(raw.decode())
     payload = {
         "version": version,
@@ -271,7 +383,11 @@ def publish(agent: str, version: str, git_sha: str, tree: list[str], *, dry_run:
     }
     if dry_run:
         print(f"  would publish {agent}@{version} prompt_hash={payload['prompt_hash']}")
-        return True
+        if verdict.promote:
+            print(f"  would promote {agent}@{version} to {ENVIRONMENT}: {verdict.reason}")
+            return Outcome(agent, PROMOTED, f"(dry run) {verdict.reason}", verdict)
+        print(f"  would REFUSE promoting {agent}@{version} ({verdict.status}): {verdict.reason}")
+        return Outcome(agent, REFUSED, f"(dry run) {_refused_detail(agent, verdict)}", verdict)
 
     status, body = _request("POST", f"/api/v1/agents/{agent}/versions", payload)
     if status == 404:
@@ -287,11 +403,9 @@ def publish(agent: str, version: str, git_sha: str, tree: list[str], *, dry_run:
             {"name": agent, "owner": owner, "description": f"{agent} (mctl-agents)"},
         )
         if create_status not in (200, 201, 409):
-            print(
-                f"  ERROR creating definition for {agent}: HTTP {create_status} {create_body[:300]}",
-                file=sys.stderr,
-            )
-            return False
+            detail = f"creating definition: HTTP {create_status} {create_body[:300]}"
+            print(f"  ERROR {agent}: {detail}", file=sys.stderr)
+            return Outcome(agent, FAILED, detail, verdict)
         print(f"  created registry definition for {agent}")
         status, body = _request("POST", f"/api/v1/agents/{agent}/versions", payload)
     if status == 409:
@@ -299,10 +413,21 @@ def publish(agent: str, version: str, git_sha: str, tree: list[str], *, dry_run:
         # which is what makes this safe to wire into a release pipeline.
         print(f"  {agent}@{version} already published")
     elif status not in (200, 201):
-        print(f"  ERROR publishing {agent}@{version}: HTTP {status} {body[:300]}", file=sys.stderr)
-        return False
+        detail = f"publishing {version}: HTTP {status} {body[:300]}"
+        print(f"  ERROR {agent}: {detail}", file=sys.stderr)
+        return Outcome(agent, FAILED, detail, verdict)
     else:
         print(f"  published {agent}@{version}")
+
+    if not verdict.promote:
+        # The security boundary of #470: a version with no matching binding
+        # stays published and inactive. Production keeps resolving whatever
+        # was promoted before.
+        print(
+            f"  REFUSED promoting {agent}@{version} to {ENVIRONMENT} ({verdict.status}): {verdict.reason}",
+            file=sys.stderr,
+        )
+        return Outcome(agent, REFUSED, _refused_detail(agent, verdict), verdict)
 
     # No 409 allowance here, deliberately, unlike /versions above: promotion
     # is idempotent server-side — PromoteRelease returns 200 for a version
@@ -316,10 +441,40 @@ def publish(agent: str, version: str, git_sha: str, tree: list[str], *, dry_run:
         {"version": version, "environment": ENVIRONMENT},
     )
     if status not in (200, 201):
-        print(f"  ERROR promoting {agent}@{version}: HTTP {status} {body[:300]}", file=sys.stderr)
-        return False
+        detail = f"promoting {version}: HTTP {status} {body[:300]}"
+        print(f"  ERROR {agent}: {detail}", file=sys.stderr)
+        return Outcome(agent, FAILED, detail, verdict)
     print(f"  promoted {agent}@{version} to {ENVIRONMENT}")
-    return True
+    return Outcome(agent, PROMOTED, verdict.reason, verdict)
+
+
+def _report(version: str, outcomes: list[Outcome]) -> None:
+    """One line per agent on stdout, an annotation per refusal or failure,
+    and a table in the job summary: a refused promotion must be visible
+    without reading the whole log."""
+    in_actions = bool(os.environ.get("GITHUB_ACTIONS"))
+    print(f"promotion summary for {version}:")
+    for outcome in outcomes:
+        print(f"  {outcome.agent}: {outcome.state} — {outcome.detail}")
+        if in_actions and outcome.state != PROMOTED:
+            level = "error" if outcome.fails_release else "warning"
+            # Annotations are one line.
+            text = f"{outcome.agent} {outcome.state}: {outcome.detail}".replace("\n", " ")
+            print(f"::{level}::{text}")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary:
+        return
+    lines = [
+        f"### Agent registry: {version} → {ENVIRONMENT}",
+        "",
+        "| agent | outcome | detail |",
+        "|---|---|---|",
+    ]
+    for outcome in outcomes:
+        detail = outcome.detail.replace("|", "\\|").replace("\n", " ")
+        lines.append(f"| `{outcome.agent}` | {outcome.state} | {detail} |")
+    with open(summary, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 
 def main() -> int:
@@ -361,11 +516,10 @@ def main() -> int:
     # Each agent is independent: one bad manifest must not abandon the
     # rest half-published, which would leave the registry in a state no
     # single re-run reproduces (agy P2).
-    failed: list[str] = []
+    outcomes: list[Outcome] = []
     for agent in agents:
         try:
-            if not publish(agent, args.version, git_sha, tree, dry_run=args.dry_run):
-                failed.append(agent)
+            outcomes.append(publish(agent, args.version, git_sha, tree, dry_run=args.dry_run))
         except Exception as exc:  # noqa: BLE001 — isolation is the point
             # Deliberately every exception, not just PublishError/HTTPError:
             # a malformed manifest reaches this loop as yaml.YAMLError, or
@@ -374,7 +528,9 @@ def main() -> int:
             # which is exactly the half-published registry this isolation
             # exists to prevent (agy P2). The run still fails below.
             print(f"  ERROR {agent}: {exc!r}", file=sys.stderr)
-            failed.append(agent)
+            outcomes.append(Outcome(agent, FAILED, repr(exc)))
+    _report(args.version, outcomes)
+    failed = [o.agent for o in outcomes if o.fails_release]
     if failed:
         print(f"failed: {', '.join(failed)}", file=sys.stderr)
         return 1

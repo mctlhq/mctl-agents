@@ -604,7 +604,26 @@ def load_definition(agent: str) -> AgentDefinition:
     path = DEFINITIONS_DIR / agent / "agent.yaml"
     if not path.is_file():
         raise ResolverError(f"unknown agent {agent!r}: no manifest at {path}")
-    document, content_hash = _read_yaml_and_hash(path)
+    return parse_definition(_read_bytes(path), path=path)
+
+
+def definition_content_hash(raw: bytes) -> str:
+    """The canonical content hash of an agent.yaml: what a release binding
+    pins in spec.sourceManifest.contentHash and what `execute()` compares.
+
+    Public so the release tooling (tools/check_binding_hash.py, and through
+    it tools/publish_agent_release.py, mctlhq/mctl-agents#470) hashes the
+    released bytes exactly as this resolver does — one hash, not two."""
+    return _hash_bytes(raw)
+
+
+def parse_definition(raw: bytes, *, path: Path) -> AgentDefinition:
+    """`load_definition` minus the file read: parse and validate agent.yaml
+    bytes that did not come from the working tree — the promotion gate reads
+    them out of a release tag. `path` must still be
+    `<definitions>/<agent>/agent.yaml`, because metadata.name is checked
+    against its directory name."""
+    document, content_hash = parse_yaml_mapping(raw, path=path), definition_content_hash(raw)
     api_version = document.get("apiVersion")
     if api_version != SUPPORTED_DEFINITION_API_VERSION:
         raise ResolverError(
