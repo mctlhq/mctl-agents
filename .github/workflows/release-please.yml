@@ -33,6 +33,14 @@ jobs:
   # failing there stops the tag, the image, the CWFT bump and the promotion
   # together, and production stays on the previous, matching release.
   #
+  # mctlhq/mctl-agents#582: the gate covers every agent, not only
+  # issue-investigator. "Refresh agent registry" promotes an agent only when
+  # its binding matches (#470), but it decides that after the tag exists, in
+  # a step a re-run skips. The gate asks the same question
+  # (check_binding_hash.evaluate_promotion) for every manifest at the release
+  # commit first, so a stale or absent binding for any agent stops the
+  # release here, while it is still a plain re-run away from recovery.
+  #
   # Gating here also keeps recovery a plain re-run. release-please cuts a
   # release for a merged PR still labelled "autorelease: pending" and only
   # relabels it once the release exists, so a run stopped by this gate leaves
@@ -42,7 +50,11 @@ jobs:
   binding-gate:
     name: binding gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Sized for one release commit in the degraded case: 14 sequential reads
+    # (two for the resolver check, two per manifest), each waiting out a 429's
+    # Retry-After (up to 60s) before both of its retries, is 28 min. See the
+    # binding-hash job in pr-validation.yml; the same test pins both.
+    timeout-minutes: 40
     permissions:
       contents: read
       pull-requests: read
@@ -93,7 +105,17 @@ jobs:
       # stay at this run's head. A pending release commit that predates the
       # gate (or a later move of the script) would otherwise fail on a
       # missing file, and no re-pin or re-run could ever clear that.
-      - name: agent.yaml must match the gitops binding at the release commit
+      #
+      # The whole agents/_manifests directory is replaced, not overlaid: the
+      # tool lists the agents from disk, so after `rm -rf` and the checkout
+      # it sees exactly the release commit's set. A manifest that commit adds
+      # is checked (and reported as missing if nobody bound it), and one it
+      # no longer has is not.
+      #
+      # Exit 1: a binding does not match or is missing. Exit 2: a binding or
+      # profile could not be read, which is never a match. One line per
+      # agent goes to the log and the job summary.
+      - name: every agent.yaml must match its gitops binding at the release commit
         if: ${{ steps.pending.outputs.shas != '' }}
         env:
           SHAS: ${{ steps.pending.outputs.shas }}
@@ -110,7 +132,7 @@ jobs:
             fi
             rm -rf agents/_manifests
             git checkout --quiet "$sha" -- agents/_manifests
-            uv run --locked python tools/check_binding_hash.py
+            uv run --locked python tools/check_agent_bindings.py --label "release commit $sha"
           done
 
       # A stopped release is otherwise silent: the release-please job's own
@@ -130,7 +152,7 @@ jobs:
           # depends on how the block scalar's indentation is stripped.
           MESSAGE=$(printf '%s\n' \
             "❌ mctl-agents release stopped by the binding gate" \
-            "agent.yaml does not match the mctl-gitops issue-investigator binding, or the binding or its execution profile could not be read. No tag, image or promotion was made." \
+            "An agent.yaml does not match its mctl-gitops release binding, a binding is missing, or a binding or its execution profile could not be read (the job summary names the agent). No tag, image or promotion was made." \
             "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
 
           curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -272,6 +294,11 @@ jobs:
       # per-agent outcome lands in the log and the job summary. The one
       # quiet refusal is a missing binding for an agent listed in the
       # tool's UNBOUND_AGENTS, which is empty since mctl-gitops#1683.
+      #
+      # The binding-gate job already asked this for every agent before the
+      # tag (#582), so a refusal here means mctl-gitops changed, or stopped
+      # answering, between that job and this step. It is still the check
+      # that decides the promotion; the gate only makes it unsurprising.
       - name: Refresh agent registry
         if: ${{ steps.release.outputs.release_created == 'true' }}
         env:

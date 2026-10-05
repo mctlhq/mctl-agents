@@ -229,18 +229,32 @@ jobs:
           MCTL_GITOPS_ROOT: ${{ github.workspace }}/_gitops/platform-gitops
         run: uv run --locked pytest -q
 
-  # mctlhq/mctl-agents#565: the PR-time half of the release binding gate in
-  # release-please.yml. Fails when agent.yaml no longer matches the
-  # issue-investigator binding on mctl-gitops main, so the author learns at
-  # PR time that the binding needs a re-pin rather than at release time. Its
-  # own job, not a step of `tests`, so the red check names the cause; the
-  # `tests` job fails on the same drift too (the real-catalog resolver
-  # tests), but as one ResolverError among many. Network on purpose: the
-  # unit tests mock the fetch, and this is the one live comparison.
+  # mctlhq/mctl-agents#565, #582: the PR-time half of the release binding
+  # gate in release-please.yml. Fails when any agents/_manifests/*/agent.yaml
+  # no longer matches its release binding on mctl-gitops main, or has no
+  # binding there at all, so the author learns at PR time that a binding
+  # needs a re-pin (or adding) rather than at release time. Every manifest is
+  # asked the question the release asks before promoting it
+  # (check_binding_hash.evaluate_promotion), and issue-investigator also
+  # keeps its stricter resolver check. Exit 1 is a mismatch or a missing
+  # binding, exit 2 a binding or profile that could not be read; the job
+  # summary has one line per agent. Its own job, not a step of `tests`, so
+  # the red check names the cause; for issue-investigator the `tests` job
+  # fails on the same drift too (the real-catalog resolver tests), but as
+  # one ResolverError among many. Network on purpose: the unit tests mock
+  # the fetch, and this is the one live comparison.
   binding-hash:
     name: binding hash
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Sized for the degraded case, not the usual 15 seconds. The tool makes
+    # two reads for the resolver check and two per manifest (14 today), one
+    # after another, and a read that keeps getting 429 waits out Retry-After
+    # (up to 60s) before each of its two retries: 14 x 2 x 60s = 28 min.
+    # Cut off earlier, that run ends as a bare timeout and not as the exit 2
+    # it should be. The tool prints each agent as it goes, so a slow run
+    # shows progress. A test ties this number to the tool's constants and to
+    # the number of manifests (claude P2 on #584).
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -250,12 +264,12 @@ jobs:
           python-version: "3.12"
           enable-cache: true
 
-      - name: agent.yaml must match the gitops binding
+      - name: every agent.yaml must match its gitops binding
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           uv sync --locked
-          uv run --locked python tools/check_binding_hash.py
+          uv run --locked python tools/check_agent_bindings.py
 
   lint:
     name: lint
