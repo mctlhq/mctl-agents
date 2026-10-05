@@ -808,6 +808,11 @@ fatal to the run:
   evidence_invalid` for unknown keys today. Until then it seals without
   them (the pre-amendment shape, which stays valid).
 
+**Implemented** by mctlhq/mctl-agents#544 in
+`orchestrator/evidence_producer.py`. The Amendment 2 blocks sit behind
+`MCTL_EVIDENCE_AMENDMENT_2` (default off), which is flipped in the CWFTs only
+once the mctl-api release carrying the follow-up below is deployed.
+
 ### Tier B follow-up (mctl-api) — checklist
 
 A follow-up mctl-api PR against `internal/evidence` must, before any

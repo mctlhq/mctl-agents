@@ -438,7 +438,7 @@ def test_review_feedback_late_rate_limit_after_commits_is_not_rate_limited(tmp_p
     monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a: True)
     monkeypatch.setattr(run_implementer, "_checkout_existing_branch", lambda *_a: None)
     monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a: None)
-    monkeypatch.setattr(run_implementer, "_capture_head_sha", lambda *_a: "abc123")
+    monkeypatch.setattr(run_implementer, "_capture_head_sha", lambda *_a, **_kw: "abc123")
     bases: list[str] = []
 
     def _commits(_dir, base="origin/HEAD"):
@@ -463,7 +463,7 @@ def test_review_feedback_rate_limit_exit_code(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a: True)
     monkeypatch.setattr(run_implementer, "_checkout_existing_branch", lambda *_a: None)
     monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a: None)
-    monkeypatch.setattr(run_implementer, "_capture_head_sha", lambda *_a: "abc123")
+    monkeypatch.setattr(run_implementer, "_capture_head_sha", lambda *_a, **_kw: "abc123")
     monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: False)
     monkeypatch.setattr(run_implementer.anyio, "run", _raise_rate_limited())
 

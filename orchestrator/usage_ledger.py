@@ -464,6 +464,7 @@ class UsageRecorder:
         """
         if type(message).__name__ != "ResultMessage":
             return
+        self._note_evidence(message)
         if not self.enabled:
             self._warn_once(
                 "disabled", "usage recording is off (%s): this run records no model usage", self._off_reason
@@ -474,6 +475,21 @@ class UsageRecorder:
             self._submit(lambda: self._record(message, observed_at))
         except Exception as exc:  # noqa: BLE001 — recording must never break the run it records
             self._warn_once("submit", "could not queue model usage (%s: %s)", type(exc).__name__, exc)
+
+    def _note_evidence(self, message: Any) -> None:
+        """Hand the session's ledger join keys to the run's execution
+        evidence (mctlhq/mctl-agents#544): the reference it carries is
+        exactly `(session_id, model_key)`, and whether this process records
+        those rows at all. Never raises; a no-op outside a governed run."""
+        try:
+            from orchestrator import evidence_producer
+
+            session_id = str(getattr(message, "session_id", "") or "")
+            model_usage = getattr(message, "model_usage", None)
+            keys = [str(k) for k in model_usage] if isinstance(model_usage, Mapping) else []
+            evidence_producer.note_usage(session_id, keys, recorded=self.enabled)
+        except Exception:  # noqa: BLE001, S110 — evidence must never break the run it records
+            pass
 
     def _record(self, message: Any, recorded_at: str) -> None:
         try:

@@ -38,10 +38,9 @@ document that says, for a single governed execution, *which* of those
 canonical records applied: a frozen-dataclass schema, a `sha256:`-prefixed
 content-hash rule, redaction and a validator. It contains **no persistence,
 no store, no retrieval and no I/O of any kind** — Tier B (durable storage
-and the retrieval API) is a separate, later mctl-api issue. This module
-ships inert and additive: nothing in `run_issue_investigator.py`,
-`run_implementer.py`, `run_shepherd.py` or `temporal/workflows/dev_loop.py`
-imports it.
+and the retrieval API) is mctl-api's. This module stays pure: the runners
+reach it only through `orchestrator/evidence_producer.py`
+(mctlhq/mctl-agents#544), which builds, seals and posts the envelope.
 
 PR #483 tried to build the referent as `orchestrator/evidence_store.py`,
 writing durable `_evidence/` trees into the public `mctl-gitops` repository

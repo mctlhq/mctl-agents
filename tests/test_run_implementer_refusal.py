@@ -179,7 +179,7 @@ def _stub_review_feedback(monkeypatch, repo: Path) -> None:
     monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a: True)
     monkeypatch.setattr(run_implementer, "_checkout_existing_branch", lambda *_a: None)
     monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a: None)
-    monkeypatch.setattr(run_implementer, "_capture_head_sha", lambda *_a: "old")
+    monkeypatch.setattr(run_implementer, "_capture_head_sha", lambda *_a, **_kw: "old")
     monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: False)
     monkeypatch.setattr(run_implementer.anyio, "run", lambda *_a, **_kw: None)
 

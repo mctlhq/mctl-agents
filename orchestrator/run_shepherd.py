@@ -99,7 +99,7 @@ from typing import Any, Literal
 import anyio
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
-from orchestrator import policy_checkpoint, tracing, usage_ledger
+from orchestrator import evidence_producer, policy_checkpoint, tracing, usage_ledger
 from orchestrator.ci_checks import CheckBlocker, CIStatus, fetch_failure_logs, read_required_checks
 from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
 from orchestrator.github_token import refresh_github_token
@@ -2801,6 +2801,9 @@ def process_one(
             decision="wait",
             error="could not fetch PR snapshot",
         )
+    # The PR at the head this tick read and decides on: the evidence's
+    # subject (ADR 018 Amendment 2), observed by this run itself.
+    evidence_producer.note("note_subject_pr", pr.repo, pr.number, pr.head_sha)
 
     # A durable PR proves Tier 2 finished its expensive work. Heal a dropped
     # status write and continue on the same tick instead of waiting forever.
@@ -3838,6 +3841,38 @@ def reconcile_one(
 
 
 # ---------------------------------------------------------------------------
+# Execution evidence (mctlhq/mctl-agents#544)
+# ---------------------------------------------------------------------------
+#: Decisions that act on nothing. A proposal that only waited, and made no
+#: checkpointed action and hit no error, governed nothing this tick, so it
+#: posts no envelope: the shepherd sweeps every open proposal every tick.
+_EVIDENCE_IDLE_DECISIONS = frozenset({"wait", "dry-run"})
+
+
+def _process_one_with_evidence(ref: ProposalRef, *, state_dir: Path, execution_context: Any) -> ShepherdResult:
+    """`process_one` under the run's execution evidence: one sealed
+    envelope per proposal this tick acted on, posted however it ends and
+    never fatal (see `orchestrator.evidence_producer`)."""
+    with evidence_producer.run(evidence_producer.STAGE_SHEPHERD) as evidence:
+        evidence_producer.note("note_runtime_context", execution_context)
+        result = process_one(ref, state_dir=state_dir, execution_id=execution_context.context_id)
+        evidence_producer.safely(_note_shepherd_evidence, evidence, ref, result)
+        return result
+
+
+def _note_shepherd_evidence(
+    evidence: evidence_producer.RunEvidence, ref: ProposalRef, result: ShepherdResult
+) -> None:
+    evidence.note_proposal_status(ref.service, ref.slug, ref.status_path)
+    if result.error:
+        evidence.set_outcome("failed", "shepherd-error")
+    else:
+        evidence.set_outcome("succeeded", result.decision)
+    if result.decision in _EVIDENCE_IDLE_DECISIONS and not result.error and not evidence.decisions:
+        evidence.discard()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def _print_summary(results: list[ShepherdResult]) -> None:
@@ -4080,7 +4115,7 @@ def main() -> None:
         # threaded through so a non-default ``--state-dir`` is honoured
         # by every helper (find_pr_for_proposal, apply_followup, ...)
         # rather than silently falling back to the env-driven default.
-        result = process_one(ref, state_dir=state_dir, execution_id=execution_context.context_id)
+        result = _process_one_with_evidence(ref, state_dir=state_dir, execution_context=execution_context)
         results.append(result)
         if result.decision == "address-review":
             spent_estimate += per_call_estimate

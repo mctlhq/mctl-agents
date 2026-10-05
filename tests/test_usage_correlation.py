@@ -315,7 +315,7 @@ def test_a_review_fix_names_its_pr(tmp_path, monkeypatch):
     monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a: True)
     monkeypatch.setattr(run_implementer, "_checkout_existing_branch", lambda *_a: None)
     monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a: None)
-    monkeypatch.setattr(run_implementer, "_capture_head_sha", lambda *_a: "old")
+    monkeypatch.setattr(run_implementer, "_capture_head_sha", lambda *_a, **_kw: "old")
     monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
     monkeypatch.setattr(run_implementer, "_push_followup", lambda *_a, **_kw: None)
     seen: list[dict] = []
