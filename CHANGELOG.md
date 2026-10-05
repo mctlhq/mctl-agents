@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.68.1](https://github.com/mctlhq/mctl-agents/compare/1.68.0...1.68.1) (2026-10-05)
+
+
+### Bug Fixes
+
+* **manifest:** map the three new catalog profiles to their agents ([47d8740](https://github.com/mctlhq/mctl-agents/commit/47d8740faa45d56a9c86199e772faa6244a673f5))
+* **manifest:** map the three new catalog profiles to their agents ([9d79764](https://github.com/mctlhq/mctl-agents/commit/9d7976463f480e94f3a4f8413212a6679f665f56)), closes [#470](https://github.com/mctlhq/mctl-agents/issues/470)
+* **release:** empty UNBOUND_AGENTS now that all six agents are bound ([866e0c7](https://github.com/mctlhq/mctl-agents/commit/866e0c72f50b5e85644c2ab643ddad95ef3aef5a)), closes [#470](https://github.com/mctlhq/mctl-agents/issues/470)
+* **release:** promote an agent only when its gitops binding matches ([8dcf1c5](https://github.com/mctlhq/mctl-agents/commit/8dcf1c5c02817dd9459a9c78a535ecba5220c909))
+
 ## [1.68.0](https://github.com/mctlhq/mctl-agents/compare/1.67.1...1.68.0) (2026-10-05)
 
 
