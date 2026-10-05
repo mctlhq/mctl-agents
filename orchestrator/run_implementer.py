@@ -3044,21 +3044,15 @@ def _has_new_commits(repo_dir: Path, base: str = "origin/HEAD") -> bool:
 def _note_pushed_head(repo_dir: Path) -> None:
     """Hand the commit this run just pushed to its execution evidence, so the
     evidence's subject is bound to the revision this run produced rather
-    than to whatever the PR head is at seal time (claude P2 on #577). Only
-    the Amendment 2 `subject` block uses it, so nothing runs while that flag
-    is off. Read straight from the local clone, which is exactly what the
-    push sent; never fatal."""
-    if not evidence_producer.amendment_2_enabled():
-        return
+    than to whatever the PR head is at seal time (claude P2 on #577). Read
+    straight from the local clone, which is exactly what the push sent;
+    cheap, so it runs whatever the Amendment 2 flag says (the seal decides
+    whether `subject` is emitted); never fatal."""
     try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],  # noqa: S607 — git from PATH, as every other caller
-            cwd=repo_dir, capture_output=True, text=True, timeout=10, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+        sha = _capture_head_sha(repo_dir)
+    except Exception:  # noqa: BLE001 — evidence bookkeeping must never fail the run
         return
-    if proc.returncode == 0:
-        evidence_producer.note("note_pushed_head", proc.stdout.strip())
+    evidence_producer.note("note_pushed_head", sha)
 
 
 def _capture_head_sha(repo_dir: Path) -> str:

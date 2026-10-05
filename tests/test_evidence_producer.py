@@ -717,6 +717,9 @@ def test_identical_policy_decisions_are_deduplicated_and_the_list_is_capped():
     many.set_outcome("succeeded")
     capped = ep.build(many, amendment_2=False, created_at=CREATED_AT)
     assert len(capped.policy_decisions) == ep.MAX_POLICY_DECISIONS
+    # The newest are kept: the last decision of the run survives the cap.
+    newest = many.decisions[-1].action_digest
+    assert capped.policy_decisions[-1].action_digest == newest
     assert ("policy_decisions", "observation_failed", True) in _gaps(capped)
     assert len(ep.envelope_bytes(capped)) < 256 * 1024
 
@@ -736,7 +739,7 @@ def test_the_implementer_subject_is_the_commit_it_pushed_not_the_head_at_seal_ti
     assert sealed.subject == ee.SubjectRef("pull_request", "mctlhq/mctl-agents", "7", SHA)
 
 
-def test_note_pushed_head_reads_the_local_clone_only_behind_the_flag(monkeypatch, tmp_path):
+def test_note_pushed_head_reads_the_local_clone_whatever_the_flag(tmp_path):
     import subprocess as sp
 
     from orchestrator import run_implementer as ri
@@ -746,9 +749,8 @@ def test_note_pushed_head_reads_the_local_clone_only_behind_the_flag(monkeypatch
             "--allow-empty", "-m", "x"], check=True)
     head = sp.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     with ep.run(ep.STAGE_IMPLEMENTER, environ={}) as evidence:
-        ri._note_pushed_head(tmp_path)
+        ri._note_pushed_head(tmp_path / "missing")  # never fatal
         assert evidence.pushed_head_sha == ""
-        monkeypatch.setenv(ep.AMENDMENT_2_ENV, "true")
         ri._note_pushed_head(tmp_path)
         assert evidence.pushed_head_sha == head
 
@@ -762,14 +764,23 @@ def test_retry_after_is_honoured_and_clamped():
         def __call__(self, url, body, headers):
             Limited.calls += 1
             if Limited.calls == 1:
-                return httpx.Response(429, headers={"Retry-After": "3"})
+                return httpx.Response(429, headers={"Retry-After": "1.5"})
             if Limited.calls == 2:
                 return httpx.Response(503, headers={"Retry-After": "120"})
             return httpx.Response(201, json={})
 
     result = ep.deliver(b"{}", url="https://x.test", token=TOKEN, post=Limited(), sleep=delays.append)
     assert result[0] == ep.CREATED
-    assert delays == [3.0, ep.MAX_RETRY_AFTER_SECONDS]
+    assert delays == [1.5, ep.MAX_RETRY_AFTER_SECONDS]
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "0", "-5", "soon"])
+def test_a_hostile_retry_after_falls_back_to_the_default_backoff(value):
+    """Claude P3 on #577: NaN must never reach time.sleep, and 0 or a
+    negative value must not remove the backoff."""
+    resp = httpx.Response(429, headers={"Retry-After": value})
+    delay = ep._retry_after(resp, default=1.0)
+    assert delay == 1.0
 
 
 def test_a_failing_result_mapper_never_reaches_the_run(monkeypatch, tmp_path, live_post):
@@ -783,3 +794,26 @@ def test_a_failing_result_mapper_never_reaches_the_run(monkeypatch, tmp_path, li
     result = ri.implement_one(_implementer_ref(tmp_path))
     assert result.pr_url == "u"
     assert live_post.envelope()["outcome"] == {"code": "failed", "reason_code": "no-outcome-recorded"}
+
+
+def test_two_proposals_in_one_implementer_batch_post_two_distinct_evidence_ids(monkeypatch, tmp_path, live_post):
+    """Claude P3 on #577: an implementer batch shares one ex- id too, so the
+    proposal-status record must tell its envelopes apart."""
+    from orchestrator import run_implementer as ri
+
+    refs = []
+    for name in ("issue-1", "issue-2"):
+        proposal_dir = tmp_path / name
+        proposal_dir.mkdir()
+        (proposal_dir / ".status.yaml").write_text("status: accepted\n")
+        refs.append(ri.ProposalRef(service="mctl-agents", slug=name, proposal_dir=proposal_dir, status="accepted"))
+
+    def failing(ref_, dry_run=False):
+        ep.note("note_runtime_context", SimpleNamespace(context_id=RUNTIME_ID, trace_id="", assertions=None))
+        return ri.ImplementResult(ref=ref_, pr_url=None, error="push failed")
+
+    monkeypatch.setattr(ri, "_implement_one", failing)
+    for ref in refs:
+        ri.implement_one(ref)
+    ids = {live_post.envelope(i)["evidence_id"] for i in range(len(live_post.calls))}
+    assert len(live_post.calls) == 2 and len(ids) == 2

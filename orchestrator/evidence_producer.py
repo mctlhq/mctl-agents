@@ -18,9 +18,11 @@ sec. 1, acceptance criterion 1 of #199 as reworded on 2026-10-04):
   work-item layer resolved one. `trace_id` only when it is known: the live
   OpenTelemetry trace when tracing (#195) is on, else a control-plane-minted
   context's own trace id. Tracing is enrichment, never a dependency.
-- `policy_decisions` and `approvals`: every `policy_checkpoint` decision this
-  run made, captured in-process from `policy_checkpoint.emit` (the one place
-  every decision is recorded). An approval-flow decision's `aar_` receipt
+- `policy_decisions` and `approvals`: every distinct `policy_checkpoint`
+  decision this run made (identical refs are kept once; past
+  `MAX_POLICY_DECISIONS` the newest are kept and the overflow is a gap),
+  captured in-process from `policy_checkpoint.emit` (the one place every
+  decision is recorded). An approval-flow decision's `aar_` receipt
   becomes an `ApprovalRef` bound to the action digest (the intent hash).
 - `snapshot_refs` and `execution_request`: the investigator's sealed
   `ContextSnapshot` (local `cs-` id and, when the store kept it, the `cs_`
@@ -75,6 +77,7 @@ import collections
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -101,7 +104,9 @@ INGEST_PATH = "/api/v1/evidence/records"
 
 # The producer's whole budget on a run's tail, every read and post included:
 # - delivery: at most ATTEMPTS posts of REQUEST_TIMEOUT_SECONDS each plus the
-#   delays between them, under 20 s against a dead store;
+#   two delays between them (each at most MAX_RETRY_AFTER_SECONDS, also when
+#   a Retry-After asks for longer): 3 x 5 s + 2 x 2 s, under 20 s against a
+#   dead store;
 # - the investigator's `xr_` read, when it was given one: one read bounded
 #   by READ_TIMEOUT_SECONDS;
 # - the PR head read at seal time, Amendment 2 only and only when the run
@@ -129,8 +134,9 @@ BUILD_FAILED = "build_failed"
 #: gaps) is counted here AND under its delivery result, so the sum of
 #: `stats()` exceeds the number of runs when any envelope was degraded.
 DEGRADED = "degraded"
-#: The longest `Retry-After` a 429/503 is honoured for, so the tail stays bounded.
-MAX_RETRY_AFTER_SECONDS = 5.0
+#: The longest `Retry-After` a 429/503 is honoured for, so the tail stays
+#: within the budget below; never shorter than the default backoff.
+MAX_RETRY_AFTER_SECONDS = 2.0
 
 EVIDENCE_LOG_PREFIX = "EXECUTION_EVIDENCE"
 
@@ -437,8 +443,9 @@ class RunEvidence:
 
     # -- subject (Amendment 2) -------------------------------------------
     def note_proposal_status(self, service: str, slug_: str, status_path: Path) -> None:
-        """The proposal's `.status.yaml` as this run left it, as an artifact
-        named `<service>.<slug>`. It is what tells two proposals' envelopes
+        """The proposal's status record as this run left it (the ref's
+        `status_path`: `.status.yaml`, or an adopted PR's record file), as an
+        artifact named `<service>.<slug>`. It is what tells two proposals' envelopes
         apart in the pre-amendment shape: a shepherd tick or an implementer
         batch shares one `ex-` id across proposals, and without a
         per-proposal record two proposals reaching the same outcome would
@@ -642,7 +649,7 @@ def _runtime_from_environment(evidence: RunEvidence) -> None:
 
 
 def _policy_refs(evidence: RunEvidence) -> tuple[list[ee.PolicyDecisionRef], list[ee.ApprovalRef], list[ee.Gap]]:
-    decisions: list[ee.PolicyDecisionRef] = []
+    decisions: dict[ee.PolicyDecisionRef, None] = {}
     approvals: dict[str, ee.ApprovalRef] = {}
     gaps: list[ee.Gap] = []
     for seen in evidence.decisions:
@@ -656,8 +663,9 @@ def _policy_refs(evidence: RunEvidence) -> tuple[list[ee.PolicyDecisionRef], lis
             rule_id=seen.rule_id,
             approval_ref=approval_ref,
         )
-        if ref not in decisions:
-            decisions.append(ref)
+        # Re-inserted at the end, so the order is by most recent occurrence.
+        decisions.pop(ref, None)
+        decisions[ref] = None
         if not approval_ref:
             continue
         state = _APPROVAL_STATE_BY_CODE.get(seen.code)
@@ -665,10 +673,13 @@ def _policy_refs(evidence: RunEvidence) -> tuple[list[ee.PolicyDecisionRef], lis
             approvals[approval_ref] = ee.ApprovalRef(approval_id=approval_ref, intent_hash=digest, state=state)
         elif seen.code in _APPROVAL_UNKNOWN_CODES:
             gaps.append(ee.Gap(block="approvals", code="observation_failed", required=True))
-    if len(decisions) > MAX_POLICY_DECISIONS:
-        decisions = decisions[:MAX_POLICY_DECISIONS]
+    refs = list(decisions)
+    if len(refs) > MAX_POLICY_DECISIONS:
+        # Keep the newest: a run long enough to overflow usually ends with
+        # its most consequential decisions (the push, the merge gate).
+        refs = refs[-MAX_POLICY_DECISIONS:]
         gaps.append(ee.Gap(block="policy_decisions", code="observation_failed", required=True))
-    return decisions, list(approvals.values()), gaps
+    return refs, list(approvals.values()), gaps
 
 
 def _tool_calls(evidence: RunEvidence) -> tuple[list[ee.ToolCallRef], list[ee.Gap]]:
@@ -940,7 +951,11 @@ def _retry_after(resp: httpx.Response | None, *, default: float) -> float:
         seconds = float(raw)
     except ValueError:
         return default
-    return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
+    if not math.isfinite(seconds):
+        return default
+    # Never shorter than the default backoff (a 0 or negative value is not
+    # an invitation to hammer), never longer than the budget allows.
+    return min(max(seconds, default), max(MAX_RETRY_AFTER_SECONDS, default))
 
 
 def safely(action: Callable[..., None], *args: Any, **kwargs: Any) -> None:
