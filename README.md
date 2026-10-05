@@ -418,6 +418,25 @@ worker: set on the shepherd alone, it defers while the worker's activity
 answers `merge_gate_disabled`, so nothing merges and the only signal is the
 shepherd's `MERGE_GATED` line.
 
+**Agent-definition gate** (mctl-agents#470,
+[ADR 016 amendment 1](docs/adr/016-shepherd-merge-approval.md)) is keyed on
+what the PR changes, not on the service, and no variable turns it off. A PR
+that changes a path under `agents/_manifests/` or
+`platform-gitops/agent-platform/` — or whose changed paths could not be
+read in full (unreadable, or more than 100 files) — is never merged by
+automation without a human decision: the merge is decided under its own
+policy rule, `github-pr-merge-agent-definition` (`REQUIRE_APPROVAL`), which
+blocks while `MCTL_POLICY_APPROVALS` is unset. The shepherd prints one
+`MERGE_NEEDS_HUMAN pr=... head=...` line per head, records
+`merge_needs_human` / `merge_needs_human_head` in `.status.yaml`, and keeps
+returning `defer-merge` without charging anything. To finish such a PR,
+review it and merge it by hand; the next tick flips the proposal to
+`merged`. `merge_needs_human` says why: `agent-definition` when a protected
+path was seen, `changed-paths-truncated` or `changed-paths-unreadable` when
+the gate only failed closed. The gate covers those two trees only: the
+prompt files a manifest points at (`agents/*/.claude/agents/*.md`,
+`agents/_mentor/CLAUDE.md`, ...) are outside it and merge as before.
+
 `NEVER_MERGE_SERVICES` (currently `{"mctl-academy"}`) is a code
 constant, not an env var: such a service never resolves to full, and
 `merge_pr()` independently refuses to merge it — content publication
@@ -491,7 +510,9 @@ Decisions:
   `gh pr merge --merge --delete-branch --match-head-commit <SHA>` so
   a push that lands between review and merge cannot smuggle
   unreviewed code through. On HEAD-SHA mismatch we fall back to
-  `wait` and the next tick re-evaluates.
+  `wait` and the next tick re-evaluates. A PR that changes agent
+  definitions is not merged here: see the agent-definition gate above
+  (the tick reports `defer-merge`).
 - **defer-merge** — codex clean, no required check failing, merge
   state mergeable, but the service is in fix-only mode: merge is
   owned by another PR lifecycle. Records `merge_owner: pr-steward` in

@@ -214,3 +214,163 @@ greppable signal for an operator to fall back to a manual merge. A policy
 flip mid-wait invalidates any pending receipt as `mismatch`, which is
 logged and recoverable by re-approving under the new policy, not silently
 lost.
+
+## Amendment 1 — a PR that changes agent definitions needs a human, always (mctlhq/mctl-agents#470)
+
+> **Date:** 2026-10-05. Owner decision: "an agent-authored PR that changes
+> agent definitions must not be merged by automation without a human
+> decision." Acceptance matrix row 4 of #470.
+
+The decision above gates a merge per **service**, and only when two
+variables are set. Nothing in it looked at **what the PR changes**, so with
+the defaults the shepherd would merge an agent-authored PR that rewrites an
+agent's own definition. This amendment adds a second, unconditional gate
+keyed on the changed paths. It changes nothing in sections 1–4.
+
+### The protected paths
+
+`run_shepherd.AGENT_DEFINITION_PATH_PREFIXES`, one constant:
+
+| prefix | where |
+| --- | --- |
+| `agents/_manifests/` | mctl-agents: the agent manifests |
+| `platform-gitops/agent-platform/` | mctl-gitops: definitions, execution profiles, policy, release bindings |
+
+The second is listed although `NEVER_MERGE_SERVICES` already keeps the
+shepherd from merging mctl-gitops: this rule must not depend on that list.
+
+**Scope.** These two trees and nothing else, which is the path #470 row 4
+names. "Agent definition" here means the manifest (`agent.yaml`: runtime
+entrypoint, prompt source list, model policy task, tool policy, budget,
+sandbox) and the gitops catalog. It does **not** cover what a manifest only
+points at:
+
+- the prompt files in `spec.prompt.sources`:
+  `agents/_shepherd/.claude/agents/shepherd.md`,
+  `agents/<service>/.claude/agents/implementer.md`,
+  `agents/_generic/.claude/agents/implementer.md`, `agents/_mentor/CLAUDE.md`,
+  `agents/_incident-responder/CLAUDE.md`;
+- the Python a manifest names (`runtime.entrypoint`, `optionsBuilder`, an
+  `inline:` prompt source), that is `orchestrator/**`.
+
+A PR that only rewrites one of those changes how an agent behaves without
+changing its manifest, and is still merged by the shepherd like any other
+PR. Nothing pins them by hash either: the release binding pins `agent.yaml`
+alone. Whether the prompt trees belong behind this gate is an open owner
+decision, raised in the review of mctlhq/mctl-agents#585. It was not taken
+here because it would stop the automated merge of every prompt-only PR,
+which is a wider change than the one decided on 2026-10-05. Taking it is
+one more prefix in the constant.
+
+### Reading the changed paths
+
+`PRSnapshot.changed_paths` (`ChangedPaths`) is read in the same GraphQL
+query as the head SHA (`changedFiles files(first:100){nodes{path changeType}
+pageInfo{hasNextPage}}`), so the list is about exactly that head. It has
+three states and they are never merged into one:
+
+| state | meaning |
+| --- | --- |
+| `complete` | GitHub said the page is the whole list (`hasNextPage` is `false` and the node count equals `changedFiles`), every node is well formed, and every rename was resolved to both of its paths |
+| `truncated` | some paths were read, GitHub has more (over 100 files) |
+| `unreadable` | not read: a missing or malformed field, a failed rename lookup, or a snapshot that was built without reading paths at all (the dataclass default) |
+
+GraphQL names only the destination of a rename. A PR that moves a manifest
+out of `agents/_manifests/` deletes a definition, so when any node's
+`changeType` is not one of `ADDED`, `MODIFIED`, `DELETED`, `CHANGED` the
+REST files endpoint is read for `previous_filename`. That second read is
+accepted only if it names exactly the files the GraphQL read did; any
+disagreement is `unreadable`.
+
+A malformed answer is `unreadable` even when its count exceeds the nodes
+read: `truncated` is reserved for GitHub saying there is more.
+
+A PR **touches agent definitions** unless its list is `complete` and no
+path is under a protected prefix. `truncated` and `unreadable` count as
+touching: fail closed. The cost is that a PR of more than 100 files is
+never merged by automation.
+
+Failing closed is not the same as claiming the PR changes definitions.
+`run_shepherd.needs_human_kind` names why a merge needs a human, and both
+the log line and `.status.yaml` carry that word:
+
+| kind | when |
+| --- | --- |
+| `agent-definition` | a protected path was seen among the changed paths |
+| `changed-paths-truncated` | no protected path was seen, and the list is truncated |
+| `changed-paths-unreadable` | the list could not be read |
+
+### The policy rule
+
+`BUILTIN_POLICY` gains, before `github-pr-merge`:
+
+```python
+Rule("github-pr-merge-agent-definition", GITHUB_PR_MERGE, "merge:agent-definition", REQUIRE_APPROVAL)
+```
+
+It is its own operation, so `MCTL_POLICY_MERGE_APPROVAL` cannot reach it:
+`MERGE_APPROVAL_POLICY` replaces only `github-pr-merge` and carries this
+rule over unchanged, and the misconfigured variant turns both into `DENY`.
+`SHEPHERD_MERGE_APPROVAL_SERVICES` does not enter into it either. With
+`MCTL_POLICY_APPROVALS` unset (production on 2026-10-05) `REQUIRE_APPROVAL`
+has no store to ask and blocks.
+
+`run_shepherd.merge_operation_for(pr)` is the one function that maps a PR to
+`merge` or `merge:agent-definition`, and every merge path asks it:
+
+| path | for a PR that touches agent definitions |
+| --- | --- |
+| `run_shepherd.merge_pr` (the pod) | decides `merge:agent-definition` with `NO_APPROVALS`, whatever `MCTL_POLICY_APPROVALS` says, so it is always refused and never creates an approval request. The reason is the one in Context: a pod's `execution_id` is new every tick, so a request made by one tick could never be redeemed by the next. Prints `MERGE_NEEDS_HUMAN` |
+| `merge_pull_request_gated` (the activity) | goes on **even with the #519 gate off for the service**, and decides `merge:agent-definition` through `run_gated`. Without a store: `approval_required`, no merge. With `MCTL_POLICY_APPROVALS=mctl-api` on the worker: the ordinary `aar_` receipt path of section 4, bound to `match_head_commit` exactly as a plain gated merge is, under rule id `github-pr-merge-agent-definition` |
+| `run_shepherd.merge_pr_unchecked` (the transport) | takes the operation its caller decided and refuses when it is not the one `merge_operation_for` names. A caller, present or future, that decided the plain `merge` rule cannot merge such a PR. A consistency check, not a permission |
+
+There is no other `gh pr merge` in this repository.
+
+This changes step 1 of section 2. With the gate off the activity can no
+longer answer before any network call, because the PR snapshot is what says
+whether the PR changes definitions: it reads the snapshot (one GraphQL
+query plus the branch-protection read) and then answers
+`merge_gate_disabled` for an ordinary PR as before, which still latches the
+gate off for 8 polls. A `NEVER_MERGE_SERVICES` repo is still answered with
+no read at all. With the gate off and an unreadable snapshot the answer is
+`merge_precondition_unmet`, not `merge_gate_disabled`: it was not observed
+that the gate does not apply. For a PR that does touch definitions the
+activity runs its full reads on every 15-minute poll, the same traffic a
+gated service already has.
+
+### The signal
+
+A blocked definition PR is not a failure. In `process_one`'s merge arm:
+
+- the first tick on a head runs `merge_pr`, which records the
+  `POLICY_DECISION` and prints one line,
+  `MERGE_NEEDS_HUMAN pr=<repo>#<n> head=<sha> reason=<kind> ... code=... rule=...`,
+  and then writes `merge_needs_human: <kind>` and
+  `merge_needs_human_head: <sha>` into `.status.yaml`;
+- every later tick with the same head **and** the same kind returns
+  `defer-merge` without a decision, a line or a write. A new head is
+  signalled once again, and so is a new kind on the same head (a list that
+  was unreadable on one tick and is read on the next);
+- if the PR then reads as ordinary, the two fields are dropped before the
+  merge is attempted, so a transient unreadable read leaves nothing behind;
+- `status` stays what it was and no counter moves (`review_attempts`,
+  `harness_failures`, `refusals`, the CI counters), so waiting on a person
+  never leads to `review-stuck` or `rejected`;
+- when a human merges the PR the next tick reads `MERGED` and takes the
+  ordinary `flip-to-merged` arm, which clears both fields (as does
+  `flip-to-rejected`, and the reconciler's two terminal flips).
+
+The line carries up to five of the matching paths for `agent-definition`,
+and the read's own detail for the other two kinds.
+`merge_owner` is deliberately not written: it is routing metadata for a
+service's mode, and mctlhq/mctl-agents#344 is what happens when a field
+like it is read as an authorization.
+
+### Consequences
+
+On release, an agent-authored PR that touches `agents/_manifests/**` (or
+whose changed paths could not be fully read, or that changes more than 100
+files) stops being merged by the shepherd and waits for a human to merge
+it. Every other PR, a prompt-only PR included (see Scope), is decided,
+logged and merged exactly as before. No gitops change is needed, and none
+can turn the gate off.

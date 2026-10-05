@@ -35,6 +35,12 @@ resolves to fix-only. NEVER_MERGE_SERVICES (a code constant, currently
 {"mctl-academy", "mctl-gitops"}) never resolves to full and merge_pr()
 independently refuses to merge those repos, regardless of env or --fix-only.
 
+Independently of the mode, a PR that changes agent definitions
+(AGENT_DEFINITION_PATH_PREFIXES), or whose changed paths could not be read
+in full, is never merged here: its merge is decided under the
+`github-pr-merge-agent-definition` policy rule and left to a human, with one
+MERGE_NEEDS_HUMAN line per head (mctlhq/mctl-agents#470, ADR 016 amendment 1).
+
 The Claude SDK is used for one specific decision: parsing review
 findings into "merge-ready vs. needs-fix" and shaping the followup
 prompt for the implementer when needed. The sub-agent prompt lives at
@@ -89,6 +95,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
@@ -626,6 +633,149 @@ def _merge_gate_delegated(service: str) -> bool:
 #   fix-only default load-bearing rather than theoretical.
 NEVER_MERGE_SERVICES = frozenset({"mctl-academy", "mctl-gitops", ".github"})
 
+# The protected trees: a PR that changes any path under one of them is never
+# merged by automation without a human decision (mctlhq/mctl-agents#470
+# acceptance row 4, owner decision 2026-10-05;
+# docs/adr/016-shepherd-merge-approval.md amendment 1).
+#
+# Repository-relative path PREFIXES, each ending in "/" so `agents/_manifests`
+# cannot match a sibling such as `agents/_manifests-old/`:
+#
+#   agents/_manifests/               mctl-agents: the agent manifests
+#                                    (`agent.yaml`): runtime entrypoint,
+#                                    prompt SOURCE LIST, model policy task,
+#                                    tool policy, budget, sandbox.
+#   platform-gitops/agent-platform/  mctl-gitops: definitions, execution
+#                                    profiles, policy and release bindings.
+#                                    The shepherd never merges mctl-gitops
+#                                    today (NEVER_MERGE_SERVICES), but this
+#                                    rule must not depend on that list.
+#
+# SCOPE, stated so nobody reads more into the name: this is the manifest and
+# catalog trees and nothing else, which is the path #470 row 4 names. It does
+# NOT cover what a manifest merely points at:
+#
+#   - the prompt files in `spec.prompt.sources`
+#     (`agents/_shepherd/.claude/agents/shepherd.md`,
+#     `agents/<service>/.claude/agents/implementer.md`,
+#     `agents/_generic/.claude/agents/implementer.md`,
+#     `agents/_mentor/CLAUDE.md`, `agents/_incident-responder/CLAUDE.md`);
+#   - the Python a manifest names (`runtime.entrypoint`, `optionsBuilder`,
+#     an `inline:` prompt source), i.e. `orchestrator/**`.
+#
+# A PR that only rewrites one of those changes how an agent behaves without
+# changing its manifest, and is merged like any other PR. Nothing pins them
+# by hash either: the release binding pins `agent.yaml` alone. Whether the
+# prompt trees belong behind this gate is an owner decision (raised in the
+# review of mctlhq/mctl-agents#585); widening it is one more prefix here.
+#
+# Matched against every path a PR changes in ANY repository: the prefixes
+# name a tree, not a repo, so a definition tree vendored elsewhere is covered.
+AGENT_DEFINITION_PATH_PREFIXES: tuple[str, ...] = (
+    "agents/_manifests/",
+    "platform-gitops/agent-platform/",
+)
+
+# What is known about the paths a PR changes. Three states, kept distinct
+# end to end: "could not observe" is never "observed absent".
+#: Every changed path was read, renames included (both endpoints).
+CHANGED_PATHS_COMPLETE = "complete"
+#: Some paths were read but GitHub has more than this read returned.
+CHANGED_PATHS_TRUNCATED = "truncated"
+#: The paths were not read: never attempted, failed, or malformed.
+CHANGED_PATHS_UNREADABLE = "unreadable"
+#: `files(first: N)` on the snapshot query; a PR with more is TRUNCATED.
+CHANGED_PATHS_PAGE = 100
+#: GitHub's `PatchStatus` values for which `path` is the only path involved.
+#: Anything else (RENAMED, COPIED, a value added later) has a second path
+#: the GraphQL node does not carry.
+_SINGLE_PATH_CHANGE_TYPES = frozenset({"ADDED", "MODIFIED", "DELETED", "CHANGED"})
+
+
+@dataclass(frozen=True)
+class ChangedPaths:
+    """The paths a PR changes, with how much of that list is known.
+
+    The default is UNREADABLE on purpose: a snapshot built without reading
+    the paths (a fixture, a projection that has no use for them) must not be
+    mistaken for a PR that changes nothing.
+    """
+
+    state: str = CHANGED_PATHS_UNREADABLE
+    paths: tuple[str, ...] = ()
+    #: Why the state is not COMPLETE; bounded, for the log line only.
+    detail: str = "changed paths were never read"
+
+    @classmethod
+    def complete(cls, paths: Iterable[str] = ()) -> ChangedPaths:
+        return cls(CHANGED_PATHS_COMPLETE, tuple(sorted(set(paths))), "")
+
+
+def agent_definition_paths(changed: ChangedPaths) -> tuple[str, ...]:
+    """The known changed paths that fall under a protected prefix."""
+    return tuple(p for p in changed.paths if p.startswith(AGENT_DEFINITION_PATH_PREFIXES))
+
+
+def touches_agent_definitions(pr: PRSnapshot) -> bool:
+    """True unless the PR's changed paths are COMPLETE and none is protected.
+
+    Fail closed: a truncated or unreadable list counts as touching, because
+    the paths that were not seen are exactly the ones nobody can vouch for.
+    A protected path in a truncated list is of course touching as well.
+    """
+    changed = pr.changed_paths
+    if changed.state != CHANGED_PATHS_COMPLETE:
+        return True
+    return bool(agent_definition_paths(changed))
+
+
+def merge_operation_for(pr: PRSnapshot) -> str:
+    """The `GITHUB_PR_MERGE` operation a merge of this PR is decided under.
+
+    The ONE place that maps a PR to its merge rule. Every merge path asks it
+    (the in-pod `merge_pr`, the gated activity, and `merge_pr_unchecked`
+    itself as the last check), so a new caller cannot pick the plain `merge`
+    rule for a PR that changes agent definitions.
+    """
+    if touches_agent_definitions(pr):
+        return policy_checkpoint.MERGE_OPERATION_AGENT_DEFINITION
+    return policy_checkpoint.MERGE_OPERATION
+
+
+#: `needs_human_kind` when a protected path was SEEN among the changed paths.
+NEEDS_HUMAN_AGENT_DEFINITION = "agent-definition"
+
+
+def needs_human_kind(pr: PRSnapshot) -> str:
+    """Why this PR's merge needs a human, as one bounded word: the value of
+    the `MERGE_NEEDS_HUMAN` line's `reason=` and of `.status.yaml`'s
+    `merge_needs_human`.
+
+    `agent-definition` only when a protected path was observed. A list that
+    could not be read in full is `changed-paths-truncated` or
+    `changed-paths-unreadable`: the gate fails closed on it, but nothing
+    observed that the PR changes agent definitions, and neither record may
+    say it did. Empty when the merge needs no human.
+    """
+    if agent_definition_paths(pr.changed_paths):
+        return NEEDS_HUMAN_AGENT_DEFINITION
+    if pr.changed_paths.state != CHANGED_PATHS_COMPLETE:
+        return f"changed-paths-{pr.changed_paths.state}"
+    return ""
+
+
+def _needs_human_reason(pr: PRSnapshot) -> str:
+    """`needs_human_kind` plus its evidence, as bounded `key=value` log fields."""
+    changed = pr.changed_paths
+    kind = needs_human_kind(pr)
+    hits = agent_definition_paths(changed)
+    if hits:
+        shown = ",".join(json.dumps(p) for p in hits[:5])
+        more = f" more={len(hits) - 5}" if len(hits) > 5 else ""
+        return f"reason={kind} paths_state={changed.state} paths={shown}{more}"
+    return f"reason={kind} detail={json.dumps(changed.detail[:200])}"
+
+
 # Per-service mode: FULL discovers/fixes/merges; FIX_ONLY discovers and fixes
 # but never merges (merge is owned by another PR lifecycle, e.g. pr-steward);
 # SKIP discovers nothing at all.
@@ -1112,6 +1262,11 @@ class PRSnapshot:
     # tests/test_temporal_activities.py) keeps constructing unchanged.
     check_contexts: tuple = ()
     required_contexts: tuple[str, ...] = ()
+    # The paths this head changes against its base (mctlhq/mctl-agents#470),
+    # read in the same GraphQL query as `head_sha`, so the list is about
+    # exactly this head. Defaults to UNREADABLE, never to "no paths": see
+    # `ChangedPaths`. Consumed by `merge_operation_for`.
+    changed_paths: ChangedPaths = ChangedPaths()
 
 
 @dataclass
@@ -1471,6 +1626,98 @@ def _fetch_required_status_check_contexts(
     return tuple(((ref.get("branchProtectionRule") or {}).get("requiredStatusCheckContexts")) or ())
 
 
+def _unreadable_paths(detail: str) -> ChangedPaths:
+    return ChangedPaths(CHANGED_PATHS_UNREADABLE, (), detail)
+
+
+def _read_changed_paths(repo: str, number: int, pr: dict[str, Any]) -> ChangedPaths:
+    """The changed paths of the PR node the snapshot query just returned.
+
+    COMPLETE only when GitHub itself said the page is the whole list
+    (`hasNextPage` is literally false AND the node count equals
+    `changedFiles`) and every node is well formed. A missing or malformed
+    field is a failed read, never an empty list.
+
+    A rename (or any change type with a second path) is resolved through
+    `_rename_sources`: the GraphQL node names only the destination, and a
+    PR that moves a file OUT of a protected tree must be seen at its source.
+    """
+    files = pr.get("files")
+    if not isinstance(files, dict):
+        return _unreadable_paths("files connection missing from the snapshot")
+    nodes = files.get("nodes")
+    if not isinstance(nodes, list):
+        return _unreadable_paths("files.nodes is not a list")
+    paths: list[str] = []
+    second_path_needed = False
+    for node in nodes:
+        path = node.get("path") if isinstance(node, dict) else None
+        if not isinstance(path, str) or not path:
+            return _unreadable_paths("a files node carries no path")
+        paths.append(path)
+        if node.get("changeType") not in _SINGLE_PATH_CHANGE_TYPES:
+            second_path_needed = True
+
+    # Malformed before truncated: `truncated` means GitHub SAID there is
+    # more, and its detail is what tells an operator a 200-file PR from a
+    # broken answer.
+    page_info = files.get("pageInfo")
+    has_next = page_info.get("hasNextPage") if isinstance(page_info, dict) else None
+    raw_total = pr.get("changedFiles")
+    if not isinstance(has_next, bool):
+        return _unreadable_paths("files.pageInfo.hasNextPage missing from the snapshot")
+    if not isinstance(raw_total, int) or isinstance(raw_total, bool):
+        return _unreadable_paths(f"changedFiles={raw_total!r} is not a count")
+    if has_next or raw_total > len(paths):
+        return ChangedPaths(
+            CHANGED_PATHS_TRUNCATED, tuple(sorted(set(paths))),
+            f"read {len(paths)} of {raw_total} changed files",
+        )
+    if raw_total != len(paths):
+        return _unreadable_paths(f"changedFiles={raw_total} does not match the {len(paths)} files read")
+
+    if second_path_needed:
+        sources = _rename_sources(repo, number, frozenset(paths))
+        if sources is None:
+            return _unreadable_paths("a renamed file's previous path could not be read")
+        paths.extend(sources)
+    return ChangedPaths.complete(paths)
+
+
+def _rename_sources(repo: str, number: int, expected: frozenset[str]) -> tuple[str, ...] | None:
+    """The `previous_filename` of every renamed/copied file of the PR, from
+    the REST files endpoint, or None when that cannot be established.
+
+    Only called for a list already known to fit one page. The REST answer
+    is accepted only if it names exactly the paths the snapshot query
+    returned: it is a second read, so a head that moved in between (or any
+    other disagreement) is a failed read, not a shorter list.
+    """
+    try:
+        rows = _gh_api_json([f"repos/{repo}/pulls/{number}/files?per_page={CHANGED_PATHS_PAGE}"])
+    except (subprocess.CalledProcessError, ValueError) as e:
+        msg = (getattr(e, "stderr", None) or "").strip() or str(e)
+        print(f"warn: {repo}#{number}: PR files read failed ({msg}); changed paths are unreadable")
+        return None
+    if not isinstance(rows, list):
+        return None
+    seen: set[str] = set()
+    sources: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("filename"), str):
+            return None
+        seen.add(row["filename"])
+        previous = row.get("previous_filename")
+        if row.get("status") in ("renamed", "copied") and not (isinstance(previous, str) and previous):
+            return None
+        if isinstance(previous, str) and previous:
+            sources.append(previous)
+    if seen != expected:
+        print(f"warn: {repo}#{number}: REST and GraphQL disagree on the changed files; changed paths are unreadable")
+        return None
+    return tuple(sources)
+
+
 def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
     """gh pr view + a small GraphQL probe to assemble a PRSnapshot.
 
@@ -1482,7 +1729,7 @@ def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
     try:
         view = _gh_api_json([
             "graphql", "-f",
-            "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){number state merged mergedAt mergeStateStatus reviewDecision isDraft headRefOid headRefName isCrossRepository headRepositoryOwner{login} baseRepository{owner{login}} baseRefName mergeCommit{oid} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){nodes{__typename ... on PullRequestCommit{commit{oid committedDate}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}}}} commits(last:1){nodes{commit{oid committedDate pushedDate statusCheckRollup{state contexts(last:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl isRequired(pullRequestNumber:$number) title summary databaseId checkSuite{databaseId workflowRun{databaseId url workflow{name}}}} ... on StatusContext{context state targetUrl isRequired(pullRequestNumber:$number)}}}}}}} statusCheckRollup{state}}}}",  # noqa: E501 — single-line GraphQL query, not the kind of prose the line-length limit is meant to keep readable
+            "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){number state merged mergedAt mergeStateStatus reviewDecision isDraft headRefOid headRefName isCrossRepository headRepositoryOwner{login} baseRepository{owner{login}} baseRefName mergeCommit{oid} changedFiles files(first:100){nodes{path changeType} pageInfo{hasNextPage}} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){nodes{__typename ... on PullRequestCommit{commit{oid committedDate}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}}}} commits(last:1){nodes{commit{oid committedDate pushedDate statusCheckRollup{state contexts(last:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl isRequired(pullRequestNumber:$number) title summary databaseId checkSuite{databaseId workflowRun{databaseId url workflow{name}}}} ... on StatusContext{context state targetUrl isRequired(pullRequestNumber:$number)}}}}}}} statusCheckRollup{state}}}}",  # noqa: E501 — single-line GraphQL query, not the kind of prose the line-length limit is meant to keep readable
             "-F", f"owner={repo.split('/')[0]}",
             "-F", f"repo={repo.split('/')[1]}",
             "-F", f"number={number}",
@@ -1618,6 +1865,7 @@ def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
         is_cross_repository=is_cross_repository,
         check_contexts=tuple(check_contexts),
         required_contexts=required_contexts,
+        changed_paths=_read_changed_paths(repo, number, pr),
     )
 
 
@@ -2637,10 +2885,20 @@ def trigger_review(pr: PRSnapshot) -> None:
 # ---------------------------------------------------------------------------
 # Merge — gh pr merge with --match-head-commit per requirements.md L50-60.
 # ---------------------------------------------------------------------------
-def merge_pr_unchecked(pr: PRSnapshot) -> tuple[bool, str | None]:
+def merge_pr_unchecked(
+    pr: PRSnapshot, *, operation: str = policy_checkpoint.MERGE_OPERATION,
+) -> tuple[bool, str | None]:
     """The merge side effect itself, without a policy checkpoint of its
     own: `gh pr merge --merge --delete-branch --match-head-commit <SHA>`,
     plus the re-read for the merge commit oid.
+
+    `operation` is the `GITHUB_PR_MERGE` operation the caller's checkpoint
+    permitted. It must be the one `merge_operation_for(pr)` names: a caller
+    that decided the plain `merge` rule (the default) for a PR that changes
+    agent definitions is refused here, so the human gate of
+    mctlhq/mctl-agents#470 is a property of the transport and not of each
+    caller remembering to ask. This is a consistency check, not a
+    permission: only a checkpoint decision permits a merge.
 
     Refuses NEVER_MERGE_SERVICES independently of any caller — this is also
     the gated Temporal activity's side effect
@@ -2659,6 +2917,14 @@ def merge_pr_unchecked(pr: PRSnapshot) -> tuple[bool, str | None]:
         print(
             f"error: refusing to merge {pr.repo}#{pr.number}: "
             f"{service} merges are gated on a human CODEOWNER"
+        )
+        return (False, None)
+    required = merge_operation_for(pr)
+    if operation != required:
+        why = f" ({_needs_human_reason(pr)})" if required != policy_checkpoint.MERGE_OPERATION else ""
+        print(
+            f"error: refusing to merge {pr.repo}#{pr.number}: the caller decided "
+            f"{operation!r} but this PR's merge is {required!r}{why}"
         )
         return (False, None)
 
@@ -2691,6 +2957,14 @@ def merge_pr_unchecked(pr: PRSnapshot) -> tuple[bool, str | None]:
     return (True, merge_commit)
 
 
+#: Stable, greppable marker of the one log line printed when a merge is left
+#: to a human because the PR changes agent definitions (or its changed paths
+#: could not be fully read). Printed once per head and reason: `process_one`
+#: records both in `.status.yaml` (`merge_needs_human_head`,
+#: `merge_needs_human`) and stays quiet while neither changes.
+MERGE_NEEDS_HUMAN = "MERGE_NEEDS_HUMAN"
+
+
 def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
     """The checkpoint wrapper: decide, then run `merge_pr_unchecked` only on
     a permitted decision. Returns (success, merge_commit_oid) — see
@@ -2719,17 +2993,39 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
     # unconfigured or this service opted out — either way this pod's own
     # merge must stay exactly what it is today (mctlhq/mctl-agents#519
     # review — the inverse used to gate every non-opted-in service).
+    #
+    # A PR that changes agent definitions is decided under its own operation
+    # (mctlhq/mctl-agents#470), whose rule is REQUIRE_APPROVAL in every
+    # policy variant. This pod then decides with NO_APPROVALS, whatever
+    # MCTL_POLICY_APPROVALS says: a pod's `execution_id` is minted per tick
+    # and is part of the approval intent, so a request created here could
+    # never be redeemed by the next tick (ADR 016, "Why #484's
+    # ApprovalTicket is not repairable") and each tick would only leave
+    # another dead request behind. The approval path for such a PR is the
+    # gated activity, which holds one identity for the whole wait; here the
+    # decision is recorded and the merge is left to a human.
+    operation = merge_operation_for(pr)
+    needs_human = operation != policy_checkpoint.MERGE_OPERATION
     try:
         policy_checkpoint.require(policy_checkpoint.checkpoint(
             policy_checkpoint.GITHUB_PR_MERGE,
-            "merge",
+            operation,
             pr_ref,
             {"method": "merge", "delete_branch": True, "match_head_commit": pr.head_sha},
             metadata={"repo": pr.repo, "pr": str(pr.number), "head_sha": pr.head_sha},
+            approvals=policy_checkpoint.NO_APPROVALS if needs_human else None,
         ))
     except policy_checkpoint.PolicyRefused as e:
-        print(f"warn: not merging {pr.repo}#{pr.number}: {e}")
+        if needs_human:
+            print(
+                f"{MERGE_NEEDS_HUMAN} pr={pr.repo}#{pr.number} head={pr.head_sha} "
+                f"{_needs_human_reason(pr)} code={e.decision.code} rule={e.decision.rule_id or '-'}"
+            )
+        else:
+            print(f"warn: not merging {pr.repo}#{pr.number}: {e}")
         return (False, None)
+    if needs_human:
+        return merge_pr_unchecked(pr, operation=operation)
     return merge_pr_unchecked(pr)
 
 
@@ -2981,6 +3277,8 @@ def process_one(
             ci_probe_failures=None,
             ci_blockers_head=None,
             ci_blockers=None,
+            merge_needs_human=None,
+            merge_needs_human_head=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-merged")
 
@@ -2999,6 +3297,8 @@ def process_one(
             ci_probe_failures=None,
             ci_blockers_head=None,
             ci_blockers=None,
+            merge_needs_human=None,
+            merge_needs_human_head=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-rejected")
 
@@ -3334,7 +3634,41 @@ def process_one(
                 decision="defer-merge",
                 notes=f"merge owned by {owner}",
             )
+        # A PR that changes agent definitions is merged by a human, not here
+        # (mctlhq/mctl-agents#470). `merge_pr` still decides it, so the
+        # refusal is the policy's and is on the audit record, but only ONCE
+        # per head and reason: both are kept in `.status.yaml` and later
+        # ticks return quietly. The reason is part of the key because it can
+        # change on one head: a list that was unreadable on one tick (a 502)
+        # may be read on the next and turn out to hold a protected path.
+        # Neither a failure nor an attempt: no counter moves and `status` is
+        # untouched, so the proposal is never flipped to review-stuck or
+        # rejected for waiting on a person. When that person merges, the
+        # next tick reads MERGED and takes the ordinary `flip-to-merged` arm.
+        kind = needs_human_kind(pr)
+        if kind:
+            recorded = _load_status(ref.status_path)
+            if (recorded.get("merge_needs_human_head"), recorded.get("merge_needs_human")) == (pr.head_sha, kind):
+                return ShepherdResult(
+                    ref=ref,
+                    decision="defer-merge",
+                    notes=f"merge needs a human decision ({kind}); already signalled for this head",
+                )
+        else:
+            # An ordinary merge: whatever an earlier tick recorded (another
+            # head, or this one while its paths were unreadable) no longer
+            # holds. Change-only, so it writes nothing when nothing is there.
+            _update_status_if_changed(ref, ref.status, merge_needs_human=None, merge_needs_human_head=None)
         ok, merge_commit = merge_pr(pr)
+        if not ok and kind:
+            _update_status_if_changed(
+                ref, ref.status, merge_needs_human=kind, merge_needs_human_head=pr.head_sha,
+            )
+            return ShepherdResult(
+                ref=ref,
+                decision="defer-merge",
+                notes=f"merge needs a human decision ({kind})",
+            )
         if not ok:
             # Transient: HEAD-SHA mismatch or branch-protection rejection.
             return ShepherdResult(
@@ -3357,6 +3691,8 @@ def process_one(
             ci_probe_failures=None,
             ci_blockers_head=None,
             ci_blockers=None,
+            merge_needs_human=None,
+            merge_needs_human_head=None,
         )
         return ShepherdResult(ref=ref, decision="merge")
 
@@ -3721,6 +4057,8 @@ def reconcile_one(
             refusals_head=None,
             failure=None,
             merge_owner=None,
+            merge_needs_human=None,
+            merge_needs_human_head=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-merged")
     if pr.closed_unmerged:
@@ -3737,6 +4075,8 @@ def reconcile_one(
             refusals_head=None,
             failure=None,
             merge_owner=None,
+            merge_needs_human=None,
+            merge_needs_human_head=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-rejected")
     if ref.status == "needs-triage" and failure_code == "merge-conflict":

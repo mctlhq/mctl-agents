@@ -241,8 +241,12 @@ def test_configured_policy_require_gates_the_merge_rule_under_its_own_version(mo
     assert policy is pc.MERGE_APPROVAL_POLICY
     assert policy.version != pc.BUILTIN_POLICY.version
     merge_rules = [r for r in policy.rules if r.action_kind == pc.GITHUB_PR_MERGE]
-    assert len(merge_rules) == 1
-    assert (merge_rules[0].rule_id, merge_rules[0].verdict) == ("github-pr-merge-approval", pc.REQUIRE_APPROVAL)
+    # The plain merge rule is the one this variant replaces; the
+    # agent-definition rule (mctlhq/mctl-agents#470) is carried over as is.
+    assert [(r.rule_id, r.operation, r.verdict) for r in merge_rules] == [
+        ("github-pr-merge-agent-definition", pc.MERGE_OPERATION_AGENT_DEFINITION, pc.REQUIRE_APPROVAL),
+        ("github-pr-merge-approval", pc.MERGE_OPERATION, pc.REQUIRE_APPROVAL),
+    ]
     # Every other rule is untouched.
     other_ids = {r.rule_id for r in policy.rules if r.action_kind != pc.GITHUB_PR_MERGE}
     assert other_ids == {r.rule_id for r in pc.BUILTIN_POLICY.rules if r.action_kind != pc.GITHUB_PR_MERGE}
@@ -252,8 +256,10 @@ def test_configured_policy_bogus_value_fails_closed_never_allow(monkeypatch):
     monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, "sometimes")
     policy = pc.configured_policy()
     merge_rules = [r for r in policy.rules if r.action_kind == pc.GITHUB_PR_MERGE]
-    assert len(merge_rules) == 1
-    assert merge_rules[0].verdict == pc.DENY
+    # Both merge operations: "refuse every merge" covers the
+    # agent-definition merge too (mctlhq/mctl-agents#470).
+    assert {r.operation for r in merge_rules} == {pc.MERGE_OPERATION, pc.MERGE_OPERATION_AGENT_DEFINITION}
+    assert [r.verdict for r in merge_rules] == [pc.DENY, pc.DENY]
 
 
 def test_configured_policy_bogus_value_never_reaches_the_policy_version(monkeypatch):

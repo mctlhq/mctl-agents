@@ -9,13 +9,20 @@ durable execution that can span the whole human wait
 Order of work, all of it recomputed from GitHub in THIS call (never trusted
 from the caller beyond the head SHA it asked about):
 
-1. Gate off (no `MCTL_POLICY_MERGE_APPROVAL=require`, or the service is not
-   in `SHEPHERD_MERGE_APPROVAL_SERVICES`) -> `merge_gate_disabled`, before
-   any network call.
-2. The service is in `run_shepherd.NEVER_MERGE_SERVICES` -> `merge_forbidden`,
-   before the checkpoint: no human is ever asked to approve a merge the code
-   forbids anyway.
-3. Read the PR snapshot, the codex review and the required-check status.
+1. The service is in `run_shepherd.NEVER_MERGE_SERVICES`: nothing is ever
+   merged here, so it answers before any network call -- `merge_gate_disabled`
+   with the gate off, `merge_forbidden` with it on (no human is ever asked
+   to approve a merge the code forbids anyway).
+2. Read the PR snapshot. With the gate off (no
+   `MCTL_POLICY_MERGE_APPROVAL=require`, or the service is not in
+   `SHEPHERD_MERGE_APPROVAL_SERVICES`) the call ends here as
+   `merge_gate_disabled` UNLESS the PR changes agent definitions
+   (`run_shepherd.merge_operation_for`, mctlhq/mctl-agents#470): that merge
+   is a human decision whatever the gate says, and this activity is the
+   only path that can carry one, so it goes on. An unreadable snapshot is
+   `merge_precondition_unmet`, never "gate disabled": it could not be
+   observed whether the PR is such a PR.
+3. Read the codex review and the required-check status.
 4. Any precondition the merge no longer meets (unreadable snapshot, merged,
    closed, draft, the head moved) -> `merge_precondition_unmet`, nothing
    created or consumed.
@@ -23,9 +30,10 @@ from the caller beyond the head SHA it asked about):
    `merge`; anything else is also `merge_precondition_unmet`. This keeps the
    settle window, the fresh-findings filter and the required-check gates in
    force at the moment of the merge, not at the moment of the request.
-6. Only then, `run_gated()`: the checkpoint decides (asking mctl-api for an
-   approval when the merge-approval policy applies), and the side effect —
-   `run_shepherd.merge_pr_unchecked` — runs only on a permitted decision.
+6. Only then, `run_gated()`: the checkpoint decides the operation
+   `merge_operation_for` named (asking mctl-api for an approval when the
+   rule requires one), and the side effect -- `run_shepherd.merge_pr_unchecked`
+   under that same operation -- runs only on a permitted decision.
 """
 from __future__ import annotations
 
@@ -89,15 +97,21 @@ def _sync_merge_pull_request_gated(inp: GatedActionInput) -> GatedActionResult:
     if not repo or not number or not head_sha or not service:
         return _blocked(CODE_MERGE_PRECONDITION_UNMET, "payload missing repo, pr_number, head_sha or service")
 
-    if not _gate_enabled(service):
-        return _blocked(CODE_MERGE_GATE_DISABLED, f"merge-approval gate is off for {service}")
-
+    gate_on = _gate_enabled(service)
     if service in run_shepherd.NEVER_MERGE_SERVICES:
+        if not gate_on:
+            return _blocked(CODE_MERGE_GATE_DISABLED, f"merge-approval gate is off for {service}")
         return _blocked(CODE_MERGE_FORBIDDEN, f"{service} merges are gated on a human CODEOWNER")
 
     pr = run_shepherd._fetch_pr_snapshot(repo, number)
     if pr is None:
         return _blocked(CODE_MERGE_PRECONDITION_UNMET, f"{repo}#{number}: PR snapshot unreadable")
+    # The operation this merge is decided under: the plain `merge`, or the
+    # agent-definition one, which requires an approval in every policy
+    # variant and regardless of this service's gate (mctlhq/mctl-agents#470).
+    operation = run_shepherd.merge_operation_for(pr)
+    if not gate_on and operation == pc.MERGE_OPERATION:
+        return _blocked(CODE_MERGE_GATE_DISABLED, f"merge-approval gate is off for {service}")
     if pr.merged:
         return _blocked(CODE_MERGE_PRECONDITION_UNMET, f"{repo}#{number} is already merged")
     if pr.closed_unmerged:
@@ -135,7 +149,12 @@ def _sync_merge_pull_request_gated(inp: GatedActionInput) -> GatedActionResult:
                     raise RuntimeError(
                         f"{repo}#{number} head moved to {snap.head_sha} after the approved merge failed"
                     )
-            ok, merge_commit = run_shepherd.merge_pr_unchecked(pr)
+            # The operation rides along only when it is not the default,
+            # so an ordinary merge calls the transport exactly as before.
+            if operation == pc.MERGE_OPERATION:
+                ok, merge_commit = run_shepherd.merge_pr_unchecked(pr)
+            else:
+                ok, merge_commit = run_shepherd.merge_pr_unchecked(pr, operation=operation)
             if ok:
                 return {"merge_commit": merge_commit or ""}
         # Every escape here costs a human decision (run_gated's contract):
@@ -149,7 +168,7 @@ def _sync_merge_pull_request_gated(inp: GatedActionInput) -> GatedActionResult:
     return run_gated(
         inp,
         pc.GITHUB_PR_MERGE,
-        "merge",
+        operation,
         pr_ref,
         {"method": "merge", "delete_branch": True, "match_head_commit": pr.head_sha},
         _side_effect,
