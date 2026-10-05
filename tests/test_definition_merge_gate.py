@@ -78,7 +78,6 @@ def test_a_protected_path_touches_agent_definitions(path: str) -> None:
 
 @pytest.mark.parametrize("path", [
     ORDINARY,
-    "agents/_shepherd/shepherd.md",
     # A sibling whose name merely starts like the protected directory.
     "agents/_manifests-old/implementer/agent.yaml",
     "agents/_manifests.md",
@@ -90,6 +89,38 @@ def test_an_unprotected_path_does_not_touch_agent_definitions(path: str) -> None
     pr = make_pr(changed_paths=ChangedPaths.complete((path,)))
     assert not run_shepherd.touches_agent_definitions(pr)
     assert run_shepherd.merge_operation_for(pr) == pc.MERGE_OPERATION
+
+
+@pytest.mark.parametrize("path", [
+    "agents/_shepherd/.claude/agents/shepherd.md",
+    "agents/mctl-web/.claude/agents/implementer.md",
+    "agents/_generic/.claude/agents/implementer.md",
+    "agents/_mentor/CLAUDE.md",
+    "agents/_incident-responder/CLAUDE.md",
+])
+def test_scope_a_prompt_file_a_manifest_points_at_is_outside_the_gate(path: str) -> None:
+    """The gate's scope today, pinned on purpose rather than by accident:
+    the manifest and catalog trees only (#470 row 4). The prompt files a
+    manifest names in `spec.prompt.sources` are NOT behind it, so a
+    prompt-only PR is merged like any other. Widening the gate to them is an
+    owner decision (review of mctlhq/mctl-agents#585); when it is taken,
+    these become protected and this test changes with the constant."""
+    pr = make_pr(changed_paths=ChangedPaths.complete((path,)))
+    assert run_shepherd.merge_operation_for(pr) == pc.MERGE_OPERATION
+
+
+@pytest.mark.parametrize(("changed", "kind"), [
+    (ChangedPaths.complete((ORDINARY, MANIFEST)), "agent-definition"),
+    # A protected path seen in a list that is not complete is still seen.
+    (ChangedPaths(run_shepherd.CHANGED_PATHS_TRUNCATED, (MANIFEST,), "read 100 of 250"), "agent-definition"),
+    (ChangedPaths(run_shepherd.CHANGED_PATHS_TRUNCATED, (ORDINARY,), "read 100 of 250"), "changed-paths-truncated"),
+    (ChangedPaths(run_shepherd.CHANGED_PATHS_UNREADABLE, (), "gh failed"), "changed-paths-unreadable"),
+    (ChangedPaths.complete((ORDINARY,)), ""),
+])
+def test_the_reason_never_claims_a_definition_change_nobody_observed(changed: ChangedPaths, kind: str) -> None:
+    pr = make_pr(changed_paths=changed)
+    assert run_shepherd.needs_human_kind(pr) == kind
+    assert bool(kind) == run_shepherd.touches_agent_definitions(pr)
 
 
 def test_a_pr_that_changes_no_file_does_not_touch_agent_definitions() -> None:
@@ -194,6 +225,24 @@ def test_read_malformed_is_unreadable_never_empty(node: dict[str, Any], label: s
     changed = _read(node)
     assert changed.state == run_shepherd.CHANGED_PATHS_UNREADABLE, label
     assert run_shepherd.touches_agent_definitions(make_pr(changed_paths=changed)), label
+
+
+@pytest.mark.parametrize("files", [
+    {"nodes": [{"path": ORDINARY, "changeType": "MODIFIED"}]},
+    {"nodes": [{"path": ORDINARY, "changeType": "MODIFIED"}], "pageInfo": {"hasNextPage": None}},
+    {"nodes": [{"path": ORDINARY, "changeType": "MODIFIED"}], "pageInfo": {"hasNextPage": "true"}},
+], ids=["no-pageInfo", "null-hasNextPage", "string-hasNextPage"])
+def test_read_a_malformed_page_is_unreadable_even_when_the_count_says_more(files: dict[str, Any]) -> None:
+    """`truncated` means GitHub said there is more. A broken answer whose
+    count happens to exceed the nodes is still a broken answer."""
+    changed = _read({"files": files, "changedFiles": 250})
+    assert changed.state == run_shepherd.CHANGED_PATHS_UNREADABLE
+    assert "hasNextPage" in changed.detail
+
+
+def test_read_has_next_page_with_a_malformed_count_is_unreadable() -> None:
+    changed = _read(_node(ORDINARY, has_next=True, total=None))
+    assert changed.state == run_shepherd.CHANGED_PATHS_UNREADABLE
 
 
 def _read_with_rest(node: dict[str, Any], rest: Any) -> tuple[ChangedPaths, list[list[str]]]:
@@ -501,7 +550,7 @@ def test_process_one_signals_a_definition_pr_once_per_head(
     assert len(_decisions(out)) == 1
     status = read_status(ref)
     assert status["merge_needs_human_head"] == pr.head_sha
-    assert status["merge_needs_human"] == run_shepherd.MERGE_NEEDS_HUMAN_AGENT_DEFINITION
+    assert status["merge_needs_human"] == run_shepherd.NEEDS_HUMAN_AGENT_DEFINITION
     # Not a failure, not an attempt: nothing that leads to review-stuck or
     # rejected moved.
     assert status["status"] == "implemented"
@@ -518,6 +567,69 @@ def test_process_one_signals_a_definition_pr_once_per_head(
     assert _decisions(out) == []
     assert ref.status_path.read_text() == written, "a repeated tick must not rewrite .status.yaml"
     assert calls == []
+
+
+@pytest.mark.parametrize(("changed", "kind"), [
+    (ChangedPaths(run_shepherd.CHANGED_PATHS_TRUNCATED, (ORDINARY,), "read 100 of 250"), "changed-paths-truncated"),
+    (ChangedPaths(run_shepherd.CHANGED_PATHS_UNREADABLE, (), "HTTP 502"), "changed-paths-unreadable"),
+])
+def test_process_one_records_why_it_could_not_vouch_not_a_definition_change(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    changed: ChangedPaths, kind: str,
+) -> None:
+    """`.status.yaml` is the durable record: it must not say a PR changes
+    agent definitions when the paths simply could not be read."""
+    _stub_gh_merge(monkeypatch)
+    ref = make_ref(tmp_path)
+
+    result = _tick(ref, make_pr(changed_paths=changed))
+
+    assert result.decision == "defer-merge"
+    status = read_status(ref)
+    assert status["merge_needs_human"] == kind
+    assert status["merge_needs_human_head"] == HEAD_SHA
+    [signal] = _signals(capsys.readouterr().out)
+    assert f"reason={kind} " in signal
+
+
+def test_process_one_signals_again_when_the_reason_changes_on_the_same_head(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Unreadable on one tick, read on the next and found to hold a
+    manifest: same head, a different fact, signalled once more."""
+    _stub_gh_merge(monkeypatch)
+    ref = make_ref(tmp_path)
+    _tick(ref, make_pr(changed_paths=ChangedPaths(run_shepherd.CHANGED_PATHS_UNREADABLE, (), "HTTP 502")))
+    capsys.readouterr()
+
+    _tick(ref, _definition_pr())
+
+    [signal] = _signals(capsys.readouterr().out)
+    assert "reason=agent-definition " in signal
+    assert read_status(ref)["merge_needs_human"] == "agent-definition"
+
+    _tick(ref, _definition_pr())
+    assert _signals(capsys.readouterr().out) == []
+
+
+def test_process_one_drops_a_stale_signal_once_the_pr_proves_ordinary(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient unreadable read must not leave "needs a human" on disk
+    for a PR that then reads as ordinary, even if its merge does not go
+    through on that tick."""
+    _stub_gh_merge(monkeypatch)
+    ref = make_ref(tmp_path)
+    _tick(ref, make_pr(changed_paths=ChangedPaths(run_shepherd.CHANGED_PATHS_UNREADABLE, (), "HTTP 502")))
+    assert "merge_needs_human" in read_status(ref)
+
+    with patch.object(run_shepherd, "merge_pr", return_value=(False, None)):
+        result = _tick(ref, make_pr())
+
+    assert result.decision == "wait"
+    status = read_status(ref)
+    assert status["status"] == "implemented"
+    assert "merge_needs_human" not in status and "merge_needs_human_head" not in status
 
 
 def test_process_one_signals_again_for_a_new_head(

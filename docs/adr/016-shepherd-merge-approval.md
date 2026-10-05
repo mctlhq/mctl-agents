@@ -239,6 +239,29 @@ keyed on the changed paths. It changes nothing in sections 1–4.
 The second is listed although `NEVER_MERGE_SERVICES` already keeps the
 shepherd from merging mctl-gitops: this rule must not depend on that list.
 
+**Scope.** These two trees and nothing else, which is the path #470 row 4
+names. "Agent definition" here means the manifest (`agent.yaml`: runtime
+entrypoint, prompt source list, model policy task, tool policy, budget,
+sandbox) and the gitops catalog. It does **not** cover what a manifest only
+points at:
+
+- the prompt files in `spec.prompt.sources`:
+  `agents/_shepherd/.claude/agents/shepherd.md`,
+  `agents/<service>/.claude/agents/implementer.md`,
+  `agents/_generic/.claude/agents/implementer.md`, `agents/_mentor/CLAUDE.md`,
+  `agents/_incident-responder/CLAUDE.md`;
+- the Python a manifest names (`runtime.entrypoint`, `optionsBuilder`, an
+  `inline:` prompt source), that is `orchestrator/**`.
+
+A PR that only rewrites one of those changes how an agent behaves without
+changing its manifest, and is still merged by the shepherd like any other
+PR. Nothing pins them by hash either: the release binding pins `agent.yaml`
+alone. Whether the prompt trees belong behind this gate is an open owner
+decision, raised in the review of mctlhq/mctl-agents#585. It was not taken
+here because it would stop the automated merge of every prompt-only PR,
+which is a wider change than the one decided on 2026-10-05. Taking it is
+one more prefix in the constant.
+
 ### Reading the changed paths
 
 `PRSnapshot.changed_paths` (`ChangedPaths`) is read in the same GraphQL
@@ -259,10 +282,23 @@ REST files endpoint is read for `previous_filename`. That second read is
 accepted only if it names exactly the files the GraphQL read did; any
 disagreement is `unreadable`.
 
+A malformed answer is `unreadable` even when its count exceeds the nodes
+read: `truncated` is reserved for GitHub saying there is more.
+
 A PR **touches agent definitions** unless its list is `complete` and no
 path is under a protected prefix. `truncated` and `unreadable` count as
 touching: fail closed. The cost is that a PR of more than 100 files is
 never merged by automation.
+
+Failing closed is not the same as claiming the PR changes definitions.
+`run_shepherd.needs_human_kind` names why a merge needs a human, and both
+the log line and `.status.yaml` carry that word:
+
+| kind | when |
+| --- | --- |
+| `agent-definition` | a protected path was seen among the changed paths |
+| `changed-paths-truncated` | no protected path was seen, and the list is truncated |
+| `changed-paths-unreadable` | the list could not be read |
 
 ### The policy rule
 
@@ -308,11 +344,15 @@ A blocked definition PR is not a failure. In `process_one`'s merge arm:
 
 - the first tick on a head runs `merge_pr`, which records the
   `POLICY_DECISION` and prints one line,
-  `MERGE_NEEDS_HUMAN pr=<repo>#<n> head=<sha> reason=... code=... rule=...`,
-  and then writes `merge_needs_human: agent-definition` and
+  `MERGE_NEEDS_HUMAN pr=<repo>#<n> head=<sha> reason=<kind> ... code=... rule=...`,
+  and then writes `merge_needs_human: <kind>` and
   `merge_needs_human_head: <sha>` into `.status.yaml`;
-- every later tick on the same head returns `defer-merge` without a
-  decision, a line or a write. A new head is signalled once again;
+- every later tick with the same head **and** the same kind returns
+  `defer-merge` without a decision, a line or a write. A new head is
+  signalled once again, and so is a new kind on the same head (a list that
+  was unreadable on one tick and is read on the next);
+- if the PR then reads as ordinary, the two fields are dropped before the
+  merge is attempted, so a transient unreadable read leaves nothing behind;
 - `status` stays what it was and no counter moves (`review_attempts`,
   `harness_failures`, `refusals`, the CI counters), so waiting on a person
   never leads to `review-stuck` or `rejected`;
@@ -320,8 +360,8 @@ A blocked definition PR is not a failure. In `process_one`'s merge arm:
   ordinary `flip-to-merged` arm, which clears both fields (as does
   `flip-to-rejected`, and the reconciler's two terminal flips).
 
-`reason=` is `agent-definition` with up to five of the matching paths, or
-`changed-paths-truncated` / `changed-paths-unreadable` with the detail.
+The line carries up to five of the matching paths for `agent-definition`,
+and the read's own detail for the other two kinds.
 `merge_owner` is deliberately not written: it is routing metadata for a
 service's mode, and mctlhq/mctl-agents#344 is what happens when a field
 like it is read as an authorization.
@@ -331,5 +371,6 @@ like it is read as an authorization.
 On release, an agent-authored PR that touches `agents/_manifests/**` (or
 whose changed paths could not be fully read, or that changes more than 100
 files) stops being merged by the shepherd and waits for a human to merge
-it. Every other PR is decided, logged and merged exactly as before. No
-gitops change is needed, and none can turn the gate off.
+it. Every other PR, a prompt-only PR included (see Scope), is decided,
+logged and merged exactly as before. No gitops change is needed, and none
+can turn the gate off.

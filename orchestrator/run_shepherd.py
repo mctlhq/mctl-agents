@@ -633,22 +633,41 @@ def _merge_gate_delegated(service: str) -> bool:
 #   fix-only default load-bearing rather than theoretical.
 NEVER_MERGE_SERVICES = frozenset({"mctl-academy", "mctl-gitops", ".github"})
 
-# Paths whose change is a change to an AGENT DEFINITION: what an agent is,
-# which model, skills, capabilities, policy and budget it runs with. A PR
-# that touches any of them is never merged by automation without a human
-# decision (mctlhq/mctl-agents#470 acceptance row 4, owner decision
-# 2026-10-05; docs/adr/016-shepherd-merge-approval.md amendment 1).
+# The protected trees: a PR that changes any path under one of them is never
+# merged by automation without a human decision (mctlhq/mctl-agents#470
+# acceptance row 4, owner decision 2026-10-05;
+# docs/adr/016-shepherd-merge-approval.md amendment 1).
 #
 # Repository-relative path PREFIXES, each ending in "/" so `agents/_manifests`
 # cannot match a sibling such as `agents/_manifests-old/`:
 #
 #   agents/_manifests/               mctl-agents: the agent manifests
-#                                    (`agent.yaml` and what it pins).
+#                                    (`agent.yaml`): runtime entrypoint,
+#                                    prompt SOURCE LIST, model policy task,
+#                                    tool policy, budget, sandbox.
 #   platform-gitops/agent-platform/  mctl-gitops: definitions, execution
 #                                    profiles, policy and release bindings.
 #                                    The shepherd never merges mctl-gitops
 #                                    today (NEVER_MERGE_SERVICES), but this
 #                                    rule must not depend on that list.
+#
+# SCOPE, stated so nobody reads more into the name: this is the manifest and
+# catalog trees and nothing else, which is the path #470 row 4 names. It does
+# NOT cover what a manifest merely points at:
+#
+#   - the prompt files in `spec.prompt.sources`
+#     (`agents/_shepherd/.claude/agents/shepherd.md`,
+#     `agents/<service>/.claude/agents/implementer.md`,
+#     `agents/_generic/.claude/agents/implementer.md`,
+#     `agents/_mentor/CLAUDE.md`, `agents/_incident-responder/CLAUDE.md`);
+#   - the Python a manifest names (`runtime.entrypoint`, `optionsBuilder`,
+#     an `inline:` prompt source), i.e. `orchestrator/**`.
+#
+# A PR that only rewrites one of those changes how an agent behaves without
+# changing its manifest, and is merged like any other PR. Nothing pins them
+# by hash either: the release binding pins `agent.yaml` alone. Whether the
+# prompt trees belong behind this gate is an owner decision (raised in the
+# review of mctlhq/mctl-agents#585); widening it is one more prefix here.
 #
 # Matched against every path a PR changes in ANY repository: the prefixes
 # name a tree, not a repo, so a definition tree vendored elsewhere is covered.
@@ -723,15 +742,38 @@ def merge_operation_for(pr: PRSnapshot) -> str:
     return policy_checkpoint.MERGE_OPERATION
 
 
+#: `needs_human_kind` when a protected path was SEEN among the changed paths.
+NEEDS_HUMAN_AGENT_DEFINITION = "agent-definition"
+
+
+def needs_human_kind(pr: PRSnapshot) -> str:
+    """Why this PR's merge needs a human, as one bounded word: the value of
+    the `MERGE_NEEDS_HUMAN` line's `reason=` and of `.status.yaml`'s
+    `merge_needs_human`.
+
+    `agent-definition` only when a protected path was observed. A list that
+    could not be read in full is `changed-paths-truncated` or
+    `changed-paths-unreadable`: the gate fails closed on it, but nothing
+    observed that the PR changes agent definitions, and neither record may
+    say it did. Empty when the merge needs no human.
+    """
+    if agent_definition_paths(pr.changed_paths):
+        return NEEDS_HUMAN_AGENT_DEFINITION
+    if pr.changed_paths.state != CHANGED_PATHS_COMPLETE:
+        return f"changed-paths-{pr.changed_paths.state}"
+    return ""
+
+
 def _needs_human_reason(pr: PRSnapshot) -> str:
-    """Why this PR's merge needs a human, as bounded `key=value` log fields."""
+    """`needs_human_kind` plus its evidence, as bounded `key=value` log fields."""
     changed = pr.changed_paths
+    kind = needs_human_kind(pr)
     hits = agent_definition_paths(changed)
     if hits:
         shown = ",".join(json.dumps(p) for p in hits[:5])
         more = f" more={len(hits) - 5}" if len(hits) > 5 else ""
-        return f"reason=agent-definition paths_state={changed.state} paths={shown}{more}"
-    return f"reason=changed-paths-{changed.state} detail={json.dumps(changed.detail[:200])}"
+        return f"reason={kind} paths_state={changed.state} paths={shown}{more}"
+    return f"reason={kind} detail={json.dumps(changed.detail[:200])}"
 
 
 # Per-service mode: FULL discovers/fixes/merges; FIX_ONLY discovers and fixes
@@ -1616,19 +1658,23 @@ def _read_changed_paths(repo: str, number: int, pr: dict[str, Any]) -> ChangedPa
         if node.get("changeType") not in _SINGLE_PATH_CHANGE_TYPES:
             second_path_needed = True
 
+    # Malformed before truncated: `truncated` means GitHub SAID there is
+    # more, and its detail is what tells an operator a 200-file PR from a
+    # broken answer.
     page_info = files.get("pageInfo")
     has_next = page_info.get("hasNextPage") if isinstance(page_info, dict) else None
     raw_total = pr.get("changedFiles")
-    total = raw_total if isinstance(raw_total, int) and not isinstance(raw_total, bool) else None
-    if has_next is True or (total is not None and total > len(paths)):
+    if not isinstance(has_next, bool):
+        return _unreadable_paths("files.pageInfo.hasNextPage missing from the snapshot")
+    if not isinstance(raw_total, int) or isinstance(raw_total, bool):
+        return _unreadable_paths(f"changedFiles={raw_total!r} is not a count")
+    if has_next or raw_total > len(paths):
         return ChangedPaths(
             CHANGED_PATHS_TRUNCATED, tuple(sorted(set(paths))),
-            f"read {len(paths)} of {total if total is not None else 'an unknown number of'} changed files",
+            f"read {len(paths)} of {raw_total} changed files",
         )
-    if has_next is not False:
-        return _unreadable_paths("files.pageInfo.hasNextPage missing from the snapshot")
-    if total != len(paths):
-        return _unreadable_paths(f"changedFiles={raw_total!r} does not match the {len(paths)} files read")
+    if raw_total != len(paths):
+        return _unreadable_paths(f"changedFiles={raw_total} does not match the {len(paths)} files read")
 
     if second_path_needed:
         sources = _rename_sources(repo, number, frozenset(paths))
@@ -2913,11 +2959,10 @@ def merge_pr_unchecked(
 
 #: Stable, greppable marker of the one log line printed when a merge is left
 #: to a human because the PR changes agent definitions (or its changed paths
-#: could not be fully read). Printed once per head: `process_one` records the
-#: head in `.status.yaml` (`merge_needs_human_head`) and stays quiet after.
+#: could not be fully read). Printed once per head and reason: `process_one`
+#: records both in `.status.yaml` (`merge_needs_human_head`,
+#: `merge_needs_human`) and stays quiet while neither changes.
 MERGE_NEEDS_HUMAN = "MERGE_NEEDS_HUMAN"
-#: The value of `.status.yaml`'s `merge_needs_human` while that holds.
-MERGE_NEEDS_HUMAN_AGENT_DEFINITION = "agent-definition"
 
 
 def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
@@ -3592,30 +3637,37 @@ def process_one(
         # A PR that changes agent definitions is merged by a human, not here
         # (mctlhq/mctl-agents#470). `merge_pr` still decides it, so the
         # refusal is the policy's and is on the audit record, but only ONCE
-        # per head: the head it was signalled for is kept in `.status.yaml`
-        # and later ticks return quietly. Neither a failure nor an attempt:
-        # no counter moves and `status` is untouched, so the proposal is
-        # never flipped to review-stuck or rejected for waiting on a person.
-        # When that person merges, the next tick reads MERGED and takes the
-        # ordinary `flip-to-merged` arm.
-        needs_human = merge_operation_for(pr) != policy_checkpoint.MERGE_OPERATION
-        if needs_human and _load_status(ref.status_path).get("merge_needs_human_head") == pr.head_sha:
-            return ShepherdResult(
-                ref=ref,
-                decision="defer-merge",
-                notes="merge needs a human decision (agent definitions); already signalled for this head",
-            )
+        # per head and reason: both are kept in `.status.yaml` and later
+        # ticks return quietly. The reason is part of the key because it can
+        # change on one head: a list that was unreadable on one tick (a 502)
+        # may be read on the next and turn out to hold a protected path.
+        # Neither a failure nor an attempt: no counter moves and `status` is
+        # untouched, so the proposal is never flipped to review-stuck or
+        # rejected for waiting on a person. When that person merges, the
+        # next tick reads MERGED and takes the ordinary `flip-to-merged` arm.
+        kind = needs_human_kind(pr)
+        if kind:
+            recorded = _load_status(ref.status_path)
+            if (recorded.get("merge_needs_human_head"), recorded.get("merge_needs_human")) == (pr.head_sha, kind):
+                return ShepherdResult(
+                    ref=ref,
+                    decision="defer-merge",
+                    notes=f"merge needs a human decision ({kind}); already signalled for this head",
+                )
+        else:
+            # An ordinary merge: whatever an earlier tick recorded (another
+            # head, or this one while its paths were unreadable) no longer
+            # holds. Change-only, so it writes nothing when nothing is there.
+            _update_status_if_changed(ref, ref.status, merge_needs_human=None, merge_needs_human_head=None)
         ok, merge_commit = merge_pr(pr)
-        if not ok and needs_human:
+        if not ok and kind:
             _update_status_if_changed(
-                ref, ref.status,
-                merge_needs_human=MERGE_NEEDS_HUMAN_AGENT_DEFINITION,
-                merge_needs_human_head=pr.head_sha,
+                ref, ref.status, merge_needs_human=kind, merge_needs_human_head=pr.head_sha,
             )
             return ShepherdResult(
                 ref=ref,
                 decision="defer-merge",
-                notes="merge needs a human decision (agent definitions)",
+                notes=f"merge needs a human decision ({kind})",
             )
         if not ok:
             # Transient: HEAD-SHA mismatch or branch-protection rejection.

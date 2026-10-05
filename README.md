@@ -431,7 +431,11 @@ blocks while `MCTL_POLICY_APPROVALS` is unset. The shepherd prints one
 `merge_needs_human` / `merge_needs_human_head` in `.status.yaml`, and keeps
 returning `defer-merge` without charging anything. To finish such a PR,
 review it and merge it by hand; the next tick flips the proposal to
-`merged`.
+`merged`. `merge_needs_human` says why: `agent-definition` when a protected
+path was seen, `changed-paths-truncated` or `changed-paths-unreadable` when
+the gate only failed closed. The gate covers those two trees only: the
+prompt files a manifest points at (`agents/*/.claude/agents/*.md`,
+`agents/_mentor/CLAUDE.md`, ...) are outside it and merge as before.
 
 `NEVER_MERGE_SERVICES` (currently `{"mctl-academy"}`) is a code
 constant, not an env var: such a service never resolves to full, and
