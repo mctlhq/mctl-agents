@@ -3856,13 +3856,20 @@ def _process_one_with_evidence(ref: ProposalRef, *, state_dir: Path, execution_c
     with evidence_producer.run(evidence_producer.STAGE_SHEPHERD) as evidence:
         evidence.note_runtime_context(execution_context)
         result = process_one(ref, state_dir=state_dir, execution_id=execution_context.context_id)
-        if result.error:
-            evidence.set_outcome("failed", "shepherd-error")
-        else:
-            evidence.set_outcome("succeeded", result.decision)
-        if result.decision in _EVIDENCE_IDLE_DECISIONS and not result.error and not evidence.decisions:
-            evidence.discard()
+        evidence_producer.safely(_note_shepherd_evidence, evidence, ref, result)
         return result
+
+
+def _note_shepherd_evidence(
+    evidence: evidence_producer.RunEvidence, ref: ProposalRef, result: ShepherdResult
+) -> None:
+    evidence.note_proposal_status(ref.service, ref.slug, ref.status_path)
+    if result.error:
+        evidence.set_outcome("failed", "shepherd-error")
+    else:
+        evidence.set_outcome("succeeded", result.decision)
+    if result.decision in _EVIDENCE_IDLE_DECISIONS and not result.error and not evidence.decisions:
+        evidence.discard()
 
 
 # ---------------------------------------------------------------------------

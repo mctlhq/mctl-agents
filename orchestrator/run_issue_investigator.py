@@ -3147,7 +3147,7 @@ def investigate(
             execution_request_id=execution_request_id,
             human_input_responses=human_input_responses,
         )
-        _note_investigation_evidence(evidence, result)
+        evidence_producer.safely(_note_investigation_evidence, evidence, result)
         return result
 
 

@@ -2620,6 +2620,7 @@ def _note_implement_evidence(
         evidence.set_outcome("failed", "no-pr")
     if result.pr_url:
         evidence.note_subject_pr_url(result.pr_url)
+    evidence.note_proposal_status(result.ref.service, result.ref.slug, result.ref.status_path)
 
 
 def review_feedback_one(
@@ -2635,7 +2636,7 @@ def review_feedback_one(
         if dry_run:
             evidence.discard()
         result = _review_feedback_one(ref, bundle, dry_run=dry_run, branch=branch)
-        _note_implement_evidence(evidence, result, success_reason="review-addressed")
+        evidence_producer.safely(_note_implement_evidence, evidence, result, success_reason="review-addressed")
         return result
 
 
@@ -2885,6 +2886,7 @@ def _review_feedback_one(
         # git runs, and the push's own lease catches it even if the claim
         # check could not (store unreachable, rollout below `enforce`).
         _push_followup(target, branch, old_head, claim_context=claim_ctx, repo=f"mctlhq/{ref.service}")
+        _note_pushed_head(target)
 
         # 8. Read the existing PR URL from `.status.yaml` for the result
         # surface; do NOT rewrite the status — that belongs to the shepherd.
@@ -3037,6 +3039,26 @@ def _has_new_commits(repo_dir: Path, base: str = "origin/HEAD") -> bool:
     """
     proc = _run(["git", "log", "--oneline", f"{base}..HEAD"], cwd=repo_dir, check=False)
     return bool(proc.stdout.strip())
+
+
+def _note_pushed_head(repo_dir: Path) -> None:
+    """Hand the commit this run just pushed to its execution evidence, so the
+    evidence's subject is bound to the revision this run produced rather
+    than to whatever the PR head is at seal time (claude P2 on #577). Only
+    the Amendment 2 `subject` block uses it, so nothing runs while that flag
+    is off. Read straight from the local clone, which is exactly what the
+    push sent; never fatal."""
+    if not evidence_producer.amendment_2_enabled():
+        return
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],  # noqa: S607 — git from PATH, as every other caller
+            cwd=repo_dir, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    if proc.returncode == 0:
+        evidence_producer.note("note_pushed_head", proc.stdout.strip())
 
 
 def _capture_head_sha(repo_dir: Path) -> str:
@@ -3862,7 +3884,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         if dry_run:
             evidence.discard()
         result = _implement_one(ref, dry_run=dry_run)
-        _note_implement_evidence(evidence, result, success_reason="pr-opened")
+        evidence_producer.safely(_note_implement_evidence, evidence, result, success_reason="pr-opened")
         return result
 
 
@@ -4332,6 +4354,7 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
 
         # 7. Push + PR.
         pr_url = _push_and_open_pr(target, ref, claim_context=claim_ctx)
+        _note_pushed_head(target)
 
         # 8. Mark implemented.
         completed_attempt = dict(attempt)

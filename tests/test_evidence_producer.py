@@ -367,13 +367,18 @@ def test_an_approval_decision_links_its_receipt_and_an_unknown_lookup_is_a_gap()
 
 def test_a_malformed_reference_degrades_to_explicit_gaps_instead_of_losing_the_envelope():
     evidence = _run()
+    _decision(evidence)
+    evidence.note_usage("sess-1", ["claude-opus"], recorded=True)
     evidence.set_outcome("succeeded")
     evidence.artifacts.append(ee.ArtifactRef(name="../escape", kind="file", content_hash="sha256:" + "0" * 64))
     sealed = ep.build(evidence, amendment_2=False, created_at=CREATED_AT)
     assert sealed.artifacts == ()
     assert ("artifacts", "observation_failed", True) in _gaps(sealed)
     assert sealed.execution.runtime_execution_id == RUNTIME_ID
-    assert ep.stats() == {"degraded": 1}
+    # Only the block that failed is lost (claude P3 on #577).
+    assert len(sealed.policy_decisions) == 1 and sealed.usage is not None
+    assert not any(g.block in ("policy_decisions", "usage") and g.code == "observation_failed" for g in sealed.gaps)
+    assert ep.stats() == {ep.DEGRADED: 1}
 
 
 # ---------------------------------------------------------------------------
@@ -666,3 +671,115 @@ def test_usage_ledger_hands_the_session_to_the_active_run():
     with ep.run(ep.STAGE_IMPLEMENTER, environ={}) as evidence:
         recorder.observe(message)
     assert evidence.usage is None and evidence.usage_unrecorded
+
+
+def test_two_proposals_on_one_shepherd_tick_post_two_distinct_evidence_ids(monkeypatch, tmp_path, live_post):
+    """Claude P2 on #577: one tick shares one ex- id across proposals, so
+    without a per-proposal record two proposals with the same outcome would
+    seal byte-identical envelopes and collapse into one Tier B row."""
+    from orchestrator import run_shepherd as rs
+    from orchestrator.execution_identity import mint_local
+
+    context = mint_local(executor_type="shepherd", workflow_type="review-fix", agent="shepherd")
+    refs = []
+    for name in ("issue-1", "issue-2"):
+        proposal_dir = tmp_path / name
+        proposal_dir.mkdir()
+        (proposal_dir / ".status.yaml").write_text("status: implemented\n")
+        refs.append(rs.ProposalRef(service="mctl-agents", slug=name, proposal_dir=proposal_dir, status="implemented"))
+    for ref in refs:
+        monkeypatch.setattr(
+            rs, "process_one",
+            lambda *a, _ref=ref, **k: rs.ShepherdResult(ref=_ref, decision="wait", error="could not fetch PR snapshot"),
+        )
+        rs._process_one_with_evidence(ref, state_dir=tmp_path, execution_context=context)
+    envelopes = [live_post.envelope(i) for i in range(len(live_post.calls))]
+    assert len(envelopes) == 2
+    assert envelopes[0]["evidence_id"] != envelopes[1]["evidence_id"]
+    assert [e["artifacts"][0]["name"] for e in envelopes] == ["mctl-agents.issue-1", "mctl-agents.issue-2"]
+
+
+def test_identical_policy_decisions_are_deduplicated_and_the_list_is_capped():
+    """Claude P2 on #577: a run that checkpoints the same call repeatedly
+    must not grow an envelope past what mctl-api accepts."""
+    evidence = _run()
+    for _ in range(1000):
+        _decision(evidence)
+    evidence.set_outcome("succeeded")
+    sealed = ep.build(evidence, amendment_2=False, created_at=CREATED_AT)
+    assert len(sealed.policy_decisions) == 1
+    assert sealed.completeness == ee.COMPLETE
+
+    many = _run()
+    for index in range(ep.MAX_POLICY_DECISIONS + 5):
+        request = pc.ActionRequest(pc.MCP_TOOL_CALL, f"tool-{index}", "t", pc.args_digest_of({}))
+        many.record_decision(request, pc.Decision(pc.ALLOW, "allowed", "r", "v1", "rule", request.action_digest()))
+    many.set_outcome("succeeded")
+    capped = ep.build(many, amendment_2=False, created_at=CREATED_AT)
+    assert len(capped.policy_decisions) == ep.MAX_POLICY_DECISIONS
+    assert ("policy_decisions", "observation_failed", True) in _gaps(capped)
+    assert len(ep.envelope_bytes(capped)) < 256 * 1024
+
+
+def test_the_implementer_subject_is_the_commit_it_pushed_not_the_head_at_seal_time():
+    """Claude P2 on #577: a head that moved after the push (a follow-up
+    commit during verification) must not become this run's subject."""
+    evidence = _run()
+    evidence.note_pushed_head(SHA)
+    evidence.note_subject_pr_url("https://github.com/mctlhq/mctl-agents/pull/7")
+    evidence.set_outcome("succeeded", "pr-opened")
+
+    def moved_head(_repo, _number):
+        raise AssertionError("the head must not be re-read when the run pushed one")
+
+    sealed = ep.build(evidence, amendment_2=True, created_at=CREATED_AT, read_pr_head=moved_head)
+    assert sealed.subject == ee.SubjectRef("pull_request", "mctlhq/mctl-agents", "7", SHA)
+
+
+def test_note_pushed_head_reads_the_local_clone_only_behind_the_flag(monkeypatch, tmp_path):
+    import subprocess as sp
+
+    from orchestrator import run_implementer as ri
+
+    sp.run(["git", "init", "-q", str(tmp_path)], check=True)
+    sp.run(["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+            "--allow-empty", "-m", "x"], check=True)
+    head = sp.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    with ep.run(ep.STAGE_IMPLEMENTER, environ={}) as evidence:
+        ri._note_pushed_head(tmp_path)
+        assert evidence.pushed_head_sha == ""
+        monkeypatch.setenv(ep.AMENDMENT_2_ENV, "true")
+        ri._note_pushed_head(tmp_path)
+        assert evidence.pushed_head_sha == head
+
+
+def test_retry_after_is_honoured_and_clamped():
+    delays: list[float] = []
+
+    class Limited:
+        calls = 0
+
+        def __call__(self, url, body, headers):
+            Limited.calls += 1
+            if Limited.calls == 1:
+                return httpx.Response(429, headers={"Retry-After": "3"})
+            if Limited.calls == 2:
+                return httpx.Response(503, headers={"Retry-After": "120"})
+            return httpx.Response(201, json={})
+
+    result = ep.deliver(b"{}", url="https://x.test", token=TOKEN, post=Limited(), sleep=delays.append)
+    assert result[0] == ep.CREATED
+    assert delays == [3.0, ep.MAX_RETRY_AFTER_SECONDS]
+
+
+def test_a_failing_result_mapper_never_reaches_the_run(monkeypatch, tmp_path, live_post):
+    from orchestrator import run_implementer as ri
+
+    def broken(*_a, **_k):
+        raise AttributeError("result shape changed")
+
+    monkeypatch.setattr(ri, "_note_implement_evidence", broken)
+    monkeypatch.setattr(ri, "_implement_one", lambda ref_, dry_run=False: ri.ImplementResult(ref=ref_, pr_url="u"))
+    result = ri.implement_one(_implementer_ref(tmp_path))
+    assert result.pr_url == "u"
+    assert live_post.envelope()["outcome"] == {"code": "failed", "reason_code": "no-outcome-recorded"}

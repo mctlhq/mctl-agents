@@ -99,13 +99,18 @@ BASE_URL_ENV = "MCTL_API_BASE_URL"
 DEFAULT_BASE_URL = "https://api.mctl.ai"
 INGEST_PATH = "/api/v1/evidence/records"
 
-# Bounded: at most ATTEMPTS posts of REQUEST_TIMEOUT_SECONDS each, with the
-# delays between them, so a dead store costs a run's tail under 20 s.
+# The producer's whole budget on a run's tail, every read and post included:
+# - delivery: at most ATTEMPTS posts of REQUEST_TIMEOUT_SECONDS each plus the
+#   delays between them, under 20 s against a dead store;
+# - the investigator's `xr_` read, when it was given one: one read bounded
+#   by READ_TIMEOUT_SECONDS;
+# - the PR head read at seal time, Amendment 2 only and only when the run
+#   neither read nor pushed a head itself: READ_TIMEOUT_SECONDS.
+# So a run's tail grows by at most ~30 s, and only when stores are down.
 REQUEST_TIMEOUT_SECONDS = 5.0
 ATTEMPTS = 3
 RETRY_DELAYS_SECONDS = (1.0, 2.0)
-# The implementer's PR head is read once at seal time (Amendment 2 only).
-PR_HEAD_READ_TIMEOUT_SECONDS = 20.0
+READ_TIMEOUT_SECONDS = 5.0
 
 STAGE_INVESTIGATOR = "investigator"
 STAGE_IMPLEMENTER = "implementer"
@@ -120,6 +125,12 @@ UNDELIVERED = "undelivered"
 DISABLED = "disabled"
 DISCARDED = "discarded"
 BUILD_FAILED = "build_failed"
+#: Additive, not a delivery result: a degraded seal (some blocks turned into
+#: gaps) is counted here AND under its delivery result, so the sum of
+#: `stats()` exceeds the number of runs when any envelope was degraded.
+DEGRADED = "degraded"
+#: The longest `Retry-After` a 429/503 is honoured for, so the tail stays bounded.
+MAX_RETRY_AFTER_SECONDS = 5.0
 
 EVIDENCE_LOG_PREFIX = "EXECUTION_EVIDENCE"
 
@@ -146,6 +157,12 @@ _APPROVAL_STATE_BY_CODE = {
 }
 # An approval lookup that could not answer: the receipt's state is unknown.
 _APPROVAL_UNKNOWN_CODES = frozenset({"approval_lookup_error"})
+#: Distinct policy-decision refs one envelope carries, mirroring Tier A's
+#: MAX_TOOL_CALLS. A run that checkpoints the same call over and over
+#: (capability_gateway digests an empty argument set) produces identical
+#: refs; those are deduplicated, and anything past the cap is an explicit
+#: unknown rather than an envelope too large for mctl-api to accept.
+MAX_POLICY_DECISIONS = 256
 
 Post = Callable[[str, dict[str, Any], dict[str, str]], httpx.Response]
 PrHeadReader = Callable[[str, int], str]
@@ -228,6 +245,9 @@ class RunEvidence:
         # (repository, number) of a PR whose head the producer reads itself
         # at seal time (Amendment 2 only).
         self.pending_pr: tuple[str, int] | None = None
+        # The commit this run itself pushed, when it pushed one: the
+        # revision its evidence is about.
+        self.pushed_head_sha = ""
         self._lock = threading.Lock()
 
     # -- identity ---------------------------------------------------------
@@ -336,15 +356,15 @@ class RunEvidence:
         """The release pins off a snapshot's `ExecutionCorrelation` (the
         ADR 007 `ExecutionPlan` pins, or the legacy definition hash)."""
         definition_hash = getattr(correlation, "definition_content_hash", "")
-        agent = getattr(correlation, "agent", "")
+        agent = slug(str(getattr(correlation, "agent", "") or ""), fallback="")
         if not (isinstance(definition_hash, str) and _SHA256_RE.fullmatch(definition_hash)):
             return
-        if not isinstance(agent, str) or not agent:
+        if not agent:
             return
         profile_hash = getattr(correlation, "profile_content_hash", "") or ""
         revision = getattr(correlation, "release_revision", None)
         self.versions = ee.VersionPins(
-            agent=slug(agent, fallback=""),
+            agent=agent,
             environment=slug(str(getattr(correlation, "environment", "") or ""), fallback=""),
             definition_version=_version_token(getattr(correlation, "definition_version", "")),
             definition_content_hash=definition_hash,
@@ -397,9 +417,11 @@ class RunEvidence:
         stage = self.stage if self.stage in ee.USAGE_DEVLOOP_STAGES else None
         self.usage = ee.UsageRef(session_id=session_id.strip(), model_key=keys[0], devloop_stage=stage)
 
-    def note_artifact_file(self, path: Path, kind: str) -> None:
-        """A generated file, by name and sha256 of its bytes. A missing file
-        was not produced; an unreadable one could not be observed."""
+    def note_artifact_file(self, path: Path, kind: str, *, name: str | None = None) -> None:
+        """A generated file, by name (`path.name` unless `name` is given:
+        an `ArtifactRef.name` is a bare, dot-free-leading name) and sha256
+        of its bytes. A missing file was not produced; an unreadable one
+        could not be observed."""
         self.expected.add("artifacts")
         try:
             if not path.is_file():
@@ -409,11 +431,20 @@ class RunEvidence:
         except OSError:
             self._add_gap(ee.Gap(block="artifacts", code="observation_failed", required=True))
             return
-        ref = ee.ArtifactRef(name=path.name, kind=slug(kind, fallback="file"), content_hash=digest)
+        ref = ee.ArtifactRef(name=name or path.name, kind=slug(kind, fallback="file"), content_hash=digest)
         with self._lock:
             self.artifacts.append(ref)
 
     # -- subject (Amendment 2) -------------------------------------------
+    def note_proposal_status(self, service: str, slug_: str, status_path: Path) -> None:
+        """The proposal's `.status.yaml` as this run left it, as an artifact
+        named `<service>.<slug>`. It is what tells two proposals' envelopes
+        apart in the pre-amendment shape: a shepherd tick or an implementer
+        batch shares one `ex-` id across proposals, and without a
+        per-proposal record two proposals reaching the same outcome would
+        seal byte-identical envelopes and collapse into one Tier B row."""
+        self.note_artifact_file(status_path, "proposal-status", name=f"{service}.{slug_}")
+
     def note_subject_issue(self, repository: str, number: Any) -> None:
         if not (isinstance(repository, str) and _REPO_RE.fullmatch(repository)):
             return
@@ -423,13 +454,20 @@ class RunEvidence:
         self.subject_observed_at = _utc_now_iso()
         self.pending_pr = None
 
+    def note_pushed_head(self, sha: str) -> None:
+        if isinstance(sha, str) and _GIT_SHA_RE.fullmatch(sha):
+            self.pushed_head_sha = sha
+
     def note_subject_pr(self, repository: str, number: Any, head_sha: str | None = None) -> None:
-        """The PR this run acted on. With `head_sha`, the revision this run
-        itself read; without, the producer reads the head at seal time."""
+        """The PR this run acted on, at `head_sha` (the revision this run
+        itself read), else at the commit this run pushed. Only with neither
+        does the producer read the head at seal time, which can be a later
+        revision than the one the run worked on."""
         if not (isinstance(repository, str) and _REPO_RE.fullmatch(repository)):
             return
         if not str(number).isdigit() or int(number) <= 0:
             return
+        head_sha = head_sha or self.pushed_head_sha or None
         if isinstance(head_sha, str) and _GIT_SHA_RE.fullmatch(head_sha):
             self.subject = ee.SubjectRef(
                 kind="pull_request", repository=repository, ref=str(int(number)), revision=head_sha
@@ -570,7 +608,7 @@ def read_pr_head_sha(repository: str, number: int) -> str:
         ["gh", "api", f"repos/{repository}/pulls/{int(number)}", "--jq", ".head.sha"],  # noqa: S607
         capture_output=True,
         text=True,
-        timeout=PR_HEAD_READ_TIMEOUT_SECONDS,
+        timeout=READ_TIMEOUT_SECONDS,
         check=False,
     )
     sha = proc.stdout.strip()
@@ -583,7 +621,7 @@ def read_execution_request(work_item_id: str, request_id: str) -> Any:
     """One read of the `xr_` request from the work-item store."""
     from orchestrator.work_context.client import WorkItemClient
 
-    return WorkItemClient().execution_request(work_item_id, request_id)
+    return WorkItemClient(timeout=int(READ_TIMEOUT_SECONDS)).execution_request(work_item_id, request_id)
 
 
 def _runtime_from_environment(evidence: RunEvidence) -> None:
@@ -610,14 +648,16 @@ def _policy_refs(evidence: RunEvidence) -> tuple[list[ee.PolicyDecisionRef], lis
     for seen in evidence.decisions:
         digest = seen.action_digest if _SHA256_RE.fullmatch(seen.action_digest) else ""
         approval_ref = seen.approval_ref if seen.approval_ref.startswith(ee.APPROVAL_ID_PREFIX) else ""
-        decisions.append(ee.PolicyDecisionRef(
+        ref = ee.PolicyDecisionRef(
             action_digest=digest,
             verdict=seen.verdict if seen.verdict in ee.VERDICTS else "",
             code=seen.code,
             policy_version=seen.policy_version,
             rule_id=seen.rule_id,
             approval_ref=approval_ref,
-        ))
+        )
+        if ref not in decisions:
+            decisions.append(ref)
         if not approval_ref:
             continue
         state = _APPROVAL_STATE_BY_CODE.get(seen.code)
@@ -625,6 +665,9 @@ def _policy_refs(evidence: RunEvidence) -> tuple[list[ee.PolicyDecisionRef], lis
             approvals[approval_ref] = ee.ApprovalRef(approval_id=approval_ref, intent_hash=digest, state=state)
         elif seen.code in _APPROVAL_UNKNOWN_CODES:
             gaps.append(ee.Gap(block="approvals", code="observation_failed", required=True))
+    if len(decisions) > MAX_POLICY_DECISIONS:
+        decisions = decisions[:MAX_POLICY_DECISIONS]
+        gaps.append(ee.Gap(block="policy_decisions", code="observation_failed", required=True))
     return decisions, list(approvals.values()), gaps
 
 
@@ -764,20 +807,58 @@ def build(
             requirements=ee.Requirements(**flags), **blocks,
         )
     except ee.ExecutionEvidenceError as exc:
-        # One malformed reference must not cost the whole envelope: keep the
-        # execution, the outcome and the gaps, and turn every block that was
-        # going to be sent into an explicit unknown.
-        logger.warning("execution evidence: sealing failed (%s); sealing a degraded envelope", exc)
-        _count("degraded")
-        degraded = [*gaps, *(
-            ee.Gap(block=name, code="observation_failed", required=True)
-            for name, value in blocks.items()
-            if value
-        )]
-        return ee.seal(
-            execution=execution, outcome=outcome, created_at=created_at, gaps=_dedupe(degraded),
-            requirements=ee.Requirements(policy_decisions=False),
-        )
+        # One malformed reference must not cost the whole envelope, nor the
+        # blocks that were fine: find the blocks that do not seal on their
+        # own, turn exactly those into explicit unknowns, keep the rest.
+        logger.warning("execution evidence: sealing failed (%s); dropping the blocks that do not seal", exc)
+        _count(DEGRADED)
+        bad = {name for name, value in blocks.items() if value and not _block_seals(
+            execution, outcome, created_at, name, value, blocks)}
+        kept = {name: (value if name not in bad else _EMPTY_BLOCKS[name]) for name, value in blocks.items()}
+        if "subject" in bad:
+            kept["provenance"] = None
+        degraded = [*gaps, *(ee.Gap(block=name, code="observation_failed", required=True) for name in sorted(bad))]
+        try:
+            return ee.seal(
+                execution=execution, outcome=outcome, created_at=created_at, gaps=_dedupe(degraded),
+                requirements=ee.Requirements(policy_decisions=False), **kept,
+            )
+        except ee.ExecutionEvidenceError:
+            # Blocks that seal alone but not together: keep none of them.
+            degraded = [*gaps, *(
+                ee.Gap(block=name, code="observation_failed", required=True)
+                for name, value in blocks.items()
+                if value
+            )]
+            return ee.seal(
+                execution=execution, outcome=outcome, created_at=created_at, gaps=_dedupe(degraded),
+                requirements=ee.Requirements(policy_decisions=False),
+            )
+
+
+_EMPTY_BLOCKS: dict[str, Any] = {
+    "policy_decisions": [], "snapshot_refs": [], "execution_request": None, "usage": None,
+    "approvals": [], "artifacts": [], "versions": None, "subject": None, "tool_calls": [], "provenance": None,
+}
+
+
+def _block_seals(
+    execution: ee.ExecutionJoin, outcome: ee.Outcome, created_at: str, name: str, value: Any,
+    blocks: Mapping[str, Any],
+) -> bool:
+    """Whether `name` seals with only execution and outcome beside it
+    (`subject` takes its `provenance` along: Tier A requires the pair)."""
+    alone: dict[str, Any] = {name: value}
+    if name == "subject":
+        alone["provenance"] = blocks.get("provenance")
+    if name == "provenance" and blocks.get("subject") is not None:
+        alone["subject"] = blocks["subject"]
+    try:
+        ee.seal(execution=execution, outcome=outcome, created_at=created_at,
+                requirements=ee.Requirements(policy_decisions=False), **alone)
+    except ee.ExecutionEvidenceError:
+        return False
+    return True
 
 
 def _dedupe(gaps: list[ee.Gap]) -> list[ee.Gap]:
@@ -828,11 +909,12 @@ def deliver(
     headers = {"Authorization": f"Bearer {token}"}
     send = post or _default_post
     status, detail = 0, ""
+    resp: httpx.Response | None = None
     for attempt in range(1, ATTEMPTS + 1):
         try:
             resp = send(url, body, headers)
         except httpx.HTTPError as exc:
-            status, detail = 0, type(exc).__name__
+            status, detail, resp = 0, type(exc).__name__, None
         except Exception as exc:  # noqa: BLE001 — a broken transport is undelivered, not a crash
             return UNDELIVERED, 0, type(exc).__name__
         else:
@@ -845,8 +927,29 @@ def deliver(
             if status < 500 and status != 429:
                 return REFUSED, status, detail
         if attempt < ATTEMPTS:
-            sleep(RETRY_DELAYS_SECONDS[min(attempt - 1, len(RETRY_DELAYS_SECONDS) - 1)])
+            delay = RETRY_DELAYS_SECONDS[min(attempt - 1, len(RETRY_DELAYS_SECONDS) - 1)]
+            sleep(_retry_after(resp if status else None, default=delay))
     return UNDELIVERED, status, detail
+
+
+def _retry_after(resp: httpx.Response | None, *, default: float) -> float:
+    """The server's `Retry-After` in seconds when it sent one, clamped to
+    `MAX_RETRY_AFTER_SECONDS`, else `default`."""
+    raw = resp.headers.get("Retry-After", "") if resp is not None else ""
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return default
+    return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
+
+
+def safely(action: Callable[..., None], *args: Any, **kwargs: Any) -> None:
+    """Run a runner-side evidence helper (mapping a result onto the
+    envelope); a failure is logged and never reaches the run."""
+    try:
+        action(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 — evidence must never break the run it describes
+        logger.warning("execution evidence: could not record the run's result (%s: %s)", type(exc).__name__, exc)
 
 
 def _credentials(env: Mapping[str, str]) -> tuple[str, str, str]:
