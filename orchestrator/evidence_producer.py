@@ -238,7 +238,11 @@ class RunEvidence:
         self.trace_id = ""
         self.outcome: tuple[str, str] | None = None
         self.decisions: list[_SeenDecision] = []
-        self.tool_results: dict[str, str] = {}
+        # Every observed result per action digest. Digests repeat (a tool
+        # checkpointed with an empty argument set), so one digest can have
+        # both a failed and a succeeded call: that is `unknown`, never the
+        # last write.
+        self.tool_results: dict[str, set[str]] = {}
         self.snapshot_refs: list[ee.SnapshotRef] = []
         self.execution_request: ee.ExecutionRequestRef | None = None
         self.execution_request_id = ""
@@ -340,7 +344,7 @@ class RunEvidence:
     def record_tool_result(self, action_digest: str, succeeded: bool) -> None:
         if isinstance(action_digest, str) and action_digest:
             with self._lock:
-                self.tool_results[action_digest] = "succeeded" if succeeded else "failed"
+                self.tool_results.setdefault(action_digest, set()).add("succeeded" if succeeded else "failed")
 
     def note_snapshot(self, snapshot: Any, store_ref: Any = None) -> None:
         """A sealed `ContextSnapshot` (local `cs-` id) and, when the store
@@ -451,7 +455,11 @@ class RunEvidence:
         apart in the pre-amendment shape: a shepherd tick or an implementer
         batch shares one `ex-` id across proposals, and without a
         per-proposal record two proposals reaching the same outcome would
-        seal byte-identical envelopes and collapse into one Tier B row."""
+        seal byte-identical envelopes and collapse into one Tier B row.
+        The discriminator is the sanitised `<service>.<slug>` (lowercased,
+        at most 128 chars) plus the status bytes: two slugs differing only
+        in case or past 128 chars would share a name. The repository's slug
+        sources (lowercase, at most 40 chars; `pr-<n>`) cannot produce that."""
         # Tier A forbids `..` in a name; slug() alone can leave one.
         name = re.sub(r"\.{2,}", ".", slug(f"{service}.{slug_}", fallback="proposal")).strip(".")
         self.note_artifact_file(status_path, "proposal-status", name=name)
@@ -687,7 +695,9 @@ def _policy_refs(evidence: RunEvidence) -> tuple[list[ee.PolicyDecisionRef], lis
 
 
 def _tool_calls(evidence: RunEvidence) -> tuple[list[ee.ToolCallRef], list[ee.Gap]]:
-    calls: list[ee.ToolCallRef] = []
+    """One ref per distinct call, ordered by most recent occurrence; past
+    `MAX_TOOL_CALLS` the newest are kept, like `_policy_refs`."""
+    calls: dict[ee.ToolCallRef, None] = {}
     for seen in evidence.decisions:
         if seen.action_kind not in ee.TOOL_CALL_KINDS or not _SHA256_RE.fullmatch(seen.action_digest):
             continue
@@ -697,16 +707,20 @@ def _tool_calls(evidence: RunEvidence) -> tuple[list[ee.ToolCallRef], list[ee.Ga
             # A permitted call whose side effect this process did not see
             # finish (checkpoint() + require() call sites) is `unknown`,
             # never assumed to have succeeded.
-            status = evidence.tool_results.get(seen.action_digest, "unknown")
-        calls.append(ee.ToolCallRef(
+            observed = evidence.tool_results.get(seen.action_digest, set())
+            status = next(iter(observed)) if len(observed) == 1 else "unknown"
+        call = ee.ToolCallRef(
             kind=seen.action_kind,
             name=seen.operation if _TOOL_NAME_RE.fullmatch(seen.operation) else "",
             action_digest=seen.action_digest,
             status=status,
-        ))
-    if len(calls) > ee.MAX_TOOL_CALLS:
-        return calls[: ee.MAX_TOOL_CALLS], [ee.Gap(block="tool_calls", code="observation_failed", required=True)]
-    return calls, []
+        )
+        calls.pop(call, None)
+        calls[call] = None
+    refs = list(calls)
+    if len(refs) > ee.MAX_TOOL_CALLS:
+        return refs[-ee.MAX_TOOL_CALLS:], [ee.Gap(block="tool_calls", code="observation_failed", required=True)]
+    return refs, []
 
 
 def build(

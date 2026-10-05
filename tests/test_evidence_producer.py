@@ -405,10 +405,10 @@ def test_enforce_reports_whether_the_side_effect_finished():
 
     with ep.run(ep.STAGE_SHEPHERD, environ={}) as evidence:
         assert pc.enforce(request, lambda: "done", policy=allow) == "done"
-        assert evidence.tool_results == {request.action_digest(): "succeeded"}
+        assert evidence.tool_results == {request.action_digest(): {"succeeded"}}
         with pytest.raises(OSError):
             pc.enforce(request, failing, policy=allow)
-        assert evidence.tool_results == {request.action_digest(): "failed"}
+        assert evidence.tool_results == {request.action_digest(): {"succeeded", "failed"}}
 
 
 # ---------------------------------------------------------------------------
@@ -864,3 +864,34 @@ def test_shepherd_process_one_binds_the_subject_to_the_head_it_read(monkeypatch,
         result = rs.process_one(ref, state_dir=tmp_path)
     assert result.decision == "wait"
     assert evidence.subject == ee.SubjectRef("pull_request", "mctlhq/mctl-agents", "9", SHA)
+
+
+def test_one_digest_that_failed_then_succeeded_is_unknown_not_succeeded():
+    """Claude P3 on #577: digests repeat, so a last-write-wins status would
+    record a failed call as a success."""
+    evidence = _run()
+    digest = _decision(evidence)
+    _decision(evidence)
+    evidence.record_tool_result(digest, succeeded=False)
+    evidence.record_tool_result(digest, succeeded=True)
+    evidence.set_outcome("succeeded")
+    sealed = ep.build(evidence, amendment_2=True, created_at=CREATED_AT)
+    assert [c.status for c in sealed.tool_calls] == ["unknown"]
+
+
+def test_the_evidence_head_read_is_bounded_at_ten_seconds(monkeypatch, tmp_path):
+    """Claude P3 on #577: dropping the bound would silently restore the
+    300 s command timeout on every push."""
+    from orchestrator import run_implementer as ri
+
+    seen: dict[str, Any] = {}
+
+    def capture(_repo_dir, **kwargs):
+        seen.update(kwargs)
+        return SHA
+
+    monkeypatch.setattr(ri, "_capture_head_sha", capture)
+    with ep.run(ep.STAGE_IMPLEMENTER, environ={}) as evidence:
+        ri._note_pushed_head(tmp_path)
+    assert seen == {"timeout": 10}
+    assert evidence.pushed_head_sha == SHA
