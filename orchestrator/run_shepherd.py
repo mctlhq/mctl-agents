@@ -3854,7 +3854,7 @@ def _process_one_with_evidence(ref: ProposalRef, *, state_dir: Path, execution_c
     envelope per proposal this tick acted on, posted however it ends and
     never fatal (see `orchestrator.evidence_producer`)."""
     with evidence_producer.run(evidence_producer.STAGE_SHEPHERD) as evidence:
-        evidence.note_runtime_context(execution_context)
+        evidence_producer.note("note_runtime_context", execution_context)
         result = process_one(ref, state_dir=state_dir, execution_id=execution_context.context_id)
         evidence_producer.safely(_note_shepherd_evidence, evidence, ref, result)
         return result

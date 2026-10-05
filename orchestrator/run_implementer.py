@@ -2634,7 +2634,7 @@ def review_feedback_one(
     fatal. A dry run governs nothing and posts nothing."""
     with evidence_producer.run(evidence_producer.STAGE_IMPLEMENTER) as evidence:
         if dry_run:
-            evidence.discard()
+            evidence_producer.note("discard")
         result = _review_feedback_one(ref, bundle, dry_run=dry_run, branch=branch)
         evidence_producer.safely(_note_implement_evidence, evidence, result, success_reason="review-addressed")
         return result
@@ -3045,19 +3045,22 @@ def _note_pushed_head(repo_dir: Path) -> None:
     """Hand the commit this run just pushed to its execution evidence, so the
     evidence's subject is bound to the revision this run produced rather
     than to whatever the PR head is at seal time (claude P2 on #577). Read
-    straight from the local clone, which is exactly what the push sent;
-    cheap, so it runs whatever the Amendment 2 flag says (the seal decides
-    whether `subject` is emitted); never fatal."""
+    straight from the local clone, which is exactly what the push sent,
+    bounded at 10 s; it runs whatever the Amendment 2 flag says (the seal
+    decides whether `subject` is emitted); never fatal."""
     try:
-        sha = _capture_head_sha(repo_dir)
+        # Bounded explicitly: the producer's tail budget, not the 300 s
+        # command bound `_run` applies by default.
+        sha = _capture_head_sha(repo_dir, timeout=10)
     except Exception:  # noqa: BLE001 — evidence bookkeeping must never fail the run
         return
     evidence_producer.note("note_pushed_head", sha)
 
 
-def _capture_head_sha(repo_dir: Path) -> str:
-    """Return the current HEAD SHA in ``repo_dir`` (no rev parsing here)."""
-    proc = _run(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+def _capture_head_sha(repo_dir: Path, *, timeout: float | None = None) -> str:
+    """Return the current HEAD SHA in ``repo_dir`` (no rev parsing here).
+    ``timeout`` overrides `_run`'s default command bound."""
+    proc = _run(["git", "rev-parse", "HEAD"], cwd=repo_dir, timeout=timeout)
     return proc.stdout.strip()
 
 
@@ -3876,7 +3879,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     fatal. A dry run governs nothing and posts nothing."""
     with evidence_producer.run(evidence_producer.STAGE_IMPLEMENTER) as evidence:
         if dry_run:
-            evidence.discard()
+            evidence_producer.note("discard")
         result = _implement_one(ref, dry_run=dry_run)
         evidence_producer.safely(_note_implement_evidence, evidence, result, success_reason="pr-opened")
         return result

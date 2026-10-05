@@ -817,3 +817,50 @@ def test_two_proposals_in_one_implementer_batch_post_two_distinct_evidence_ids(m
         ri.implement_one(ref)
     ids = {live_post.envelope(i)["evidence_id"] for i in range(len(live_post.calls))}
     assert len(live_post.calls) == 2 and len(ids) == 2
+
+
+def test_a_hostile_proposal_name_is_sanitised_not_a_degraded_seal(tmp_path):
+    """Claude P3 on #577: the per-proposal record must not be lost to a
+    name Tier A rejects."""
+    status = tmp_path / ".status.yaml"
+    status.write_text("status: implemented\n")
+    evidence = _run(ep.STAGE_SHEPHERD)
+    evidence.note_proposal_status("mctl-agents", "../Odd Slug", status)
+    evidence.set_outcome("succeeded", "merge")
+    sealed = ep.build(evidence, amendment_2=False, created_at=CREATED_AT)
+    assert len(sealed.artifacts) == 1
+    assert ep.stats() == {}
+
+
+def test_a_head_pushed_after_the_pr_was_named_still_wins_over_a_read():
+    """agy P3 on #577: ordering of note_subject_pr_url and note_pushed_head
+    must not matter."""
+    evidence = _run()
+    evidence.note_subject_pr_url("https://github.com/mctlhq/mctl-agents/pull/7")
+    evidence.note_pushed_head(SHA)
+    evidence.set_outcome("succeeded", "pr-opened")
+
+    def unexpected(_repo, _number):
+        raise AssertionError("must not read the head")
+
+    sealed = ep.build(evidence, amendment_2=True, created_at=CREATED_AT, read_pr_head=unexpected)
+    assert sealed.subject == ee.SubjectRef("pull_request", "mctlhq/mctl-agents", "7", SHA)
+
+
+def test_shepherd_process_one_binds_the_subject_to_the_head_it_read(monkeypatch, tmp_path):
+    """agy P3 on #577: the real process_one, not a stub, feeds the PR head
+    it read into the run's evidence."""
+    from orchestrator import run_shepherd as rs
+
+    ref = rs.ProposalRef(service="mctl-agents", slug="issue-1", proposal_dir=tmp_path, status="in-progress")
+    snapshot = rs.PRSnapshot(
+        number=9, repo="mctlhq/mctl-agents", state="OPEN", merged=False, closed_unmerged=False,
+        merge_commit=None, close_comment_or_default="", head_sha=SHA, head_pushed_at=None,
+        merge_state_status="CLEAN", checks_green=True, is_draft=False,
+    )
+    monkeypatch.setattr(rs, "find_pr_for_proposal", lambda *a, **k: snapshot)
+    monkeypatch.setattr(rs, "_attempt_is_fresh", lambda *_a: True)
+    with ep.run(ep.STAGE_SHEPHERD, environ={}) as evidence:
+        result = rs.process_one(ref, state_dir=tmp_path)
+    assert result.decision == "wait"
+    assert evidence.subject == ee.SubjectRef("pull_request", "mctlhq/mctl-agents", "9", SHA)

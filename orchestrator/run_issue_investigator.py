@@ -3128,8 +3128,8 @@ def investigate(
     (mctlhq/mctl-agents#544, never fatal — see `orchestrator.evidence_producer`)."""
     with evidence_producer.run(evidence_producer.STAGE_INVESTIGATOR) as evidence:
         if dry_run:
-            evidence.discard()
-        evidence.expect_execution_request(execution_request_id)
+            evidence_producer.note("discard")
+        evidence_producer.note("expect_execution_request", execution_request_id)
         result = _investigate_and_finish(
             issue_url,
             state_dir,

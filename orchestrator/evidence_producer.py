@@ -134,8 +134,10 @@ BUILD_FAILED = "build_failed"
 #: gaps) is counted here AND under its delivery result, so the sum of
 #: `stats()` exceeds the number of runs when any envelope was degraded.
 DEGRADED = "degraded"
-#: The longest `Retry-After` a 429/503 is honoured for, so the tail stays
-#: within the budget below; never shorter than the default backoff.
+#: The longest `Retry-After` a 429/503 is honoured for. Deliberately the last
+#: step of the default ladder: the producer runs on a run's tail and keeps
+#: the budget below rather than wait out real backpressure, so a server that
+#: asks for longer gets at most this and the envelope may end `undelivered`.
 MAX_RETRY_AFTER_SECONDS = 2.0
 
 EVIDENCE_LOG_PREFIX = "EXECUTION_EVIDENCE"
@@ -450,7 +452,9 @@ class RunEvidence:
         batch shares one `ex-` id across proposals, and without a
         per-proposal record two proposals reaching the same outcome would
         seal byte-identical envelopes and collapse into one Tier B row."""
-        self.note_artifact_file(status_path, "proposal-status", name=f"{service}.{slug_}")
+        # Tier A forbids `..` in a name; slug() alone can leave one.
+        name = re.sub(r"\.{2,}", ".", slug(f"{service}.{slug_}", fallback="proposal")).strip(".")
+        self.note_artifact_file(status_path, "proposal-status", name=name)
 
     def note_subject_issue(self, repository: str, number: Any) -> None:
         if not (isinstance(repository, str) and _REPO_RE.fullmatch(repository)):
@@ -785,7 +789,8 @@ def build(
             repository, number = evidence.pending_pr
             flags["subject"] = True
             try:
-                sha = (read_pr_head or read_pr_head_sha)(repository, number)
+                # A head pushed after the PR was named still wins over a read.
+                sha = evidence.pushed_head_sha or (read_pr_head or read_pr_head_sha)(repository, number)
                 if not _GIT_SHA_RE.fullmatch(sha):
                     raise ValueError("not a full git SHA")
                 subject = ee.SubjectRef(kind="pull_request", repository=repository, ref=str(number), revision=sha)
@@ -944,8 +949,9 @@ def deliver(
 
 
 def _retry_after(resp: httpx.Response | None, *, default: float) -> float:
-    """The server's `Retry-After` in seconds when it sent one, clamped to
-    `MAX_RETRY_AFTER_SECONDS`, else `default`."""
+    """The server's `Retry-After` in seconds when it sent a finite one,
+    floored at `default` (0 or a negative value never removes the backoff)
+    and capped at `MAX_RETRY_AFTER_SECONDS`; otherwise `default`."""
     raw = resp.headers.get("Retry-After", "") if resp is not None else ""
     try:
         seconds = float(raw)
