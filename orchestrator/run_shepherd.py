@@ -35,11 +35,12 @@ resolves to fix-only. NEVER_MERGE_SERVICES (a code constant, currently
 {"mctl-academy", "mctl-gitops"}) never resolves to full and merge_pr()
 independently refuses to merge those repos, regardless of env or --fix-only.
 
-Independently of the mode, a PR that changes agent definitions
-(AGENT_DEFINITION_PATH_PREFIXES), or whose changed paths could not be read
-in full, is never merged here: its merge is decided under the
+Independently of the mode, a PR that changes agent definitions or runtime
+prompt files (AGENT_DEFINITION_PATH_PREFIXES), or whose changed paths could
+not be read in full, is never merged here: its merge is decided under the
 `github-pr-merge-agent-definition` policy rule and left to a human, with one
-MERGE_NEEDS_HUMAN line per head (mctlhq/mctl-agents#470, ADR 016 amendment 1).
+MERGE_NEEDS_HUMAN line per head (mctlhq/mctl-agents#470, ADR 016 amendments
+1 and 2).
 
 The Claude SDK is used for one specific decision: parsing review
 findings into "merge-ready vs. needs-fix" and shaping the followup
@@ -635,44 +636,58 @@ NEVER_MERGE_SERVICES = frozenset({"mctl-academy", "mctl-gitops", ".github"})
 
 # The protected trees: a PR that changes any path under one of them is never
 # merged by automation without a human decision (mctlhq/mctl-agents#470
-# acceptance row 4, owner decision 2026-10-05;
-# docs/adr/016-shepherd-merge-approval.md amendment 1).
+# acceptance row 4, owner decisions 2026-10-05 and 2026-10-07;
+# docs/adr/016-shepherd-merge-approval.md amendments 1 and 2).
 #
-# Repository-relative path PREFIXES, each ending in "/" so `agents/_manifests`
-# cannot match a sibling such as `agents/_manifests-old/`:
+# Repository-relative path PREFIXES, each ending in "/" so `agents` cannot
+# match a sibling such as `agents-old/`:
 #
-#   agents/_manifests/               mctl-agents: the agent manifests
-#                                    (`agent.yaml`): runtime entrypoint,
-#                                    prompt SOURCE LIST, model policy task,
-#                                    tool policy, budget, sandbox.
+#   agents/                          mctl-agents: everything an agent is
+#                                    defined by on disk. The manifests
+#                                    (`agents/_manifests/*/agent.yaml`:
+#                                    runtime entrypoint, prompt SOURCE LIST,
+#                                    model policy task, tool policy, budget,
+#                                    sandbox) and the runtime prompt files
+#                                    they declare as `file:` / `glob:`
+#                                    sources: each agent's `CLAUDE.md`,
+#                                    `.claude/agents/*.md`, `.claude/skills/**`
+#                                    and `context/**`.
 #   platform-gitops/agent-platform/  mctl-gitops: definitions, execution
 #                                    profiles, policy and release bindings.
 #                                    The shepherd never merges mctl-gitops
 #                                    today (NEVER_MERGE_SERVICES), but this
 #                                    rule must not depend on that list.
 #
-# SCOPE, stated so nobody reads more into the name: this is the manifest and
-# catalog trees and nothing else, which is the path #470 row 4 names. It does
-# NOT cover what a manifest merely points at:
+# Why the whole `agents/` tree and not the declared sources one by one: the
+# SDK loads `CLAUDE.md`, `.claude/agents/*.md` and `.claude/skills/**` from an
+# agent's directory whether or not a manifest lists the file, so a new
+# sub-agent or skill file changes behaviour before anyone declares it. A
+# prefix holds that PR too. The list is static because it must be decided
+# from trusted data: it ships in the image, and the shepherd also evaluates
+# PRs in repositories whose manifests it does not have. Reading the sources
+# from the PR head would let the PR choose its own gate. So that the list
+# cannot go stale, tests/test_definition_merge_gate.py fails when a manifest
+# or docs/agent-inventory.yaml declares a `file:` / `glob:` prompt source
+# these prefixes do not cover.
 #
-#   - the prompt files in `spec.prompt.sources`
-#     (`agents/_shepherd/.claude/agents/shepherd.md`,
-#     `agents/<service>/.claude/agents/implementer.md`,
-#     `agents/_generic/.claude/agents/implementer.md`,
-#     `agents/_mentor/CLAUDE.md`, `agents/_incident-responder/CLAUDE.md`);
+# NOT covered, stated so nobody reads more into the name:
+#
 #   - the Python a manifest names (`runtime.entrypoint`, `optionsBuilder`,
-#     an `inline:` prompt source), i.e. `orchestrator/**`.
-#
-# A PR that only rewrites one of those changes how an agent behaves without
-# changing its manifest, and is merged like any other PR. Nothing pins them
-# by hash either: the release binding pins `agent.yaml` alone. Whether the
-# prompt trees belong behind this gate is an owner decision (raised in the
-# review of mctlhq/mctl-agents#585); widening it is one more prefix here.
+#     an `inline:` prompt source), i.e. `orchestrator/run_*.py`. An inline
+#     template is prompt text as much as a file is, but it shares a module
+#     with the runner's code: of the 60 PRs merged before 2026-10-07, 15
+#     touched an inline source's module and none touched a file or glob
+#     source, so gating whole modules would hold a quarter of ordinary PRs.
+#     Left as an owner decision; the fix that fits is moving the templates
+#     out of the modules, not one more prefix here.
+#   - a TARGET repository's own `CLAUDE.md`, `.claude/` and `.mctl/skills/**`,
+#     which the implementer and the investigator read at run time
+#     (`runtimeContextInputs` in docs/agent-inventory.yaml).
 #
 # Matched against every path a PR changes in ANY repository: the prefixes
 # name a tree, not a repo, so a definition tree vendored elsewhere is covered.
 AGENT_DEFINITION_PATH_PREFIXES: tuple[str, ...] = (
-    "agents/_manifests/",
+    "agents/",
     "platform-gitops/agent-platform/",
 )
 

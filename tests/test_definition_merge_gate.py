@@ -1,6 +1,7 @@
-"""A PR that changes agent definitions is never merged by automation without
-a human decision (mctlhq/mctl-agents#470 acceptance row 4, owner decision
-2026-10-05; docs/adr/016-shepherd-merge-approval.md amendment 1).
+"""A PR that changes agent definitions, or the runtime prompt files an agent
+is built from, is never merged by automation without a human decision
+(mctlhq/mctl-agents#470 acceptance row 4, owner decisions 2026-10-05 and
+2026-10-07; docs/adr/016-shepherd-merge-approval.md amendments 1 and 2).
 
 Four layers, each tested here against the real code below it:
 
@@ -13,14 +14,18 @@ Four layers, each tested here against the real code below it:
 """
 from __future__ import annotations
 
+import glob
 import json
 import subprocess
+from collections.abc import Iterable
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+import yaml
 from temporalio.testing import ActivityEnvironment
 
 from orchestrator import action_approvals as aa
@@ -34,7 +39,10 @@ from tests.test_run_shepherd import HEAD_SHA, OLD_SHA, make_pr, make_ref, read_s
 
 MANIFEST = "agents/_manifests/implementer/agent.yaml"
 GITOPS_DEFINITION = "platform-gitops/agent-platform/releases/implementer.yaml"
+# A runtime prompt file a manifest declares as a `file:` source.
+PROMPT_FILE = "agents/_mentor/CLAUDE.md"
 ORDINARY = "orchestrator/run_shepherd.py"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFINITION_RULE = "github-pr-merge-agent-definition"
 APPROVED_REVIEW = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
 
@@ -69,6 +77,20 @@ def _production_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     "agents/_manifests/new-agent/prompts/system.md",
     GITOPS_DEFINITION,
     "platform-gitops/agent-platform/policy.yaml",
+    # Runtime prompt files: one per shape a manifest declares.
+    PROMPT_FILE,
+    "agents/_incident-responder/CLAUDE.md",
+    "agents/_shepherd/.claude/agents/shepherd.md",
+    "agents/_generic/.claude/agents/implementer.md",
+    "agents/mctl-web/.claude/agents/implementer.md",
+    "agents/mctl-api/.claude/agents/researcher.md",
+    "agents/mctl-api/CLAUDE.md",
+    "agents/mctl-api/.claude/skills/track-dependencies/SKILL.md",
+    "agents/mctl-api/context/decisions/0001-mcp-go-library-choice.md",
+    # Loaded by the SDK from the agent's directory although no manifest
+    # declares it yet: a new sub-agent, a new service.
+    "agents/mctl-api/.claude/agents/brand-new.md",
+    "agents/mctl-new-service/CLAUDE.md",
 ])
 def test_a_protected_path_touches_agent_definitions(path: str) -> None:
     pr = make_pr(changed_paths=ChangedPaths.complete((path,)))
@@ -79,11 +101,17 @@ def test_a_protected_path_touches_agent_definitions(path: str) -> None:
 @pytest.mark.parametrize("path", [
     ORDINARY,
     # A sibling whose name merely starts like the protected directory.
-    "agents/_manifests-old/implementer/agent.yaml",
-    "agents/_manifests.md",
+    "agents-old/_manifests/implementer/agent.yaml",
+    "agents.md",
+    "platform-gitops/agent-platform-old/policy.yaml",
     # The prefix names a tree at the repository root, not a path fragment.
     "docs/agents/_manifests/implementer/agent.yaml",
+    "docs/agents/_mentor/CLAUDE.md",
     "tests/fixtures/platform-gitops/agent-platform/policy.yaml",
+    # Positive controls: prompt-looking names outside the protected trees.
+    "CLAUDE.md",
+    "docs/agent-inventory.yaml",
+    "tests/test_definition_merge_gate.py",
 ])
 def test_an_unprotected_path_does_not_touch_agent_definitions(path: str) -> None:
     pr = make_pr(changed_paths=ChangedPaths.complete((path,)))
@@ -91,26 +119,101 @@ def test_an_unprotected_path_does_not_touch_agent_definitions(path: str) -> None
     assert run_shepherd.merge_operation_for(pr) == pc.MERGE_OPERATION
 
 
-@pytest.mark.parametrize("path", [
-    "agents/_shepherd/.claude/agents/shepherd.md",
-    "agents/mctl-web/.claude/agents/implementer.md",
-    "agents/_generic/.claude/agents/implementer.md",
-    "agents/_mentor/CLAUDE.md",
-    "agents/_incident-responder/CLAUDE.md",
+# ---------------------------------------------------------------------------
+# The static prefix list against what the manifests declare
+# ---------------------------------------------------------------------------
+_GLOB_MAGIC = "*?["
+
+
+def _declared_prompt_sources() -> list[tuple[str, str, str]]:
+    """Every `file:` / `glob:` prompt source this repository declares, as
+    (where, kind, value): each manifest's `spec.prompt.sources` and each
+    docs/agent-inventory.yaml `promptSources`. Read as plain YAML, so a
+    manifest the loader would need a mctl-gitops checkout for is read too."""
+    declared: list[tuple[str, str, str]] = []
+    manifests = sorted((REPO_ROOT / "agents" / "_manifests").glob("*/agent.yaml"))
+    assert manifests, "no manifest found: this check would pass on nothing"
+    for path in manifests:
+        sources = yaml.safe_load(path.read_text())["spec"]["prompt"]["sources"]
+        assert sources, f"{path}: no prompt sources"
+        declared += [(str(path.relative_to(REPO_ROOT)), k, v) for src in sources for k, v in src.items()]
+    agents = yaml.safe_load((REPO_ROOT / "docs" / "agent-inventory.yaml").read_text())["agents"]
+    assert agents, "docs/agent-inventory.yaml lists no agent"
+    for agent in agents:
+        sources = agent["promptSources"]
+        assert sources, f"inventory agent {agent['name']}: no prompt sources"
+        declared += [(f"inventory:{agent['name']}", k, v) for src in sources for k, v in src.items()]
+    unknown = sorted({k for _w, k, _v in declared} - {"file", "glob", "inline"})
+    assert not unknown, f"prompt source kinds this check does not know: {unknown}"
+    return [(w, k, v.split("#")[0].strip()) for w, k, v in declared if k in ("file", "glob")]
+
+
+def _uncovered(declared: Iterable[tuple[str, str, str]]) -> list[str]:
+    """The declared file/glob sources the gate would let a PR change.
+
+    Two checks per source. The literal head of the pattern (up to its first
+    glob character) must sit under a protected prefix, so every file the
+    pattern can EVER match is covered, not only today's. And every file it
+    matches today must be classified as protected by the real classifier.
+    """
+    problems: list[str] = []
+    for where, kind, value in declared:
+        magic = [value.index(c) for c in _GLOB_MAGIC if c in value] if kind == "glob" else []
+        head = value[:min(magic)] if magic else value
+        if not head.startswith(run_shepherd.AGENT_DEFINITION_PATH_PREFIXES):
+            problems.append(f"{where}: {kind} {value!r} is not under a protected prefix")
+            continue
+        matched = glob.glob(value, root_dir=REPO_ROOT, recursive=True) if kind == "glob" else [value]
+        files = [m for m in matched if (REPO_ROOT / m).is_file()]
+        if not files:
+            problems.append(f"{where}: {kind} {value!r} matches no file, so nothing was checked")
+        open_paths = set(files) - set(run_shepherd.agent_definition_paths(ChangedPaths.complete(files)))
+        problems += [f"{where}: {path} is merged without a human" for path in sorted(open_paths)]
+    return problems
+
+
+def test_every_declared_file_and_glob_prompt_source_is_behind_the_gate() -> None:
+    """The prefix list is static (it must not be read from a PR head), so
+    this is what keeps it from going stale: a manifest or inventory entry
+    that declares a prompt file outside AGENT_DEFINITION_PATH_PREFIXES fails
+    here until the prefix is added."""
+    declared = _declared_prompt_sources()
+    assert {kind for _w, kind, _v in declared} == {"file", "glob"}, "both shapes must be exercised"
+    assert _uncovered(declared) == []
+
+
+@pytest.mark.parametrize(("kind", "value"), [
+    ("file", "prompts/mentor.md"),
+    ("file", "orchestrator/prompts/system.md"),
+    ("glob", "prompts/*/system.md"),
+    # A glob whose literal head is above the protected tree can match
+    # outside it, whatever it matches today.
+    ("glob", "*/_mentor/CLAUDE.md"),
+    ("glob", "agent[s]/_mentor/CLAUDE.md"),
+    ("glob", "**/CLAUDE.md"),
 ])
-def test_scope_a_prompt_file_a_manifest_points_at_is_outside_the_gate(path: str) -> None:
-    """The gate's scope today, pinned on purpose rather than by accident:
-    the manifest and catalog trees only (#470 row 4). The prompt files a
-    manifest names in `spec.prompt.sources` are NOT behind it, so a
-    prompt-only PR is merged like any other. Widening the gate to them is an
-    owner decision (review of mctlhq/mctl-agents#585); when it is taken,
-    these become protected and this test changes with the constant."""
-    pr = make_pr(changed_paths=ChangedPaths.complete((path,)))
-    assert run_shepherd.merge_operation_for(pr) == pc.MERGE_OPERATION
+def test_the_coverage_check_reports_a_source_outside_the_protected_trees(kind: str, value: str) -> None:
+    """The check above can fail: a source it must reject is rejected."""
+    [problem] = _uncovered([("fixture", kind, value)])
+    assert "is not under a protected prefix" in problem
+
+
+def test_the_coverage_check_reports_a_source_that_matches_nothing() -> None:
+    """Matching no file is not the same as every matched file being covered."""
+    [problem] = _uncovered([("fixture", "glob", "agents/[!_]*/no-such-file.md")])
+    assert "matches no file" in problem
+
+
+def test_the_manifest_tree_is_behind_the_gate() -> None:
+    """Folding `agents/_manifests/` into `agents/` must not have opened it."""
+    manifests = [str(p.relative_to(REPO_ROOT)) for p in (REPO_ROOT / "agents" / "_manifests").rglob("*") if p.is_file()]
+    assert manifests
+    assert set(run_shepherd.agent_definition_paths(ChangedPaths.complete(manifests))) == set(manifests)
 
 
 @pytest.mark.parametrize(("changed", "kind"), [
     (ChangedPaths.complete((ORDINARY, MANIFEST)), "agent-definition"),
+    (ChangedPaths.complete((PROMPT_FILE,)), "agent-definition"),
     # A protected path seen in a list that is not complete is still seen.
     (ChangedPaths(run_shepherd.CHANGED_PATHS_TRUNCATED, (MANIFEST,), "read 100 of 250"), "agent-definition"),
     (ChangedPaths(run_shepherd.CHANGED_PATHS_TRUNCATED, (ORDINARY,), "read 100 of 250"), "changed-paths-truncated"),
@@ -414,6 +517,8 @@ def _stub_gh_merge(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
 BLOCKED_PATHS = [
     pytest.param(ChangedPaths.complete((ORDINARY, MANIFEST)), id="definition"),
     pytest.param(ChangedPaths.complete((GITOPS_DEFINITION,)), id="gitops-definition"),
+    pytest.param(ChangedPaths.complete((PROMPT_FILE,)), id="prompt-only"),
+    pytest.param(ChangedPaths.complete((ORDINARY, "agents/mctl-web/.claude/agents/implementer.md")), id="prompt-mixed"),
     pytest.param(ChangedPaths(run_shepherd.CHANGED_PATHS_TRUNCATED, (ORDINARY,), "read 100 of 250"), id="truncated"),
     pytest.param(ChangedPaths(run_shepherd.CHANGED_PATHS_UNREADABLE, (), "gh failed"), id="unreadable"),
 ]
@@ -467,7 +572,7 @@ def test_merge_pr_of_an_ordinary_pr_is_unchanged(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
     calls = _stub_gh_merge(monkeypatch)
-    pr = make_pr(changed_paths=ChangedPaths.complete((ORDINARY, "agents/_shepherd/shepherd.md")))
+    pr = make_pr(changed_paths=ChangedPaths.complete((ORDINARY, "docs/runbooks/shepherd.md")))
 
     assert run_shepherd.merge_pr(pr) == (True, "m" * 40)
 
@@ -567,6 +672,31 @@ def test_process_one_signals_a_definition_pr_once_per_head(
     assert _decisions(out) == []
     assert ref.status_path.read_text() == written, "a repeated tick must not rewrite .status.yaml"
     assert calls == []
+
+
+def test_process_one_holds_an_approved_prompt_only_pr_for_a_human(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A green PR with a bot approval that only rewrites a prompt file: the
+    case the 2026-10-07 decision is about. Same PR as
+    test_process_one_merges_an_ordinary_pr_as_before but for its one path."""
+    calls = _stub_gh_merge(monkeypatch)
+    ref = make_ref(tmp_path)
+    pr = make_pr(changed_paths=ChangedPaths.complete((PROMPT_FILE,)))
+
+    result = _tick(ref, pr)
+
+    assert result.decision == "defer-merge"
+    assert calls == []
+    out = capsys.readouterr().out
+    [signal] = _signals(out)
+    assert json.dumps(PROMPT_FILE) in signal
+    [record] = _decisions(out)
+    assert (record["rule_id"], record["code"]) == (DEFINITION_RULE, pc.CODE_APPROVAL_REQUIRED)
+    status = read_status(ref)
+    assert status["status"] == "implemented"
+    assert status["merge_needs_human"] == run_shepherd.NEEDS_HUMAN_AGENT_DEFINITION
+    assert status["merge_needs_human_head"] == pr.head_sha
 
 
 @pytest.mark.parametrize(("changed", "kind"), [
