@@ -1101,6 +1101,23 @@ def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
     ))
 
 
+# mctlhq/mctl-agents#596: the inert authoring canary. A plain constant on
+# purpose (no env knob that could raise the budget of an agent that must not run).
+AUTHORING_CANARY_BUDGET_USD = 0.01
+AUTHORING_CANARY_TOOLS = ("Read", "Glob", "Grep")
+
+
+def build_authoring_canary_options(agent_dir: Path, model: str) -> ClaudeAgentOptions:
+    """Options for the inert authoring canary (#596, #470): read-only, no MCP, no hooks."""
+    return _scrubbed(ClaudeAgentOptions(
+        cwd=str(agent_dir),
+        model=model,
+        allowed_tools=list(AUTHORING_CANARY_TOOLS),
+        setting_sources=[],
+        max_budget_usd=AUTHORING_CANARY_BUDGET_USD,
+    ))
+
+
 def build_incident_responder_options(
     agent_dir: Path,
     model: str,

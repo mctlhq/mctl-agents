@@ -1,0 +1,30 @@
+# AgentManifest for authoring-canary (mctlhq/mctl-agents#596, proof run for #470).
+# Inert by design: no caller, read-only tools, minimal budget. The sandbox CWFT
+# below is nominal; that CWFT never invokes this agent.
+# tests/test_authoring_canary.py pins all of this.
+apiVersion: agents.mctl.ai/v1alpha1
+kind: Agent
+metadata:
+  name: authoring-canary
+  owner: mctl-agents
+spec:
+  runtime:
+    type: claude-agent-sdk
+    entrypoint: orchestrator.run_authoring_canary:run_authoring_canary
+    optionsBuilder: orchestrator.options:build_authoring_canary_options
+  prompt:
+    sources:
+      - inline: orchestrator/run_authoring_canary.py:PROMPT
+  triggers: []          # informational; inert by design (#596)
+  modelPolicy:
+    task: service_agent
+  toolPolicy:
+    allow:
+      - Read
+      - Glob
+      - Grep
+  execution:
+    budgetUsd: 0.01     # AUTHORING_CANARY_BUDGET_USD
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-run   # nominal; the CWFT never invokes this agent

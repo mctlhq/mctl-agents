@@ -39,11 +39,21 @@ _MANIFESTS = _REPO_ROOT / "agents" / "_manifests"
 # manifest (hash, name and profile pin only).
 _V2 = "issue-investigator"
 _V1 = "shepherd"
-# Every agent with a binding in the mctl-gitops catalog: all six shipped
-# agents since mctl-gitops#1683. Kept here, not in the tool: it only exists to
+# Every agent with a binding in the mctl-gitops catalog: the six agents bound
+# since mctl-gitops#1683, plus authoring-canary (mctl-agents#596), whose binding
+# is added by the mctl-gitops follow-up and must be on mctl-gitops main before
+# the next release. Kept here, not in the tool: it only exists to
 # force a decision at PR time, when a manifest is added or removed.
 _BOUND_AGENTS = frozenset(
-    {"implementer", "incident-responder", "issue-investigator", "mentor", "service-agent", "shepherd"}
+    {
+        "authoring-canary",
+        "implementer",
+        "incident-responder",
+        "issue-investigator",
+        "mentor",
+        "service-agent",
+        "shepherd",
+    }
 )
 # The profile each fake binding pins. Only issue-investigator's has to agree
 # with its agent.yaml; a v1alpha1 manifest names no profile of its own.
