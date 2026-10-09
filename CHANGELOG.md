@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.70.0](https://github.com/mctlhq/mctl-agents/compare/1.69.0...1.70.0) (2026-10-09)
+
+
+### Features
+
+* **agents:** issue-601-feat-devloop-register-mctl-claude-remote ([3ff0ac9](https://github.com/mctlhq/mctl-agents/commit/3ff0ac966d34d5cbb99199e3e4b9f06ec85f314c))
+* **agents:** issue-601-feat-devloop-register-mctl-claude-remote ([06a436b](https://github.com/mctlhq/mctl-agents/commit/06a436bcd99527edbbff285e5caec8d5e422b56e))
+
+
+### Bug Fixes
+
+* **agents:** refresh mctl-docs version in its agent context ([004fb82](https://github.com/mctlhq/mctl-agents/commit/004fb8211eff99a91c524faad84a1d32abd2c850))
+* **agents:** refresh mctl-docs version in its agent context ([c5d5caa](https://github.com/mctlhq/mctl-agents/commit/c5d5caa5639a393279ecf426b5bc6468a70df176))
+
 ## [1.69.0](https://github.com/mctlhq/mctl-agents/compare/1.68.3...1.69.0) (2026-10-09)
 
 
