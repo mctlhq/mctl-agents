@@ -59,6 +59,15 @@ def test_newton_mcp_gateway_is_non_rotating():
     assert "newton-mcp-gateway" not in ROTATING_SERVICES
 
 
+def test_mctl_claude_remote_is_a_registered_service():
+    assert "mctl-claude-remote" in SERVICES
+
+
+def test_mctl_claude_remote_is_non_rotating():
+    assert "mctl-claude-remote" in NON_ROTATING_SERVICES
+    assert "mctl-claude-remote" not in ROTATING_SERVICES
+
+
 def test_no_service_name_is_shell_glob_hostile_beyond_a_leading_dot():
     """A service name becomes a path segment under agents-state/.
 

@@ -402,6 +402,37 @@ def test_main_exits_zero_on_partial_failures(monkeypatch):
     assert _run_main(monkeypatch, PollResult(started=1, failures=2)) == 0
 
 
+def test_poll_dispatches_mctl_claude_remote(monkeypatch):
+    ref = _ref(repo="mctl-claude-remote", number=79)
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: [ref])
+    started: list = []
+    monkeypatch.setattr(run_issue_poller, "start_dev_loop_workflow", _start_ok_recording(started))
+    removed: list = []
+    monkeypatch.setattr(run_issue_poller, "remove_label",
+                        lambda url, label: removed.append((url, label)))
+    result = _run(poll())
+    assert result.failures == 0
+    assert result.started == 1
+    assert started == [ref.url]
+    assert removed == [(ref.url, "agents:intake")]
+
+
+def test_poll_dry_run_treats_mctl_claude_remote_as_known(monkeypatch, capsys):
+    ref = _ref(repo="mctl-claude-remote", number=79)
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: [ref])
+    started: list = []
+    removed: list = []
+    monkeypatch.setattr(run_issue_poller, "start_dev_loop_workflow", _start_ok_recording(started))
+    monkeypatch.setattr(run_issue_poller, "remove_label",
+                        lambda url, label: removed.append(url))
+    result = _run(poll(dry_run=True))
+    out = capsys.readouterr().out
+    assert "would start/attach" in out
+    assert "not a known service" not in out
+    assert result.failures == 0
+    assert started == [] and removed == []
+
+
 # Keep an explicit reference so an accidental removal of a public helper
 # trips the import at collection time.
 assert callable(remove_label)
