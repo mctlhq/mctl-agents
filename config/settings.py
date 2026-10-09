@@ -70,6 +70,13 @@ AGENTS_DIR = REPO_ROOT / "agents"
 # generic implementer sub-agent
 # (agents/_generic/.claude/agents/implementer.md) covers it. Its PRs stay
 # shepherd-owned — no SHEPHERD_SKIP_SERVICES entry.
+#
+# `mctl-claude-remote` is issue-driven only (human-labelled `agents:intake`,
+# first target `mctlhq/mctl-claude-remote#79`). Registered so
+# `run_issue_poller.py` dispatches it. Like `newton-mcp-gateway` it has no
+# `agents/mctl-claude-remote/` scaffold, so it must NOT enter
+# ROTATING_SERVICES; the generic implementer sub-agent covers it and its PRs
+# stay shepherd-owned (no SHEPHERD_SKIP_SERVICES entry).
 SERVICES = [
     "mctl-web",
     "mctl-openclaw",
@@ -87,6 +94,7 @@ SERVICES = [
     "portfolio",
     ".github",
     "newton-mcp-gateway",
+    "mctl-claude-remote",
     # "upwork-mcp",
 ]
 
@@ -102,6 +110,7 @@ NON_ROTATING_SERVICES = {
     "portfolio",
     ".github",
     "newton-mcp-gateway",
+    "mctl-claude-remote",
 }
 
 # Subset of SERVICES that the proactive R&D rotation analyzes via
