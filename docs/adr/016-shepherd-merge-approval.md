@@ -262,6 +262,9 @@ here because it would stop the automated merge of every prompt-only PR,
 which is a wider change than the one decided on 2026-10-05. Taking it is
 one more prefix in the constant.
 
+> Superseded on 2026-10-07 by [amendment 2](#amendment-2--runtime-prompt-files-need-a-human-too-mctlhqmctl-agents470):
+> the prompt files are behind the gate, the Python is not.
+
 ### Reading the changed paths
 
 `PRSnapshot.changed_paths` (`ChangedPaths`) is read in the same GraphQL
@@ -374,3 +377,75 @@ files) stops being merged by the shepherd and waits for a human to merge
 it. Every other PR, a prompt-only PR included (see Scope), is decided,
 logged and merged exactly as before. No gitops change is needed, and none
 can turn the gate off.
+
+## Amendment 2 — runtime prompt files need a human too (mctlhq/mctl-agents#470)
+
+> **Date:** 2026-10-07. Owner decision: a PR that only changes an agent's
+> runtime prompt must not be merged by automation either. It closes the
+> question amendment 1 left open.
+
+Amendment 1 protected the manifest and left what the manifest points at
+mergeable on a bot approval. A prompt file changes what an agent does in
+production exactly as a manifest edit does, so the same gate now covers it.
+Nothing else in amendment 1 changes: the same three-state read of the
+changed paths, the same policy rule, the same `MERGE_NEEDS_HUMAN` signal
+and the same `merge_needs_human: agent-definition` value.
+
+### The protected paths
+
+| prefix | where |
+| --- | --- |
+| `agents/` | mctl-agents: the manifests (`agents/_manifests/`) and the runtime prompt files |
+| `platform-gitops/agent-platform/` | mctl-gitops: unchanged |
+
+`agents/` replaces `agents/_manifests/`, which it contains. Every `file:`
+and `glob:` entry of every manifest's `spec.prompt.sources` (mirrored in
+`docs/agent-inventory.yaml` `promptSources`) is under it: each agent's
+`CLAUDE.md`, `.claude/agents/*.md`, `.claude/skills/**` and `context/**`.
+`issue-investigator` (v1alpha2) declares no file or glob source in this
+repository; its execution profile lives in the gitops catalog, under the
+second prefix.
+
+**Why a prefix and not the declared list.** Two reasons.
+
+- The SDK runs each agent with `cwd` inside `agents/` and
+  `setting_sources=["project"]`, so it loads `CLAUDE.md`,
+  `.claude/agents/*.md` and `.claude/skills/**` from there whether or not a
+  manifest lists the file. A new sub-agent or skill file changes behaviour
+  before anyone declares it; the prefix holds that PR too.
+- The set must come from trusted data. The constant ships in the image. The
+  shepherd also evaluates PRs in repositories whose manifests it does not
+  have, and reading the source list from the PR head would let a PR choose
+  its own gate.
+
+A static list can go stale, so `tests/test_definition_merge_gate.py` reads
+every manifest and the inventory and fails when one declares a `file:` or
+`glob:` prompt source that is not under a protected prefix, or whose
+matched files the classifier would let through.
+
+### What is still outside
+
+- **`inline:` prompt sources**, i.e. the templates in
+  `orchestrator/run_implementer.py`, `run_issue_investigator.py`,
+  `run_mentor.py`, `run_incident_responder.py`, `run_service_agent.py` and
+  `run_shepherd.py`. They are prompt text as much as a file is, but each
+  shares a module with its runner's code, and the gate sees paths, not
+  symbols. Measured over the 60 PRs merged between 2026-09-24 and
+  2026-10-05: 15 touched one of those six modules (2 of them merged by the
+  shepherd), 0 touched a file or glob prompt source, 1 touched a manifest.
+  Gating the modules would hold a quarter of all PRs for a reason that is
+  mostly not a prompt change. Left as an owner decision. The change that
+  fits is to move the templates into files under `agents/`, which this
+  gate then covers with no further edit.
+- **The Python a manifest names** (`runtime.entrypoint`, `optionsBuilder`),
+  as in amendment 1.
+- **A target repository's own `CLAUDE.md`, `.claude/` and `.mctl/skills/**`**
+  (`runtimeContextInputs` in the inventory). The implementer and the
+  investigator read them at run time; they belong to the target repository
+  and are pinned per run by its git SHA.
+
+### Consequences
+
+On release, a PR that touches any path under `agents/` waits for a human
+to merge it, whoever authored it. In the measured window that is one PR in
+sixty. No gitops change is needed, and none can turn the gate off.

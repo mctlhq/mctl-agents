@@ -419,9 +419,9 @@ answers `merge_gate_disabled`, so nothing merges and the only signal is the
 shepherd's `MERGE_GATED` line.
 
 **Agent-definition gate** (mctl-agents#470,
-[ADR 016 amendment 1](docs/adr/016-shepherd-merge-approval.md)) is keyed on
-what the PR changes, not on the service, and no variable turns it off. A PR
-that changes a path under `agents/_manifests/` or
+[ADR 016 amendments 1 and 2](docs/adr/016-shepherd-merge-approval.md)) is
+keyed on what the PR changes, not on the service, and no variable turns it
+off. A PR that changes a path under `agents/` or
 `platform-gitops/agent-platform/` — or whose changed paths could not be
 read in full (unreadable, or more than 100 files) — is never merged by
 automation without a human decision: the merge is decided under its own
@@ -433,9 +433,14 @@ returning `defer-merge` without charging anything. To finish such a PR,
 review it and merge it by hand; the next tick flips the proposal to
 `merged`. `merge_needs_human` says why: `agent-definition` when a protected
 path was seen, `changed-paths-truncated` or `changed-paths-unreadable` when
-the gate only failed closed. The gate covers those two trees only: the
-prompt files a manifest points at (`agents/*/.claude/agents/*.md`,
-`agents/_mentor/CLAUDE.md`, ...) are outside it and merge as before.
+the gate only failed closed. `agents/` is the manifests
+(`agents/_manifests/`) and every runtime prompt file a manifest declares as
+a `file:` or `glob:` source (`agents/*/CLAUDE.md`,
+`agents/*/.claude/agents/*.md`, `agents/*/.claude/skills/**`,
+`agents/*/context/**`), so a prompt-only PR waits for a human as well. Not
+covered: the `inline:` prompt templates, which live in
+`orchestrator/run_*.py` next to the runner code, and a target repository's
+own `CLAUDE.md`.
 
 `NEVER_MERGE_SERVICES` (currently `{"mctl-academy"}`) is a code
 constant, not an env var: such a service never resolves to full, and
