@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.69.0](https://github.com/mctlhq/mctl-agents/compare/1.68.3...1.69.0) (2026-10-09)
+
+
+### Features
+
+* **agents:** issue-596-test-agent-platform-add-an-inert-authori ([3cd1d1f](https://github.com/mctlhq/mctl-agents/commit/3cd1d1f61c5c2dbb4a0211c5b816212761667ab3))
+* **agents:** issue-596-test-agent-platform-add-an-inert-authori ([15afef7](https://github.com/mctlhq/mctl-agents/commit/15afef703a2d5dbf23ff64a862e3fbe5cfd54d4e))
+
+
+### Bug Fixes
+
+* **shepherd:** hold prompt-file PRs for a human merge ([c521a04](https://github.com/mctlhq/mctl-agents/commit/c521a04edb92b0f73978ba62c7b4421ffeaff589))
+* **shepherd:** hold prompt-file PRs for a human merge ([bf2a821](https://github.com/mctlhq/mctl-agents/commit/bf2a8215919a4f4163443c2c7acb86a037ca0606)), closes [#470](https://github.com/mctlhq/mctl-agents/issues/470)
+
 ## [1.68.3](https://github.com/mctlhq/mctl-agents/compare/1.68.2...1.68.3) (2026-10-05)
 
 
