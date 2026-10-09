@@ -93,6 +93,9 @@ _AGENT_BY_CATALOG_PROFILE = {
     "incident-responder-default": "incident-responder",
     "mentor-default": "mentor",
     "service-agent-default": "service-agent",
+    # mctlhq/mctl-agents#596: mapped ahead of the profile (a mctl-gitops
+    # follow-up), for the same reason as the #470 entries above.
+    "authoring-canary-default": "authoring-canary",
 }
 
 # Every build_*_options() builder consults mctl_mcp_config()/_mctl_tool_globs(),

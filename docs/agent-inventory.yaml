@@ -327,6 +327,23 @@ agents:
     triggeredBy:
       - cwft-mctl-agents-daily (after the service-agent rotation)
 
+  # mctlhq/mctl-agents#596: standing fixture for the governed authoring path
+  # (#470). Inert by design: no caller anywhere; tests/test_authoring_canary.py
+  # pins that.
+  - name: authoring-canary
+    driver: orchestrator/run_authoring_canary.py
+    entrypoint: orchestrator.run_authoring_canary:run_authoring_canary
+    optionsBuilder: orchestrator.options:build_authoring_canary_options
+    promptSources:
+      - inline: orchestrator/run_authoring_canary.py:PROMPT
+    modelPolicyTask: service_agent
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-run
+    writes: nothing
+    riskLevel: low
+    triggeredBy: []
+
 # ---------------------------------------------------------------------------
 # Orchestration — NOT agents. No manifest, no version, no release.
 # ---------------------------------------------------------------------------

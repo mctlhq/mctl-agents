@@ -55,7 +55,7 @@ places:
 Both jobs write one line per agent to the log and a table to the job summary, each as soon
 as that agent has been checked. A summary table with no `Exit` line under it is a run that
 was cancelled before it finished: the rows are the agents it reached, not a verdict. The
-job timeouts (35 and 40 minutes) are sized so that a rate-limited run ends as exit `2`
+job timeouts (40 minutes each) are sized so that a rate-limited run ends as exit `2`
 rather than as a cancellation.
 
 Exit codes: `0` means every binding matches. `1` means at least one was observed and is
