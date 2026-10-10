@@ -12,6 +12,7 @@ What these pin, in the order the design states it:
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
 import subprocess
@@ -650,3 +651,76 @@ def test_an_unsampled_root_is_returned_even_without_ids(exported):
     """None would let the activity span open a sampled trace of its own."""
     assert tracing.workflow_root_context("", "", sampled=False) is not None
     assert tracing.workflow_root_context("", "") is None
+
+
+# ─── Log correlation (mctlhq/mctl-agent#97) ─────────────────────────────────
+
+
+def _formatted(logger_name: str = "corr-test") -> tuple[logging.Logger, io.StringIO]:
+    stream = io.StringIO()
+    root = logging.Logger("root-under-test")
+    handler = logging.StreamHandler(stream)
+    root.addHandler(handler)
+    assert tracing.install_log_correlation(root) == 1
+    assert tracing.install_log_correlation(root) == 0  # idempotent
+    return root, stream
+
+
+def test_a_line_inside_a_recording_span_carries_its_ids(exported):
+    root, stream = _formatted()
+    with tracing.span("work") as handle:
+        root.warning("hello")
+        ctx = handle.otel_span.get_span_context()
+    assert stream.getvalue() == (
+        f"WARNING:root-under-test:hello trace_id={ctx.trace_id:032x} span_id={ctx.span_id:016x}\n"
+    )
+
+
+def test_a_line_outside_any_span_is_unchanged(exported):
+    root, stream = _formatted()
+    root.warning("hello")
+    assert stream.getvalue() == "WARNING:root-under-test:hello\n"
+
+
+def test_a_line_with_tracing_off_is_unchanged():
+    root, stream = _formatted()
+    root.warning("hello")
+    assert stream.getvalue() == "WARNING:root-under-test:hello\n"
+
+
+def test_a_line_under_an_unsampled_root_names_no_trace(exported):
+    """An out-of-scope workflow's context is valid but never exported: a line
+    naming it would point at a trace that does not exist."""
+    root, stream = _formatted()
+    ctx = tracing.workflow_root_context("wf", "run", sampled=False)
+    with tracing.span("work", parent=ctx):
+        root.warning("hello")
+    assert "trace_id=" not in stream.getvalue()
+
+
+def test_a_broken_span_read_never_drops_or_breaks_the_line(exported, monkeypatch):
+    def boom():
+        raise RuntimeError("no")
+
+    monkeypatch.setattr(tracing, "log_trace_ids", boom)
+    root, stream = _formatted()
+    with tracing.span("work"):
+        root.warning("hello")
+    assert stream.getvalue() == "WARNING:root-under-test:hello\n"
+
+
+def test_the_pod_root_prints_one_anchor_line(exported, capsys):
+    env = {tracing.TRACEPARENT_ENV: _TRACEPARENT, tracing.ARGO_WORKFLOW_NAME_ENV: "mctl-agents-investigate-ab12"}
+    with tracing.pod_root_span("investigator.run", environ=env) as handle:
+        ctx = handle.otel_span.get_span_context()
+    out = capsys.readouterr().out.splitlines()
+    assert out == [
+        f"[trace] trace_id={_PARENT_TRACE} span_id={ctx.span_id:016x} argo_workflow=mctl-agents-investigate-ab12"
+    ]
+
+
+def test_an_unsampled_parent_prints_no_anchor(exported, capsys):
+    unsampled = f"00-{_PARENT_TRACE}-{_PARENT_SPAN}-00"
+    with tracing.pod_root_span("run", environ={tracing.TRACEPARENT_ENV: unsampled}):
+        pass
+    assert "[trace]" not in capsys.readouterr().out

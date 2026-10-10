@@ -644,7 +644,87 @@ def pod_root_span(
     if argo_name:
         attrs.setdefault(ARGO_WORKFLOW_NAME, argo_name)
     with span(name, attrs, parent=parent, kind="server") as handle:
+        _print_log_anchor(argo_name)
         yield handle
+
+
+def _print_log_anchor(argo_name: str) -> None:
+    """Print one `[trace]` line naming the pod root span (mctlhq/mctl-agent#97).
+
+    The pods log with `print`, so their lines carry no ids of their own. This
+    one line is the hop from a trace to the pod's log stream: a Loki search
+    for `trace_id=<id>` finds it, and its `pod` label is the whole stream.
+    Printed only when the root span is recording, so it never names a trace
+    that was not exported."""
+    try:
+        ids = log_trace_ids()
+        if ids:
+            suffix = f" argo_workflow={argo_name}" if argo_name else ""
+            print(f"[trace] trace_id={ids[0]} span_id={ids[1]}{suffix}", flush=True)
+    except Exception:  # noqa: BLE001, S110 -- a log line must not fail a run
+        pass
+
+
+def log_trace_ids() -> tuple[str, str] | None:
+    """The (trace_id, span_id) to stamp on a log line, or None.
+
+    Only a RECORDING span counts: an unsampled one (a workflow outside the
+    rollout scope) has a valid context too, but its trace is never exported,
+    and a log line naming it would point at a trace that does not exist."""
+    handle = current()
+    if not handle.recording:
+        return None
+    try:
+        ctx = handle.otel_span.get_span_context()
+        return f"{ctx.trace_id:032x}", f"{ctx.span_id:016x}"
+    except Exception as exc:  # noqa: BLE001
+        _warn_once("log_ids", "could not read the span context for a log line (%s)", type(exc).__name__)
+        return None
+
+
+#: The log format `install_log_correlation` puts on the root handlers: the
+#: stdlib default plus the correlation suffix, so a line outside a traced
+#: span reads exactly as before.
+LOG_FORMAT = "%(levelname)s:%(name)s:%(message)s%(trace_context)s"
+
+
+class LogCorrelationFilter(logging.Filter):
+    """Sets `record.trace_context` to ` trace_id=<32 hex> span_id=<16 hex>`
+    inside a recording span, and to "" everywhere else (mctlhq/mctl-agent#97).
+
+    Plain `key=value` text at the end of the line, on purpose: Loki needs no
+    parsing stage to find it (`|= "trace_id=<id>"`), any other backend can
+    regex it, and nothing here becomes a label, so the ids add no stream
+    cardinality. The names are the log correlation fields of
+    `mctl-docs` `telemetry-attributes.md`. It never drops a record and never
+    raises: a log line must not depend on the tracing pipeline."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.trace_context = ""
+        try:
+            ids = log_trace_ids()
+            if ids:
+                record.trace_context = f" trace_id={ids[0]} span_id={ids[1]}"
+        except Exception:  # noqa: BLE001, S110 -- see the docstring
+            pass
+        return True
+
+
+def install_log_correlation(root: logging.Logger | None = None) -> int:
+    """Add the correlation suffix to every handler on the root logger.
+
+    Returns how many handlers it changed. Call it after `basicConfig`. A
+    handler that already carries the filter is left alone, so a second call
+    is harmless."""
+    logger = root or logging.getLogger()
+    changed = 0
+    for handler in logger.handlers:
+        if any(isinstance(f, LogCorrelationFilter) for f in handler.filters):
+            continue
+        handler.addFilter(LogCorrelationFilter())
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        changed += 1
+    return changed
 
 
 def now_ns() -> int:
