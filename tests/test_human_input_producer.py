@@ -175,7 +175,15 @@ def test_ungranted_prompt_is_byte_identical_to_the_pre_change_golden(extra):
     """T2: the golden was generated from the PR's merge-base (8660f59), not
     from this code — see gen_prompt_golden.py."""
     golden = json.loads((_GOLDEN_DIR / "prompt_golden_pre_473.json").read_text())
-    assert _golden_cases(**extra) == golden
+    # The deployed-state grounding block was added to every prompt after
+    # #473, on purpose, as one contiguous code-owned block. Taking exactly
+    # that block out must give back the pre-#473 bytes: anything else that
+    # changed in the ungranted prompt still fails here.
+    block = rii._deployed_state_grounding_block("mctl-telegram")
+    rendered = _golden_cases(**extra)
+    for name, prompt in rendered.items():
+        assert prompt.count(block) == 1, name
+    assert {name: prompt.replace(block, "", 1) for name, prompt in rendered.items()} == golden
 
 
 _ISSUE = rii.IssueData(
