@@ -33,6 +33,9 @@ def _no_live_refusal_replies(monkeypatch):
     shepherd = sys.modules.get("orchestrator.run_shepherd")
     if shepherd is not None:
         monkeypatch.setattr(shepherd, "post_refusal_replies", lambda *_a, **_kw: None)
+        # Same reason, read side: the address-review path reads the PR's agy
+        # comment before the follow-up. "Unknown" (None) is its no-op answer.
+        monkeypatch.setattr(shepherd, "read_agy_advisory", lambda *_a, **_kw: None)
     yield
 
 
