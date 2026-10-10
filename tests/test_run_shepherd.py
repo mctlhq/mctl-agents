@@ -2827,7 +2827,12 @@ def test_apply_followup_skip_subprocess_does_not_fork(monkeypatch) -> None:
         bundle = run_shepherd.apply_followup(
             "mctl-web", "test-slug", findings, skip_subprocess=True,
         )
-    assert bundle == {"p1": True, "p2": False, "summaries": ["fix"]}
+    # The SDK bundle is passed through untouched; the deterministic
+    # `findings` records ride alongside it (asserted in detail below).
+    assert {k: v for k, v in bundle.items() if k != "findings"} == {
+        "p1": True, "p2": False, "summaries": ["fix"],
+    }
+    assert [r["body"] for r in bundle["findings"]] == [findings[0].body]
     assert calls == []
 
 
@@ -2922,7 +2927,12 @@ def test_apply_followup_bare_list_still_works(monkeypatch) -> None:
             "mctl-web", "test-slug", findings, skip_subprocess=True,
         )
     assert "ci_failures" not in bundle
-    assert bundle == {"p1": True, "p2": False, "summaries": ["fix"]}
+    # The SDK bundle is passed through untouched; the deterministic
+    # `findings` records ride alongside it (asserted in detail below).
+    assert {k: v for k, v in bundle.items() if k != "findings"} == {
+        "p1": True, "p2": False, "summaries": ["fix"],
+    }
+    assert [r["body"] for r in bundle["findings"]] == [findings[0].body]
 
 
 def test_apply_followup_neutralises_and_bounds_ci_excerpt(monkeypatch) -> None:
@@ -3118,7 +3128,12 @@ def test_apply_followup_invokes_implementer_subprocess(monkeypatch) -> None:
             "mctl-web", "test-slug", findings,
         )
 
-    assert bundle == {"p1": True, "p2": False, "summaries": ["fix"]}
+    # The SDK bundle is passed through untouched; the deterministic
+    # `findings` records ride alongside it (asserted in detail below).
+    assert {k: v for k, v in bundle.items() if k != "findings"} == {
+        "p1": True, "p2": False, "summaries": ["fix"],
+    }
+    assert [r["body"] for r in bundle["findings"]] == [findings[0].body]
     cmd = captured["cmd"]
     # Last two args are --review-feedback <path>.
     assert "orchestrator.run_implementer" in cmd

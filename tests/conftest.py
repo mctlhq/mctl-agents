@@ -17,6 +17,25 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+@pytest.fixture(autouse=True)
+def _no_live_refusal_replies(monkeypatch):
+    """Keep the shepherd's refusal arm from talking to GitHub in tests.
+
+    `process_one`'s refusal arm calls `run_shepherd.post_refusal_replies`,
+    which lists the PR's comments and posts the implementer's reason with
+    `gh`. Dozens of existing tests drive that arm with fixture PRs that point
+    at real repositories (`mctlhq/mctl-web`), and on a machine where `gh` is
+    authenticated a stray run would post a real comment. Stubbed for every
+    test; the tests of the function itself hold a reference taken at import
+    time (before this fixture runs) and drive it with `_run`/`_gh_api_json`
+    stubbed.
+    """
+    shepherd = sys.modules.get("orchestrator.run_shepherd")
+    if shepherd is not None:
+        monkeypatch.setattr(shepherd, "post_refusal_replies", lambda *_a, **_kw: None)
+    yield
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     # Pins anyio's pytest plugin (auto-registered since anyio is already a
