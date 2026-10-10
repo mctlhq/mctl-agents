@@ -96,7 +96,15 @@ def test_empty_block_changes_the_prompt_by_zero_bytes():
     default = investigator._build_prompt(issue, "x", "slug")
     explicit_empty = investigator._build_prompt(issue, "x", "slug", service_skills_block="")
     assert default == explicit_empty
-    assert "\n- `$PROPOSAL_DIR` (env var) is where you write the proposal files.\n\n## What to produce\n" in default
+    # The deployed-state grounding block is unconditional and sits right
+    # before the slot, so an empty slot leaves exactly one blank line
+    # between it and "## What to produce".
+    grounding = investigator._deployed_state_grounding_block("x")
+    assert (
+        "\n- `$PROPOSAL_DIR` (env var) is where you write the proposal files.\n"
+        + grounding
+        + "\n## What to produce\n"
+    ) in default
 
 
 def test_hostile_heading_in_issue_body_does_not_capture_the_skills_block():
