@@ -51,7 +51,11 @@ class _RootActivityInbound(temporalio.worker.ActivityInboundInterceptor):
         token = None
         try:
             info = temporalio.activity.info()
-            context = tracing.workflow_root_context(info.workflow_id or "", info.workflow_run_id or "")
+            context = tracing.workflow_root_context(
+                info.workflow_id or "",
+                info.workflow_run_id or "",
+                sampled=tracing.workflow_type_traced(info.workflow_type),
+            )
             if context is not None:
                 from opentelemetry import context as otel_context
 

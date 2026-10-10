@@ -66,6 +66,18 @@ ERROR_DETAIL_ENV = "MCTL_TRACE_ERROR_DETAIL"
 # Set by the CWFT from `{{workflow.name}}` (gitops follow-up). Read, never
 # required: absent, the pod's spans simply do not carry the attribute.
 ARGO_WORKFLOW_NAME_ENV = "ARGO_WORKFLOW_NAME"
+# Rollout scope, worker side. Unset: every workflow run the worker hosts is
+# traced. Set: a comma-separated list of Temporal workflow type names (e.g.
+# `DevLoopWorkflow`), and a run of any other type gets an UNSAMPLED virtual
+# root. The SDK's default parent-based sampler then records nothing under it:
+# not its activities, not its Argo span, and not a pod that inherits the
+# unsampled traceparent. Set but empty means no type is traced.
+WORKFLOW_TYPES_ENV = "MCTL_TRACE_WORKFLOW_TYPES"
+# Rollout scope, pod side. When true, a process whose TRACEPARENT is absent,
+# malformed or unsampled stays untraced, without even importing the SDK. So a
+# CWFT carrying the OTLP env exports only for runs a traced worker submitted,
+# never for a manual or sweep submit of the same template.
+REQUIRE_PARENT_ENV = "MCTL_TRACE_REQUIRE_PARENT"
 
 EXPORT_TIMEOUT_SECONDS = 5.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -174,6 +186,11 @@ def init_tracing(
     """
     if _state.enabled:
         return True
+    if _flag(REQUIRE_PARENT_ENV, environ):
+        env = os.environ if environ is None else environ
+        if not sampled_traceparent(env.get(TRACEPARENT_ENV)):
+            logger.info("tracing: off for this process (%s set, no sampled %s)", REQUIRE_PARENT_ENV, TRACEPARENT_ENV)
+            return False
     if exporter is None and not endpoint_configured(environ):
         return False
     try:
@@ -473,6 +490,25 @@ def valid_traceparent(value: str | None) -> bool:
     return trace_id != "0" * 32 and span_id != "0" * 16
 
 
+def sampled_traceparent(value: str | None) -> bool:
+    """A valid traceparent whose sampled flag is set."""
+    if not valid_traceparent(value):
+        return False
+    match = _TRACEPARENT_RE.match((value or "").strip())
+    return match is not None and bool(int(match.group(3), 16) & 0x01)
+
+
+def workflow_type_traced(workflow_type: str | None, environ: Mapping[str, str] | None = None) -> bool:
+    """Whether runs of this Temporal workflow type are in the rollout scope
+    (`MCTL_TRACE_WORKFLOW_TYPES`). Every type is, while the variable is unset."""
+    env = os.environ if environ is None else environ
+    raw = env.get(WORKFLOW_TYPES_ENV)
+    if raw is None:
+        return True
+    allowed = {name.strip() for name in raw.split(",") if name.strip()}
+    return bool(workflow_type) and workflow_type in allowed
+
+
 def current_traceparent() -> str | None:
     """The W3C traceparent of the current span, or None when there is none
     (tracing off, or no recording span in context)."""
@@ -560,9 +596,15 @@ def workflow_trace_ids(workflow_id: str, run_id: str) -> tuple[int, int]:
     return trace_id, span_id
 
 
-def workflow_root_context(workflow_id: str, run_id: str) -> Any:
-    """A Context whose remote parent is the run's virtual root, or None."""
-    if not _state.enabled or not workflow_id or not run_id:
+def workflow_root_context(workflow_id: str, run_id: str, *, sampled: bool = True) -> Any:
+    """A Context whose remote parent is the run's virtual root, or None.
+
+    `sampled=False` gives an unsampled root, which is how a run outside the
+    rollout scope is kept out of the trace: everything parented on it is
+    dropped by the parent-based sampler. It is returned even when an id is
+    missing, because None would let the activity span start a sampled trace
+    of its own."""
+    if not _state.enabled or (sampled and (not workflow_id or not run_id)):
         return None
     try:
         from opentelemetry import trace
@@ -573,7 +615,7 @@ def workflow_root_context(workflow_id: str, run_id: str) -> Any:
             trace_id=trace_id,
             span_id=span_id,
             is_remote=True,
-            trace_flags=TraceFlags(TraceFlags.SAMPLED),
+            trace_flags=TraceFlags(TraceFlags.SAMPLED if sampled else TraceFlags.DEFAULT),
         )
         return trace.set_span_in_context(NonRecordingSpan(parent))
     except Exception as exc:  # noqa: BLE001
