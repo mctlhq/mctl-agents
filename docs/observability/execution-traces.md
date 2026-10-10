@@ -222,6 +222,21 @@ worker restart, a manual `mctl-agents-investigate` submit or an
 `ImplementSweepWorkflow` submit exports nothing. Widening the scope means
 editing a list in values that a reviewer can see.
 
+## Logs: from a trace to its lines and back
+
+`mctlhq/mctl-agent#97`. Two hooks, both plain `key=value` text, so any log backend can find them without a parsing stage. Neither becomes a Loki label, so the ids add no stream cardinality.
+
+- **Worker.** `tracing.install_log_correlation()` runs right after `basicConfig`. A line logged inside a *recording* span ends in ` trace_id=<32 hex> span_id=<16 hex>`. A line outside one, or under an unsampled root (a workflow outside `MCTL_TRACE_WORKFLOW_TYPES`), is unchanged, so it never names a trace that was not exported.
+- **Agent pods.** These log with `print`. When the root span is recording, `pod_root_span` prints one anchor line: `[trace] trace_id=<id> span_id=<root span> argo_workflow=<name>`.
+
+| Direction | How |
+|---|---|
+| Trace to logs | Search for `trace_id=<id>`, e.g. `{namespace=~"admins\|argo-workflows"} \|= "trace_id=<id>"`. The pod anchor's `pod` label is the pod's whole log stream. Every span also carries `k8s.pod.name`. |
+| Logs to trace | Take the `trace_id=` value from the line and open it in Tempo. |
+| Workflow to trace | `mctl_get_workflow_status` returns `live.trace.trace_id` (mctl-api 4.75.0+). |
+
+Both hooks swallow their own errors. A log line never depends on the tracing pipeline, and neither does a run.
+
 ## Follow-ups outside this repo
 
 The rollout order is fail-closed: gitops first, then mctl-api, then the flag in this

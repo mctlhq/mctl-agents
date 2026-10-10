@@ -126,6 +126,9 @@ IMPLEMENT_SWEEP_WORKFLOW_ID = "implement-sweep-mctl-agents"
 # the incident loop's execution record (#254).
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
+# Lines logged inside a recording span end in ` trace_id=… span_id=…`
+# (mctlhq/mctl-agent#97); every other line is unchanged.
+tracing.install_log_correlation()
 logger = logging.getLogger(__name__)
 
 # How long to let the surviving workers drain when a worker died on its own
