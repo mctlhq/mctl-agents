@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.71.0](https://github.com/mctlhq/mctl-agents/compare/1.70.1...1.71.0) (2026-10-10)
+
+
+### Features
+
+* **tracing:** bound the live rollout to listed workflow types ([af1776e](https://github.com/mctlhq/mctl-agents/commit/af1776e0829c303a20854571e662eda0b7e8f333))
+* **tracing:** bound the live rollout to listed workflow types ([bbffc9d](https://github.com/mctlhq/mctl-agents/commit/bbffc9d68a6bd261d7d76152e6162fa5fa3400ba)), closes [#195](https://github.com/mctlhq/mctl-agents/issues/195)
+
+
+### Bug Fixes
+
+* **devloop:** give the merge-gate context the run's OTel trace id ([cf159b8](https://github.com/mctlhq/mctl-agents/commit/cf159b8a0823a24ebf7446cda8dafa44009f91ec))
+* **devloop:** give the merge-gate context the run's OTel trace id ([301897d](https://github.com/mctlhq/mctl-agents/commit/301897d85305569a588650baa087646a237f0774))
+
 ## [1.70.1](https://github.com/mctlhq/mctl-agents/compare/1.70.0...1.70.1) (2026-10-10)
 
 
