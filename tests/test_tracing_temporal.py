@@ -38,7 +38,13 @@ ISSUE_URL = "https://github.com/mctlhq/mctl-telegram/issues/617"
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
-    for name in (tracing.ARGO_PARAM_ENV, tracing.TRACEPARENT_ENV, "OTEL_EXPORTER_OTLP_ENDPOINT"):
+    for name in (
+        tracing.ARGO_PARAM_ENV,
+        tracing.TRACEPARENT_ENV,
+        tracing.WORKFLOW_TYPES_ENV,
+        tracing.REQUIRE_PARENT_ENV,
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MCTL_TOKEN", "test-token")
     tracing._reset_for_tests()
@@ -201,6 +207,50 @@ async def test_an_untraced_worker_sends_the_params_unchanged(env, monkeypatch):
     await _run_probe(env, {"issue_url": ISSUE_URL})
     (body,) = posted
     assert body == {"issue_url": ISSUE_URL}
+
+
+async def test_a_listed_workflow_type_is_traced(env, exported, monkeypatch):
+    monkeypatch.setenv(tracing.WORKFLOW_TYPES_ENV, "DevLoopWorkflow,ArgoProbeWorkflow")
+    monkeypatch.setenv(tracing.ARGO_PARAM_ENV, "true")
+    posted = _fake_mctl_api(monkeypatch)
+    workflow_id, run_id = await _run_probe(env, {"issue_url": ISSUE_URL})
+
+    trace_id, _root = tracing.workflow_trace_ids(workflow_id, run_id)
+    assert _by_name(exported, "RunActivity:submit_and_wait").context.trace_id == trace_id
+    (body,) = posted
+    assert tracing.sampled_traceparent(body[tracing.TRACEPARENT_PARAM])
+
+
+async def test_an_unlisted_workflow_type_records_nothing_down_to_the_pod(env, exported, monkeypatch):
+    """The rollout scope: a run outside MCTL_TRACE_WORKFLOW_TYPES exports no
+    span on the worker, and the pod it submits -- which inherits the
+    unsampled traceparent -- exports none either. With
+    MCTL_TRACE_REQUIRE_PARENT the pod does not even start tracing."""
+    monkeypatch.setenv(tracing.WORKFLOW_TYPES_ENV, "DevLoopWorkflow")
+    monkeypatch.setenv(tracing.ARGO_PARAM_ENV, "true")
+    posted = _fake_mctl_api(monkeypatch)
+    workflow_id, run_id = await _run_probe(env, {"issue_url": ISSUE_URL})
+
+    assert exported.get_finished_spans() == ()
+    (body,) = posted
+    traceparent = body[tracing.TRACEPARENT_PARAM]
+    trace_id, _root = tracing.workflow_trace_ids(workflow_id, run_id)
+    assert traceparent.startswith(f"00-{trace_id:032x}-") and not tracing.sampled_traceparent(traceparent)
+
+    # A pod without the require-parent gate: parent-based sampling drops it.
+    with tracing.pod_root_span("issue-investigator.run", environ={tracing.TRACEPARENT_ENV: traceparent}):
+        with tracing.span("model"):
+            pass
+    assert exported.get_finished_spans() == ()
+
+    # A pod with the gate never turns tracing on at all.
+    tracing._reset_for_tests()
+    pod_env = {
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4318",
+        tracing.REQUIRE_PARENT_ENV: "true",
+        tracing.TRACEPARENT_ENV: traceparent,
+    }
+    assert not tracing.init_tracing("pod", environ=pod_env)
 
 
 _REPLAY_CASES = [(s, kind) for s in SCENARIOS for kind in ("prepatch", "patched")]

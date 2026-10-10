@@ -37,6 +37,8 @@ _OTEL_ENV = (
     tracing.ARGO_PARAM_ENV,
     tracing.ERROR_DETAIL_ENV,
     tracing.TRACEPARENT_ENV,
+    tracing.WORKFLOW_TYPES_ENV,
+    tracing.REQUIRE_PARENT_ENV,
 )
 
 
@@ -581,3 +583,70 @@ def test_workflow_trace_ids_are_deterministic_per_run():
     assert a[0] != tracing.workflow_trace_ids("dev-loop-mctlhq-x-1", "run-b")[0]
     assert a[0] != tracing.workflow_trace_ids("dev-loop-mctlhq-x-2", "run-a")[0]
     assert 0 < a[0] < 2**128 and 0 < a[1] < 2**64
+
+
+# ---------------------------------------------------------------------------
+# Rollout scope (#195 live rollout): MCTL_TRACE_WORKFLOW_TYPES and
+# MCTL_TRACE_REQUIRE_PARENT
+# ---------------------------------------------------------------------------
+
+_SAMPLED = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+_UNSAMPLED = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00"
+
+
+@pytest.mark.parametrize(
+    ("value", "sampled"),
+    [(_SAMPLED, True), (_UNSAMPLED, False), ("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-03", True),
+     ("", False), (None, False), ("garbage", False)],
+)
+def test_sampled_traceparent(value, sampled):
+    assert tracing.sampled_traceparent(value) is sampled
+
+
+@pytest.mark.parametrize(
+    ("environ", "workflow_type", "traced"),
+    [
+        ({}, "AnyWorkflow", True),
+        ({tracing.WORKFLOW_TYPES_ENV: "DevLoopWorkflow"}, "DevLoopWorkflow", True),
+        ({tracing.WORKFLOW_TYPES_ENV: " DevLoopWorkflow , Other "}, "Other", True),
+        ({tracing.WORKFLOW_TYPES_ENV: "DevLoopWorkflow"}, "ReconcileWorkflow", False),
+        ({tracing.WORKFLOW_TYPES_ENV: "DevLoopWorkflow"}, "", False),
+        ({tracing.WORKFLOW_TYPES_ENV: "DevLoopWorkflow"}, None, False),
+        ({tracing.WORKFLOW_TYPES_ENV: ""}, "DevLoopWorkflow", False),
+    ],
+)
+def test_workflow_type_traced(environ, workflow_type, traced):
+    assert tracing.workflow_type_traced(workflow_type, environ) is traced
+
+
+@pytest.mark.parametrize(
+    ("traceparent", "on"),
+    [(None, False), ("", False), ("garbage", False), (_UNSAMPLED, False), (_SAMPLED, True)],
+)
+def test_require_parent_keeps_a_process_without_a_sampled_parent_inert(traceparent, on):
+    environ = {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4318", tracing.REQUIRE_PARENT_ENV: "true"}
+    if traceparent is not None:
+        environ[tracing.TRACEPARENT_ENV] = traceparent
+    assert tracing.init_tracing("test", exporter=InMemorySpanExporter(), synchronous=True,
+                                set_global=False, environ=environ) is on
+    assert tracing.enabled() is on
+
+
+def test_without_require_parent_a_parentless_process_still_traces():
+    environ = {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4318"}
+    assert tracing.init_tracing("test", exporter=InMemorySpanExporter(), synchronous=True,
+                                set_global=False, environ=environ)
+
+
+def test_an_unsampled_workflow_root_drops_everything_under_it(exported):
+    context = tracing.workflow_root_context("wf", "run", sampled=False)
+    assert context is not None
+    with tracing.span("child", parent=context), tracing.span("grandchild"):
+        pass
+    assert exported.get_finished_spans() == ()
+
+
+def test_an_unsampled_root_is_returned_even_without_ids(exported):
+    """None would let the activity span open a sampled trace of its own."""
+    assert tracing.workflow_root_context("", "", sampled=False) is not None
+    assert tracing.workflow_root_context("", "") is None

@@ -837,7 +837,12 @@ async def main() -> None:
     # endpoint variables are set on the Deployment, and never fatal.
     tracing.init_tracing("mctl-agents-worker")
     interceptors = worker_interceptors()
-    logger.info("execution tracing %s", "enabled" if interceptors else "off")
+    scope = os.environ.get(tracing.WORKFLOW_TYPES_ENV)
+    logger.info(
+        "execution tracing %s%s",
+        "enabled" if interceptors else "off",
+        f" for workflow types: {scope.strip() or '(none)'}" if interceptors and scope is not None else "",
+    )
     logger.info("serving metrics on :%d/metrics", METRICS_PORT)
 
     logger.info("connecting to Temporal at %s (namespace=%s)", address, namespace)

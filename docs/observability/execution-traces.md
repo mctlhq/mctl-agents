@@ -204,6 +204,23 @@ standing deployment.
 | `TRACEPARENT` | pods | unset | W3C parent of the pod's root span. A malformed or empty value starts a fresh trace. |
 | `ARGO_WORKFLOW_NAME` | pods | unset | Stamped as `mctl.argo.workflow.name` on the pod root. |
 | `MCTL_TRACE_ERROR_DETAIL` | worker, pods | off | The one redaction opt-in (see above). |
+| `MCTL_TRACE_WORKFLOW_TYPES` | worker | unset (every type) | Rollout scope. A comma-separated list of Temporal workflow type names. A run of any other type gets an unsampled virtual root, so nothing under it is recorded: its activities, its Argo span, or a pod that inherits the unsampled `traceparent`. Set but empty traces nothing. |
+| `MCTL_TRACE_REQUIRE_PARENT` | pods | off | Rollout scope. When true, a pod whose `TRACEPARENT` is absent, malformed or unsampled stays inert and does not import the SDK. A CWFT with the OTLP env then exports only for runs a traced worker submitted, never for a manual or sweep submit of the same template. |
+
+## Bounded rollout
+
+The first live rollout traces the DevLoop only, not every workflow the workers
+host. The exec and implement workers also run reconcile, incident and sweep
+submits, and the control worker runs the poller and the schedules. So:
+
+- the workers carry `MCTL_TRACE_WORKFLOW_TYPES=DevLoopWorkflow`;
+- the investigate and implement CWFTs carry `MCTL_TRACE_REQUIRE_PARENT=true`
+  beside their OTLP env.
+
+The two variables bound the rollout in code, not only in configuration. A
+worker restart, a manual `mctl-agents-investigate` submit or an
+`ImplementSweepWorkflow` submit exports nothing. Widening the scope means
+editing a list in values that a reviewer can see.
 
 ## Follow-ups outside this repo
 
@@ -294,8 +311,9 @@ run, so it closes on this list, each item with a link or a screenshot:
    `gen_ai.usage.input_tokens` arrives as an integer, not `****`.
 3. [ ] **Catalog updated.** The mctl-docs reservation PR for the proposed names
    is merged.
-4. [ ] **Worker env.** `otel.enabled: true` is live on all three worker
-   Deployments. `kubectl exec` shows `OTEL_EXPORTER_OTLP_ENDPOINT` and
+4. [ ] **Worker env.** `otel.enabled: true` is live on the worker
+   Deployments that run DevLoop activities, with
+   `MCTL_TRACE_WORKFLOW_TYPES=DevLoopWorkflow` (see "Bounded rollout"). `kubectl exec` shows `OTEL_EXPORTER_OTLP_ENDPOINT` and
    `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`. The worker log says
    `execution tracing enabled`.
 5. [ ] **CWFT wiring.** Both CWFTs declare `traceparent` and map it to
