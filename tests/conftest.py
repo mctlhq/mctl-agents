@@ -35,6 +35,9 @@ def _no_live_refusal_replies(monkeypatch):
     # must not depend on some other test module having imported it first.
     shepherd = importlib.import_module("orchestrator.run_shepherd")
     monkeypatch.setattr(shepherd, "post_refusal_replies", lambda *_a, **_kw: None)
+    # Same reason, read side: the address-review path reads the PR's agy
+    # comment before the follow-up. "Unknown" (None) is its no-op answer.
+    monkeypatch.setattr(shepherd, "read_agy_advisory", lambda *_a, **_kw: None)
     yield
 
 

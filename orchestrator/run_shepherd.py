@@ -2307,6 +2307,294 @@ def read_copilot_review(pr: PRSnapshot) -> CopilotReview:
 
 
 # ---------------------------------------------------------------------------
+# agy (Antigravity) review — ADVISORY input to a follow-up, never a gate.
+#
+# Owner policy: agy is informational. It never blocks a merge, never counts as
+# a review response, and never starts a follow-up. But when a follow-up is
+# running anyway, its P1/P2 findings must be fixed or refuted with evidence,
+# so they ride along in the bundle as `advisory_findings`, rendered to the
+# implementer in a section of their own. Nothing here is read by decide(),
+# `Blockers` or `has_responded`.
+# ---------------------------------------------------------------------------
+AGY_REVIEW_BOT = "github-actions[bot]"
+AGY_REVIEW_MARKER = "<!-- agy-review -->"
+# "_Model: gemini-... · commit `d41de55`._" -- anchored to the `_Model:` line
+# so a commit SHA quoted in a finding body is never taken for the head.
+_AGY_COMMIT_RE = re.compile(r"(?m)^_Model:[^\n]*?\bcommit\s+`([0-9a-fA-F]{7,40})`")
+# Every verdict marker in the comment. agy ends its comment with one, but a
+# finding may quote one (e.g. about agy's own workflow), so only the LAST
+# marker is the comment's verdict.
+_AGY_VERDICT_RE = re.compile(r"<!--\s*VERDICT:\s*([A-Za-z]+)[^\n]*?-->")
+# A finding starts at a level-3 or level-4 heading. agy has used at least
+# three layouts on real PRs:
+#   #### [P2] `cmd/api/main.go`:957                (mctl-api#542)
+#   #### [P2] Invalid `await` on ...                (mctl-agents#566)
+#   ### Finding 1: title  + "- **Severity:** P1"   (mctl-agents#567)
+#   ### Finding 1         + "* **Severity:** P1"   (mctl-agents#567, round 3)
+# so the severity is read from the heading line OR from a "Severity:" line
+# near the top of the section, and a section with neither (the "### Findings"
+# container heading, prose) is not a finding.
+_AGY_HEADING_LINE_RE = re.compile(r"^(#{3,4})[ \t]+\S")
+_AGY_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
+_AGY_HEADING_SEVERITY_RE = re.compile(r"(?<![\w-])\[?(P[123])\]?(?![\w-])")
+_AGY_SEVERITY_LINE_RE = re.compile(
+    r"(?i)^[ \t]*(?:[-*+][ \t]+)?\**severity\W{0,8}(P[123])\b"
+)
+# The severity line must sit among the first few non-blank lines under the
+# heading; a "severity: P1" deep inside a finding's prose or quoted code is
+# not that finding's label.
+_AGY_SEVERITY_LINE_WINDOW = 4
+_AGY_TRAILING_RULE_RE = re.compile(r"\n[ \t]*-{3,}[ \t]*\s*$")
+
+
+@dataclass(frozen=True)
+class AdvisoryFinding:
+    """One P1/P2 item from an advisory (non-gating) reviewer."""
+
+    severity: str
+    body: str
+    reviewer: str
+    comment_id: int | None
+    commit: str | None
+
+
+def _agy_headings(body: str) -> list[tuple[int, int]]:
+    """``[(offset, level), ...]`` of the level-3/4 headings OUTSIDE fenced
+    code blocks -- a ``### ...`` line inside a quoted snippet is content.
+
+    A fence that never closes does not hide the rest of the comment: the
+    headings seen after its opener are kept after all, since an unclosed
+    fence is a formatting slip, and swallowing the findings after it (and
+    labelling them by the finding it started in) would lose them silently.
+    """
+    out: list[tuple[int, int]] = []
+    fenced: list[tuple[int, int]] = []
+    fence: str | None = None
+    offset = 0
+    for line in body.split("\n"):
+        f = _AGY_FENCE_RE.match(line)
+        h = _AGY_HEADING_LINE_RE.match(line)
+        if fence is not None:
+            # CommonMark: a closing fence is the same character, at least as
+            # long, with no info string.
+            if (f and f.group(1)[0] == fence[0] and len(f.group(1)) >= len(fence)
+                    and not f.group(2).strip()):
+                fence = None
+                fenced = []
+            elif h:
+                fenced.append((offset, len(h.group(1))))
+        elif f:
+            fence = f.group(1)
+        elif h:
+            out.append((offset, len(h.group(1))))
+        offset += len(line) + 1
+    return out + fenced
+
+
+def _agy_section_severity(section: str) -> str | None:
+    """The P-label of one section: from its heading line, else from a
+    "Severity:" line among the first few non-blank lines below it."""
+    lines = section.split("\n")
+    m = _AGY_HEADING_SEVERITY_RE.search(lines[0] if lines else "")
+    if m:
+        return m.group(1)
+    seen = 0
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        m = _AGY_SEVERITY_LINE_RE.match(line)
+        if m:
+            return m.group(1)
+        seen += 1
+        if seen >= _AGY_SEVERITY_LINE_WINDOW:
+            break
+    return None
+
+
+def _agy_trailer(body: str) -> re.Match[str] | None:
+    """The comment's verdict trailer: its LAST marker, and only when nothing
+    but whitespace follows it. A marker with text after it is a quote (in a
+    finding, or in a comment that lost its trailer), never the verdict."""
+    verdicts = list(_AGY_VERDICT_RE.finditer(body or ""))
+    if verdicts and not (body or "")[verdicts[-1].end():].strip():
+        return verdicts[-1]
+    return None
+
+
+def _agy_verdict(body: str) -> str | None:
+    """The comment's verdict word (``PASS``, ``FAIL``), or None without a trailer."""
+    trailer = _agy_trailer(body)
+    return trailer.group(1).upper() if trailer else None
+
+
+def _parse_agy_findings(body: str) -> list[tuple[str, str]]:
+    """``[(severity, section_text), ...]`` for the P1/P2 items in one agy
+    comment. P3 and unlabelled sections are dropped; a PASS verdict has no
+    findings by definition.
+
+    Only structure agy itself controls is used to cut the text: its verdict
+    trailer (see `_agy_trailer`) and one trailing ``---`` rule. A ``---`` or
+    a quoted verdict inside a finding -- YAML front matter, a quoted agy
+    comment -- stays in that finding's text instead of truncating it.
+    """
+    body = body or ""
+    # Only a real trailer decides PASS and is cut. A comment without one
+    # (truncated, edited) keeps its whole text and is parsed as is: a marker
+    # quoted in finding 1 must neither pass the comment nor drop findings 2..N.
+    trailer = _agy_trailer(body)
+    if trailer is not None:
+        if trailer.group(1).upper() == "PASS":
+            return []
+        body = body[:trailer.start()]
+    body = _AGY_TRAILING_RULE_RE.sub("", body.rstrip())
+
+    headings = _agy_headings(body)
+    # Sections at every candidate level, to find the level agy used for its
+    # findings: the level of the first labelled one. Splitting only at that
+    # level (and above) keeps a finding's own "#### Suggested fix" sub-heading
+    # inside it.
+    level: int | None = None
+    for i, (start, lvl) in enumerate(headings):
+        end = headings[i + 1][0] if i + 1 < len(headings) else len(body)
+        if _agy_section_severity(body[start:end]) is not None:
+            level = lvl
+            break
+    if level is None:
+        return []
+    bounds = [(o, lv) for o, lv in headings if lv <= level]
+    out: list[tuple[str, str]] = []
+    for i, (start, lvl) in enumerate(bounds):
+        if lvl != level:
+            continue
+        end = bounds[i + 1][0] if i + 1 < len(bounds) else len(body)
+        # The `---` agy puts between findings belongs to neither of them.
+        section = _AGY_TRAILING_RULE_RE.sub("", body[start:end].strip()).strip()
+        sev = _agy_section_severity(section)
+        if sev in ("P1", "P2"):
+            out.append((sev, section))
+    return out
+
+
+def read_agy_advisory(pr: PRSnapshot) -> list[AdvisoryFinding] | None:
+    """`_read_agy_advisory`, made unable to crash the tick: it runs right
+    before a paid follow-up, and an advisory input failing in an unforeseen
+    way must cost the advisory, not the follow-up."""
+    try:
+        return _read_agy_advisory(pr)
+    except Exception as e:  # noqa: BLE001 — advisory input, see docstring
+        print(
+            f"warn: agy advisory unknown for {pr.repo}#{pr.number} "
+            f"({type(e).__name__}: {e}); follow-up runs without it"
+        )
+        return None
+
+
+def _read_agy_advisory(pr: PRSnapshot) -> list[AdvisoryFinding] | None:
+    """The P1/P2 items of the newest agy review that belongs to the current head.
+
+    A comment belongs to the head when its ``commit `<sha>``` prefix matches
+    ``pr.head_sha``; a comment with no commit line belongs to it when it was
+    posted after ``head_pushed_at``. A comment we cannot attribute to this
+    head is not used: an advisory about older code would send the implementer
+    after something that may already be gone.
+
+    Returns ``None`` when the comments could not be read -- an UNKNOWN, kept
+    apart from ``[]`` (read fine, nothing to add) so the log says which one it
+    was. Both lead to the same bundle (no advisory section), because the
+    input is advisory: an unknown must not block or delay the follow-up,
+    and must not be reported as "agy found nothing" either.
+    """
+    try:
+        # `_gh_api_list`, not `_gh_api_json(..., "--paginate")`: agy posts one
+        # comment per push, so a long PR is exactly where its newest comment
+        # sits on page 2+, and concatenated pages do not parse as one JSON.
+        comments = _gh_api_list(f"repos/{pr.repo}/issues/{pr.number}/comments")
+    except (subprocess.CalledProcessError, OSError, ValueError) as e:
+        msg = (getattr(e, "stderr", None) or "").strip() or str(e)
+        print(
+            f"warn: agy advisory unknown for {pr.repo}#{pr.number} ({msg}); "
+            f"follow-up runs without it"
+        )
+        return None
+
+    newest: dict | None = None
+    commit: str | None = None
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        if (c.get("user") or {}).get("login") != AGY_REVIEW_BOT:
+            continue
+        body = c.get("body") or ""
+        if AGY_REVIEW_MARKER not in body:
+            continue
+        m = _AGY_COMMIT_RE.search(body)
+        sha = m.group(1).lower() if m else None
+        if sha is not None:
+            if not pr.head_sha.lower().startswith(sha):
+                continue
+        elif not _iso_gt(c.get("created_at"), pr.head_pushed_at):
+            continue
+        if newest is None or (c.get("created_at") or "") >= (newest.get("created_at") or ""):
+            newest = c
+            commit = sha
+    if newest is None:
+        print(f"info: agy advisory on {pr.repo}#{pr.number}: no agy comment for this head")
+        return []
+    newest_body = newest.get("body") or ""
+    items = _parse_agy_findings(newest_body)
+    verdict = _agy_verdict(newest_body)
+    print(
+        f"info: agy advisory on {pr.repo}#{pr.number}: comment {newest.get('id')} "
+        f"commit {commit or '(dated by push)'} verdict {verdict} -> "
+        f"{len(items)} P1/P2 item(s)"
+    )
+    if verdict not in (None, "PASS") and not items and re.search(r"\bP[12]\b", newest_body):
+        # A non-PASS verdict naming P1/P2 with nothing parsed is a layout the
+        # parser does not know, not a clean review -- say so, or the "fix or
+        # refute agy's P1/P2" policy stops being applied without a trace.
+        print(
+            f"warn: agy advisory on {pr.repo}#{pr.number}: verdict {verdict} names "
+            f"P1/P2 but no finding was parsed from comment {newest.get('id')}; "
+            f"layout not recognised"
+        )
+    return [
+        AdvisoryFinding(
+            severity=sev,
+            body=text,
+            reviewer="agy",
+            comment_id=newest.get("id"),
+            commit=commit,
+        )
+        for sev, text in items
+    ]
+
+
+def _augment_bundle_with_advisory(bundle: dict, advisory: list[AdvisoryFinding] | None) -> dict:
+    """Attach advisory reviewer findings as `advisory_findings`.
+
+    Kept out of `summaries`/`findings`, `p1`/`p2` and every other key the
+    gate or the prompt framing reads: advisory input must never look like a
+    blocker. Same neutralisation and per-item cap as `findings`.
+    """
+    if not advisory:
+        return bundle
+    bundle = dict(bundle)
+    records: list[dict] = []
+    for a in advisory:
+        capped, truncated = _cap_finding_body(a.body)
+        records.append({
+            "reviewer": a.reviewer,
+            "severity": a.severity,
+            "comment_id": a.comment_id,
+            "commit": a.commit,
+            "body": _neutralize_findings_tags(capped),
+            "truncated": truncated,
+        })
+    bundle["advisory_findings"] = records
+    return bundle
+
+
+# ---------------------------------------------------------------------------
 # Decision logic — the pure function. No I/O, no globals.
 # ---------------------------------------------------------------------------
 def decide(
@@ -2765,6 +3053,7 @@ def apply_followup(
     state_dir: Path | None = None,
     adopted_pr: str | None = None,
     repo: str | None = None,
+    advisory_findings: list[AdvisoryFinding] | None = None,
 ) -> dict:
     """Bundle findings + CI blockers, invoke the Tier 2 implementer with
     --review-feedback.
@@ -2802,6 +3091,12 @@ def apply_followup(
     (every existing direct caller, including the many tests that construct a
     bare ``list[CodexFinding]`` and therefore never reach the CI branch at
     all).
+
+    ``advisory_findings`` are a non-gating reviewer's P1/P2 items (agy, see
+    `read_agy_advisory`). They only ride along: they go to
+    ``bundle["advisory_findings"]`` and nowhere else, and never cause a
+    follow-up by themselves -- the caller only gets here because there are
+    real blockers.
     """
     if isinstance(blockers, Blockers):
         findings = blockers.findings
@@ -2827,6 +3122,7 @@ def apply_followup(
         # the implementer as if it were real review findings.
         bundle = _fallback_bundle(findings)
     bundle = _augment_bundle_with_findings(bundle, findings)
+    bundle = _augment_bundle_with_advisory(bundle, advisory_findings)
     bundle = _augment_bundle_with_ci(bundle, checks)
 
     if skip_subprocess:
@@ -3725,6 +4021,11 @@ def process_one(
                     state_dir=state_dir,
                     adopted_pr=(ref.pr_url if ref.is_adopted else None),
                     repo=pr.repo,
+                    # Read HERE, on the address-review path only: agy is
+                    # informational (owner policy), so it never starts a
+                    # follow-up and never reaches decide(); it only rides
+                    # along on one that real blockers already started.
+                    advisory_findings=read_agy_advisory(pr),
                 )
         except FollowupSubprocessError as e:
             if e.kind == "refused":
