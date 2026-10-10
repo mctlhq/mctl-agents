@@ -2398,11 +2398,10 @@ def _read_agy_advisory(pr: PRSnapshot) -> list[AdvisoryFinding] | None:
     and must not be reported as "agy found nothing" either.
     """
     try:
-        comments = _gh_api_json([
-            f"repos/{pr.repo}/issues/{pr.number}/comments", "--paginate",
-        ])
-        if not isinstance(comments, list):
-            raise ValueError(f"unexpected listing shape: {type(comments).__name__}")
+        # `_gh_api_list`, not `_gh_api_json(..., "--paginate")`: agy posts one
+        # comment per push, so a long PR is exactly where its newest comment
+        # sits on page 2+, and concatenated pages do not parse as one JSON.
+        comments = _gh_api_list(f"repos/{pr.repo}/issues/{pr.number}/comments")
     except (subprocess.CalledProcessError, OSError, ValueError) as e:
         msg = (getattr(e, "stderr", None) or "").strip() or str(e)
         print(

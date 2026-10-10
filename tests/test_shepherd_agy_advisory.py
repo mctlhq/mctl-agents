@@ -11,6 +11,7 @@ layout agy has used.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -149,14 +150,18 @@ def _agy(cid, body, created_at="2026-04-29T11:00:00Z", login="github-actions[bot
     return {"id": cid, "user": {"login": login}, "created_at": created_at, "body": body}
 
 
-def _read(comments=None, *, error=None, pr=None):
-    def fake(args):
-        assert args[0].endswith("/issues/42/comments")
+def _read(comments=None, *, error=None, pr=None, raw=None):
+    """Drive the real reader through `_run`, answering the way
+    `gh api --paginate --jq '.[]'` does: one compact object per line."""
+    def fake(cmd, cwd=None, check=True):
+        assert cmd[:5] == ["gh", "api", "--paginate", "--jq", ".[]"], cmd
+        assert cmd[-1].endswith("/issues/42/comments")
         if error is not None:
             raise error
-        return comments
+        out = raw if raw is not None else "".join(json.dumps(c) + "\n" for c in comments or [])
+        return subprocess.CompletedProcess(cmd, 0, out, "")
 
-    with patch.object(run_shepherd, "_gh_api_json", side_effect=fake):
+    with patch.object(run_shepherd, "_run", side_effect=fake):
         return REAL_READ_AGY_ADVISORY(pr or make_pr())
 
 
@@ -201,7 +206,16 @@ def test_unreadable_comments_are_unknown_not_empty(capsys) -> None:
 
 
 def test_malformed_listing_is_unknown() -> None:
-    assert _read({"message": "Not Found"}) is None
+    assert _read(raw='{"id": 1}\nnot json\n') is None
+    assert _read(raw='"a string"\n') is None
+
+
+def test_the_newest_comment_on_a_later_page_is_found() -> None:
+    """agy posts once per push, so on a long PR its newest comment is past
+    the first page; the listing must be read whole."""
+    filler = [_agy(i, "chatter", "2026-04-29T10:30:00Z", login="someone") for i in range(100, 130)]
+    got = _read([*filler, _agy(2, AGY_HEADING_TAG, "2026-04-29T11:30:00Z")])
+    assert [a.comment_id for a in got] == [2]
 
 
 def test_an_unexpected_error_never_escapes(capsys) -> None:
