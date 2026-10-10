@@ -2829,7 +2829,7 @@ def test_apply_followup_skip_subprocess_does_not_fork(monkeypatch) -> None:
         )
     # The SDK bundle is passed through untouched; the deterministic
     # `findings` records ride alongside it (asserted in detail below).
-    assert {k: v for k, v in bundle.items() if k != "findings"} == {
+    assert {k: v for k, v in bundle.items() if k not in ("findings", "findings_chars_total")} == {
         "p1": True, "p2": False, "summaries": ["fix"],
     }
     assert [r["body"] for r in bundle["findings"]] == [findings[0].body]
@@ -2929,7 +2929,7 @@ def test_apply_followup_bare_list_still_works(monkeypatch) -> None:
     assert "ci_failures" not in bundle
     # The SDK bundle is passed through untouched; the deterministic
     # `findings` records ride alongside it (asserted in detail below).
-    assert {k: v for k, v in bundle.items() if k != "findings"} == {
+    assert {k: v for k, v in bundle.items() if k not in ("findings", "findings_chars_total")} == {
         "p1": True, "p2": False, "summaries": ["fix"],
     }
     assert [r["body"] for r in bundle["findings"]] == [findings[0].body]
@@ -3130,7 +3130,7 @@ def test_apply_followup_invokes_implementer_subprocess(monkeypatch) -> None:
 
     # The SDK bundle is passed through untouched; the deterministic
     # `findings` records ride alongside it (asserted in detail below).
-    assert {k: v for k, v in bundle.items() if k != "findings"} == {
+    assert {k: v for k, v in bundle.items() if k not in ("findings", "findings_chars_total")} == {
         "p1": True, "p2": False, "summaries": ["fix"],
     }
     assert [r["body"] for r in bundle["findings"]] == [findings[0].body]
