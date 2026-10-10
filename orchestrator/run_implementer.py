@@ -2277,10 +2277,13 @@ def _render_review_feedback(bundle: dict) -> str:
     rendered = "\n".join(lines).rstrip() + "\n"
     if full_text:
         rendered += "\n" + full_text
-    if advisory:
-        rendered += "\n" + advisory
     if ci_failures:
         rendered += "\n" + _render_ci_failures_section(ci_failures)
+    # Last, after the CI section: its intro points the agent at "the work
+    # above (review findings or failing checks)", which must be true on the
+    # CI-only path too.
+    if advisory:
+        rendered += "\n" + advisory
     return rendered
 
 

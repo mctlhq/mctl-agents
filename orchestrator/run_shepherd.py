@@ -2324,7 +2324,7 @@ _AGY_COMMIT_RE = re.compile(r"(?m)^_Model:[^\n]*?\bcommit\s+`([0-9a-fA-F]{7,40})
 # Every verdict marker in the comment. agy ends its comment with one, but a
 # finding may quote one (e.g. about agy's own workflow), so only the LAST
 # marker is the comment's verdict.
-_AGY_VERDICT_RE = re.compile(r"<!--\s*VERDICT:\s*([A-Za-z]+)")
+_AGY_VERDICT_RE = re.compile(r"<!--\s*VERDICT:\s*([A-Za-z]+)[^\n]*?-->")
 # A finding starts at a level-3 or level-4 heading. agy has used at least
 # three layouts on real PRs:
 #   #### [P2] `cmd/api/main.go`:957                (mctl-api#542)
@@ -2335,7 +2335,7 @@ _AGY_VERDICT_RE = re.compile(r"<!--\s*VERDICT:\s*([A-Za-z]+)")
 # near the top of the section, and a section with neither (the "### Findings"
 # container heading, prose) is not a finding.
 _AGY_HEADING_LINE_RE = re.compile(r"^(#{3,4})[ \t]+\S")
-_AGY_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+_AGY_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
 _AGY_HEADING_SEVERITY_RE = re.compile(r"(?<![\w-])\[?(P[123])\]?(?![\w-])")
 _AGY_SEVERITY_LINE_RE = re.compile(
     r"(?i)^[ \t]*(?:[-*+][ \t]+)?\**severity\W{0,8}(P[123])\b"
@@ -2360,23 +2360,35 @@ class AdvisoryFinding:
 
 def _agy_headings(body: str) -> list[tuple[int, int]]:
     """``[(offset, level), ...]`` of the level-3/4 headings OUTSIDE fenced
-    code blocks -- a ``### ...`` line inside a quoted snippet is content."""
+    code blocks -- a ``### ...`` line inside a quoted snippet is content.
+
+    A fence that never closes does not hide the rest of the comment: the
+    headings seen after its opener are kept after all, since an unclosed
+    fence is a formatting slip, and swallowing the findings after it (and
+    labelling them by the finding it started in) would lose them silently.
+    """
     out: list[tuple[int, int]] = []
+    fenced: list[tuple[int, int]] = []
     fence: str | None = None
     offset = 0
     for line in body.split("\n"):
         f = _AGY_FENCE_RE.match(line)
+        h = _AGY_HEADING_LINE_RE.match(line)
         if fence is not None:
-            if f and f.group(1)[0] == fence[0] and len(f.group(1)) >= len(fence):
+            # CommonMark: a closing fence is the same character, at least as
+            # long, with no info string.
+            if (f and f.group(1)[0] == fence[0] and len(f.group(1)) >= len(fence)
+                    and not f.group(2).strip()):
                 fence = None
+                fenced = []
+            elif h:
+                fenced.append((offset, len(h.group(1))))
         elif f:
             fence = f.group(1)
-        else:
-            h = _AGY_HEADING_LINE_RE.match(line)
-            if h:
-                out.append((offset, len(h.group(1))))
+        elif h:
+            out.append((offset, len(h.group(1))))
         offset += len(line) + 1
-    return out
+    return out + fenced
 
 
 def _agy_section_severity(section: str) -> str | None:
@@ -2399,22 +2411,41 @@ def _agy_section_severity(section: str) -> str | None:
     return None
 
 
+def _agy_trailer(body: str) -> re.Match[str] | None:
+    """The comment's verdict trailer: its LAST marker, and only when nothing
+    but whitespace follows it. A marker with text after it is a quote (in a
+    finding, or in a comment that lost its trailer), never the verdict."""
+    verdicts = list(_AGY_VERDICT_RE.finditer(body or ""))
+    if verdicts and not (body or "")[verdicts[-1].end():].strip():
+        return verdicts[-1]
+    return None
+
+
+def _agy_verdict(body: str) -> str | None:
+    """The comment's verdict word (``PASS``, ``FAIL``), or None without a trailer."""
+    trailer = _agy_trailer(body)
+    return trailer.group(1).upper() if trailer else None
+
+
 def _parse_agy_findings(body: str) -> list[tuple[str, str]]:
     """``[(severity, section_text), ...]`` for the P1/P2 items in one agy
     comment. P3 and unlabelled sections are dropped; a PASS verdict has no
     findings by definition.
 
-    Only structure agy itself controls is used to cut the text: its LAST
-    verdict marker (the trailer) and one trailing ``---`` rule. A ``---`` or
+    Only structure agy itself controls is used to cut the text: its verdict
+    trailer (see `_agy_trailer`) and one trailing ``---`` rule. A ``---`` or
     a quoted verdict inside a finding -- YAML front matter, a quoted agy
     comment -- stays in that finding's text instead of truncating it.
     """
     body = body or ""
-    verdicts = list(_AGY_VERDICT_RE.finditer(body))
-    if verdicts:
-        if verdicts[-1].group(1).upper() == "PASS":
+    # Only a real trailer decides PASS and is cut. A comment without one
+    # (truncated, edited) keeps its whole text and is parsed as is: a marker
+    # quoted in finding 1 must neither pass the comment nor drop findings 2..N.
+    trailer = _agy_trailer(body)
+    if trailer is not None:
+        if trailer.group(1).upper() == "PASS":
             return []
-        body = body[:verdicts[-1].start()]
+        body = body[:trailer.start()]
     body = _AGY_TRAILING_RULE_RE.sub("", body.rstrip())
 
     headings = _agy_headings(body)
@@ -2507,7 +2538,25 @@ def _read_agy_advisory(pr: PRSnapshot) -> list[AdvisoryFinding] | None:
             newest = c
             commit = sha
     if newest is None:
+        print(f"info: agy advisory on {pr.repo}#{pr.number}: no agy comment for this head")
         return []
+    newest_body = newest.get("body") or ""
+    items = _parse_agy_findings(newest_body)
+    verdict = _agy_verdict(newest_body)
+    print(
+        f"info: agy advisory on {pr.repo}#{pr.number}: comment {newest.get('id')} "
+        f"commit {commit or '(dated by push)'} verdict {verdict} -> "
+        f"{len(items)} P1/P2 item(s)"
+    )
+    if verdict not in (None, "PASS") and not items and re.search(r"\bP[12]\b", newest_body):
+        # A non-PASS verdict naming P1/P2 with nothing parsed is a layout the
+        # parser does not know, not a clean review -- say so, or the "fix or
+        # refute agy's P1/P2" policy stops being applied without a trace.
+        print(
+            f"warn: agy advisory on {pr.repo}#{pr.number}: verdict {verdict} names "
+            f"P1/P2 but no finding was parsed from comment {newest.get('id')}; "
+            f"layout not recognised"
+        )
     return [
         AdvisoryFinding(
             severity=sev,
@@ -2516,7 +2565,7 @@ def _read_agy_advisory(pr: PRSnapshot) -> list[AdvisoryFinding] | None:
             comment_id=newest.get("id"),
             commit=commit,
         )
-        for sev, text in _parse_agy_findings(newest.get("body") or "")
+        for sev, text in items
     ]
 
 

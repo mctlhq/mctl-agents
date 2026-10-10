@@ -481,3 +481,78 @@ def test_advisory_survives_the_empty_bundle_early_return() -> None:
     })
     assert "re-read the PR's code review on GitHub" in rendered
     assert "adv body" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 on mctl-agents#617
+# ---------------------------------------------------------------------------
+def test_advisory_comes_after_the_ci_section() -> None:
+    """Its intro points at "the work above (review findings or failing
+    checks)", so on a CI-only follow-up the checks must be above it."""
+    from tests.test_run_shepherd import make_check
+
+    blockers = run_shepherd.Blockers(findings=[], checks=[make_check()])
+    with patch.object(run_shepherd, "fetch_failure_logs", side_effect=lambda _r, c: c):
+        bundle = run_shepherd.apply_followup(
+            "mctl-web", "s", blockers, skip_subprocess=True,
+            advisory_findings=[AdvisoryFinding("P2", "#### [P2] adv", "agy", 9, SHA7)],
+        )
+    rendered = run_implementer._render_review_feedback(bundle)
+    ci_heading = run_implementer._render_ci_failures_section(bundle["ci_failures"]).splitlines()[0]
+    assert rendered.index(ci_heading) < rendered.index("## Advisory reviewer (agy)")
+
+
+def test_a_quoted_marker_without_a_trailer_keeps_every_finding() -> None:
+    body = AGY_PAREN_HEADINGS.replace("<!-- VERDICT: FAIL:P2 -->\n", "")
+    # The quoted PASS in finding 1 is now the LAST marker, but text follows
+    # it, so it is a quote, not a verdict.
+    items = run_shepherd._parse_agy_findings(body)
+    assert [sev for sev, _ in items] == ["P2", "P2"]
+    assert "key: value" in items[1][1]
+    assert run_shepherd._agy_verdict(body) is None
+
+
+def test_an_unclosed_fence_does_not_swallow_later_findings() -> None:
+    # (Without finding 2's own YAML fence: a later fence would pair with the
+    # unclosed one -- fence parity cannot be repaired without a real
+    # CommonMark parser, and agy never nests fences that way.)
+    body = AGY_SEVERITY_LINES.replace(
+        "- **Severity:** P1\n",
+        "- **Severity:** P3\n```python\nnever closed\n",
+    ).replace('  ```yaml\n  MESSAGE="x"\n  ```\n', '  MESSAGE="x"\n')
+    # Finding 1 is now P3 with an unclosed fence; finding 2 (P2) must still
+    # be found on its own heading rather than merged into the P3.
+    items = run_shepherd._parse_agy_findings(body)
+    assert [sev for sev, _ in items] == ["P2"]
+    assert items[0][1].startswith("### Finding 2")
+
+
+def test_a_fence_line_with_an_info_string_does_not_close_a_fence() -> None:
+    body = AGY_STAR_BULLETS.replace(
+        "* **Concrete failure scenario:** 403 on every run.",
+        "* **Concrete failure scenario:** 403 on every run.\n"
+        "```\n```python\n### [P1] not a heading\n```\nstill finding one",
+    )
+    items = run_shepherd._parse_agy_findings(body)
+    assert [sev for sev, _ in items] == ["P1"]
+    assert "still finding one" in items[0][1]
+
+
+def test_the_success_path_logs_what_it_used(capsys) -> None:
+    _read([_agy(2, AGY_HEADING_TAG, "2026-04-29T11:30:00Z")])
+    out = capsys.readouterr().out
+    assert f"comment 2 commit {SHA7} verdict FAIL -> 1 P1/P2 item(s)" in out
+    assert "layout not recognised" not in out
+
+    _read([])
+    assert "no agy comment for this head" in capsys.readouterr().out
+
+
+def test_a_fail_verdict_with_nothing_parsed_is_flagged(capsys) -> None:
+    unknown_layout = AGY_STAR_BULLETS.replace("### Finding 1", "**Finding 1**")
+    assert _read([_agy(1, unknown_layout, "2026-04-29T11:30:00Z")]) == []
+    assert "layout not recognised" in capsys.readouterr().out
+    # A FAIL that only carries P3 is not a parse miss.
+    p3_only = AGY_STAR_BULLETS.replace("P1", "P3")
+    assert _read([_agy(1, p3_only, "2026-04-29T11:30:00Z")]) == []
+    assert "layout not recognised" not in capsys.readouterr().out
