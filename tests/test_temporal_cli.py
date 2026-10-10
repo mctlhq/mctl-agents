@@ -27,7 +27,7 @@ def test_workflow_id_for_matches_go_side_format():
     # Must stay byte-for-byte identical to
     # mctl-api/internal/temporalclient.WorkflowIDForIssueURL's output —
     # both sides start/signal the same Temporal workflow ID.
-    assert workflow_id_for("https://github.com/mctlhq/mctl-openclaw/issues/1") == "dev-loop-mctlhq-mctl-openclaw-1"
+    assert workflow_id_for("https://github.com/mctlhq/mctl-docs/issues/1") == "dev-loop-mctlhq-mctl-docs-1"
 
 
 def _run(coro):

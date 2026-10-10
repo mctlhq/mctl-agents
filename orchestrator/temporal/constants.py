@@ -234,7 +234,7 @@ def implement_sweep_max_submits() -> int:
 # monitoring.coreos.com/v1 ServiceMonitor. This cluster runs VictoriaMetrics,
 # whose operator auto-converts such an object and leaves the original
 # orphaned — an ArgoCD drift already paid for twice (mctl-gitops incidents
-# 43d9e608 and 992434e2, recorded in services/labs/openclaw/values.yaml).
+# 43d9e608 and 992434e2).
 # Binding here makes the declared port real and lets a native VMServiceScrape
 # target `port: http` with no chart change at all.
 METRICS_PORT = 8080

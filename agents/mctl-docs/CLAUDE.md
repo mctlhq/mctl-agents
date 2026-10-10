@@ -31,7 +31,6 @@ The list (from platform memory):
 - `mctl-agent` — self-healing Go agent (AlertManager → PR fixer)
 - `mctl-agents` — proactive R&D Python agents (this repo!)
 - `mctl-gitops` — ArgoCD source of truth
-- `mctl-openclaw` — multi-channel AI gateway (3 tenants)
 
 You do not monitor yourself (`mctl-docs`) — that is a closed loop.
 
@@ -55,7 +54,7 @@ Once a day:
 - `context/` — read-only knowledge base. Do not edit.
 - `inbox/` — append-only. One new file `YYYY-MM-DD.md` per day.
 - `proposals/` — write proposals here. Slug = `<area>-<short-desc>`,
-  e.g. `mcp-identity-tools` or `openclaw-skill-quotas`.
+  e.g. `mcp-identity-tools` or `tenant-skill-bindings`.
 - Stay inside your folder. Other services — read git log only, never edit.
 - **Do not clone anything.** In the cluster the sibling clones are absent
   (the `clone-gitops` step only clones `mctl-gitops`); in that case the

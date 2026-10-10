@@ -19,7 +19,7 @@ GitOps source of truth for the entire platform. ArgoCD watches this repo and rec
 
 ## Tech stack
 - **Kubernetes manifests** (raw YAML)
-- **Helm** charts (base-service, openclaw, custom)
+- **Helm** charts (base-service, custom)
 - **Argo Workflows** + **Argo Rollouts**
 - **ArgoCD ApplicationSet** for generating Apps via directory pattern
 - **External Secrets Operator** + **Vault** ClusterSecretStore (`vault-backend`)
@@ -30,7 +30,6 @@ GitOps source of truth for the entire platform. ArgoCD watches this repo and rec
 The bootstrap chart deploys several ApplicationSets:
 - `apps` — ApplicationSet, generates Apps via the pattern `services/*/*`
 - `tenants` — ApplicationSet, generates Apps for tenant namespaces
-- `openclaw-skills` — ApplicationSet for openclaw skill overlays
 
 Inside each App: `helm-charts/base-service` + `services/<tenant>/<svc>/values.yaml`.
 

@@ -25,7 +25,6 @@ Use it to tell "already documented or gap" for a specific user-visible change. T
 | `docs/mcp/tools-reference.md` | MCP Tools Reference |
 | `docs/platform/architecture.md` | Architecture |
 | `docs/platform/components.md` | Components |
-| `docs/platform/openclaw.md` | OpenClaw Integration |
 | `docs/platform/overview.md` | What is MCTL? |
 | `docs/api/index.md` | REST API |
 | `docs/security/authentication.md` | Authentication |
@@ -45,7 +44,6 @@ Use it to tell "already documented or gap" for a specific user-visible change. T
 | `mctl-portal` (Backstage scaffolder, plugins) | `docs/platform/components.md`, `docs/getting-started/index.md` |
 | `mctl-agent` (new skill, reaction change) | `docs/platform/components.md` (mctl-agent block), `docs/reference/troubleshooting.md` |
 | `mctl-gitops` (new helm charts, ArgoCD apps, workflow templates) | `docs/guides/gitops-workflows.md`, `docs/reference/` |
-| `mctl-openclaw` (new channels, skill changes) | `docs/platform/openclaw.md` |
 | `mctl-web` (forms, OAuth flow) | `docs/getting-started/index.md` (if it touches onboarding) |
 | `mctl-agents` (this repo!) | NOT documented in docs.mctl.ai (internal tool) |
 

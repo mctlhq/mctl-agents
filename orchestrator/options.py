@@ -536,7 +536,7 @@ SIBLING_REPOS_PATH = os.getenv(
 SERVICES_NEEDING_SIBLING_ACCESS = {"mctl-docs"}
 _SIBLING_REPOS = (
     "mctl-api", "mctl-web", "mctl-portal", "mctl-agent",
-    "mctl-agents", "mctl-gitops", "mctl-openclaw",
+    "mctl-agents", "mctl-gitops",
 )
 
 
