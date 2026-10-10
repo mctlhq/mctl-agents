@@ -3334,10 +3334,10 @@ def _result_branch_is_missing(detail: str) -> bool:
 
 def _open_pr_for_branch(ref: ProposalRef, branch: str) -> str:
     title, body = _pr_title_and_body(ref)
-    # Pin the base repo with --repo: on a fork (e.g. mctl-openclaw, forked from
-    # openclaw/openclaw) `gh pr create` otherwise defaults the base to the parent
-    # repo and the non-interactive call fails, so the branch is pushed but no PR
-    # is opened. --repo forces the PR into our repo against our own `main`.
+    # Pin the base repo with --repo: on a fork `gh pr create` otherwise defaults
+    # the base to the parent repo and the non-interactive call fails, so the
+    # branch is pushed but no PR is opened. --repo forces the PR into our repo
+    # against our own `main`.
     repo = f"mctlhq/{ref.service}"
     # The policy checkpoint (#197): on refusal PolicyRefused is raised and
     # `gh pr create` never runs. Title and body are recorded only as a digest.

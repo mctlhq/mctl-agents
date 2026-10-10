@@ -90,7 +90,7 @@ def test_anything_no_rule_covers_is_denied():
 def test_every_mctl_tool_that_is_not_a_known_read_or_agent_mutation_needs_an_approval():
     for tool in ("mctl_deploy_service", "mctl_rollback_service", "mctl_delete_tenant", "mctl_retire_service",
                  "mctl_promote_agent", "mctl_scale_service", "mctl_grant_repo_access", "mctl_trigger_approve",
-                 "mctl_approve_dev_loop", "mctl_deploy_openclaw",
+                 "mctl_approve_dev_loop",
                  # verb-final and unknown names are gated too, never allowed
                  "mctl_trigger_deploy", "mctl_trigger_rollback", "mctl_delete", "mctl_brand_new_tool",
                  "mctl_set_budget_limit", "deploy_service",

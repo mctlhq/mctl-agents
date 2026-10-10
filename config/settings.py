@@ -79,7 +79,6 @@ AGENTS_DIR = REPO_ROOT / "agents"
 # stay shepherd-owned (no SHEPHERD_SKIP_SERVICES entry).
 SERVICES = [
     "mctl-web",
-    "mctl-openclaw",
     "mctl-docs",
     "mctl-api",
     "mctl-portal",
