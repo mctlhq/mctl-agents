@@ -480,6 +480,14 @@ def test_gh_api_list_reads_streamed_objects() -> None:
     assert run.call_args[0][0] == ["gh", "api", "--paginate", "--jq", ".[]", "repos/o/r/issues/1/comments"]
 
 
+def test_gh_api_list_keeps_unicode_line_separators_inside_a_body() -> None:
+    """JSON leaves U+0085/U+2028/U+2029 raw inside strings; only "\\n"
+    separates `--jq '.[]'` items."""
+    out = json.dumps({"id": 1, "body": "a\u0085b\u2028c\u2029d"}, ensure_ascii=False) + "\n"
+    with patch.object(run_shepherd, "_run", return_value=subprocess.CompletedProcess([], 0, out, "")):
+        assert run_shepherd._gh_api_list("p") == [{"id": 1, "body": "a\u0085b\u2028c\u2029d"}]
+
+
 def test_gh_api_list_rejects_a_non_object_item() -> None:
     """A line that is valid JSON but not an object is a malformed read, not an
     item: callers index items with `.get`."""
@@ -542,8 +550,14 @@ def test_truncation_closes_an_open_code_fence() -> None:
     reason = "Finding 1 is handled:\n```python\n" + "x = 1\n" * 1000 + "```\n"
     _call(gh, [_inline(11)], reason=reason)
     body = _body_of(gh.posts[0])
-    head = body.split("[... truncated]")[0]
-    assert head.count("```") % 2 == 0
+    lines = body.split("\n")
+    fences = [i for i, ln in enumerate(lines) if ln.startswith("```")]
+    assert len(fences) % 2 == 0
+    # The closer is a bare fence on its own line (CommonMark: a closing
+    # fence may be followed only by whitespace), and the footer follows it.
+    assert lines[fences[-1]].strip() == "```"
+    assert "[... truncated]" in "\n".join(lines[:fences[-1]])
+    assert "_The DevLoop implementer" in "\n".join(lines[fences[-1]:])
 
 
 def test_no_findings_or_blank_reason_posts_nothing() -> None:
