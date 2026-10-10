@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.70.1](https://github.com/mctlhq/mctl-agents/compare/1.70.0...1.70.1) (2026-10-10)
+
+
+### Bug Fixes
+
+* stop targeting the removed openclaw service ([b2e7476](https://github.com/mctlhq/mctl-agents/commit/b2e747679992ce86402c70a356531d4131f1447f))
+* stop targeting the removed openclaw service ([b8ff89c](https://github.com/mctlhq/mctl-agents/commit/b8ff89c294acee755505e68755e2010514f1a393))
+
 ## [1.70.0](https://github.com/mctlhq/mctl-agents/compare/1.69.0...1.70.0) (2026-10-09)
 
 
