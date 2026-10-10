@@ -5,6 +5,7 @@ up from this file so `pytest` can be run from anywhere.
 """
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -15,6 +16,26 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+@pytest.fixture(autouse=True)
+def _no_live_refusal_replies(monkeypatch):
+    """Keep the shepherd's refusal arm from talking to GitHub in tests.
+
+    `process_one`'s refusal arm calls `run_shepherd.post_refusal_replies`,
+    which lists the PR's comments and posts the implementer's reason with
+    `gh`. Dozens of existing tests drive that arm with fixture PRs that point
+    at real repositories (`mctlhq/mctl-web`), and on a machine where `gh` is
+    authenticated a stray run would post a real comment. Stubbed for every
+    test; the tests of the function itself hold a reference taken at import
+    time (before this fixture runs) and drive it with `_run`/`_gh_api_json`
+    stubbed.
+    """
+    # Imported unconditionally, not looked up in sys.modules: the guarantee
+    # must not depend on some other test module having imported it first.
+    shepherd = importlib.import_module("orchestrator.run_shepherd")
+    monkeypatch.setattr(shepherd, "post_refusal_replies", lambda *_a, **_kw: None)
+    yield
 
 
 @pytest.fixture

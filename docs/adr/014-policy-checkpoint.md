@@ -108,6 +108,7 @@ code says what happened to it. Whether the action ran is therefore
   | `run_shepherd`: `gh pr merge --merge --match-head-commit` | `github.pull_request.merge` | `merge` | the PR URL | method, delete-branch, head SHA | `merge_pr` answers `(False, None)`, i.e. `wait`, like any failed merge |
   | `run_shepherd`: the same merge, for a PR that changes agent definitions or whose changed paths could not be read in full (ADR 016 amendment 1) | `github.pull_request.merge` | `merge:agent-definition` | the PR URL | method, delete-branch, head SHA | `REQUIRE_APPROVAL`, decided with no approval store in the pod: always refused, one `MERGE_NEEDS_HUMAN` line per head, the tick reports `defer-merge` |
   | `run_shepherd`: `@claude review` comment | `github.pull_request.comment` | `comment:review-trigger` | the PR URL | body, head SHA | logged, best effort, like a failed post |
+  | `run_shepherd`: refusal reply (the implementer's exit-47 reason, posted on each inline review thread and as one PR comment for findings without a thread) | `github.pull_request.comment` | `comment:refusal-reply` | the PR URL | body, head SHA, thread id or `pr` | logged, best effort, like a failed post |
   | `run_shepherd`: `gh run rerun --failed` | `github.actions.run.rerun` | `rerun:failed` | `<repo>/actions/runs/<id>` | repo, run id | `False`, "nothing to do this tick", like a failed rerun |
   | `run_issue_investigator`: proposal comment | `github.issue.comment` | `comment` | the issue URL | body | warning; the investigation still succeeds, like a failed post |
   | `run_issue_poller`: `gh issue edit --remove-label` | `github.issue.label` | `remove` | the issue URL | label | counted as a per-issue failure; the label stays, like a failed write |
@@ -156,7 +157,7 @@ Built-in policy `mctl-agents/policy/v1`:
 | the investigate operation | ALLOW |
 | sealing this execution's context snapshot (`mctl.work_item.write`, `seal:context-snapshot`; insert-only in mctl-api, #431) | ALLOW |
 | attaching this run's own engine run to its work item, or advancing that execution's phase (`mctl.work_item.write`, `attach:work-item-execution`; keyed by `(engine, engine_ref)` in mctl-api, #455) | ALLOW |
-| the orchestrator's own GitHub mutations above: `push:new-branch`, `push:force-with-lease`, `create`, `merge`, `comment:review-trigger`, `rerun:failed`, label `remove` (one rule each) | ALLOW |
+| the orchestrator's own GitHub mutations above: `push:new-branch`, `push:force-with-lease`, `create`, `merge`, `comment:review-trigger`, `comment:refusal-reply`, `rerun:failed`, label `remove` (one rule each) | ALLOW |
 | mctl MCP reads (`get_`, `list_`, `read_`, `search_`, `describe_`, `whoami`, …) and the agent mutations `resolve_incident`, `acknowledge_incident` | ALLOW |
 | every other granted mctl MCP tool, including any added to mctl-api later | REQUIRE_APPROVAL |
 | anything else | DENY |
