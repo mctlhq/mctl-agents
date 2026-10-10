@@ -1515,7 +1515,10 @@ def _gh_api_list(path: str) -> list[dict]:
     """
     proc = _run(["gh", "api", "--paginate", "--jq", ".[]", path])
     items: list[dict] = []
-    for line in (proc.stdout or "").splitlines():
+    # split("\n"), not splitlines(): the latter also breaks on U+0085,
+    # U+2028 and U+2029, which JSON leaves unescaped inside a string, so one
+    # comment carrying them would split an object and fail the read forever.
+    for line in (proc.stdout or "").split("\n"):
         line = line.strip()
         if not line:
             continue
@@ -3063,12 +3066,12 @@ def _defang_mentions(text: str) -> str:
 def _refusal_reply_body(reason: str, head_sha: str, extra: str = "") -> str:
     reason = (reason or "").strip()
     if len(reason) > REFUSAL_REPLY_REASON_CAP:
-        reason = reason[:REFUSAL_REPLY_REASON_CAP]
+        reason = reason[:REFUSAL_REPLY_REASON_CAP] + " [... truncated]"
         # Reasons quote code; a cut inside a ``` fence would leave the rest
-        # of the reply (and the footer) rendered as code. Close it.
+        # of the reply (and the footer) rendered as code. Close it on a line
+        # of its own: a fence followed by text is content, not a closer.
         if reason.count("```") % 2:
             reason += "\n```"
-        reason += " [... truncated]"
     text = (
         f"{REFUSAL_REPLY_PREFIX}{reason}\n\n"
         f"{extra}"
