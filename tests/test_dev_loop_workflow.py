@@ -28,6 +28,7 @@ from temporalio.worker import UnsandboxedWorkflowRunner
 
 import orchestrator.human_input as hi
 from orchestrator import policy_checkpoint as pc
+from orchestrator import tracing
 from orchestrator.context_snapshot import ExecutionCorrelation as _ExecutionCorrelation
 from orchestrator.lifecycle.contract import Owner, answer_from
 from orchestrator.temporal.activities.action_approval import ApprovalPoll, GatedActionInput, GatedActionResult
@@ -272,6 +273,7 @@ def _fake_activities(
     gate_results: list[GatedActionResult] | None = None,
     gate_calls: list[GatedActionInput] | None = None,
     mint_raises: bool = False,
+    mint_requests: list[MintRequest] | None = None,
     # mctlhq/mctl-agents#473: the end-to-end test runs the REAL investigator
     # inside the fake investigate CWFT (`investigate_hook(params)`, awaited
     # before the fake returns) and serves `find_human_input_request` from
@@ -638,6 +640,8 @@ def _fake_activities(
     # SERVICES are unset, which they are in every test in this module.
     @activity.defn(name="mint_execution_context")
     async def fake_mint_execution_context(req: MintRequest) -> MintedContext:
+        if mint_requests is not None:
+            mint_requests.append(req)
         if mint_raises:
             raise ApplicationError("mctl-api hung", non_retryable=True)
         return MintedContext(
@@ -7214,11 +7218,13 @@ def _open_pr(head_sha: str) -> PRState:
 class TestMergeGateInTheWatch:
     """Workflow-level: the gated merge activity as the watch loop drives it."""
 
-    async def _run(self, env, *, pr_states, gate_results, issue: int, caplog=None, mint_raises=False):
+    async def _run(
+        self, env, *, pr_states, gate_results, issue: int, caplog=None, mint_raises=False, mint_requests=None,
+    ):
         gate_calls: list[GatedActionInput] = []
         activities, _calls, investigate_ran, _ops = _fake_activities(
             released=True, pr_states=pr_states, gate_results=gate_results, gate_calls=gate_calls,
-            mint_raises=mint_raises,
+            mint_raises=mint_raises, mint_requests=mint_requests,
         )
 
         @activity.defn(name="read_action_approval")
@@ -7267,6 +7273,23 @@ class TestMergeGateInTheWatch:
         )
         assert result.pr is not None and result.pr.state == "MERGED"
         assert [c.payload["head_sha"] for c in gate_calls] == ["a" * 40, "b" * 40]
+
+    async def test_the_merge_gate_context_carries_the_runs_otel_trace_id(self, env):
+        """mctlhq/mctl-agent#97: the execution context the merge gate mints
+        used to carry a random trace id, a second id scheme next to the
+        execution trace's. It now carries the run's OTel trace id, so a
+        policy checkpoint and the trace join on one value."""
+        mint_requests: list[MintRequest] = []
+        await self._run(
+            env, pr_states=[_open_pr("a" * 40), MERGED_PR],
+            gate_results=[GatedActionResult(code="merge_gate_disabled")], issue=5195,
+            mint_requests=mint_requests,
+        )
+        assert len(mint_requests) == 1
+        req = mint_requests[0]
+        assert req.temporal_workflow_id and req.temporal_run_id
+        trace_id, _root = tracing.workflow_trace_ids(req.temporal_workflow_id, req.temporal_run_id)
+        assert req.trace_id == f"{trace_id:032x}"
 
     async def test_a_failing_identity_mint_never_fails_the_watch(self, env):
         """Claude P2 on c079004: the mint is awaited inline on every fresh

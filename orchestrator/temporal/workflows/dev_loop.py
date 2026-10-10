@@ -68,7 +68,7 @@ from temporalio.exceptions import (
 )
 
 with workflow.unsafe.imports_passed_through():
-    from orchestrator import human_input
+    from orchestrator import human_input, tracing
     from orchestrator.lifecycle.contract import (
         OWNED_BY_OTHER,
         UNKNOWN,
@@ -483,6 +483,11 @@ MERGE_GATE_SETTLED_OUTCOMES = frozenset({
 # identity mint, the gated activity, the child approval wait), so entering it
 # unconditionally would replay a command an in-flight execution never made.
 MERGE_GATE_PATCH = "gated-merge"
+# The merge gate's execution context used to carry a `workflow.uuid4()`
+# trace id; it now carries the run's OTel trace id (mctlhq/mctl-agent#97).
+# A history that already drew that uuid must keep drawing it, or every later
+# `workflow.uuid4()` in the run shifts.
+MERGE_GATE_OTEL_TRACE_ID_PATCH = "merge-gate-otel-trace-id"
 # The implementer writes the pr: link into .status.yaml in the same commit
 # that flips it to implemented, so the link should be visible on the first
 # poll. A few polls of grace absorb gitops main lag; after that, a missing
@@ -4073,19 +4078,28 @@ class DevLoopWorkflow:
         identity would orphan a pending receipt as a fresh, unrelated
         request every time this method ran.
 
-        `trace_id` is minted here (`workflow.uuid4()`, deterministic and
-        replay-safe) because `seal()` requires a well-formed one and this is
-        workflow code, which may not read `os.urandom` directly the way
-        `mint_local`'s degrade path does.
+        `trace_id` is the run's OTel trace id (`tracing.workflow_trace_ids`),
+        so the execution context, its policy checkpoints and the execution
+        trace share ONE id rather than two parallel schemes (mctlhq/mctl-agent#97).
+        It is a pure function of the workflow and run ids, so it is as
+        replay-safe as the `workflow.uuid4()` it replaces. That call stays
+        behind MERGE_GATE_OTEL_TRACE_ID_PATCH for histories that already made
+        it, because dropping it would shift every later `workflow.uuid4()`.
+        After a merge-watch hop the cached id is the minting run's trace, not
+        the continued run's.
         """
         if self._merge_gate_execution_id:
             return self._merge_gate_execution_id, self._merge_gate_trace_id
         info = workflow.info()
+        if workflow.patched(MERGE_GATE_OTEL_TRACE_ID_PATCH):
+            trace_id = f"{tracing.workflow_trace_ids(info.workflow_id, info.run_id)[0]:032x}"
+        else:
+            trace_id = workflow.uuid4().hex
         try:
             minted: MintedContext = await workflow.execute_activity(
                 mint_execution_context,
                 MintRequest(
-                    trace_id=workflow.uuid4().hex,
+                    trace_id=trace_id,
                     workflow_type="review-fix",
                     actor_type="system",
                     actor_id="devloop-workflow",
