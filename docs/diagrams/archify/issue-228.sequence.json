@@ -162,7 +162,7 @@
       "from": "argo",
       "to": "pod",
       "y": 352,
-      "label": "sandboxed run · $3 · ≤2 h",
+      "label": "sandboxed run · $8 · ≤2 h",
       "variant": "default"
     },
     {

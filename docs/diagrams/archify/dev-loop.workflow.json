@@ -198,7 +198,7 @@
       "type": "backend",
       "label": "issue-investigator",
       "sublabel": "writes the proposal",
-      "tag": "$3 budget",
+      "tag": "$8 budget",
       "width": 128
     },
     {

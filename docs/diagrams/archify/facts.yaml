@@ -18,21 +18,20 @@ budgets_usd:
   implementer: '3.00'
   incident_responder: '5.00'
   issue_investigator: '8.00'
-  mentor: '2.00'
+  mentor: '10.00'
   service_agent: '5.00'
   shepherd: '5.00'
 cronworkflows:
   cronworkflow-labs-claude-remote-restart.yaml: 0 3 * * 0
-  cronworkflow-mctl-agents-implement.yaml: '*/5 * * * *'
   cronworkflow-mctl-agents-incidents.yaml: 15 * * * *
-  cronworkflow-mctl-agents-issue-poll.yaml: '*/15 * * * *'
-  cronworkflow-mctl-agents-shepherd.yaml: 0 7-21/2 * * *
+  cronworkflow-mctl-agents-usage-collector.yaml: 21 * * * *
   cwft-mctl-agents-daily.yaml: 0 0 * * 6
 cwft_env_overrides:
   IMPLEMENTER_BUDGET_USD: '20.00'
+  IMPLEMENTER_DRAIN_TIMEOUT_SECONDS: '300'
   IMPLEMENTER_TIMEOUT_SECONDS: '5400'
   INCIDENT_RESPONDER_BUDGET_USD: '20.00'
-  ISSUE_INVESTIGATOR_BUDGET_USD: '3.00'
+  ISSUE_INVESTIGATOR_BUDGET_USD: '8.00'
   MENTOR_BUDGET_USD: '10.00'
   SERVICE_AGENT_BUDGET_USD: '5.00'
   SHEPHERD_BUDGET_USD: '5.00'
@@ -41,10 +40,10 @@ cwfts:
 - mctl-agents-daily
 - mctl-agents-implement
 - mctl-agents-investigate
-- mctl-agents-issue-poll
 - mctl-agents-reconcile
 - mctl-agents-run
 - mctl-agents-shepherd
+- mctl-agents-usage-collector
 dev_loop:
   approval_poll_interval: 6 h
   approval_wait_deadline: 14 d
@@ -60,6 +59,7 @@ dev_loop:
   - deploy-observation
   - exec-queue
   - fast-shepherd-cadence
+  - human-input
   - implement-outcome
   - implement-queue
   - incident-watch
@@ -71,6 +71,7 @@ dev_loop:
   - shepherd-in-loop
   - slug-scoped-implement
   - stale-issue-admission
+  - work-context-resume
   release_lookup_deadline: 20 min
   sdk_step_retry_attempts: '3'
   sdk_step_timeout: 2 h
@@ -85,12 +86,14 @@ manifest_api_versions:
   mentor: agents.mctl.ai/v1alpha1
   service-agent: agents.mctl.ai/v1alpha1
   shepherd: agents.mctl.ai/v1alpha1
-mcp_tool_count: 73
+mcp_tool_count: 98
 mcp_tools:
+- mctl_abandon_dev_loop
 - mctl_acknowledge_incident
 - mctl_add_custom_domain
 - mctl_apply_openclaw_resource_profile
 - mctl_approve_dev_loop
+- mctl_bind_agent_release
 - mctl_create_agent
 - mctl_create_preview
 - mctl_create_tenant
@@ -103,6 +106,8 @@ mcp_tools:
 - mctl_deprecate_platform_skill
 - mctl_disable_tenant_skill
 - mctl_enable_tenant_skill
+- mctl_get_agent
+- mctl_get_dev_loop
 - mctl_get_incident
 - mctl_get_openclaw_sizing_recommendation
 - mctl_get_operation
@@ -117,6 +122,7 @@ mcp_tools:
 - mctl_incident_summary
 - mctl_list_agent_executions
 - mctl_list_agent_versions
+- mctl_list_agents
 - mctl_list_domains
 - mctl_list_incidents
 - mctl_list_openclaw_identity
@@ -133,6 +139,8 @@ mcp_tools:
 - mctl_list_workflows
 - mctl_promote_agent
 - mctl_provision_database
+- mctl_publish_agent_definition_version
+- mctl_publish_agent_profile_version
 - mctl_publish_agent_version
 - mctl_publish_platform_skill
 - mctl_read_openclaw_identity
@@ -144,10 +152,12 @@ mcp_tools:
 - mctl_resume_openclaw_deploy
 - mctl_retire_service
 - mctl_rollback_agent
+- mctl_rollback_agent_binding
 - mctl_rollback_service
 - mctl_save_openclaw_identity
 - mctl_save_openclaw_skill
 - mctl_scale_service
+- mctl_set_agent_version_lifecycle
 - mctl_sync_repos
 - mctl_trigger_agents_run
 - mctl_trigger_approve
@@ -155,6 +165,7 @@ mcp_tools:
 - mctl_trigger_incident_responder
 - mctl_trigger_issue
 - mctl_trigger_mentor_only
+- mctl_trigger_portal_server_auth_apply
 - mctl_trigger_reconcile
 - mctl_trigger_shepherd
 - mctl_trigger_single_service
@@ -192,6 +203,7 @@ operations:
 platform_skills:
 - archify-diagrams
 - argocd-health-remediation
+- devloop-ownership-roles
 - git-flow
 - mcp-troubleshooting
 - mctl-demo-walkthrough
@@ -205,13 +217,13 @@ registry_environments:
 - production
 - shadow
 releases_seen:
-  mctlhq/mctl-academy: 0.1.50
-  mctlhq/mctl-agent: 2.0.1
-  mctlhq/mctl-agents: 1.39.0
-  mctlhq/mctl-api: 4.37.0
-  mctlhq/mctl-docs: 0.1.38
-  mctlhq/mctl-portal: 4.15.0
-  mctlhq/mctl-telegram: 0.59.0
+  mctlhq/mctl-academy: 0.1.52
+  mctlhq/mctl-agent: 2.4.0
+  mctlhq/mctl-agents: 1.68.1
+  mctlhq/mctl-api: 4.66.0
+  mctlhq/mctl-docs: 0.1.42
+  mctlhq/mctl-portal: 4.17.3
+  mctlhq/mctl-telegram: 0.79.1
 schedules:
   ImplementSweepWorkflow: 15 min
   IncidentLoopWorkflow: 1 h
@@ -238,9 +250,11 @@ shepherd:
   - in-progress
   - review-fixing
 workflows:
+- ActionApprovalWaitWorkflow
 - DevLoopWorkflow
 - ImplementSweepWorkflow
 - IncidentLoopWorkflow
 - IssuePollWorkflow
 - ReconcileWorkflow
+- ScheduledDispatchWorkflow
 - SweptImplementWorkflow
