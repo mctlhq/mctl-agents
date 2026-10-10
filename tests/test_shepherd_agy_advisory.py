@@ -359,3 +359,125 @@ def test_renderer_puts_advisory_in_its_own_fenced_section() -> None:
 def test_renderer_without_advisory_has_no_section() -> None:
     rendered = run_implementer._render_review_feedback({"p2": True, "summaries": ["s"]})
     assert "Advisory reviewer" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 on mctl-agents#617: structure inside a finding must not cut
+# or hide it.
+# ---------------------------------------------------------------------------
+# mctl-agents#617 round 1, verbatim shape: "### Finding N (P2 - Category)",
+# "---" between findings, and finding 1 quoting a PASS verdict marker.
+AGY_PAREN_HEADINGS = f"""<!-- agy-review -->
+## Antigravity (agy) review
+
+_Model: gemini-3.8-flash-medium · commit `{SHA7}`._
+
+### Finding 1 (P2 - Correctness / Security)
+- **Anchor:** `+    if _AGY_VERDICT_PASS_RE.search(body or ""):`
+- **Concrete failure scenario:** the comment quotes `<!-- VERDICT: PASS -->`
+  and the reader returns [] although the comment ends in FAIL.
+
+---
+
+### Finding 2 (P2 - Correctness)
+- **Concrete failure scenario:** YAML in a fence:
+  ```yaml
+  ---
+  key: value
+  ```
+  and the text after it is the proposed fix.
+
+---
+
+### Finding 3 (P3 - Robustness)
+- **Concrete failure scenario:** nit.
+
+<!-- VERDICT: FAIL:P2 -->
+"""
+
+
+def test_a_quoted_pass_marker_does_not_hide_a_fail() -> None:
+    items = run_shepherd._parse_agy_findings(AGY_PAREN_HEADINGS)
+    assert [sev for sev, _ in items] == ["P2", "P2"]
+    assert "the reader returns [] although" in items[0][1]
+
+
+def test_only_the_last_verdict_counts() -> None:
+    # A FAIL quoted inside a PASS comment does not turn it into a FAIL either.
+    quoted_fail = AGY_PASS.replace(
+        "No significant issues found.",
+        "#### [P2] an old note quoting `<!-- VERDICT: FAIL:P2 -->`\n\ntext",
+    )
+    assert run_shepherd._parse_agy_findings(quoted_fail) == []
+
+
+def test_a_rule_or_yaml_inside_a_finding_does_not_truncate_it() -> None:
+    items = run_shepherd._parse_agy_findings(AGY_PAREN_HEADINGS)
+    second = items[1][1]
+    assert "key: value" in second
+    assert second.rstrip().endswith("and the text after it is the proposed fix.")
+    # The separator agy puts BETWEEN findings is dropped from both.
+    assert not items[0][1].rstrip().endswith("---")
+    # A "---" above the severity line no longer hides the finding.
+    ruled = AGY_STAR_BULLETS.replace("### Finding 1\n", "### Finding 1\n\n---\n")
+    assert [sev for sev, _ in run_shepherd._parse_agy_findings(ruled)] == ["P1"]
+
+
+def test_a_heading_inside_a_fence_or_below_the_finding_level_stays_in_it() -> None:
+    body = AGY_STAR_BULLETS.replace(
+        "* **Concrete failure scenario:** 403 on every run.",
+        "* **Concrete failure scenario:** 403 on every run.\n\n"
+        "#### Suggested fix\n\nuse an App token\n\n"
+        "```md\n### [P3] quoted heading\n```\n\nend of finding one",
+    )
+    items = run_shepherd._parse_agy_findings(body)
+    assert [sev for sev, _ in items] == ["P1"]
+    assert "use an App token" in items[0][1]
+    assert "end of finding one" in items[0][1]
+
+
+def test_a_severity_line_deep_in_the_prose_is_not_the_label() -> None:
+    body = AGY_STAR_BULLETS.replace(
+        "* **Severity:** P1\n",
+        "* a\n* b\n* c\n* d\n* e\n* **Severity:** P1\n",
+    )
+    assert run_shepherd._parse_agy_findings(body) == []
+
+
+def test_a_commit_quoted_in_a_finding_is_not_the_head() -> None:
+    """No `_Model:` commit, but a finding mentions another commit: the
+    comment is dated by the push, not skipped as "another head"."""
+    body = AGY_STAR_BULLETS.replace(f"· commit `{SHA7}`", "").replace(
+        "403 on every run.", "403 since commit `abcdef1`.",
+    )
+    got = _read([_agy(1, body, "2026-04-29T11:00:00Z")])
+    assert [a.commit for a in got] == [None]
+
+
+def test_advisory_rides_along_on_a_ci_only_followup() -> None:
+    """CI-only follow-up (no review findings, a failing check): the bundle
+    comes from `_fallback_bundle`, and the advisory must still reach it and
+    the rendered prompt."""
+    from tests.test_run_shepherd import make_check
+
+    blockers = run_shepherd.Blockers(findings=[], checks=[make_check()])
+    with patch.object(run_shepherd, "fetch_failure_logs", side_effect=lambda _r, c: c):
+        bundle = run_shepherd.apply_followup(
+            "mctl-web", "s", blockers, skip_subprocess=True,
+            advisory_findings=[AdvisoryFinding("P2", "#### [P2] adv", "agy", 9, SHA7)],
+        )
+    assert [a["severity"] for a in bundle["advisory_findings"]] == ["P2"]
+    assert bundle["ci_failures"]
+    assert run_implementer._bundle_is_ci_only(bundle)
+    rendered = run_implementer._render_review_feedback(bundle)
+    assert "## Advisory reviewer (agy)" in rendered
+    assert "#### [P2] adv" in rendered
+
+
+def test_advisory_survives_the_empty_bundle_early_return() -> None:
+    rendered = run_implementer._render_review_feedback({
+        "p2": True, "summaries": [],
+        "advisory_findings": [{"reviewer": "agy", "severity": "P1", "body": "adv body"}],
+    })
+    assert "re-read the PR's code review on GitHub" in rendered
+    assert "adv body" in rendered

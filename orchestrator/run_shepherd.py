@@ -2318,9 +2318,13 @@ def read_copilot_review(pr: PRSnapshot) -> CopilotReview:
 # ---------------------------------------------------------------------------
 AGY_REVIEW_BOT = "github-actions[bot]"
 AGY_REVIEW_MARKER = "<!-- agy-review -->"
-# "_Model: gemini-... · commit `d41de55`._"
-_AGY_COMMIT_RE = re.compile(r"\bcommit\s+`([0-9a-fA-F]{7,40})`")
-_AGY_VERDICT_PASS_RE = re.compile(r"<!--\s*VERDICT:\s*PASS\b")
+# "_Model: gemini-... · commit `d41de55`._" -- anchored to the `_Model:` line
+# so a commit SHA quoted in a finding body is never taken for the head.
+_AGY_COMMIT_RE = re.compile(r"(?m)^_Model:[^\n]*?\bcommit\s+`([0-9a-fA-F]{7,40})`")
+# Every verdict marker in the comment. agy ends its comment with one, but a
+# finding may quote one (e.g. about agy's own workflow), so only the LAST
+# marker is the comment's verdict.
+_AGY_VERDICT_RE = re.compile(r"<!--\s*VERDICT:\s*([A-Za-z]+)")
 # A finding starts at a level-3 or level-4 heading. agy has used at least
 # three layouts on real PRs:
 #   #### [P2] `cmd/api/main.go`:957                (mctl-api#542)
@@ -2328,14 +2332,19 @@ _AGY_VERDICT_PASS_RE = re.compile(r"<!--\s*VERDICT:\s*PASS\b")
 #   ### Finding 1: title  + "- **Severity:** P1"   (mctl-agents#567)
 #   ### Finding 1         + "* **Severity:** P1"   (mctl-agents#567, round 3)
 # so the severity is read from the heading line OR from a "Severity:" line
-# inside the section, and a section with neither (the "### Findings"
+# near the top of the section, and a section with neither (the "### Findings"
 # container heading, prose) is not a finding.
-_AGY_HEADING_RE = re.compile(r"^#{3,4}[ \t]+\S", re.MULTILINE)
+_AGY_HEADING_LINE_RE = re.compile(r"^(#{3,4})[ \t]+\S")
+_AGY_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 _AGY_HEADING_SEVERITY_RE = re.compile(r"(?<![\w-])\[?(P[123])\]?(?![\w-])")
 _AGY_SEVERITY_LINE_RE = re.compile(
-    r"(?im)^[ \t]*(?:[-*+][ \t]+)?\**severity\W{0,8}(P[123])\b"
+    r"(?i)^[ \t]*(?:[-*+][ \t]+)?\**severity\W{0,8}(P[123])\b"
 )
-_AGY_SECTION_END_RE = re.compile(r"(?m)^(?:[ \t]*---+[ \t]*$|[ \t]*<!--\s*VERDICT)")
+# The severity line must sit among the first few non-blank lines under the
+# heading; a "severity: P1" deep inside a finding's prose or quoted code is
+# not that finding's label.
+_AGY_SEVERITY_LINE_WINDOW = 4
+_AGY_TRAILING_RULE_RE = re.compile(r"\n[ \t]*-{3,}[ \t]*\s*$")
 
 
 @dataclass(frozen=True)
@@ -2349,25 +2358,89 @@ class AdvisoryFinding:
     commit: str | None
 
 
+def _agy_headings(body: str) -> list[tuple[int, int]]:
+    """``[(offset, level), ...]`` of the level-3/4 headings OUTSIDE fenced
+    code blocks -- a ``### ...`` line inside a quoted snippet is content."""
+    out: list[tuple[int, int]] = []
+    fence: str | None = None
+    offset = 0
+    for line in body.split("\n"):
+        f = _AGY_FENCE_RE.match(line)
+        if fence is not None:
+            if f and f.group(1)[0] == fence[0] and len(f.group(1)) >= len(fence):
+                fence = None
+        elif f:
+            fence = f.group(1)
+        else:
+            h = _AGY_HEADING_LINE_RE.match(line)
+            if h:
+                out.append((offset, len(h.group(1))))
+        offset += len(line) + 1
+    return out
+
+
+def _agy_section_severity(section: str) -> str | None:
+    """The P-label of one section: from its heading line, else from a
+    "Severity:" line among the first few non-blank lines below it."""
+    lines = section.split("\n")
+    m = _AGY_HEADING_SEVERITY_RE.search(lines[0] if lines else "")
+    if m:
+        return m.group(1)
+    seen = 0
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        m = _AGY_SEVERITY_LINE_RE.match(line)
+        if m:
+            return m.group(1)
+        seen += 1
+        if seen >= _AGY_SEVERITY_LINE_WINDOW:
+            break
+    return None
+
+
 def _parse_agy_findings(body: str) -> list[tuple[str, str]]:
     """``[(severity, section_text), ...]`` for the P1/P2 items in one agy
     comment. P3 and unlabelled sections are dropped; a PASS verdict has no
-    findings by definition."""
-    if _AGY_VERDICT_PASS_RE.search(body or ""):
+    findings by definition.
+
+    Only structure agy itself controls is used to cut the text: its LAST
+    verdict marker (the trailer) and one trailing ``---`` rule. A ``---`` or
+    a quoted verdict inside a finding -- YAML front matter, a quoted agy
+    comment -- stays in that finding's text instead of truncating it.
+    """
+    body = body or ""
+    verdicts = list(_AGY_VERDICT_RE.finditer(body))
+    if verdicts:
+        if verdicts[-1].group(1).upper() == "PASS":
+            return []
+        body = body[:verdicts[-1].start()]
+    body = _AGY_TRAILING_RULE_RE.sub("", body.rstrip())
+
+    headings = _agy_headings(body)
+    # Sections at every candidate level, to find the level agy used for its
+    # findings: the level of the first labelled one. Splitting only at that
+    # level (and above) keeps a finding's own "#### Suggested fix" sub-heading
+    # inside it.
+    level: int | None = None
+    for i, (start, lvl) in enumerate(headings):
+        end = headings[i + 1][0] if i + 1 < len(headings) else len(body)
+        if _agy_section_severity(body[start:end]) is not None:
+            level = lvl
+            break
+    if level is None:
         return []
-    starts = [m.start() for m in _AGY_HEADING_RE.finditer(body or "")]
+    bounds = [(o, lv) for o, lv in headings if lv <= level]
     out: list[tuple[str, str]] = []
-    for i, start in enumerate(starts):
-        end = starts[i + 1] if i + 1 < len(starts) else len(body)
-        section = body[start:end]
-        cut = _AGY_SECTION_END_RE.search(section)
-        if cut:
-            section = section[:cut.start()]
-        section = section.strip()
-        heading = section.splitlines()[0] if section else ""
-        m = _AGY_HEADING_SEVERITY_RE.search(heading) or _AGY_SEVERITY_LINE_RE.search(section)
-        if m and m.group(1) in ("P1", "P2"):
-            out.append((m.group(1), section))
+    for i, (start, lvl) in enumerate(bounds):
+        if lvl != level:
+            continue
+        end = bounds[i + 1][0] if i + 1 < len(bounds) else len(body)
+        # The `---` agy puts between findings belongs to neither of them.
+        section = _AGY_TRAILING_RULE_RE.sub("", body[start:end].strip()).strip()
+        sev = _agy_section_severity(section)
+        if sev in ("P1", "P2"):
+            out.append((sev, section))
     return out
 
 
