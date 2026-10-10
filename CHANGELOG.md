@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.73.0](https://github.com/mctlhq/mctl-agents/compare/1.72.0...1.73.0) (2026-10-10)
+
+
+### Features
+
+* **investigator:** ground proposals in the deployed state ([48e5cf6](https://github.com/mctlhq/mctl-agents/commit/48e5cf6f086388a28c000aef972cc049337df1de))
+* **investigator:** ground proposals in the deployed state ([7e0dc05](https://github.com/mctlhq/mctl-agents/commit/7e0dc057f83260a33c62caf46c3144629bfa5fe5))
+
 ## [1.72.0](https://github.com/mctlhq/mctl-agents/compare/1.71.0...1.72.0) (2026-10-10)
 
 
