@@ -1894,14 +1894,16 @@ def _build_prompt(
                 "EVERY one,\n   not only the first. Stay in scope — do not "
                 "refactor outside the touched files.\n   If you fix some and "
                 "decline others, commit the fixes and say in the commit\n   "
-                "body, per declined finding (by its number), why, with evidence."
+                "body, per declined finding (by its \"Reviewer text\" number), "
+                "why, with evidence."
             )
             refusal_line = (
                 "5. If a finding is invalid, is already addressed, or must NOT "
                 "be acted on\n   because of an explicit operator decision "
                 "recorded on the PR, do not commit.\n   The reason is posted "
                 "back to the reviewer on the finding's thread, so for\n   EACH "
-                "declined finding name it by its number and give the evidence "
+                "declined finding name it by its \"Reviewer text\" number and "
+                "give the evidence "
                 "that\n   refutes it (file:line of the code that already handles "
                 "it, the operator\n   note) — a bare \"not applicable\" will "
                 "just be raised again."
@@ -2190,7 +2192,13 @@ def _bundle_is_ci_only(bundle: dict) -> bool:
     bundle is rebuilt next tick, and the proposal walks to review-stuck over a
     lint/mypy failure nobody ever asked the implementer to fix.
     """
-    return not (bundle.get("summaries") or []) and bool(bundle.get("ci_failures") or [])
+    return (
+        not (bundle.get("summaries") or [])
+        # Real findings carried verbatim make it a review bundle even when
+        # the summariser returned no summaries for them.
+        and not (bundle.get("findings") or [])
+        and bool(bundle.get("ci_failures") or [])
+    )
 
 
 def _bundle_work_class(bundle: dict) -> str:
@@ -2230,11 +2238,17 @@ def _render_review_feedback(bundle: dict) -> str:
         lines.append("Severity: P2 only — fix all of them.")
     lines.append("")
 
+    full_text = _render_full_findings_section(bundle.get("findings") or [])
     if not summaries:
         # A CI-only bundle (mctlhq/mctl-agents#411: an actionable required
         # check failed with a clean review) still has something useful to
         # say — render the CI section below instead of the old dead end.
-        if ci_failures:
+        if full_text:
+            # The summariser returned no summaries, but the findings' full
+            # text is right here: render it rather than send the agent to
+            # GitHub (or, with CI failures, call the review clean).
+            lines.append("(No summaries in bundle — work from the full reviewer text below.)")
+        elif ci_failures:
             lines.append("(No code review findings in this bundle.)")
         else:
             lines.append("(No summaries in bundle — re-read the PR's code review on GitHub.)")
@@ -2256,7 +2270,6 @@ def _render_review_feedback(bundle: dict) -> str:
                 lines.append(f"- {str(item).strip()}")
 
     rendered = "\n".join(lines).rstrip() + "\n"
-    full_text = _render_full_findings_section(bundle.get("findings") or [])
     if full_text:
         rendered += "\n" + full_text
     advisory = _render_advisory_section(bundle.get("advisory_findings") or [])
@@ -2362,7 +2375,10 @@ def _render_full_findings_section(findings: list) -> str:
         meta = [m for m in (item.get("author"), item.get("comment_kind")) if m]
         if item.get("comment_id"):
             meta.append(f"id {item.get('comment_id')}")
-        header = f"### Finding {i} [{severity}] — {loc}"
+        # Its own label, not "Finding N": these number `findings`, which
+        # need not line up with the summaries above (the summariser may merge
+        # or split items, the fallback does not number them at all).
+        header = f"### Reviewer text {i} [{severity}] — {loc}"
         if meta:
             header += f" ({', '.join(str(m) for m in meta)})"
         lines.append(_neutralize_reviewer_text_tags(header))

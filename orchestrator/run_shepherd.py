@@ -1499,6 +1499,33 @@ def _gh_api_json(args: list[str]) -> Any:
     return json.loads(out)
 
 
+def _gh_api_list(path: str) -> list[dict]:
+    """Every item of a paginated GitHub REST listing, or an exception.
+
+    `_gh_api_json([path, "--paginate"])` is NOT safe for a listing that can
+    span pages: `gh api --paginate` then prints several JSON arrays back to
+    back, which `json.loads` rejects, so the read fails on exactly the
+    long-lived PRs with 31+ comments. `--jq '.[]'` streams one compact object
+    per line instead (bodies keep their newlines escaped, so one line is one
+    item) -- the pattern run_issue_directive_poller already uses.
+
+    Raises (CalledProcessError, OSError, ValueError) on any failed or
+    malformed read; a line that is not a JSON object is a malformed read,
+    not an item to skip. Empty output is an empty listing.
+    """
+    proc = _run(["gh", "api", "--paginate", "--jq", ".[]", path])
+    items: list[dict] = []
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        item = json.loads(line)
+        if not isinstance(item, dict):
+            raise ValueError(f"listing item is not an object: {type(item).__name__}")
+        items.append(item)
+    return items
+
+
 def _find_pr_url_by_branch(service: str, slug: str) -> str | None:
     """Find the canonical implementer PR even when YAML lost its URL."""
     branch = f"feat/agents-{slug}"
@@ -2835,6 +2862,11 @@ def _augment_bundle_with_findings(bundle: dict, findings: list[CodexFinding]) ->
             "truncated": truncated,
         })
     bundle["findings"] = records
+    # Per-finding cap only; the aggregate is reported so an oversized prompt
+    # is diagnosable from the tick log (the CI side has `budget_report`).
+    total = sum(len(r["body"]) for r in records)
+    bundle["findings_chars_total"] = total
+    print(f"info: bundle carries {len(records)} finding(s) verbatim, {total} chars")
     return bundle
 
 
@@ -2876,7 +2908,10 @@ def _augment_bundle_with_ci(bundle: dict, checks: list[CheckBlocker]) -> dict:
         }
         for c in checks
     ]
-    bundle["work_class"] = "mixed" if (bundle.get("summaries") or []) else "ci-remediation"
+    # `findings` counts too: a summariser that returns `summaries: []` for real
+    # findings must not turn a mixed bundle into a CI-only one.
+    has_review = bool(bundle.get("summaries") or bundle.get("findings"))
+    bundle["work_class"] = "mixed" if has_review else "ci-remediation"
     bundle["budget_report"] = {
         "n_checks": len(checks),
         "log_statuses": [c.log_status for c in checks],
@@ -3203,7 +3238,12 @@ def _defang_mentions(text: str) -> str:
 def _refusal_reply_body(reason: str, head_sha: str, extra: str = "") -> str:
     reason = (reason or "").strip()
     if len(reason) > REFUSAL_REPLY_REASON_CAP:
-        reason = reason[:REFUSAL_REPLY_REASON_CAP] + " [... truncated]"
+        reason = reason[:REFUSAL_REPLY_REASON_CAP]
+        # Reasons quote code; a cut inside a ``` fence would leave the rest
+        # of the reply (and the footer) rendered as code. Close it.
+        if reason.count("```") % 2:
+            reason += "\n```"
+        reason += " [... truncated]"
     text = (
         f"{REFUSAL_REPLY_PREFIX}{reason}\n\n"
         f"{extra}"
@@ -3305,14 +3345,10 @@ def _post_refusal_replies(pr: PRSnapshot, findings: list[CodexFinding], reason: 
 
     if threads:
         try:
-            existing = _gh_api_json([
-                f"repos/{pr.repo}/pulls/{pr.number}/comments", "--paginate",
-            ])
-            if not isinstance(existing, list):
-                raise ValueError(f"unexpected listing shape: {type(existing).__name__}")
+            existing = _gh_api_list(f"repos/{pr.repo}/pulls/{pr.number}/comments")
             answered = {
                 c.get("in_reply_to_id") for c in existing
-                if isinstance(c, dict) and marker in (c.get("body") or "")
+                if marker in (c.get("body") or "")
             }
         except (subprocess.CalledProcessError, OSError, ValueError) as e:
             msg = (getattr(e, "stderr", None) or "").strip() or str(e)
@@ -3336,14 +3372,8 @@ def _post_refusal_replies(pr: PRSnapshot, findings: list[CodexFinding], reason: 
 
     if loose:
         try:
-            existing = _gh_api_json([
-                f"repos/{pr.repo}/issues/{pr.number}/comments", "--paginate",
-            ])
-            if not isinstance(existing, list):
-                raise ValueError(f"unexpected listing shape: {type(existing).__name__}")
-            already = any(
-                isinstance(c, dict) and marker in (c.get("body") or "") for c in existing
-            )
+            existing = _gh_api_list(f"repos/{pr.repo}/issues/{pr.number}/comments")
+            already = any(marker in (c.get("body") or "") for c in existing)
         except (subprocess.CalledProcessError, OSError, ValueError) as e:
             msg = (getattr(e, "stderr", None) or "").strip() or str(e)
             print(

@@ -5,6 +5,7 @@ up from this file so `pytest` can be run from anywhere.
 """
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -30,12 +31,13 @@ def _no_live_refusal_replies(monkeypatch):
     time (before this fixture runs) and drive it with `_run`/`_gh_api_json`
     stubbed.
     """
-    shepherd = sys.modules.get("orchestrator.run_shepherd")
-    if shepherd is not None:
-        monkeypatch.setattr(shepherd, "post_refusal_replies", lambda *_a, **_kw: None)
-        # Same reason, read side: the address-review path reads the PR's agy
-        # comment before the follow-up. "Unknown" (None) is its no-op answer.
-        monkeypatch.setattr(shepherd, "read_agy_advisory", lambda *_a, **_kw: None)
+    # Imported unconditionally, not looked up in sys.modules: the guarantee
+    # must not depend on some other test module having imported it first.
+    shepherd = importlib.import_module("orchestrator.run_shepherd")
+    monkeypatch.setattr(shepherd, "post_refusal_replies", lambda *_a, **_kw: None)
+    # Same reason, read side: the address-review path reads the PR's agy
+    # comment before the follow-up. "Unknown" (None) is its no-op answer.
+    monkeypatch.setattr(shepherd, "read_agy_advisory", lambda *_a, **_kw: None)
     yield
 
 
