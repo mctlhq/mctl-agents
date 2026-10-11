@@ -161,7 +161,7 @@ class ProviderIngress:
 
     def _row(self, key: str) -> tuple[Any, ...] | None:
         cur = self._db.execute(
-            "SELECT invocation_id, args_digest, state, is_error, result_text FROM paid_operations "
+            "SELECT invocation_id, args_digest, tenant_id, state, is_error, result_text FROM paid_operations "
             "WHERE provider_operation_key = ?", (key,))
         return cur.fetchone()
 
@@ -196,8 +196,12 @@ class ProviderIngress:
         spec = self._verify(tool, arguments, authorization)
         existing = self._accept(authorization)
         if existing is not None:
-            invocation_id, digest, state, is_error, text = existing
-            if invocation_id != authorization.invocation_id or digest != authorization.args_digest:
+            invocation_id, digest, tenant, state, is_error, text = existing
+            # Invocation ids are unique and signed for one tenant, so a
+            # mismatch here is never legitimate; the tenant is compared too
+            # so a stored outcome is never handed across tenants.
+            if (invocation_id != authorization.invocation_id or digest != authorization.args_digest
+                    or tenant != authorization.tenant_id):
                 raise DispatchRefused("provider operation key is bound to another invocation")
             if state == IN_PROGRESS:
                 # A concurrent or restarted duplicate: never a second run.
@@ -216,6 +220,13 @@ class ProviderIngress:
             result = await spec.handler(arguments)
         except Exception:  # noqa: BLE001 — a failing handler is a recorded failure
             result = ToolCallResult(is_error=True, text=_HANDLER_FAILED_TEXT)
+        # A cancelled handler (the process shutting down) is deliberately NOT
+        # recorded: whether its side effect happened is unknown, and a
+        # `failed` record would let per_successful_call release the charge
+        # for an effect that may have taken place. The row stays in_progress,
+        # the gateway reports outcome-unknown, and only a human or the
+        # reconciler resolves it (ADR 020 sec. 11: time never releases
+        # unknown liability).
         self._complete(key, result)
         return result
 
@@ -227,7 +238,7 @@ class ProviderIngress:
                 raise OutcomeUnavailable(f"outcome store unreadable: {type(exc).__name__}") from exc
         if row is None:
             return ProviderOutcome(NOT_FOUND)
-        _inv, _digest, state, is_error, text = row
+        _inv, _digest, _tenant, state, is_error, text = row
         if state == IN_PROGRESS:
             return ProviderOutcome(IN_PROGRESS)
         return ProviderOutcome(state, is_error=bool(is_error), text=text)

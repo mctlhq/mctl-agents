@@ -187,9 +187,9 @@ class PaidInvocation:
         return self.runtime.tenant_id
 
     def _refusal(self, code: str, error: str, **extra: Any) -> PaidResult:
-        return PaidResult(code, error=error, policy_checkpoint=self._policy_status(), **extra)
+        return PaidResult(code, error=error, policy_checkpoint=self.policy_status(), **extra)
 
-    def _policy_status(self) -> str:
+    def policy_status(self) -> str:
         d = self._decision
         if d is None:
             return "denied"
@@ -700,7 +700,7 @@ class PaidInvocation:
             "provider-error" if failed else "ok", text=text,
             error=_FAILED_ERROR if failed and text is None else "",
             invocation_id=str(inv.get("invocation_id", "")), phase=str(inv.get("phase", "")),
-            policy_checkpoint=self._policy_status(), result_hash_source=text,
+            policy_checkpoint=self.policy_status(), result_hash_source=text,
         )
         self._note(inv, "commerce_settled" if settled else "commerce_result_unsettled")
         return out

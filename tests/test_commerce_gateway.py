@@ -1133,3 +1133,41 @@ def test_terms_repriced_to_free_after_discovery_refuse_until_rediscovered(world)
     out = run(g.invoke(PILOT_CAP, {"ticket": "OPS-1"}))
     assert out["reason_code"] == "commerce-terms-unknown"
     assert world.ledger.writes() == [] and world.executions == []
+
+
+def test_a_cancelled_handler_stays_in_progress_never_failed(world):
+    """Shutdown mid-handler: the effect is unknown, so the provider must not
+    claim `failed`, which would release a per_successful_call charge."""
+    async def shutdown():
+        ingress = world.new_ingress()
+        world.gate, world.entered = asyncio.Event(), asyncio.Event()
+        auth = _auth(world)
+        task = asyncio.ensure_future(ingress.call(cp.PILOT_TOOL, {"ticket": "OPS-1"}, auth))
+        await world.entered.wait()
+        for running in list(ingress._running):
+            running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return ingress.outcome(auth.provider_operation_key).status
+
+    assert run(shutdown()) == cm.IN_PROGRESS
+
+
+def test_a_stored_outcome_is_never_handed_to_another_tenant(world):
+    ingress = world.new_ingress()
+    ingress.tenant_id = ""  # a multi-tenant provider
+    run(ingress.call(cp.PILOT_TOOL, {"ticket": "OPS-1"}, _auth(world)))
+    with pytest.raises(cm.DispatchRefused, match="another invocation"):
+        run(ingress.call(cp.PILOT_TOOL, {"ticket": "OPS-1"}, _auth(world, tenant_id="other")))
+    assert len(world.executions) == 1
+
+
+def test_a_gateway_bug_after_approval_audits_the_policy_verdict(world, monkeypatch, capsys):
+    async def boom(self, inv):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(cg.PaidInvocation, "_from_reserved", boom)
+    out = run(_invoke(world))
+    assert out["reason_code"] == "outcome-unknown"
+    record = [line for line in capsys.readouterr().out.splitlines() if line.startswith("CAPABILITY_INVOCATION ")]
+    assert record and '"policy_checkpoint": "allowed"' in record[-1]

@@ -1117,7 +1117,10 @@ class CapabilityGateway:
             result = await paid.run()
         except Exception as exc:  # noqa: BLE001 — a bug here must not look like a definite answer
             _emit_trace({"capability_id": capability_id, "error_type": type(exc).__name__}, event="commerce_failed")
-            result = cg.PaidResult("outcome-unknown", error="the paid call's state is unknown")
+            # The checkpoint verdict reached before the failure, not a
+            # blanket "denied": the audit must say what policy decided.
+            result = cg.PaidResult("outcome-unknown", error="the paid call's state is unknown",
+                                   policy_checkpoint=paid.policy_status())
         outcome = "ok" if result.reason_code == "ok" else (
             "error" if result.reason_code in ("provider-error", "outcome-unknown", "timeout") else "refused")
         result_hash = (
