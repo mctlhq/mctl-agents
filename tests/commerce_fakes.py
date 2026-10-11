@@ -233,6 +233,7 @@ class FakeLedger:
                 "settlement_status": "none",
                 "approval_id": approval_id, "provider_operation_key": cm.provider_operation_key(inv_id),
                 "reason_code": "", "input_schema_hash": quote["input_schema_hash"],
+                "created_at": cm.hashed_time(self.clock()),
             }
             self.invocations[inv_id] = inv
             self.by_key[(tenant_id, idempotency_key)] = inv_id
@@ -398,7 +399,7 @@ class FakeLedger:
                 "invocation_id", "capability_id", "terms_id", "terms_version", "quote_id", "quote_digest",
                 "price_mode", "funds_mode", "provider_id", "execution_outcome", "charge_status",
                 "settlement_status", "phase", "reason_code", "approval_id", "execution_id", "price",
-                "tenant_id")},
+                "tenant_id", "created_at")},
             **({"usage_quantity": 1} if inv["charge_status"] == "captured" else {}),
             "payment_status": "authorized" if inv["charge_status"] in ("reserved", "captured") else "none",
             "idempotency_key": inv.get("idempotency_key", ""), "args_digest": inv.get("args_digest", ""),
@@ -423,7 +424,8 @@ class FakeLedger:
                 return _no(404, "not-found")
             rows = [self._row(i) for i in self.invocations.values() if i["tenant_id"] == tenant_id
                     and (not capability_id or i["capability_id"] == capability_id)
-                    and (not phase or i["phase"] == phase)]
+                    and (not phase or i["phase"] == phase)
+                    and (not since or cm.parse_time(i["created_at"]) >= cm.parse_time(since))]
             return _ok({"invocations": rows[:limit]})
 
         def parse(body):

@@ -98,18 +98,19 @@ ENV_FUNDS_MODE = "MCTL_COMMERCE_FUNDS_MODE"
 ENV_TENANT_ID = "MCTL_COMMERCE_TENANT_ID"
 
 logger = logging.getLogger(__name__)
+_EXPLICITLY_OFF = frozenset({"false", "0", "no", "off"})
 
 
 def commerce_enabled(source: Mapping[str, str]) -> bool:
     """The one enable gate: the value must be exactly `true` (no case
     folding, no trimming), so only a deliberate setting enables paid work.
-    A value that is set but not exactly `true` is a mistake, not a default,
-    so it stays off and says so: otherwise it would look exactly like
-    commerce deliberately off."""
+    A truthy-looking value that is not exactly `true` (`True`, `1`, ` true`)
+    is a mistake, so it stays off and says so: otherwise it would look
+    exactly like commerce deliberately off. An explicit negative is silent."""
     value = source.get(ENV_ENABLED, "")
     if value == "true":
         return True
-    if value.strip():
+    if value.strip() and value.strip().lower() not in _EXPLICITLY_OFF:
         logger.warning("%s=%r is not exactly 'true'; commerce stays disabled", ENV_ENABLED, value)
     return False
 

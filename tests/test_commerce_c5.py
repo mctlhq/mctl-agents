@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import sys
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -329,8 +330,10 @@ def test_t5_from_env_is_off_by_default_and_fails_closed_when_misconfigured(caplo
         assert not cg.commerce_enabled({"MCTL_COMMERCE_ENABLED": "True"})
         assert "not exactly 'true'" in caplog.text
         caplog.clear()
-        assert not cg.commerce_enabled({}) and not cg.commerce_enabled({"MCTL_COMMERCE_ENABLED": ""})
-        assert caplog.text == ""
+        for off in ({}, {"MCTL_COMMERCE_ENABLED": ""}, {"MCTL_COMMERCE_ENABLED": "false"},
+                    {"MCTL_COMMERCE_ENABLED": "0"}, {"MCTL_COMMERCE_ENABLED": " Off "}):
+            assert not cg.commerce_enabled(off)
+        assert caplog.text == ""  # a deliberate off is not a mistake
     for env in ({}, {**ON, "MCTL_COMMERCE_ENABLED": "false"}):
         assert cg.CommerceRuntime.from_env(env=env, client=client) is None
     runtime = cg.CommerceRuntime.from_env(env=ON, client=client)
@@ -565,6 +568,7 @@ def _shared_env(monkeypatch):
             proof._mark(w)
             env.worlds.append(w)
             yield w
+            proof._close(env, w)
 
     env.new_world = new_world
     return env, ledger
@@ -630,6 +634,28 @@ def test_s14_after_scenarios_fails_when_their_rows_are_not_in_the_scoped_read(mo
     ledger.invocations.clear()  # the scoped read now sees none of S3's rows
     [s14] = proof.run_suite(env, ["S14"])
     assert s14.status == proof.FAILED and s14.observed["missed"] == sorted(s3.receipt_ids) != []
+
+
+def test_s14_covers_scenarios_that_report_no_receipts():
+    """Review of #634: S13 passes no `receipts=`; its world still reports
+    its row on close, so a sweep that missed it fails."""
+    env = proof.offline_env()
+    [s13] = proof.run_suite(env, ["S13"])
+    assert s13.status == proof.PASSED and s13.receipt_ids == []
+    [world] = env.worlds
+    created = {r["invocation_id"] for r in proof._rows(world)}
+    assert created and created <= env.reported
+    world.ledger.invocations.clear()
+    [s14] = proof.run_suite(env, ["S14"])
+    assert s14.status == proof.FAILED and set(s14.observed["missed"]) == created
+
+
+def test_the_fake_ledger_honours_since_like_mctl_api(monkeypatch):
+    env, ledger = _shared_env(monkeypatch)
+    proof.run_suite(env, ["S3"])
+    later = cm.hashed_time(ledger.clock() + timedelta(seconds=1))
+    assert ledger.list_invocations(ledger.tenant).body["invocations"]
+    assert ledger.list_invocations(ledger.tenant, since=later).body["invocations"] == []
 
 
 def test_s14_passes_when_the_scenarios_that_ran_created_no_invocation(monkeypatch):

@@ -121,7 +121,7 @@ class Env:
     order: tuple[str, ...] = ()
     other_tenant: str = "tenant-b"
     other_ledger: Any = None
-    #: Invocation ids the scenarios reported, collected by `run_suite` for S14.
+    #: Invocation ids every closed world created (`_close`), for S14.
     reported: set[str] = field(default_factory=set)
 
 
@@ -153,6 +153,7 @@ def offline_env() -> Env:
             _mark(world)
             env.worlds.append(world)
             yield world
+            _close(env, world)
 
     env.new_world = new_world
     env.other_ledger = None
@@ -204,6 +205,7 @@ def live_env() -> Env:
             _mark(world)
             env.worlds.append(world)
             yield world
+            _close(env, world)
 
     env.new_world = new_world
     return env
@@ -264,8 +266,15 @@ def _list(world: Any, *, phase: str | None = None, since: str | None = None) -> 
 def _mark(world: Any) -> None:
     """Scope a world to the invocations it creates: on a shared live tenant,
     rows that existed when it opened are never this scenario's."""
-    world.proof_since = (datetime.now(UTC) - timedelta(seconds=LOOKBACK_S)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    world.proof_since = cm.hashed_time(world.clock() - timedelta(seconds=LOOKBACK_S))
     world.proof_preexisting = frozenset(r["invocation_id"] for r in _list(world, since=world.proof_since))
+
+
+def _close(env: Env, world: Any) -> None:
+    """On a world's normal exit, record the invocations it created for S14,
+    whatever its scenario passed as `receipts=` (S8, S10, S12 and S13 pass
+    none). A world that raised is a failed scenario already."""
+    env.reported.update(str(r["invocation_id"]) for r in _rows(world))
 
 
 def _rows(world: Any) -> list[dict[str, Any]]:
@@ -827,10 +836,7 @@ def run_suite(env: Env, only: list[str] | None = None) -> list[Result]:
                                   {}, {}, [], note=note))
             continue
         try:
-            result = SCENARIOS[sid](env)
-            results.append(result)
-            if sid != "S14":
-                env.reported.update(result.receipt_ids)
+            results.append(SCENARIOS[sid](env))
         except Skip as exc:
             results.append(Result(sid, NAMES[sid], SKIPPED, {}, {}, [], note=str(exc)))
         except Exception as exc:  # noqa: BLE001 — an unobservable scenario fails, never passes
