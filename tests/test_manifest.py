@@ -1572,7 +1572,16 @@ class TestClusterWorkflowTemplateNames:
             ),
             "cwft-plain.yaml": "kind: ClusterWorkflowTemplate\nmetadata: {name: plain}\n",
         })
-        assert cluster_workflow_template_names(directory) == {"rotate-cron", "rotate", "plain"}
+        assert cluster_workflow_template_names(directory) == {"rotate", "plain"}
+
+    def test_a_cronworkflow_is_not_a_template(self, tmp_path) -> None:
+        """The mentor manifest named the CronWorkflow mctl-agents-daily, and
+        the check accepted it because names were not filtered by kind."""
+        directory = self._dir(tmp_path, {
+            "cwft-daily.yaml": "kind: CronWorkflow\nmetadata: {name: daily}\n",
+            "cwft-run.yaml": "kind: ClusterWorkflowTemplate\nmetadata: {name: run}\n",
+        })
+        assert cluster_workflow_template_names(directory) == {"run"}
 
     def test_an_unparseable_file_raises_instead_of_defining_nothing(self, tmp_path) -> None:
         directory = self._dir(tmp_path, {"cwft-broken.yaml": "kind: [unclosed\n"})

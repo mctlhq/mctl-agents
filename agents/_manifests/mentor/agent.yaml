@@ -34,4 +34,6 @@ spec:
     budgetUsd: 10.00         # MENTOR_BUDGET_USD default
     sandbox:
       backend: argo
-      clusterWorkflowTemplate: mctl-agents-daily
+      # The template the mentor's pod runs in. The CronWorkflow
+      # mctl-agents-daily only submits it with mode=full.
+      clusterWorkflowTemplate: mctl-agents-run
