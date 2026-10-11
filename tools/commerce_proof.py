@@ -279,10 +279,11 @@ def _mark(world: Any) -> None:
 def _close(env: Env, world: Any) -> None:
     """On every exit of a world (pass, failure or `Skip`), record the
     invocations it created for S14, whatever its scenario passed as
-    `receipts=`. Never raises: a failed bookkeeping read must not turn a
-    scenario whose checks held into a failure, or mask the exception it is
-    unwinding. The read failure is S14's instead, the scenario the ids are
-    for."""
+    `receipts=`. Never raises an `Exception` (a `BaseException` such as
+    `KeyboardInterrupt` still propagates): a failed bookkeeping read must not
+    turn a scenario whose checks held into a failure, or mask the exception
+    it is unwinding. The read failure is S14's, the scenario the ids are for,
+    and `summary.created_unreadable`'s, so a run without S14 is not ok."""
     try:
         env.created.update(str(r["invocation_id"]) for r in _rows(world))
     except Exception as exc:  # noqa: BLE001 — recorded for S14, never raised here
@@ -872,7 +873,7 @@ def _git(*args: str) -> str:
 def build_bundle(
     results: list[Result], *, backend: str, terms: Mapping[str, Any], mctl_agents_sha: str,
     mctl_api_sha: str = "not-recorded", image_tags: Mapping[str, str] | None = None,
-    generated_at: str | None = None,
+    generated_at: str | None = None, created_unreadable: list[str] | None = None,
 ) -> dict[str, Any]:
     """The machine-readable evidence. Pure. No arguments, results, tokens or
     payment proofs."""
@@ -894,7 +895,10 @@ def build_bundle(
         "summary": {"counts": counts, "failed": [r.id for r in results if r.status == FAILED],
                     # Never read as passed: each with the reason it was not driven here.
                     "not_driven": {r.id: r.note for r in results if r.status in (SKIPPED, OFFLINE_ONLY)},
-                    "ok": not any(r.status == FAILED for r in results)},
+                    # A world whose rows could not be read is unobserved, so
+                    # the run is not ok even when S14 was not selected.
+                    "created_unreadable": list(created_unreadable or []),
+                    "ok": not any(r.status == FAILED for r in results) and not created_unreadable},
     }
 
 
@@ -918,6 +922,9 @@ def write_bundle(bundle: Mapping[str, Any], out: Path) -> None:
 
 
 def _terms_of(env: Env) -> Mapping[str, Any]:
+    """Read before any scenario: its world creates no invocation, and a
+    failed read here stops the run before it starts instead of discarding a
+    finished one."""
     with env.new_world() as w:
         answer = w.ledger.current_terms(_cap(), w.schema_hash())
         return dict(answer.body) if answer.ok else {}
@@ -940,12 +947,14 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         env = offline_env() if args.backend == "offline" else live_env()
+        terms = _terms_of(env)
         results = run_suite(env, args.only)
         # S14 sweeps the worlds the others opened, so it runs after them above.
         bundle = build_bundle(
-            results, backend=args.backend, terms=_terms_of(env), mctl_agents_sha=_git("rev-parse", "HEAD"),
+            results, backend=args.backend, terms=terms, mctl_agents_sha=_git("rev-parse", "HEAD"),
             mctl_api_sha=args.mctl_api_sha,
             image_tags=dict(item.split("=", 1) for item in args.image_tag),
+            created_unreadable=env.created_unreadable,
         )
     except ProofError as exc:
         print(f"commerce_proof: {exc}", file=sys.stderr)

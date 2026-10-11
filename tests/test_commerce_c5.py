@@ -703,6 +703,34 @@ def test_scoping_excludes_an_earlier_scenario_by_time_not_only_by_preexisting_id
         assert proof._list(later, since=later.proof_since) == []
 
 
+def test_an_unreadable_world_makes_the_bundle_not_ok_even_without_s14():
+    """Review of #634: S14 is not the only reader of a failed close-time read."""
+    ok = proof.Result("S3", "x", proof.PASSED, {}, {}, [])
+    assert proof.build_bundle([ok], backend="live", terms={}, mctl_agents_sha="s")["summary"]["ok"]
+    bundle = proof.build_bundle([ok], backend="live", terms={}, mctl_agents_sha="s",
+                                created_unreadable=["ProofError: 503"])
+    assert not bundle["summary"]["ok"] and bundle["summary"]["created_unreadable"] == ["ProofError: 503"]
+
+
+def test_terms_are_read_before_the_suite_so_a_failure_discards_no_run(monkeypatch, tmp_path):
+    ran = []
+
+    def boom(env):
+        raise proof.ProofError("invocations could not be listed: 503")
+
+    monkeypatch.setattr(proof, "_terms_of", boom)
+    monkeypatch.setattr(proof, "run_suite", lambda env, only: ran.append(1) or [])
+    assert proof.main(["--backend", "offline", "--only", "S3"]) == 2
+    assert ran == []
+
+
+def test_the_investigator_has_one_enable_gate(monkeypatch):
+    from orchestrator import run_issue_investigator as rii
+
+    monkeypatch.setenv("MCTL_COMMERCE_ENABLED", "True")
+    assert rii._commerce_runtime() is None
+
+
 def test_s14_passes_when_the_scenarios_that_ran_created_no_invocation(monkeypatch):
     """Review of #634: S6 opens a world but creates no row; that is not a
     vacuous sweep."""
