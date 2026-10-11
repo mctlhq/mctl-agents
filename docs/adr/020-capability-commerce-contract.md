@@ -8,8 +8,10 @@
 > invocation). **Reuses:** ADR 012 (attribution, versioned pricing,
 > deterministic dedupe), the action-approval intent encoding
 > (mctl-api#366) and canonical principals (mctl-api#373, #428).
-> **Supersedes:** nothing. This is a contract document. It ships no code,
-> schema migration, endpoint or flag, and enables no payment behaviour.
+> **Amends:** ADR 017, additively only: an optional `commerce` descriptor
+> field (sec. 12) and new reason codes (sec. 13). **Supersedes:** nothing.
+> This is a contract document. It ships no code, schema migration, endpoint
+> or flag, and enables no payment behaviour.
 
 ## Context
 
@@ -112,7 +114,7 @@ is ever read from a request body.
 | `subject_principal_id` | the principal the action is performed for | required; equals `principal_id` when no delegation applies |
 | `delegation_grant_id` | the execution-bound grant (mctl-api#428) | required whenever `subject_principal_id != principal_id`, else empty |
 | `payer_account_id` | the tenant's budget account in `funds_mode` (C3) | required; in the milestone always the tenant's own account |
-| `execution_id` | the `we_…` / `ex-…` correlation id (ADR 012) | required when the invocation runs inside an execution, else empty |
+| `execution_id` | the `we_…` / `ex-…` correlation id (ADR 012) | required. In the milestone a paid invocation exists only inside a governed execution; the approval contract (sec. 8) requires it too |
 
 **Commerce boundaries fail closed on identity.** Phase 1 allows a request
 with an unresolved principal to continue (`docs/principals.md`). Every
@@ -183,7 +185,7 @@ for these exact arguments, until this time.
 | `tenant_id`, `payer_account_id`, `principal_id`, `subject_principal_id`, `delegation_grant_id`, `execution_id` | sec. 3 |
 | `args_digest` | `sha256:` over ADR 017's `canonical_json(arguments)`, the same value `InvocationRecord.arguments_hash` carries |
 | `price_mode`, `currency`, `amount_minor`, `funds_mode` | copied from the terms; `amount_minor` is the maximum the invocation can capture |
-| `expires_at` | UTC, second precision, `created_at + quote_ttl_seconds` |
+| `expires_at` | `created_at + quote_ttl_seconds`, written exactly as `YYYY-MM-DDTHH:MM:SSZ`: UTC, no fractional seconds, no numeric offset. Go `time.RFC3339` produces this; Python `isoformat()` produces `+00:00` and must not be used for the hashed text |
 | `quote_digest` | below |
 
 `quote_digest` uses the length-prefixed encoding mctl-api already uses for
@@ -234,8 +236,10 @@ Quote rules:
 - **No silent repricing.** An invocation accepted on a quote is charged at
   that quote's terms, never at the latest terms. If the quote expired, or
   its terms version was retired before acceptance, the request is refused
-  with `quote-expired` / `quote-stale`. The client must request a new quote,
-  and any approval bound to the old one no longer matches (sec. 8).
+  with `quote-expired` / `quote-stale`. The client must request a new quote.
+  An approval is bound to the price, not to the quote (sec. 8): it survives
+  a quote expiry and is consumed by the replacement quote at the same
+  terms, but a retired terms version invalidates it.
 - **Mismatch.** An invocation whose arguments, capability version, payer
   or identities differ from its quote is refused with `quote-mismatch`.
   Nothing is reserved and nothing is dispatched.
@@ -280,9 +284,9 @@ state that section 11 defines for it.
 | 1 | Authenticate the actor and resolve `principal_id`, subject, delegation and tenant; refuse if unresolved | mctl-api |
 | 2 | Resolve the capability from the sealed set (ADR 017 sec. 3) and check current tenant authorization | mctl-agents gateway + mctl-api |
 | 3 | `PolicyCheckpoint` (ADR 017 sec. 6, ADR 014) | mctl-agents |
-| 4 | Mint the quote and run a preliminary, non-binding budget check | mctl-api |
-| 5 | Exact-action approval if policy requires it (sec. 8). **No funds are held while waiting.** | mctl-api approvals (#366) |
-| 6 | Accept the invocation: idempotency row, quote validation, `phase = accepted` | mctl-api |
+| 4 | Resolve the current terms version, compute the `terms_binding` (sec. 8) and run a preliminary, non-binding budget check | mctl-api |
+| 5 | Exact-action approval if policy requires it (sec. 8). **No funds are held while waiting**, and no quote exists yet, so a slow approver never races a quote's expiry | mctl-api approvals (#366) |
+| 6 | Mint the quote (sec. 5) and accept the invocation: idempotency row, `phase = accepted`. The quote's terms version, amount, currency, payer and `funds_mode` must equal the `terms_binding` the approval covers, otherwise `quote-stale` | mctl-api |
 | 7 | Re-validate identity, authorization, policy and the quote; consume the approval if any | mctl-api + mctl-agents |
 | 8 | Atomically reserve budget (C3) and authorize payment (sec. 10) | mctl-api |
 | 9 | Persist dispatch intent with a fencing token, then dispatch with a signed invocation authorization (sec. 9) | mctl-agents (dispatch), mctl-api (intent, token) |
@@ -307,21 +311,50 @@ step 6. Nothing is reserved for it.
 
 ### 8. Approval binding
 
-A paid invocation that policy routes to approval uses the existing
-action-approval contract unchanged:
+A paid invocation that policy routes to approval goes through the existing
+checkpoint and approval path with **no new action kind, no new intent field
+and no encoding change**. Today `capability_invoke` checkpoints an
+`ActionRequest` of kind `mcp.tool.call`, and `orchestrator/action_approvals.py`'s
+`intent_for()` derives the intent from it: `action_kind =
+"mcp.tool.call:<operation>"`, `args_digest = request.args_digest`,
+`artifact_hash = request.action_digest()`. That stays as it is.
 
-| Intent field | Value |
-|---|---|
-| `action_kind` | `capability_invoke` |
-| `target` | `capability_id` |
-| `args_digest` | the quote's `args_digest` |
-| `artifact_hash` | the `quote_digest` (the field is documented as an optional payload hash) |
-| `execution_id`, `policy_rule_id`, `policy_version`, `work_item_id` | as today |
+What changes is the **request content**. For a paid capability the gateway
+adds one argument, `commerce_terms_binding`, to the `ActionRequest`
+arguments before the checkpoint runs, so both `args_digest` and
+`artifact_hash` cover it:
 
-This keeps the encoding at `mctl-action-intent/v1`. An approver approves a
-specific price, for specific arguments, for a specific payer. A new quote,
-whether from a price change, expiry or different arguments, produces a
-different `intent_hash`, so the old approval cannot be consumed for it.
+```text
+terms_binding = sha256 over the length-prefixed encoding (sec. 5 style)
+  mctl-commerce-terms/v1\n
+  terms_id, terms_version, capability_id, input_schema_hash,
+  tenant_id, payer_account_id, price_mode, currency, amount_minor, funds_mode
+```
+
+Golden vector, over the same values as the section 5 quote (`terms_id`
+`ctm_01JZ8PZ0000000000000000000`, version `3`, the same capability and
+schema hash, tenant `acme`, payer `acct_tenant_acme`,
+`per_successful_call`, `EUR`, `12`, `simulated`):
+
+```text
+terms_binding = sha256:edefb0ce2c0ce7b46abb82aab173268568657ee2ae9fd32af8e8eac54e5514e1
+```
+
+The binding deliberately has **no quote id and no expiry**. An approval can
+legitimately take hours or days (`MaxApprovalTTL` is 7 days), while a quote
+lives at most 15 minutes. Binding the approval to the price, not to a
+quote, is what lets step 6 mint the quote *after* the approval and still
+prove the approver saw this exact price for these exact arguments and
+this exact payer. A price change, a different capability version, different
+arguments or a different payer produces a different `intent_hash`, so the
+old approval cannot be consumed for it. The quote minted at step 6 must
+reproduce the approved `terms_binding`, otherwise it is `quote-stale`.
+
+Because `execution_id`, `policy_rule_id` and `policy_version` are required
+by `ActionApprovalInput.validate()`, a paid invocation always carries them
+(sec. 3 makes `execution_id` required for exactly this reason). The
+evidence envelope (ADR 018, `TOOL_CALL_KINDS`) keeps seeing paid calls
+because their kind is still `mcp.tool.call`.
 
 An approval is consumed once, by one invocation, at step 7. The invocation
 records the consumed `approval_id`. On restart, the consumed approval
@@ -349,8 +382,12 @@ prove it before the provider is admitted.
    before any side effect. "Accepted" in section 4 means exactly this
    record.
 4. **Dispatch deadline.** The provider refuses a key whose
-   `dispatch_deadline` has passed and has not already been accepted. This
-   makes a later `not_found` safe to act on.
+   `dispatch_deadline` has passed on the provider's clock and has not
+   already been accepted. mctl-api treats `not_found` as definitive only
+   after `dispatch_deadline + max_clock_skew`, where `max_clock_skew` is
+   60 seconds in the milestone. Between the deadline and that margin a
+   `not_found` is still "not yet accepted". The margin, not the deadline,
+   is what makes a later `not_found` safe to act on.
 5. **Outcome lookup.** `outcome(key)` returns one of the following:
 
    | Result | Meaning | MCTL may act on it |
@@ -358,8 +395,8 @@ prove it before the provider is admitted.
    | `succeeded` | accepted and completed successfully | capture (both paid modes) |
    | `failed` | accepted and completed unsuccessfully | `per_call`: capture; `per_successful_call`: release |
    | `in_progress` | accepted, not finished | wait |
-   | `not_found` after `dispatch_deadline` | never accepted, and can no longer be | release |
-   | `not_found` before `dispatch_deadline` | not yet accepted | nothing; not proof of absence |
+   | `not_found` after `dispatch_deadline + max_clock_skew` | never accepted, and can no longer be | release |
+   | `not_found` before that | not yet accepted | nothing; not proof of absence |
    | timeout, transport error, malformed answer | **unknown** | nothing; never treated as `not_found` |
 
 6. **Outcome authority.** Success is the provider's `succeeded` record.
@@ -453,10 +490,11 @@ never applied blindly.
 |---|---|
 | identity, authorization, policy, approval or budget rejection | `refused`, `reason_code` set, no dispatch, no charge, refusal audited |
 | quote expired, stale or mismatched | `refused` (`quote-expired` / `quote-stale` / `quote-mismatch`) |
-| payment authorization denied | `released` (`payment-denied`), reservation released, no dispatch |
+| payment authorization denied, simulated funds | `refused` (`payment-denied`). Step 8 reserves and authorizes in one transaction, so a denial commits no reservation and there is nothing to release |
+| payment authorization denied, future external rail | `released` (`payment-denied`): the reservation committed before the remote authorization is released, no dispatch |
 | failure before the provider accepts dispatch | `released`, `execution_outcome: not_dispatched`, no charge |
 | cancellation before dispatch | `released` |
-| cancellation after dispatch | no change until the provider confirms the cancellation or an outcome |
+| cancellation after dispatch | not supported in the milestone. The request is answered `too-late-to-cancel`, nothing changes, and the invocation runs to its outcome. A provider cancel operation and a `cancelled` outcome are a later scope |
 | confirmed provider failure | `finalized`, `failed`; `per_call` captures once, `per_successful_call` releases |
 | confirmed success | `finalized`, `succeeded`, captured exactly once at the quoted price, including when the client disconnected |
 | timeout, crash or ambiguous response after dispatch | `outcome_unknown`; liability held at the quoted amount; no re-execution; reconciled by provider operation key |
@@ -476,7 +514,8 @@ spendable again just because time passed.
 
 | State | Who resolves it | How |
 |---|---|---|
-| `accepted` / `reserved` with no dispatch intent | mctl-api reconciler | release once `reservation_deadline` passes |
+| `accepted` with no reservation | mctl-api reconciler | mark `refused` (`quote-expired`) once the quote's `expires_at` passes; nothing is held, so nothing is released |
+| `reserved` with no dispatch intent | mctl-api reconciler | release once `reservation_deadline` passes |
 | `dispatching` | the dispatcher holding the fencing token; after its lease, the mctl-api reconciler | `outcome(key)` on the provider operation key; a new dispatcher never re-dispatches without a definitive `not_found` after `dispatch_deadline` |
 | `dispatched` / `outcome_unknown` | mctl-api reconciler | `outcome(key)` until definitive; then capture or release |
 | `payment_status: unknown`, `settlement_status: pending` | mctl-api reconciler | `PaymentAuthorizer.status` on the same key |
@@ -503,9 +542,21 @@ the user, and execution never reads it:
 - A descriptor whose `commerce` references terms that mctl-api cannot
   resolve is **not free**. Its invocation is refused with
   `commerce-terms-unknown`.
-- The field is part of the sealed `content_hash`. Sealed sets created before
-  this extension keep their hashes because the field is absent. ADR 017's
-  "no allow/deny/permit/grant/authorized field" test applies to it unchanged.
+- **Serialization rule.** `CapabilityDescriptor.to_dict()` today emits every
+  key unconditionally, and `content_hash` is `canonical_json` of that dict.
+  `commerce` is therefore **omitted from `to_dict()` when absent**, never
+  emitted as `null`, so every sealed set produced before this extension
+  recomputes to its original `content_hash` (ADR 017 sec. 2 drift check).
+  When present it is part of the hash. `from_dict` accepts the key.
+- **Reader sequencing.** A reader built before C4 rejects a set carrying
+  `commerce` as an unknown key. C4 lands the reader and serializer change
+  first, and no terms are published for any provider until every consumer
+  of sealed sets runs that version. ADR 017's "no
+  allow/deny/permit/grant/authorized field" test applies to the new field
+  unchanged.
+- ADR 017 names its field table and reason-code vocabulary as closed. This
+  ADR amends ADR 017 for exactly these two additive extensions, and ADR 017
+  carries a dated amendment pointing here.
 - `capability_search` rows may show `price_mode` and `price`.
   `capability_describe` shows the full summary. Both draw only from the
   sealed set, so a capability the caller cannot see shows no price either.
@@ -531,7 +582,8 @@ ADR 017 sec. 7's closed vocabulary is extended, additively, with:
 `identity-unresolved`, `commerce-terms-unknown`, `quote-expired`,
 `quote-stale`, `quote-mismatch`, `idempotency-conflict`,
 `currency-mismatch`, `funds-mode-unavailable`, `budget-exhausted`,
-`payment-denied`, `unsupported-execution`, `outcome-unknown`.
+`payment-denied`, `unsupported-execution`, `outcome-unknown`,
+`too-late-to-cancel`.
 `policy-denied`, `not-eligible`, `not-found`, `provider-unavailable`,
 `provider-error` and `timeout` keep their ADR 017 meanings.
 
@@ -579,9 +631,16 @@ point to the rule.
 8. Same key and same digest return the original invocation with no second
    reservation, dispatch or capture. Same key and a changed digest are
    refused with 409 and leave the original unchanged (sec. 6).
-9. An approval bound to one quote cannot be consumed by an invocation on a
-   different quote (sec. 8).
+9. An approval whose `terms_binding` covers one price, capability version,
+   argument digest and payer cannot be consumed by an invocation whose quote
+   differs in any of them; an approval decided 20 minutes after the request
+   is still consumable, because no quote existed while it waited (sec. 8).
 10. No funds are held while an approval is pending (sec. 7).
+10a. `expires_at` round-trips between the Go and Python implementations as
+    the identical `…Z` string, so a quote minted by one verifies in the
+    other (sec. 5).
+10b. A sealed set serialized before C4 recomputes to its original
+    `content_hash` after C4 (sec. 12).
 11. With EUR 0.12 `per_successful_call` and a EUR 1.00 budget, at most 8
     concurrent invocations capture and the 9th is `budget-exhausted`
     (sec. 7; demonstrated in C5).
@@ -609,10 +668,14 @@ point to the rule.
 3. **A separate billing service.** Rejected for the same reasons ADR 012
    rejected a separate usage store: it would re-derive identity, duplicate
    authentication and need reconciliation against mctl-api.
-4. **Bind the quote by adding an approval intent field (`mctl-action-intent/v2`).**
-   Rejected for now. `artifact_hash` already exists for an optional payload
-   hash and binds the quote with no encoding change. A version bump is only
-   warranted if a later scope needs to bind something it cannot carry.
+4. **Bind the approval to the quote (`artifact_hash = quote_digest`) or add
+   an intent field (`mctl-action-intent/v2`).** Both rejected. A quote
+   lives at most 15 minutes and an approval up to 7 days, so a quote-bound
+   approval expires before a human can act on it. `artifact_hash` is
+   already `action_digest()` on the checkpoint path and cannot be
+   repurposed without changing what every existing approval binds. Putting
+   the `terms_binding` into the checkpoint arguments (sec. 8) binds the
+   price with no change to any encoding, kind or field.
 5. **Adopt x402 or MPP state machines as the core model.** Rejected. Their
    lifecycles differ by scheme and facilitator (see the plan's protocol
    research). The core keeps one authorize/capture/void/status contract, and
@@ -629,7 +692,8 @@ this document.
 
 ## Implementation map
 
-This PR changes only `docs/adr/020-capability-commerce-contract.md`.
+This PR changes `docs/adr/020-capability-commerce-contract.md` and adds one
+dated amendment to `docs/adr/017-capability-discovery-and-gateway-contract.md`.
 
 | Item | Builds | Depends on |
 |---|---|---|
