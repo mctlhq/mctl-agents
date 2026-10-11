@@ -303,18 +303,19 @@ def _check_legacy_env_override(manifest: AgentManifest) -> list[str]:
 
 
 def cluster_workflow_template_names(directory: Path) -> set[str]:
-    """The `metadata.name` of every document in `directory`'s `cwft-*.yaml`
-    files. A file may hold several documents: since mctl-gitops fc958d6
-    (templateReferencing: Strict) a CronWorkflow and the template it
+    """The `metadata.name` of every ClusterWorkflowTemplate in `directory`'s
+    `cwft-*.yaml` files. A file may hold several documents: since mctl-gitops
+    fc958d6 (templateReferencing: Strict) a CronWorkflow and the template it
     references share one file, and reading only the first document failed
-    every manifest. The names are not filtered by `kind`, which keeps the
-    check exactly as permissive as before: the mentor manifest names the
-    CronWorkflow `mctl-agents-daily`, not a template. A file that does not
-    parse raises: it is never read as "defines nothing"."""
+    every manifest. Other kinds are skipped: a CronWorkflow is not something
+    a pod is created from, and accepting its name let the mentor manifest
+    name `mctl-agents-daily` instead of the `mctl-agents-run` template that
+    CronWorkflow submits. A file that does not parse raises: it is never read
+    as "defines nothing"."""
     names: set[str] = set()
     for path in sorted(directory.glob("cwft-*.yaml")):
         for document in yaml.safe_load_all(path.read_text(encoding="utf-8")):
-            if document is not None:
+            if document is not None and document.get("kind") == "ClusterWorkflowTemplate":
                 names.add(document["metadata"]["name"])
     return names
 

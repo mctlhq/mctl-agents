@@ -321,7 +321,7 @@ agents:
     budgetEnv: MENTOR_BUDGET_USD               # default 10.00
     sandbox:
       backend: argo
-      clusterWorkflowTemplate: mctl-agents-daily
+      clusterWorkflowTemplate: mctl-agents-run
     writes: agents/_mentor/digest/<week>.md
     riskLevel: low
     triggeredBy:
