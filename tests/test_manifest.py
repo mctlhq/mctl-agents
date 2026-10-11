@@ -36,6 +36,7 @@ from orchestrator.validate_manifest import (
     check_implement_admission_is_safe,
     check_manifests_match_inventory,
     check_service_skills_limits,
+    cluster_workflow_template_names,
     implement_admission_clamp_warnings,
     validate,
 )
@@ -1550,3 +1551,30 @@ def test_check_service_skills_limits_no_op_when_ceilings_not_yet_configured(tmp_
         service_skills=ServiceSkillPolicy(enabled=True, max_skills=999, max_skill_bytes=999, max_total_bytes=999),
     )
     assert check_service_skills_limits({"x": huge}) == []
+
+
+class TestClusterWorkflowTemplateNames:
+    """mctl-gitops fc958d6 put a CronWorkflow and the template it references
+    in one cwft-*.yaml file; a single-document read failed every manifest."""
+
+    def _dir(self, tmp_path, files: dict[str, str]):
+        directory = tmp_path / "cluster-templates"
+        directory.mkdir()
+        for name, text in files.items():
+            (directory / name).write_text(text, encoding="utf-8")
+        return directory
+
+    def test_a_template_after_a_cronworkflow_in_one_file_is_found(self, tmp_path) -> None:
+        directory = self._dir(tmp_path, {
+            "cwft-rotate.yaml": (
+                "kind: CronWorkflow\nmetadata: {name: rotate-cron}\n---\n"
+                "kind: ClusterWorkflowTemplate\nmetadata: {name: rotate}\n"
+            ),
+            "cwft-plain.yaml": "kind: ClusterWorkflowTemplate\nmetadata: {name: plain}\n",
+        })
+        assert cluster_workflow_template_names(directory) == {"rotate-cron", "rotate", "plain"}
+
+    def test_an_unparseable_file_raises_instead_of_defining_nothing(self, tmp_path) -> None:
+        directory = self._dir(tmp_path, {"cwft-broken.yaml": "kind: [unclosed\n"})
+        with pytest.raises(yaml.YAMLError):
+            cluster_workflow_template_names(directory)

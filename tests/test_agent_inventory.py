@@ -22,6 +22,7 @@ import pytest
 import yaml
 
 from config.settings import ROTATING_SERVICES
+from orchestrator.validate_manifest import cluster_workflow_template_names
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INVENTORY = REPO_ROOT / "docs" / "agent-inventory.yaml"
@@ -163,10 +164,7 @@ def test_agents_match_the_options_builders():
 )
 @pytest.mark.parametrize("agent", _agents(), ids=_agent_ids())
 def test_cluster_workflow_template_exists(agent):
-    names = {
-        yaml.safe_load(path.read_text())["metadata"]["name"]
-        for path in GITOPS_CWFT_DIR.glob("cwft-*.yaml")
-    }
+    names = cluster_workflow_template_names(GITOPS_CWFT_DIR)
     assert agent["sandbox"]["clusterWorkflowTemplate"] in names
 
 
