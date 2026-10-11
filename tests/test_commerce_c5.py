@@ -740,7 +740,6 @@ def test_an_unread_terms_world_stops_the_run_before_any_scenario(monkeypatch, ca
     assert "terms world could not be read on close: ProofError: invocations could not be listed: 503" in err
 
 
-
 def test_the_terms_guard_names_only_the_terms_worlds_failure(monkeypatch):
     """Review of #634: the guard reads what the terms world added, not any
     earlier entry, so its message cannot misattribute one."""
@@ -754,6 +753,7 @@ def test_the_terms_guard_names_only_the_terms_worlds_failure(monkeypatch):
     monkeypatch.setattr(proof, "offline_env", seeded)
     monkeypatch.setattr(proof, "run_suite", lambda env, only: [])
     assert proof.main(["--backend", "offline", "--only", "S3"]) != 2
+
 
 def test_the_markdown_names_unreadable_worlds():
     """Review of #634: --markdown has no row for a world that went unread."""
