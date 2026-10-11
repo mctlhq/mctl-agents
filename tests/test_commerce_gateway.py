@@ -1328,3 +1328,10 @@ def test_a_call_revoked_before_dispatch_stays_denied_on_retry(world, capsys):
     _restart(world)
     assert '"policy_checkpoint": "denied"' in _invocation_records(capsys.readouterr().out)[-1]
     assert world.executions == []
+
+
+@pytest.mark.parametrize("arguments", [None, 7, ["ticket"]])
+def test_the_paid_path_refuses_non_object_arguments_on_its_own(world, arguments):
+    g = run(world.gateway())
+    out = run(g._invoke_paid(g.descriptors_by_id[PILOT_CAP], arguments, "", 0.0))
+    assert out["reason_code"] == "invalid-arguments" and world.ledger.writes() == []

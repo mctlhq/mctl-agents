@@ -1099,6 +1099,12 @@ class CapabilityGateway:
             self._trace(self._record(capability_id, "refused", code, start, arguments, policy_checkpoint="absent"))
             return {"reason_code": code, "error": error}
 
+        if not isinstance(arguments, Mapping):
+            # `invoke` already refuses this before routing here; kept so the
+            # paid path never depends on its caller for the `dict()` below.
+            self._trace(self._record(capability_id, "refused", "invalid-arguments", start, {},
+                                     policy_checkpoint="absent"))
+            return {"reason_code": "invalid-arguments", "error": "arguments must be a JSON object"}
         if self.commerce is None:
             return refuse("commerce-terms-unknown", "paid capabilities are not available in this execution")
         if not isinstance(self.checkpoint, PolicyDecidePolicyCheckpoint):

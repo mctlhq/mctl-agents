@@ -527,6 +527,12 @@ class PaidInvocation:
         it consumed it)."""
         if self._request is None or self._decision is None:
             return
+        # The verdict is the rule's REQUIRE_APPROVAL (`pc._verdict_for` maps
+        # every approval-flow code to it, never to DENY), and it stays that:
+        # `pc.decision_record`'s contract is that a permitted REQUIRE_APPROVAL
+        # keeps the rule's verdict and carries `code: approved`, which is
+        # exactly what `pc.decide` writes when it redeems an approval itself.
+        # Whether the action ran is read from `code`, not from `decision`.
         approved = pc.Decision(
             self._decision.verdict, pc.CODE_APPROVED, f"approval {approval_id} consumed for this invocation",
             self._decision.policy_version, self._decision.rule_id, self._request.action_digest(), approval_id,
