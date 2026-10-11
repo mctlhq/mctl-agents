@@ -509,6 +509,14 @@ Decisions:
   malformed response, a truncated contexts page). Fails closed: no
   merge/defer-merge this tick. Tracked on `ci_probe_failures`, cleared
   by any successful probe.
+- **merge-state-unknown** — everything else says merge (review clean,
+  checks green, settle window passed), but GitHub reports
+  `mergeStateStatus` as `UNKNOWN` (mctl-agents#633). Never merges.
+  Tracked per head SHA on `merge_unknown_ticks`; after
+  `SHEPHERD_MERGE_UNKNOWN_MAX` consecutive ticks (default 4) the
+  proposal flips to `review-stuck` with a blameless note, so the loop
+  ends instead of waiting silently. Cleared by any tick that reads a
+  known state. Not used for fix-only services.
 - **merge** — codex clean, no required check failing, merge state
   mergeable, and the service is not fix-only or in
   `NEVER_MERGE_SERVICES`. Calls
