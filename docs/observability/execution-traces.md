@@ -316,12 +316,14 @@ that to a rejection.
 ## Live-evidence checklist for closing #195
 
 Everything above is offline evidence. #195's acceptance criteria are about a real
-run, so it closes on this list, each item with a link or a screenshot:
+run. The criteria in the issue are authoritative; this list is how to show them,
+each item with a link or a screenshot, and it adds no gate the issue does not have.
 
-1. [ ] **Backend chosen and wired.** mctl-gitops#1280 is decided, and the
-   Collector's `backendEndpoint` points at it. A synthetic span sent to
-   `otel-collector.monitoring:4318` (e.g. `telemetrygen traces
-   --otlp-http --otlp-insecure`) is visible in the backend.
+1. [ ] **Backend wired.** The Collector exports traces to a backend that can be
+   queried, and a span sent to `otel-collector.monitoring:4318` (e.g.
+   `telemetrygen traces --otlp-http --otlp-insecure`) is visible there. The
+   mctl-gitops#1280 evaluation backend counts. #1280's verdict and teardown are
+   not a prerequisite for closing #195.
 2. [ ] **Token counters survive the Collector** (mctl-gitops#1332 closed).
    `gen_ai.usage.input_tokens` arrives as an integer, not `****`.
 3. [ ] **Catalog updated.** The mctl-docs reservation PR for the proposed names
@@ -338,13 +340,20 @@ run, so it closes on this list, each item with a link or a screenshot:
    with the parameter logs no `ignoring undeclared operation parameters` line.
 7. [ ] **Flag on.** `MCTL_TRACE_ARGO_PARAM=true` on the worker(s) running
    `submit_and_wait`.
-8. [ ] **One real investigation, end to end.** Label a real issue
-   `agents:intake`, and in the backend find the trace by `mctl.workflow.id`
-   (`dev-loop-<owner>-<repo>-<n>`). It must show, in one tree:
-   `RunActivity:submit_and_wait` → `argo.workflow mctl-agents-investigate`
-   → `issue-investigator.run` → `invoke_agent` with `chat` spans carrying token
-   usage and `execute_tool` spans with status → `github.issue.comment`
-   (`mctl.github.mutation=true`) → `mctl.artifact.write` events for the triplet.
+8. [ ] **At least one organic real workflow, end to end.** Use a DevLoop the
+   platform ran on its own, whose Temporal run started after tracing was
+   enabled. Do not label an issue only to produce evidence. Find the trace by
+   `mctl.workflow.id` (`dev-loop-<owner>-<repo>-<n>`). One tree must show
+   `RunActivity:submit_and_wait` → `argo.workflow mctl-agents-<investigate|implement>`
+   → the pod root (`issue-investigator.run` or `implementer.run`) → `invoke_agent`
+   with `chat` spans carrying latency, outcome and token usage (when the provider
+   reports it) and `execute_tool` spans with status → GitHub mutation spans
+   (`github.issue.comment`, or `git.commit`, `git.push` and `github.pr.create`,
+   with `mctl.repository.name` and `mctl.github.mutation=true`) →
+   `mctl.artifact.write` events for generated artifacts. An investigation or an
+   implementation qualifies; both are not required. If one run does not exercise
+   every acceptance criterion (no GitHub mutation or no artifact, say), use
+   another organic run for the rest.
 9. [ ] **Correlation holds.** On that trace:
    - `mctl.argo.workflow.name` equals the Argo workflow the mctl-api execution
      record names.
@@ -352,13 +361,14 @@ run, so it closes on this list, each item with a link or a screenshot:
    - `mctl.workflow.run_id` equals `temporal workflow describe`.
    - With the work-item layer on, `mctl.execution.id` is the `we_` id in
      `work_context`.
-10. [ ] **One real implementation** in the same trace family: `implementer.run`
-    with `git.commit`, `git.push` and `github.pr.create`
-    (`mctl.repository.name`, `mctl.github.mutation=true`).
+10. *Retired: "one real implementation" is folded into item 8. The number is
+    kept because mctl-gitops' ADR 0001 cites the redaction check as item 11.*
 11. [ ] **Redaction holds on real data.** Export that trace as JSON and grep it
     for the issue's body text, a line of the proposal, `ghp_`/`ghs_`/`sk-`,
     `Bearer` and the prompt's opening sentence. Expect zero hits.
-12. [ ] **Failure isolation holds live.** Scale the Collector to zero (or point
-    one worker at a dead endpoint) for one investigation. The run still
-    succeeds, the worker and pod each log one `tracing:` warning, and the pod
-    exits within the 5 s flush bound.
+
+Failure isolation is shown offline (see "Failure isolation" and
+`tests/test_tracing.py`) and is not a closure criterion. Do not scale the
+production Collector to zero or point a production worker at a dead endpoint to
+prove it. A live drill, if one is ever wanted, is a separate owner-approved
+sandbox exercise, not an implicit requirement of #195 or mctl-gitops#1280.
