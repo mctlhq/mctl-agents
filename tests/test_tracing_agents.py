@@ -195,6 +195,31 @@ def test_a_reported_zero_cache_counter_is_recorded(exported, tmp_path, monkeypat
     assert tracing.USAGE_CACHE_CREATION not in root.attributes
 
 
+def test_cache_counters_sum_across_result_frames_without_touching_input(exported):
+    first = {"input_tokens": 3, "output_tokens": 5, "cache_read_input_tokens": 4000}
+    second = {
+        "input_tokens": 2,
+        "output_tokens": 1,
+        "cache_read_input_tokens": 600,
+        "cache_creation_input_tokens": 1200,
+    }
+    # The investigator driver stops at the first ResultMessage of a turn, so
+    # drive the observer directly to get two result frames into one run.
+    with tracing.agent_run("issue-investigator", MODEL) as obs:
+        for usage in (first, second):
+            obs.observe(
+                ResultMessage(
+                    subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=1, session_id="s",
+                    usage=usage,
+                )
+            )
+    root = _spans(exported)["invoke_agent issue-investigator"]
+    assert root.attributes["gen_ai.usage.input_tokens"] == 5
+    assert root.attributes["gen_ai.usage.output_tokens"] == 6
+    assert root.attributes[tracing.USAGE_CACHE_READ] == 4600
+    assert root.attributes[tracing.USAGE_CACHE_CREATION] == 1200
+
+
 def test_a_frame_reporting_only_input_still_emits_output_zero_on_the_root(exported, tmp_path, monkeypatch):
     root, _ = _usage_run(exported, tmp_path, monkeypatch, {"input_tokens": 7}, {"input_tokens": 7})
     assert root.attributes["gen_ai.usage.input_tokens"] == 7
