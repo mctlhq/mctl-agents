@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.73.0](https://github.com/mctlhq/mctl-agents/compare/1.72.0...1.73.0) (2026-10-11)
+
+
+### Features
+
+* **investigator:** ground proposals in the deployed state ([48e5cf6](https://github.com/mctlhq/mctl-agents/commit/48e5cf6f086388a28c000aef972cc049337df1de))
+* **investigator:** ground proposals in the deployed state ([7e0dc05](https://github.com/mctlhq/mctl-agents/commit/7e0dc057f83260a33c62caf46c3144629bfa5fe5))
+* **shepherd:** hand the implementer full findings, reply on refusal ([10c3e71](https://github.com/mctlhq/mctl-agents/commit/10c3e71c778c853c133a599759d3ae40ca7cc6dc))
+* **shepherd:** hand the implementer full findings, reply on refusal ([80c8e64](https://github.com/mctlhq/mctl-agents/commit/80c8e64ea02b3b82cefcd9e3d8eaef853941726d))
+* **shepherd:** pass agy P1/P2 to follow-ups as advisory findings ([43386e2](https://github.com/mctlhq/mctl-agents/commit/43386e27a4492577c296bf5228f8e8d191b6b2e8))
+* **shepherd:** pass agy P1/P2 to follow-ups as advisory findings ([44d460e](https://github.com/mctlhq/mctl-agents/commit/44d460edc4ef66523587860ec95aa79ca7b4f39f))
+
+
+### Bug Fixes
+
+* **implementer:** admit agy advisory items on the CI-only prompt ([fb190ed](https://github.com/mctlhq/mctl-agents/commit/fb190ed49fdd51edc7bff401ec9e5c277417cf49))
+* **implementer:** let the Ground rules scope admit advisory items ([72dea3d](https://github.com/mctlhq/mctl-agents/commit/72dea3d7b61c6d12374ee1b2c682d87cd6e430d6))
+* **shepherd:** parse agy comments by their own structure only ([ed894d1](https://github.com/mctlhq/mctl-agents/commit/ed894d198afdaa22eec3cb0af11ad0fc361e27a4))
+* **shepherd:** read paginated listings whole, keep findings visible ([5c739bc](https://github.com/mctlhq/mctl-agents/commit/5c739bcac2dffbecfe37e39854597723a3b017fe))
+* **shepherd:** read the agy comment listing across pages ([66c3230](https://github.com/mctlhq/mctl-agents/commit/66c32301ed749bfc697d472b73dc554fd9a1c220))
+* **shepherd:** render agy advisory last and trust only a real trailer ([a7a16dc](https://github.com/mctlhq/mctl-agents/commit/a7a16dcc1c7c174cdba0a8286c42b25563143507))
+* **shepherd:** split listings on newline only, close fences cleanly ([07001a4](https://github.com/mctlhq/mctl-agents/commit/07001a4a7535b72ac9eeb9c2a4095cda79b6e403))
+
 ## [1.72.0](https://github.com/mctlhq/mctl-agents/compare/1.71.0...1.72.0) (2026-10-10)
 
 
