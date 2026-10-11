@@ -585,7 +585,12 @@ async def _commerce_summary(
     commerce: CommerceRuntime, capability_id: str, schema_hash: str, provider: ProviderRef,
 ) -> CommerceSummary | None:
     """The descriptor's `commerce` field: a read-only summary of the terms
-    in force. `None` only on mctl-api's typed `commerce-terms-unknown`."""
+    in force. `None` only on mctl-api's typed `commerce-terms-unknown`.
+
+    One sequential mctl-api read per matched tool, free ones included, so
+    with a commerce runtime discovery cost is linear in the matched tools
+    (worst case N x the client timeout). Batching or gathering these reads
+    is tracked for before C5 enables the runtime anywhere real."""
     import asyncio
 
     answer = await asyncio.to_thread(commerce.client.current_terms, capability_id, schema_hash)

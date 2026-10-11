@@ -715,7 +715,7 @@ class PaidInvocation:
         text = result.text if result is not None else None
         out = PaidResult(
             "provider-error" if failed else "ok", text=text,
-            error=_FAILED_ERROR if failed and text is None else "",
+            error=(_FAILED_ERROR if failed else _RESULT_UNAVAILABLE) if text is None else "",
             invocation_id=str(inv.get("invocation_id", "")), phase=str(inv.get("phase", "")),
             policy_checkpoint=self.policy_status(), result_hash_source=text,
         )
@@ -724,6 +724,9 @@ class PaidInvocation:
 
 
 _FAILED_ERROR = "the provider failed to execute this capability"
+#: A settled success whose result the provider can no longer produce: the
+#: charge stands, but an absent text must not read as the capability's output.
+_RESULT_UNAVAILABLE = "the capability succeeded, but its result could not be retrieved"
 
 #: Phases a row reaches only after its approval was consumed and the policy
 #: rechecked before dispatch (`reserved` is excluded: its recheck still runs).

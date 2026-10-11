@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -1240,3 +1241,46 @@ def test_two_provider_processes_racing_one_key_never_both_run(world):
         return await running
 
     assert run(race()).text == "OPS-1: open" and len(world.executions) == 1
+
+
+# ---------------------------------------------------------------------------
+# agy review of 9051e6f
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("arguments", [None, 123, "OPS-1", ["ticket"]])
+def test_non_object_arguments_to_a_paid_capability_are_refused_before_commerce(world, arguments):
+    g = run(world.gateway())
+    out = run(g.invoke(PILOT_CAP, arguments, None))
+    assert out["reason_code"] == "invalid-arguments"
+    assert world.ledger.writes() == [] and world.executions == []
+
+
+def _policy_decisions(out: str) -> list[dict]:
+    prefix = pc.DECISION_PREFIX + " "
+    return [json.loads(line[len(prefix):]) for line in out.splitlines() if line.startswith(prefix)]
+
+
+def test_a_consumed_approval_is_audited_like_policy_checkpoint_audits_it(world, capsys):
+    world.policy = APPROVE_PAID
+    ref = run(_invoke(world))["approval_ref"]
+    world.approvals.decide(ref, "approved")
+    capsys.readouterr()
+    assert run(_invoke(world))["reason_code"] == "ok"
+    approved = [d for d in _policy_decisions(capsys.readouterr().out) if d["code"] == pc.CODE_APPROVED]
+    assert len(approved) == 1
+    # The same shape `policy_checkpoint.decide` writes when it redeems an
+    # approval itself: the rule's REQUIRE_APPROVAL verdict, code approved,
+    # the receipt and the approver. Never DENY, and not ALLOW either.
+    assert approved[0]["decision"] == pc.REQUIRE_APPROVAL == pc._verdict_for(pc.CODE_APPROVED)
+    assert approved[0]["approval_ref"] == ref and approved[0]["approver"]
+
+
+def test_a_settled_success_whose_result_is_lost_says_so(world):
+    first = run(_invoke(world))
+    assert first["reason_code"] == "ok" and first["text"]
+    (world.tmp / "pilot.db").unlink()  # the provider's records are gone
+    out = _restart(world)
+    assert out["reason_code"] == "ok" and "text" not in out
+    assert out["error"] == cg._RESULT_UNAVAILABLE
+    assert len(world.executions) == 1
