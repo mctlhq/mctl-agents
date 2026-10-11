@@ -3,6 +3,7 @@ hint, tenant reads, the enablement switch, commerce metrics and the offline
 proof. T1-T12 of the proposal."""
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -313,7 +314,9 @@ ON = {"MCTL_COMMERCE_ENABLED": "true", "MCTL_COMMERCE_ADMITTED_PROVIDERS": "pilo
 
 def test_t5_from_env_is_off_by_default_and_fails_closed_when_misconfigured():
     client = cm.CommerceClient(base_url="https://api.example", token="t")  # noqa: S106
-    for env in ({}, {**ON, "MCTL_COMMERCE_ENABLED": "false"}, {**ON, "MCTL_COMMERCE_ENABLED": "1"}):
+    for value in ("false", "1", "True", "TRUE", " true", "true "):
+        assert cg.CommerceRuntime.from_env(env={**ON, "MCTL_COMMERCE_ENABLED": value}, client=client) is None
+    for env in ({}, {**ON, "MCTL_COMMERCE_ENABLED": "false"}):
         assert cg.CommerceRuntime.from_env(env=env, client=client) is None
     runtime = cg.CommerceRuntime.from_env(env=ON, client=client)
     assert runtime is not None and runtime.tenant_id == "commerce-proof"
@@ -506,6 +509,19 @@ def test_an_exception_inside_the_paid_path_is_recorded_as_outcome_unknown(world,
     assert [n for n, _a in recorder.points].count(metrics.DURATION) == 1
 
 
+def test_a_cancelled_paid_call_is_counted_by_both_instruments(world, recorder, monkeypatch):
+    """Review of #634: `asyncio.CancelledError` is a BaseException; the
+    dedicated counter must agree with the `invocations` label."""
+    async def cancelled(self):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(cg.PaidInvocation, "_run", cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        run(_invoke(world))
+    names = [n for n, _a in recorder.points]
+    assert names.count(metrics.INVOCATIONS) == 1 and names.count(metrics.OUTCOME_UNKNOWN) == 1
+
+
 def _shared_env(monkeypatch):
     """The live shape offline: every world shares one ledger and one budget,
     and the live order and not-driven list apply."""
@@ -584,8 +600,20 @@ def test_each_live_world_gets_its_own_execution_id():
     assert len(ids) == 3 and all(len(n) == 26 and n == n.upper() for n in ids)
 
 
-def test_s14_alone_cannot_pass_by_sweeping_nothing():
+def test_s14_alone_reads_every_ledger_and_passes_on_a_clean_tenant():
+    """Review of #634: `--only S14` opens its own world, so every read runs;
+    a clean tenant passes instead of failing for having nothing to sweep."""
     [s14] = proof.run_suite(proof.offline_env(), ["S14"])
+    assert s14.status == proof.PASSED
+    assert s14.observed["reads"] == 1 + len(proof.NON_TERMINAL) and s14.observed["invocations_swept"] == 0
+
+
+def test_s14_after_scenarios_fails_when_their_rows_are_not_in_the_scoped_read(monkeypatch):
+    env, ledger = _shared_env(monkeypatch)
+    [s3] = proof.run_suite(env, ["S3"])
+    assert s3.status == proof.PASSED
+    ledger.invocations.clear()  # the scoped read now sees none of S3's rows
+    [s14] = proof.run_suite(env, ["S14"])
     assert s14.status == proof.FAILED and s14.observed["invocations_swept"] == 0
 
 

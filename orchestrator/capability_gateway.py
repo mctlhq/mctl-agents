@@ -973,8 +973,12 @@ class CapabilityGateway:
 
     def _offered_commerce(self, descriptor: CapabilityDescriptor) -> CommerceSummary | None:
         """The summary discovery may show: None for a legacy descriptor and
-        for a paid one this execution could not charge. A free summary needs
-        no runtime, so it is shown as sealed."""
+        for a paid one this execution could not charge. A free summary is
+        shown even when the paid path is unavailable (provider not admitted,
+        no policy adapter): it is advisory. A free descriptor is invoked down
+        the legacy path, so whether that call succeeds depends on the
+        provider session; a provider behind the ingress fence refuses an
+        unsigned legacy dispatch (`provider-error`)."""
         if descriptor.commerce is None:
             return None
         if descriptor.commerce.price_mode == "free":

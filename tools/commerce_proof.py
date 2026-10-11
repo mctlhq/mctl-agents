@@ -60,6 +60,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from orchestrator import action_approvals as aa  # noqa: E402
 from orchestrator import commerce as cm  # noqa: E402
+from orchestrator import commerce_gateway as cg  # noqa: E402
 from orchestrator import commerce_metrics  # noqa: E402
 from orchestrator import commerce_provider as cp  # noqa: E402
 from orchestrator import policy_checkpoint as pc  # noqa: E402
@@ -68,7 +69,10 @@ BUNDLE_SCHEMA_VERSION = 1
 PRICE_MINOR = 12
 BUDGET_MINOR = 100
 OFFLINE_ONLY_SETTLEMENT = "offline-only (owner decision 2026-10-11)"
-TERMINAL = frozenset({"refused", "released", "finalized"})
+#: Authoritative for S14's verdict, so it is the gateway's own set.
+TERMINAL = cg.TERMINAL_PHASES
+#: Drives only S14's tenant-wide cross-check reads; a stale entry costs a
+#: missed cross-check, never a wrong verdict.
 NON_TERMINAL = ("accepted", "reserved", "dispatching", "dispatched", "outcome_unknown")
 #: `CommerceClient.list_invocations` caps a page here; a full page is a
 #: truncated read, never a complete one.
@@ -752,16 +756,22 @@ def s14(env: Env) -> Result:
     phase outside `TERMINAL`, known or not, is outstanding. Tenant-wide reads
     of each known non-terminal phase cross-check it, so a stale row from an
     earlier run is caught too. Any read that fills a page fails rather than
-    passing on a partial list. With no world opened yet (`--only S14`) it
-    opens one, so a sweep of nothing cannot pass."""
-    if not env.worlds:
+    passing on a partial list. `invocations_swept` counts the rows read
+    since the earliest world's `proof_since` (rows from the lookback window
+    before it included, so a stale one is caught) plus the cross-check rows.
+    With no world opened yet (`--only S14`) it opens one, so every read
+    runs and a sweep that read nothing cannot pass; a clean tenant is then a
+    pass, not a failure. After other scenarios ran, their rows must show up
+    in the run-scoped read, so there `swept > 0` is required too."""
+    opened_own = not env.worlds
+    if opened_own:
         with env.new_world():
             pass
     groups: dict[tuple[int, str], list[Any]] = {}
     for w in env.worlds:
         groups.setdefault((id(w.ledger), w.tenant), []).append(w)  # live worlds share one client and tenant
     outstanding: dict[str, dict[str, str]] = {}
-    swept = 0
+    swept = reads = 0
 
     def flag(row: Mapping[str, Any]) -> None:
         outstanding.setdefault(str(row["invocation_id"]), {
@@ -772,16 +782,22 @@ def s14(env: Env) -> Result:
         w = worlds[0]
         since = min(x.proof_since for x in worlds)
         rows = _list(w, since=since)
+        reads += 1
         swept += len(rows)
         for row in rows:
             if row.get("phase") not in TERMINAL:
                 flag(row)
         for phase in NON_TERMINAL:
-            for row in _list(w, phase=phase):
+            phase_rows = _list(w, phase=phase)
+            reads += 1
+            swept += len(phase_rows)
+            for row in phase_rows:
                 flag(row)
-    observed = {"ledgers": len(groups), "invocations_swept": swept, "non_terminal": list(outstanding.values())}
+    observed = {"ledgers": len(groups), "reads": reads, "invocations_swept": swept,
+                "non_terminal": list(outstanding.values())}
     return _finish("S14", NAMES["S14"], {"non_terminal": 0}, observed, [
-        ("the sweep read at least one invocation", swept > 0),
+        ("every ledger was read in full", len(groups) > 0 and reads == len(groups) * (1 + len(NON_TERMINAL))),
+        ("the scenarios' invocations were swept", opened_own or swept > 0),
         ("zero invocations outside a terminal phase", not outstanding),
         ("every outstanding one carries a reason",
          all(o["reason_code"] != "unexplained" for o in outstanding.values())),

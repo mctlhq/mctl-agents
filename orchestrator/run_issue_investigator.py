@@ -189,9 +189,9 @@ def _commerce_runtime() -> Any:
     built: an unsafe configuration raises `CommerceConfigError` there, before
     any paid call. In `eager` mode nothing reads these variables at all."""
     from orchestrator import action_approvals
-    from orchestrator.commerce_gateway import CommerceRuntime
+    from orchestrator.commerce_gateway import CommerceRuntime, commerce_enabled
 
-    if os.environ.get("MCTL_COMMERCE_ENABLED", "").strip().lower() != "true":
+    if not commerce_enabled(os.environ):
         return None
     return CommerceRuntime.from_env(approvals=action_approvals.ActionApprovalClient())
 
