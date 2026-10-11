@@ -11,7 +11,8 @@ follow-up gitops PR; this module is the orchestrator only):
        filter to state=open, otherwise a human merge between ticks is
        never observed and the proposal sits in `implemented` forever).
     3. Run decide(pr, codex_review). One of: wait, address-review,
-       merge, flip-to-merged, flip-to-rejected, defer-merge. `decide()`
+       merge, flip-to-merged, flip-to-rejected, defer-merge,
+       ci-infra, ci-unknown, merge-state-unknown. `decide()`
        is a pure function. The `MAX_REVIEW_ATTEMPTS` cap on follow-up
        loops lives in the OUTER state machine (this module), not in
        decide().
@@ -69,6 +70,12 @@ Env:
         failures (CIStatus(known=False)) before flipping to review-stuck
         (default 6). Cleared on any successful probe; never charges
         review_attempts either.
+    SHEPHERD_MERGE_UNKNOWN_MAX — max consecutive ticks on one head SHA
+        where a PR is otherwise ready to merge but GitHub reports
+        mergeStateStatus UNKNOWN (mctl-agents#633; default 4). Exhausting it
+        flips the proposal to review-stuck, blamelessly, so a merge the
+        shepherd cannot observe ends in a terminal state instead of an
+        indefinite wait. Cleared as soon as the state is known again.
     SHEPHERD_CI_REQUIRED_OVERRIDE — optional comma/whitespace-separated
         allowlist of check names treated as required when GitHub reports no
         per-context signal AND the branch protection context list is silent
@@ -543,6 +550,18 @@ SHEPHERD_CI_INFRA_RERUN_MAX = _int_from_env("SHEPHERD_CI_INFRA_RERUN_MAX", 2)
 # Bound on consecutive required-check probe outages (CIStatus(known=False))
 # before flipping to review-stuck. Cleared on any successful probe.
 SHEPHERD_CI_PROBE_FAILURES_MAX = _int_from_env("SHEPHERD_CI_PROBE_FAILURES_MAX", 6)
+# Bound on consecutive ticks, per head SHA, on which a PR is ready to merge in
+# every other respect but GitHub reports its mergeStateStatus as UNKNOWN
+# (mctl-agents#633). UNKNOWN is usually GitHub still computing mergeability and
+# clears within a tick, but in mctl-gitops it stayed UNKNOWN for the App token
+# on every tick for hours, and the loop waited on it silently. An unknown state
+# is never treated as mergeable: exhausting the bound flips the proposal to
+# review-stuck for a human. Cleared as soon as a tick reads a known state.
+SHEPHERD_MERGE_UNKNOWN_MAX = _int_from_env("SHEPHERD_MERGE_UNKNOWN_MAX", 4)
+
+# mergeStateStatus values that mean "GitHub did not tell us". An absent field
+# is read as "" by _fetch_pr_snapshot and is no more an answer than UNKNOWN.
+UNKNOWN_MERGE_STATES = {"UNKNOWN", ""}
 
 
 # Per-service ownership. A repo whose name is listed in SHEPHERD_SKIP_SERVICES
@@ -1142,6 +1161,10 @@ class ProposalRef:
     ci_infra_retries: int = 0
     ci_infra_head: str | None = None
     ci_probe_failures: int = 0
+    # Consecutive ready-but-UNKNOWN ticks (mctl-agents#633), per head like
+    # ci_infra_retries above.
+    merge_unknown_ticks: int = 0
+    merge_unknown_head: str | None = None
     status_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1349,7 +1372,7 @@ def update_status(
     # refs carry state that a later reader would reasonably trust.
     for _field in (
         "review_attempts", "harness_failures", "refusals",
-        "ci_infra_retries", "ci_probe_failures",
+        "ci_infra_retries", "ci_probe_failures", "merge_unknown_ticks",
     ):
         if _field in fields:
             _value = fields[_field]
@@ -1361,6 +1384,9 @@ def update_status(
     if "ci_infra_head" in fields:
         _ci_head = fields["ci_infra_head"]
         ref.ci_infra_head = str(_ci_head) if _ci_head else None
+    if "merge_unknown_head" in fields:
+        _mu_head = fields["merge_unknown_head"]
+        ref.merge_unknown_head = str(_mu_head) if _mu_head else None
 
 
 # ---------------------------------------------------------------------------
@@ -1470,6 +1496,8 @@ def _discover_refs(
                     ci_infra_retries=int(data.get("ci_infra_retries", 0) or 0),
                     ci_infra_head=(data.get("ci_infra_head") or None),
                     ci_probe_failures=int(data.get("ci_probe_failures", 0) or 0),
+                    merge_unknown_ticks=int(data.get("merge_unknown_ticks", 0) or 0),
+                    merge_unknown_head=(data.get("merge_unknown_head") or None),
                 )
             )
     return refs
@@ -2707,7 +2735,18 @@ def decide(
         # not evidence of anything — wait, emit nothing.
         return ("wait", None)
     if pr.merge_state_status not in MERGEABLE_STATES:
-        # BLOCKED, BEHIND, DIRTY, UNKNOWN, DRAFT — retry next tick.
+        # BLOCKED, BEHIND, DIRTY, UNKNOWN, DRAFT — retry next tick. UNKNOWN on
+        # a PR that is ready in every other respect gets its own decision so
+        # process_one can bound it (mctl-agents#633); it still never merges.
+        # Not for fix-only: that merge is another actor's, and so is waiting
+        # on it.
+        if (
+            pr.merge_state_status in UNKNOWN_MERGE_STATES
+            and not fix_only
+            and pr.checks_green
+            and not _within_settle_window(pr.head_pushed_at, now, SHEPHERD_MERGE_SETTLE_MIN)
+        ):
+            return ("merge-state-unknown", None)
         return ("wait", None)
     if not pr.checks_green:
         return ("wait", None)
@@ -3816,8 +3855,53 @@ def process_one(
             ci_blockers=(current_ci_names or None),
         )
 
+    if decision != "merge-state-unknown" and (ref.merge_unknown_ticks or ref.merge_unknown_head):
+        # The bound counts CONSECUTIVE unknown ticks: any tick that decided
+        # anything else clears it. Change-only, so a healthy run writes nothing.
+        _update_status_if_changed(ref, ref.status, merge_unknown_ticks=None, merge_unknown_head=None)
+
     if decision == "wait":
         return ShepherdResult(ref=ref, decision="wait")
+
+    if decision == "merge-state-unknown":
+        # Ready to merge except that GitHub will not say whether it can be
+        # merged (mctl-agents#633). Never merge on that; wait, bounded per
+        # head, and hand the PR to a human once the bound is spent. The
+        # proposal is blameless: review_attempts is never charged.
+        same_head = ref.merge_unknown_head in (None, pr.head_sha)
+        new_ticks = ref.merge_unknown_ticks + 1 if same_head else 1
+        if new_ticks >= SHEPHERD_MERGE_UNKNOWN_MAX:
+            update_status(
+                ref,
+                "review-stuck",
+                notes=(
+                    f"PR is approved and its checks are green, but GitHub "
+                    f"reported mergeStateStatus UNKNOWN on head "
+                    f"{pr.head_sha[:7]} for {new_ticks} consecutive tick(s); "
+                    f"the shepherd does not merge on an unknown state. "
+                    f"Proposal is blameless. Human merge or triage required."
+                ),
+                merge_unknown_ticks=new_ticks,
+                merge_unknown_head=pr.head_sha,
+            )
+            return ShepherdResult(
+                ref=ref,
+                decision="review-stuck",
+                notes="merge state unknown budget exhausted; proposal not at fault",
+            )
+        print(
+            f"warn: {ref.service}/{ref.slug}: ready to merge but "
+            f"mergeStateStatus={pr.merge_state_status or '(absent)'} on head "
+            f"{pr.head_sha[:7]}; merge_unknown_ticks "
+            f"{ref.merge_unknown_ticks} -> {new_ticks} "
+            f"(max {SHEPHERD_MERGE_UNKNOWN_MAX})"
+        )
+        update_status(ref, ref.status, merge_unknown_ticks=new_ticks, merge_unknown_head=pr.head_sha)
+        return ShepherdResult(
+            ref=ref,
+            decision="wait",
+            notes=f"merge state unknown; ticks={new_ticks}",
+        )
 
     if decision == "ci-infra":
         # Only non-actionable (infrastructure) required-check failures
@@ -3915,6 +3999,8 @@ def process_one(
             ci_blockers=None,
             merge_needs_human=None,
             merge_needs_human_head=None,
+            merge_unknown_ticks=None,
+            merge_unknown_head=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-merged")
 
@@ -3935,6 +4021,8 @@ def process_one(
             ci_blockers=None,
             merge_needs_human=None,
             merge_needs_human_head=None,
+            merge_unknown_ticks=None,
+            merge_unknown_head=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-rejected")
 
@@ -4345,6 +4433,8 @@ def process_one(
             ci_blockers=None,
             merge_needs_human=None,
             merge_needs_human_head=None,
+            merge_unknown_ticks=None,
+            merge_unknown_head=None,
         )
         return ShepherdResult(ref=ref, decision="merge")
 
@@ -4711,6 +4801,8 @@ def reconcile_one(
             merge_owner=None,
             merge_needs_human=None,
             merge_needs_human_head=None,
+            merge_unknown_ticks=None,
+            merge_unknown_head=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-merged")
     if pr.closed_unmerged:
@@ -4729,6 +4821,8 @@ def reconcile_one(
             merge_owner=None,
             merge_needs_human=None,
             merge_needs_human_head=None,
+            merge_unknown_ticks=None,
+            merge_unknown_head=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-rejected")
     if ref.status == "needs-triage" and failure_code == "merge-conflict":

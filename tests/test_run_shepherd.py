@@ -6698,3 +6698,104 @@ def test_required_status_check_contexts_null_protection_rule_degrades_to_empty()
     ):
         assert run_shepherd._fetch_required_status_check_contexts(
             "mctlhq", "mctl-web", "main") == ()
+
+
+# ---------------------------------------------------------------------------
+# mctl-agents#633: a ready PR whose mergeStateStatus stays UNKNOWN is bounded
+# ---------------------------------------------------------------------------
+def _approved() -> CodexReview:
+    return CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
+
+
+@pytest.mark.parametrize("state", ["UNKNOWN", ""])
+def test_decide_ready_but_merge_state_unknown(state) -> None:
+    """Ready in every other respect + UNKNOWN (or absent) -> its own
+    decision, never merge."""
+    pr = make_pr(merge_state_status=state)
+    assert decide(pr, _approved(), ci=make_ci()) == ("merge-state-unknown", None)
+
+
+@pytest.mark.parametrize(
+    "pr_kwargs",
+    [
+        {"merge_state_status": "UNKNOWN", "checks_green": False},
+        {"merge_state_status": "BLOCKED"},
+        {"merge_state_status": "BEHIND"},
+    ],
+)
+def test_decide_merge_state_unknown_needs_an_otherwise_ready_pr(pr_kwargs) -> None:
+    """Only UNKNOWN on a PR that would otherwise merge is counted; a known
+    blocking state, or red checks, stays a plain wait."""
+    pr = make_pr(**pr_kwargs)
+    assert decide(pr, _approved(), ci=make_ci()) == ("wait", None)
+
+
+def test_decide_merge_state_unknown_waits_inside_settle_window() -> None:
+    pr = make_pr(merge_state_status="UNKNOWN", head_pushed_at="2026-04-29T10:00:00Z")
+    now = datetime(2026, 4, 29, 10, 1, tzinfo=UTC)
+    with patch.object(run_shepherd, "SHEPHERD_MERGE_SETTLE_MIN", 10):
+        assert decide(pr, _approved(), now=now, ci=make_ci()) == ("wait", None)
+
+
+def test_decide_merge_state_unknown_fix_only_stays_wait() -> None:
+    """Fix-only: the merge belongs to another actor, so does the wait."""
+    pr = make_pr(merge_state_status="UNKNOWN")
+    assert decide(pr, _approved(), fix_only=True, ci=make_ci()) == ("wait", None)
+
+
+def _tick(ref: ProposalRef, pr: PRSnapshot) -> run_shepherd.ShepherdResult:
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=_approved()), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "read_required_checks", return_value=make_ci(head_sha=pr.head_sha)), \
+         patch.object(run_shepherd, "merge_pr", side_effect=AssertionError("must not merge")):
+        return process_one(ref, skip_subprocess=True)
+
+
+def _reload(ref: ProposalRef, tmp_path: Path) -> ProposalRef:
+    """Each production tick is a fresh process: the counter must survive
+    a round trip through .status.yaml, not just live on the in-memory ref."""
+    refs = run_shepherd._discover_refs(tmp_path, service_filter=ref.service, slug_filter=ref.slug)
+    assert len(refs) == 1
+    return refs[0]
+
+
+def test_process_one_merge_state_unknown_is_bounded(tmp_path) -> None:
+    """A persistent UNKNOWN on one head reaches review-stuck after
+    SHEPHERD_MERGE_UNKNOWN_MAX ticks, blamelessly, and never merges."""
+    ref = make_ref(tmp_path)
+    pr = make_pr(merge_state_status="UNKNOWN")
+    for i in range(1, run_shepherd.SHEPHERD_MERGE_UNKNOWN_MAX):
+        result = _tick(_reload(ref, tmp_path), pr)
+        assert result.decision == "wait"
+        status = read_status(ref)
+        assert status["status"] == "implemented"
+        assert status["merge_unknown_ticks"] == i
+        assert status["merge_unknown_head"] == HEAD_SHA
+
+    result = _tick(_reload(ref, tmp_path), pr)
+    assert result.decision == "review-stuck"
+    final = read_status(ref)
+    assert final["status"] == "review-stuck"
+    assert "mergeStateStatus UNKNOWN" in final["notes"]
+    assert "blameless" in final["notes"]
+    assert final.get("review_attempts", 0) == 0
+
+
+def test_process_one_merge_state_unknown_counter_resets(tmp_path) -> None:
+    """The bound counts consecutive ticks on one head: a known state clears
+    it, and a new head starts over at 1."""
+    ref = make_ref(tmp_path)
+    _tick(_reload(ref, tmp_path), make_pr(merge_state_status="UNKNOWN"))
+    _tick(_reload(ref, tmp_path), make_pr(merge_state_status="UNKNOWN"))
+    assert read_status(ref)["merge_unknown_ticks"] == 2
+
+    _tick(_reload(ref, tmp_path), make_pr(merge_state_status="UNKNOWN", head_sha=OLD_SHA))
+    assert read_status(ref)["merge_unknown_ticks"] == 1
+    assert read_status(ref)["merge_unknown_head"] == OLD_SHA
+
+    _tick(_reload(ref, tmp_path), make_pr(merge_state_status="BLOCKED", head_sha=OLD_SHA))
+    status = read_status(ref)
+    assert "merge_unknown_ticks" not in status
+    assert "merge_unknown_head" not in status
