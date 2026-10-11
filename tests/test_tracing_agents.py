@@ -195,6 +195,14 @@ def test_a_reported_zero_cache_counter_is_recorded(exported, tmp_path, monkeypat
     assert tracing.USAGE_CACHE_CREATION not in root.attributes
 
 
+def test_a_frame_reporting_only_input_still_emits_output_zero_on_the_root(exported, tmp_path, monkeypatch):
+    root, _ = _usage_run(exported, tmp_path, monkeypatch, {"input_tokens": 7}, {"input_tokens": 7})
+    assert root.attributes["gen_ai.usage.input_tokens"] == 7
+    assert root.attributes["gen_ai.usage.output_tokens"] == 0
+    assert tracing.USAGE_CACHE_READ not in root.attributes
+    assert tracing.USAGE_CACHE_CREATION not in root.attributes
+
+
 def test_tool_spans_carry_the_name_and_outcome_but_not_the_arguments(exported, tmp_path, monkeypatch):
     _run_investigator_agent(tmp_path, monkeypatch, _stream())
     spans = _spans(exported)

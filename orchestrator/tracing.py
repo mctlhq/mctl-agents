@@ -1125,6 +1125,11 @@ class AgentRunObserver:
         for scope in list(self._chats):
             self._end_chat(scope)
         usage = _usage_counts(getattr(message, "usage", None))
+        if "gen_ai.usage.input_tokens" in usage or "gen_ai.usage.output_tokens" in usage:
+            # Input/output keep their pre-cache shape: a frame reporting either
+            # one emits both, so a missing counter still reads 0 on the root.
+            self._usage_totals.setdefault("gen_ai.usage.input_tokens", 0)
+            self._usage_totals.setdefault("gen_ai.usage.output_tokens", 0)
         for key, value in usage.items():
             self._usage_totals[key] = self._usage_totals.get(key, 0) + value
         if getattr(message, "is_error", False):
