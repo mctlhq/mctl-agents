@@ -121,6 +121,8 @@ def test_model_spans_carry_model_usage_and_latency_but_no_prompt(exported, tmp_p
     assert root.attributes["mctl.agent.name"] == "issue-investigator"
     assert root.attributes["gen_ai.usage.input_tokens"] == 1500
     assert root.attributes["gen_ai.usage.output_tokens"] == 420
+    assert root.attributes[tracing.USAGE_CACHE_READ] == 9
+    assert tracing.USAGE_CACHE_CREATION not in root.attributes
     assert "error.type" not in root.attributes
 
     chats = [s for s in exported.get_finished_spans() if s.name == f"chat {MODEL}"]
@@ -137,6 +139,60 @@ def test_model_spans_carry_model_usage_and_latency_but_no_prompt(exported, tmp_p
     assert first.parent.span_id == root.context.span_id
 
     _assert_no_payload(exported, PROMPT_MARKER, ASSISTANT_MARKER, TOOL_ARG_MARKER, TOOL_OUTPUT_MARKER)
+
+
+def _usage_run(exported, tmp_path, monkeypatch, assistant_usage, *result_usages):
+    results = [
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=1, session_id="s", usage=u
+        )
+        for u in result_usages
+    ]
+    messages = [_assistant("m1", [TextBlock(text="x")], usage=assistant_usage), *results]
+    _run_investigator_agent(tmp_path, monkeypatch, messages)
+    spans = _spans(exported)
+    return spans["invoke_agent issue-investigator"], spans[f"chat {MODEL}"]
+
+
+def test_cache_read_and_write_are_separate_from_input_tokens(exported, tmp_path, monkeypatch):
+    usage = {
+        "input_tokens": 3,
+        "output_tokens": 5,
+        "cache_read_input_tokens": 4000,
+        "cache_creation_input_tokens": 1200,
+    }
+    root, chat = _usage_run(exported, tmp_path, monkeypatch, usage, usage)
+    assert chat.attributes["gen_ai.usage.input_tokens"] == 3
+    assert chat.attributes[tracing.USAGE_CACHE_READ] == 4000
+    assert chat.attributes[tracing.USAGE_CACHE_CREATION] == 1200
+    assert root.attributes["gen_ai.usage.input_tokens"] == 3
+    assert root.attributes["gen_ai.usage.output_tokens"] == 5
+    assert root.attributes[tracing.USAGE_CACHE_READ] == 4000
+    assert root.attributes[tracing.USAGE_CACHE_CREATION] == 1200
+
+
+def test_cache_attributes_are_absent_unless_reported_as_integers(exported, tmp_path, monkeypatch):
+    for bad in (None, "12", True):
+        exported.clear()
+        usage = {
+            "input_tokens": 3,
+            "output_tokens": 5,
+            "cache_read_input_tokens": bad,
+            "cache_creation_input_tokens": bad,
+        }
+        root, chat = _usage_run(exported, tmp_path, monkeypatch, usage, usage)
+        for span in (root, chat):
+            assert tracing.USAGE_CACHE_READ not in span.attributes
+            assert tracing.USAGE_CACHE_CREATION not in span.attributes
+            assert span.attributes["gen_ai.usage.input_tokens"] == 3
+
+
+def test_a_reported_zero_cache_counter_is_recorded(exported, tmp_path, monkeypatch):
+    usage = {"input_tokens": 3, "output_tokens": 5, "cache_read_input_tokens": 0}
+    root, chat = _usage_run(exported, tmp_path, monkeypatch, usage, usage)
+    assert chat.attributes[tracing.USAGE_CACHE_READ] == 0
+    assert root.attributes[tracing.USAGE_CACHE_READ] == 0
+    assert tracing.USAGE_CACHE_CREATION not in root.attributes
 
 
 def test_tool_spans_carry_the_name_and_outcome_but_not_the_arguments(exported, tmp_path, monkeypatch):

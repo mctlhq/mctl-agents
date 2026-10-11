@@ -434,6 +434,8 @@ def test_sensitive_or_unknown_keys_are_refused(key):
         "gen_ai.request.model",
         "gen_ai.usage.input_tokens",
         "gen_ai.usage.output_tokens",
+        "gen_ai.usage.cache_read.input_tokens",
+        "gen_ai.usage.cache_creation.input_tokens",
         "error.type",
         "temporalWorkflowID",
         "k8s.pod.name",
@@ -445,6 +447,15 @@ def test_catalog_keys_are_allowed(key):
 
 def test_a_string_under_a_usage_counter_is_refused():
     assert tracing_sdk.redact_attributes({"gen_ai.usage.input_tokens": "ghp_" + "a" * 36}) == {}
+
+
+@pytest.mark.parametrize(
+    "key", ["gen_ai.usage.cache_read.input_tokens", "gen_ai.usage.cache_creation.input_tokens"]
+)
+def test_cache_counters_are_kept_as_ints_and_dropped_otherwise(key):
+    assert tracing_sdk.redact_attributes({key: 42}) == {key: 42}
+    assert tracing_sdk.redact_attributes({key: "42"}) == {}
+    assert tracing_sdk.redact_attributes({key: True}) == {}
 
 
 # ---------------------------------------------------------------------------

@@ -270,17 +270,18 @@ attributes.
 | `provider` | `gen_ai.system` | mctl value set, not the upstream enum |
 | `input_tokens` | `gen_ai.usage.input_tokens` | |
 | `output_tokens` | `gen_ai.usage.output_tokens` | |
-| `cache_read_tokens` / `cache_write_tokens` | — | **no stable upstream attribute; mctl-owned `mctl.gen_ai.usage.cache_*`** |
+| `cache_read_tokens` / `cache_write_tokens` | `gen_ai.usage.cache_read.input_tokens` / `gen_ai.usage.cache_creation.input_tokens` | upstream GenAI development names, on spans only; the ledger fields stay mctl-owned |
 | `calculated_cost` | — | deliberately not exported as a `gen_ai.*` attribute |
 | `temporal_workflow_id`, `agent`, stage | per the telemetry attribute catalog | |
 
 Two deliberate divergences:
 
-- **Cache tokens have no stable upstream home.** The GenAI conventions are
-  still moving (the registry now lives in
-  `open-telemetry/semantic-conventions-genai`), so cache accounting uses an
-  `mctl.`-prefixed name. An `mctl.`-prefixed attribute cannot be silently
-  redefined by an upstream release.
+- **Cache tokens use development-status upstream names.** Spans carry
+  `gen_ai.usage.cache_read.input_tokens` and
+  `gen_ai.usage.cache_creation.input_tokens`. The GenAI conventions are still
+  moving (the registry now lives in `open-telemetry/semantic-conventions-genai`),
+  so the ledger record fields `cache_read_tokens` / `cache_write_tokens` stay
+  mctl-owned and are the source of truth for accounting.
 - **Cost is not exported as a span attribute.** A span is sampled; a cost
   ledger must not be. Sampling would under-count spend by exactly the sampling
   rate, and the resulting number would look plausible. Cost lives in the

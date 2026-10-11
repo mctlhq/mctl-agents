@@ -918,12 +918,20 @@ def command_span(cmd: list[str] | tuple[str, ...]) -> Iterator[_CommandSpan]:
 
 PROVIDER = "anthropic"
 
+USAGE_CACHE_READ = "gen_ai.usage.cache_read.input_tokens"
+USAGE_CACHE_CREATION = "gen_ai.usage.cache_creation.input_tokens"
+
 
 def _usage_counts(usage: Any) -> dict[str, int]:
     out: dict[str, int] = {}
     if not isinstance(usage, Mapping):
         return out
-    pairs = (("input_tokens", "gen_ai.usage.input_tokens"), ("output_tokens", "gen_ai.usage.output_tokens"))
+    pairs = (
+        ("input_tokens", "gen_ai.usage.input_tokens"),
+        ("output_tokens", "gen_ai.usage.output_tokens"),
+        ("cache_read_input_tokens", USAGE_CACHE_READ),
+        ("cache_creation_input_tokens", USAGE_CACHE_CREATION),
+    )
     for source, target in pairs:
         value = usage.get(source)
         if isinstance(value, int) and not isinstance(value, bool):
@@ -946,7 +954,7 @@ class AgentRunObserver:
 
     Span shape, per agent run:
 
-        invoke_agent <agent>                 usage summed over result frames
+        invoke_agent <agent>                 usage (incl. cache read/write) summed over result frames
           chat <model>                       one per model message (message_id)
           execute_tool <name>                ToolUseBlock -> matching ToolResultBlock
             chat <model>                     a sub-agent's turns nest under its Task/Agent tool
@@ -973,9 +981,9 @@ class AgentRunObserver:
         # Seeded with the observer's own start, so a driver that never calls
         # query_sent() still gets a non-zero first chat span.
         self._last_ns: dict[str | None, int] = {None: time.time_ns()}
-        self._input_tokens = 0
-        self._output_tokens = 0
-        self._saw_usage = False
+        # Per-attribute usage summed over result frames; a key is present only
+        # if some frame reported it (cache counters are never fabricated as 0).
+        self._usage_totals: dict[str, int] = {}
 
     # -- public -----------------------------------------------------------
 
@@ -1013,10 +1021,8 @@ class AgentRunObserver:
                 handle.set_attributes({TOOL_STATUS: "incomplete"})
                 handle.end()
             self._tools.clear()
-            if self._saw_usage:
-                self._root.set_attributes(
-                    {"gen_ai.usage.input_tokens": self._input_tokens, "gen_ai.usage.output_tokens": self._output_tokens}
-                )
+            if self._usage_totals:
+                self._root.set_attributes(dict(self._usage_totals))
             if error is not None:
                 self._root.fail(_error_type(error))
         except Exception as exc:  # noqa: BLE001
@@ -1119,10 +1125,8 @@ class AgentRunObserver:
         for scope in list(self._chats):
             self._end_chat(scope)
         usage = _usage_counts(getattr(message, "usage", None))
-        if usage:
-            self._saw_usage = True
-            self._input_tokens += usage.get("gen_ai.usage.input_tokens", 0)
-            self._output_tokens += usage.get("gen_ai.usage.output_tokens", 0)
+        for key, value in usage.items():
+            self._usage_totals[key] = self._usage_totals.get(key, 0) + value
         if getattr(message, "is_error", False):
             status = getattr(message, "api_error_status", None)
             if isinstance(status, int) and not isinstance(status, bool):
