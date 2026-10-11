@@ -914,8 +914,9 @@ def render_markdown(bundle: Mapping[str, Any]) -> str:
                   f"mctl-api {bundle['mctl_api_sha']}.",
               f"Contract: {', '.join(bundle['provider_contract'].values())}. "
               f"Terms {bundle['terms']['terms_id']} v{bundle['terms']['terms_version']}."]
-    if bundle["summary"]["created_unreadable"]:
-        lines.append(f"Unreadable worlds: {bundle['summary']['created_unreadable']}.")
+    unreadable = bundle.get("summary", {}).get("created_unreadable")
+    if unreadable:
+        lines.append(f"Unreadable worlds: {', '.join(unreadable)}.")
     return "\n".join(lines)
 
 
@@ -950,11 +951,13 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         env = offline_env() if args.backend == "offline" else live_env()
+        unread_before = len(env.created_unreadable)
         terms = _terms_of(env)
-        if env.created_unreadable:
+        terms_unread = env.created_unreadable[unread_before:]
+        if terms_unread:
             # The terms world holds no liability, but an unread close here
             # would fail the finished run, so stop before any budget is spent.
-            raise ProofError(f"the terms world could not be read on close: {env.created_unreadable}")
+            raise ProofError(f"the terms world could not be read on close: {'; '.join(terms_unread)}")
         results = run_suite(env, args.only)
         # S14 sweeps the worlds the others opened, so it runs after them above.
         bundle = build_bundle(

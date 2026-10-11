@@ -75,7 +75,9 @@ Notes on what each backend proves:
   must appear in the run-scoped read, and every world's rows must have been
   readable when it closed; a run that created none, or `--only S14` on a
   clean tenant, passes. A close-time read that failed also sets
-  `summary.ok` to false, so it is visible even in a run without S14.
+  `summary.ok` to false, so it is visible even in a run without S14. The
+  terms read runs first and its world holds no liability, so a failed close
+  read there exits 2 before any scenario runs and writes no bundle.
 
 ## Result
 
