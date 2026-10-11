@@ -225,8 +225,11 @@ def _b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
+_BASE64URL = re.compile(r"[A-Za-z0-9_-]+")
+
+
 def _unb64url(text: str) -> bytes:
-    if not isinstance(text, str) or "=" in text:
+    if not isinstance(text, str) or not _BASE64URL.fullmatch(text):
         raise AuthorizationRejected("signature is not base64url without padding")
     try:
         return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))

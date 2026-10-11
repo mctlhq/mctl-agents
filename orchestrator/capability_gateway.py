@@ -590,7 +590,9 @@ async def _commerce_summary(
 
     answer = await asyncio.to_thread(commerce.client.current_terms, capability_id, schema_hash)
     if not answer.ok:
-        if answer.status == "refused" and answer.code == "commerce-terms-unknown":
+        from orchestrator import commerce as cm
+
+        if answer.status == cm.REFUSED and answer.code == "commerce-terms-unknown":
             return None
         raise GatewayError(
             f"capability {capability_id!r}: commerce terms could not be read ({answer.reason or answer.status})"

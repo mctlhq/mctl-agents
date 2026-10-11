@@ -286,7 +286,7 @@ class PaidInvocation:
         )
 
         # Resume: the same call in the same execution already has a row.
-        found = await self._find(key)
+        found = await self._find(key, arguments_digest)
         if isinstance(found, PaidResult):
             return found
         if found is not None:
@@ -295,6 +295,15 @@ class PaidInvocation:
         if not self._decision_permits(decided):
             return self._refusal("policy-denied", decided.reason)
 
+        # Step 4 (budget): non-binding; the reservation is what binds. It
+        # runs before the approval so an exhausted budget never opens a
+        # human request that could not be honoured.
+        pre = await self._ledger("precheck", self._tenant, currency=currency, amount_minor=amount)
+        if pre.status == cm.UNKNOWN:
+            return self._refusal("outcome-unknown", _LEDGER_UNREACHABLE)
+        if not pre.ok or pre.body.get("sufficient") is not True:
+            return self._refusal("budget-exhausted", "the tenant budget cannot cover this call")
+
         # Step 5: approval, read or created, never consumed here.
         approval_id = ""
         if decided.code == pc.CODE_APPROVAL_REQUIRED:
@@ -302,13 +311,6 @@ class PaidInvocation:
             if isinstance(checked, PaidResult):
                 return checked
             approval_id = checked
-
-        # Step 4 (budget): non-binding; the reservation is what binds.
-        pre = await self._ledger("precheck", self._tenant, currency=currency, amount_minor=amount)
-        if pre.status == cm.UNKNOWN:
-            return self._refusal("outcome-unknown", _LEDGER_UNREACHABLE)
-        if not pre.ok or pre.body.get("sufficient") is not True:
-            return self._refusal("budget-exhausted", "the tenant budget cannot cover this call")
 
         # Step 6: quote, verified locally, then accept.
         quote = await self._ledger(
@@ -334,7 +336,7 @@ class PaidInvocation:
         # A concurrent attempt accepted first (idempotency-conflict), or the
         # answer was lost: the ledger says which.
         if accepted.status == cm.UNKNOWN or accepted.code == "idempotency-conflict":
-            again = await self._find(key)
+            again = await self._find(key, arguments_digest)
             if isinstance(again, PaidResult):
                 return again
             if again is not None:
@@ -344,7 +346,7 @@ class PaidInvocation:
         return self._refusal(_code(accepted.code, "policy-denied"), "the invocation was not accepted",
                              approval_ref=approval_id)
 
-    async def _find(self, key: str) -> dict[str, Any] | PaidResult | None:
+    async def _find(self, key: str, arguments_digest: str) -> dict[str, Any] | PaidResult | None:
         ans = await self._ledger("find_invocation", self._tenant, key)
         if not ans.ok:
             # Could not observe whether a row exists: never "absent".
@@ -356,7 +358,19 @@ class PaidInvocation:
             return None
         if len(rows) != 1 or not isinstance(rows[0], dict):
             return self._refusal("outcome-unknown", "the ledger holds an ambiguous record for this call")
-        return rows[0]
+        row = rows[0]
+        # The same identity checks a fresh quote gets: a row is resumed only
+        # if it names exactly this call.
+        if self._request is None:
+            raise RuntimeError("the policy request was not built")
+        expected = {
+            "capability_id": self.descriptor.capability_id, "args_digest": arguments_digest,
+            "execution_id": self._request.execution_id, "tenant_id": self._tenant,
+        }
+        if any(row.get(field) != value for field, value in expected.items()):
+            return self._refusal("outcome-unknown", "the ledger's record for this key names another call",
+                                 invocation_id=str(row.get("invocation_id", "")))
+        return row
 
     def _verify_quote(self, quote: Mapping[str, Any], arguments_digest: str) -> PaidResult | None:
         if self._request is None:
@@ -416,6 +430,11 @@ class PaidInvocation:
     async def _advance(self, inv: dict[str, Any]) -> PaidResult:
         for _ in range(_MAX_STEPS):
             phase = inv.get("phase")
+            if inv.get("approval_id") and phase in _APPROVAL_SPENT_PHASES:
+                # Past reserved, the approval was consumed and the policy
+                # rechecked by the attempt that moved the row: a resumed or
+                # replayed call reports that verdict, not "denied".
+                self._approved_earlier = True
             if phase in TERMINAL_PHASES:
                 return await self._settled(inv)
             if phase == ACCEPTED:
@@ -707,3 +726,7 @@ class PaidInvocation:
 
 
 _FAILED_ERROR = "the provider failed to execute this capability"
+
+#: Phases a row reaches only after its approval was consumed and the policy
+#: rechecked before dispatch (`reserved` is excluded: its recheck still runs).
+_APPROVAL_SPENT_PHASES = frozenset({DISPATCHING, DISPATCHED, OUTCOME_UNKNOWN, FINALIZED})

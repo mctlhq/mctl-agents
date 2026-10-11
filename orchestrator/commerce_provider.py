@@ -175,11 +175,16 @@ class ProviderIngress:
                 return row
             if self._now() > authorization.deadline():
                 raise DispatchRefused("dispatch deadline has passed")
-            self._db.execute(
+            # ON CONFLICT keeps the dedupe correct across processes sharing
+            # the store: the lock only serializes this process.
+            inserted = self._db.execute(
                 "INSERT INTO paid_operations (provider_operation_key, invocation_id, capability_id, args_digest, "
-                "tenant_id, state, accepted_at) VALUES (?, ?, ?, ?, ?, 'in_progress', ?)",
+                "tenant_id, state, accepted_at) VALUES (?, ?, ?, ?, ?, 'in_progress', ?) "
+                "ON CONFLICT(provider_operation_key) DO NOTHING",
                 (key, authorization.invocation_id, authorization.capability_id, authorization.args_digest,
                  authorization.tenant_id, self._now().isoformat()))
+            if inserted.rowcount == 0:
+                return self._row(key)
             return None
 
     def _complete(self, key: str, result: ToolCallResult) -> None:

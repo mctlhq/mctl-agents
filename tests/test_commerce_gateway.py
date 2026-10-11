@@ -148,7 +148,7 @@ class FakeLedger:
         return answer
 
     def writes(self) -> list[str]:
-        return [c for c in self.calls if c not in ("current_terms", "find_invocation", "get_invocation")]
+        return [c for c in self.calls if c not in ("current_terms", "find_invocation", "get_invocation", "precheck")]
 
     # -- routes ----------------------------------------------------------------
 
@@ -1171,3 +1171,72 @@ def test_a_gateway_bug_after_approval_audits_the_policy_verdict(world, monkeypat
     assert out["reason_code"] == "outcome-unknown"
     record = [line for line in capsys.readouterr().out.splitlines() if line.startswith("CAPABILITY_INVOCATION ")]
     assert record and '"policy_checkpoint": "allowed"' in record[-1]
+
+
+
+# ---------------------------------------------------------------------------
+# Review of 0152cb9
+# ---------------------------------------------------------------------------
+
+
+def _invocation_records(out: str) -> list[str]:
+    return [line for line in out.splitlines() if line.startswith("CAPABILITY_INVOCATION ")]
+
+
+def test_a_resumed_approved_call_is_audited_as_allowed(world, capsys):
+    world.policy = APPROVE_PAID
+    ref = run(_invoke(world))["approval_ref"]
+    world.approvals.decide(ref, "approved")
+    world.ledger.inject("transition", "crash-before")
+    with pytest.raises(Crash):
+        _restart(world)
+    capsys.readouterr()
+    out = _restart(world)
+    assert out["reason_code"] == "ok" and len(world.executions) == 1
+    records = _invocation_records(capsys.readouterr().out)
+    assert records and '"policy_checkpoint": "allowed"' in records[-1]
+    # A plain replay of the finalized invocation reports the same verdict.
+    _restart(world)
+    assert '"policy_checkpoint": "allowed"' in _invocation_records(capsys.readouterr().out)[-1]
+
+
+def test_an_exhausted_budget_never_opens_an_approval_request(world):
+    world.policy = APPROVE_PAID
+    world.ledger.budget["available"] = 5
+    out = run(_invoke(world))
+    assert out["reason_code"] == "budget-exhausted" and world.approvals.by_id == {}
+
+
+@pytest.mark.parametrize("field", ["capability_id", "args_digest", "execution_id", "tenant_id"])
+def test_a_resumed_row_naming_another_call_is_not_adopted(world, field):
+    world.ledger.inject("reserve", "crash-after")
+    with pytest.raises(Crash):
+        run(_invoke(world))
+    world.ledger.only()[field] = "something-else"
+    out = _restart(world)
+    assert out["reason_code"] == "outcome-unknown" and world.executions == []
+    assert "dispatch" not in world.ledger.calls
+
+
+def test_two_provider_processes_racing_one_key_never_both_run(world):
+    async def race():
+        first = world.new_ingress()
+        world.gate, world.entered = asyncio.Event(), asyncio.Event()
+        auth = _auth(world)
+        running = asyncio.ensure_future(first.call(cp.PILOT_TOOL, {"ticket": "OPS-1"}, auth))
+        await world.entered.wait()
+        second = world.new_ingress()  # another process on the same store
+        real_row = second._row
+        calls = {"n": 0}
+
+        def stale_row(key):
+            calls["n"] += 1
+            return None if calls["n"] == 1 else real_row(key)  # lost the check-then-insert race
+
+        second._row = stale_row  # type: ignore[method-assign]
+        with pytest.raises(cm.OutcomeUnavailable):
+            await second.call(cp.PILOT_TOOL, {"ticket": "OPS-1"}, auth)
+        world.gate.set()
+        return await running
+
+    assert run(race()).text == "OPS-1: open" and len(world.executions) == 1

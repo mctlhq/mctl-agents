@@ -325,3 +325,8 @@ def test_parse_time_rejects_naive_and_garbage():
     for bad in ("2026-10-11T12:05:00", "nope", None):
         with pytest.raises(cm.CommerceError):
             cm.parse_time(bad)  # type: ignore[arg-type]
+
+
+def test_a_signature_outside_the_base64url_alphabet_is_refused_as_such():
+    with pytest.raises(cm.AuthorizationRejected, match="not base64url"):
+        cm._unb64url("QUdL!uG4S")
