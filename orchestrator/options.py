@@ -966,6 +966,100 @@ def _compose_hooks(
     return merged
 
 
+#: Subdirectories of the mctl-gitops ``platform-gitops/`` checkout the issue
+#: investigator is pointed at so it can ground a proposal in a service's
+#: DEPLOYED config (``services/<tenant>/<service>/values.yaml``) and in the
+#: tenants that actually exist (``tenants/<tenant>/``), instead of inventing
+#: them (an mctl-api#537 proposal named tenants absent from mctl-gitops).
+_INVESTIGATOR_GITOPS_CONTEXT_SUBDIRS = ("services", "tenants")
+
+
+def _investigator_gitops_context_dirs() -> list[str]:
+    """Read-only mctl-gitops context directories for the issue investigator.
+
+    Rooted at ``MCTL_GITOPS_ROOT`` only — the Argo CWFT already clones
+    mctl-gitops into the investigator pod and points this variable at its
+    ``platform-gitops/`` (it is how the declarative resolver finds the
+    agent-platform catalog), so this adds no clone, volume or trust boundary.
+    Deliberately NOT the resolver's sibling-checkout fallback: an unset
+    variable means no gitops context was provided, and a developer's local
+    sibling checkout must not silently widen a run's workspace. A missing
+    subdirectory is skipped rather than invented.
+    """
+    root = os.environ.get("MCTL_GITOPS_ROOT", "").strip()
+    if not root:
+        return []
+    base = Path(root)
+    return [str(base / d) for d in _INVESTIGATOR_GITOPS_CONTEXT_SUBDIRS if (base / d).is_dir()]
+
+
+def _containing_dir(target: str, dirs: tuple[str, ...]) -> str | None:
+    """The entry of ``dirs`` that ``target`` resolves inside, or ``None``.
+    Both sides go through ``realpath``, so ``..`` and symlinks are resolved
+    before the comparison, and ``commonpath`` compares whole components (a
+    sibling named ``services-notes.md`` is not inside ``services``)."""
+    resolved = os.path.realpath(target)
+    for d in dirs:
+        base = os.path.realpath(d)
+        if os.path.commonpath([resolved, base]) == base:
+            return d
+    return None
+
+
+#: SDK file-editing tools whose target path a read-only directory guard checks.
+_FILE_EDIT_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+
+
+@dataclass(frozen=True)
+class _ReadOnlyDirsHook:
+    """PreToolUse hook that denies the file-editing tools inside ``dirs``.
+
+    ``add_dirs`` grants Read/Glob/Grep AND, under ``acceptEdits``, edits;
+    the gitops context directories are reference material only, so the edit
+    half is taken back here. Paths are compared after ``realpath`` so a
+    ``..`` segment or a symlink cannot step around the check, and an input
+    the hook cannot read is a deny, never a pass. A frozen dataclass (not a
+    closure) so the legacy and declarative builders' hooks still compare
+    ``==``. Bash is not covered: like every other builder here, the shell is
+    unrestricted — the commit step that ships the investigator's output only
+    carries ``agents-state/*/proposals/**``, which is what keeps a stray write
+    from leaving the pod.
+    """
+
+    dirs: tuple[str, ...]
+
+    async def __call__(self, input_data: Any, _tool_use_id: str | None, _context: Any) -> dict[str, Any]:
+        try:
+            if not isinstance(input_data, dict):
+                return _deny("read-only directory guard: unreadable tool call")
+            raw = input_data.get("tool_input")
+            if not isinstance(raw, dict):
+                return _deny("read-only directory guard: unreadable tool input")
+            target = raw.get("file_path") or raw.get("notebook_path")
+            if not isinstance(target, str) or not target:
+                return _deny("read-only directory guard: no target path in the tool input")
+            guarded = _containing_dir(target, self.dirs)
+            if guarded is not None:
+                return _deny(
+                    f"{guarded} is read-only reference material for this run; "
+                    "write only under $PROPOSAL_DIR"
+                )
+        except Exception as exc:  # noqa: BLE001 — fail closed
+            return _deny(f"read-only directory guard failed ({type(exc).__name__}); the edit was not made")
+        return {}
+
+
+def _read_only_dirs_hooks(dirs: list[str]) -> dict[HookEventName, list[HookMatcher]]:
+    if not dirs:
+        return {}
+    hook = _ReadOnlyDirsHook(tuple(dirs))
+    return {
+        "PreToolUse": [
+            HookMatcher(matcher="|".join(_FILE_EDIT_TOOLS), hooks=[cast(Any, hook)]),
+        ],
+    }
+
+
 def _sibling_add_dirs(service_name: str) -> list[str | Path]:
     """For services that scan sibling repos, expand the workspace to include them."""
     if service_name not in SERVICES_NEEDING_SIBLING_ACCESS:
@@ -1175,11 +1269,18 @@ def build_issue_investigator_options(
     cwd — so it must be granted via ``add_dirs``. The orchestrator creates
     that directory before launching the agent.
 
+    When ``MCTL_GITOPS_ROOT`` points at a mctl-gitops ``platform-gitops/``
+    checkout (the investigate CWFT sets it), its ``services/`` and
+    ``tenants/`` are added too, read-only (see
+    ``_investigator_gitops_context_dirs`` and ``_ReadOnlyDirsHook``), so the
+    proposal can be grounded in the deployed state, not just the code.
+
     GITHUB_TOKEN is forwarded for any `gh`/`git` the agent might run, though
     the Python wrapper already does the issue read + clone + comment.
     """
     env = {**os.environ, "PROPOSAL_DIR": str(proposal_dir)}
     allowed_tools = ["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()]
+    gitops_dirs = _investigator_gitops_context_dirs()
     return _scrubbed(ClaudeAgentOptions(
         cwd=str(repo_dir),
         setting_sources=["project"],
@@ -1188,9 +1289,11 @@ def build_issue_investigator_options(
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=ISSUE_INVESTIGATOR_BUDGET_USD,
-        add_dirs=[str(proposal_dir)],
+        add_dirs=[str(proposal_dir), *gitops_dirs],
         env=env,
-        hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
+        hooks=_compose_hooks(
+            _command_audit_hooks(), _policy_hooks(allowed_tools), _read_only_dirs_hooks(gitops_dirs),
+        ),
     ))
 
 
@@ -1255,6 +1358,7 @@ def build_issue_investigator_options_from_plan(
     allowed_tools = [
         t for t in plan.tools if t not in ("mcp__mctl__*", HUMAN_INPUT_CAPABILITY)
     ]
+    gitops_dirs = _investigator_gitops_context_dirs()
     if gateway is None:
         if "mcp__mctl__*" in plan.tools:
             allowed_tools += _mctl_tool_globs()
@@ -1266,9 +1370,11 @@ def build_issue_investigator_options_from_plan(
             mcp_servers=mctl_mcp_config(always_load=True),
             permission_mode="acceptEdits",
             max_budget_usd=plan.budget_usd,
-            add_dirs=[str(proposal_dir)],
+            add_dirs=[str(proposal_dir), *gitops_dirs],
             env=env,
-            hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
+            hooks=_compose_hooks(
+                _command_audit_hooks(), _policy_hooks(allowed_tools), _read_only_dirs_hooks(gitops_dirs),
+            ),
         ))
     # gateway is not None: the capability gateway's own SDK server replaces
     # the remote mctl connection entirely — the model never sees
@@ -1285,11 +1391,12 @@ def build_issue_investigator_options_from_plan(
         mcp_servers={"capability": gateway.sdk_server()},
         permission_mode="acceptEdits",
         max_budget_usd=plan.budget_usd,
-        add_dirs=[str(proposal_dir)],
+        add_dirs=[str(proposal_dir), *gitops_dirs],
         env=env,
         hooks=_compose_hooks(
             _command_audit_hooks(),
             _policy_hooks(allowed_tools, delegated_prefix=CAPABILITY_GATEWAY_TOOL_PREFIX),
+            _read_only_dirs_hooks(gitops_dirs),
         ),
         strict_mcp_config=True,
     ))

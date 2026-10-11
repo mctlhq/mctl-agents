@@ -1615,3 +1615,104 @@ def test_gateway_is_keyword_only(tmp_path, monkeypatch):
     plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
     with pytest.raises(TypeError):
         options.build_issue_investigator_options_from_plan(plan, repo_dir, tmp_path / "p", _FakeGateway())
+
+
+# ---------------------------------------------------------------------------
+# Issue investigator: read-only mctl-gitops context directories
+# ---------------------------------------------------------------------------
+def _gitops_root(tmp_path):
+    root = tmp_path / "mctl-gitops" / "platform-gitops"
+    (root / "services" / "admins" / "mctl-web").mkdir(parents=True)
+    (root / "tenants" / "admins").mkdir(parents=True)
+    return root
+
+
+def _call_hook(hook, tool_name, tool_input):
+    return anyio.run(hook, {"tool_name": tool_name, "tool_input": tool_input}, None, None)
+
+
+def test_issue_investigator_gets_gitops_services_and_tenants_as_add_dirs(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    root = _gitops_root(tmp_path)
+    monkeypatch.setenv("MCTL_GITOPS_ROOT", str(root))
+    repo_dir = tmp_path / "mctl-api"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-537"
+
+    built = options.build_issue_investigator_options(repo_dir, model="m", proposal_dir=proposal_dir)
+
+    assert built.add_dirs == [str(proposal_dir), str(root / "services"), str(root / "tenants")]
+
+
+def test_issue_investigator_gitops_dirs_absent_without_root_or_missing_subdir(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "mctl-api"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-537"
+
+    monkeypatch.delenv("MCTL_GITOPS_ROOT", raising=False)
+    built = options.build_issue_investigator_options(repo_dir, model="m", proposal_dir=proposal_dir)
+    assert built.add_dirs == [str(proposal_dir)]
+    assert not any(m.matcher.startswith("Write") for m in built.hooks["PreToolUse"])
+
+    root = tmp_path / "partial" / "platform-gitops"
+    (root / "tenants").mkdir(parents=True)
+    monkeypatch.setenv("MCTL_GITOPS_ROOT", str(root))
+    built = options.build_issue_investigator_options(repo_dir, model="m", proposal_dir=proposal_dir)
+    assert built.add_dirs == [str(proposal_dir), str(root / "tenants")]
+
+
+def test_issue_investigator_declarative_builder_matches_legacy_gitops_dirs(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    monkeypatch.delenv("ISSUE_INVESTIGATOR_MODEL", raising=False)
+    monkeypatch.delenv("CLAUDE_BALANCED_MODEL", raising=False)
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="a" * 40))
+    root = _gitops_root(tmp_path)
+    monkeypatch.setenv("MCTL_GITOPS_ROOT", str(root))
+    repo_dir = tmp_path / "mctl-api"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-537"
+
+    legacy = options.build_issue_investigator_options(repo_dir, model=plan.model, proposal_dir=proposal_dir)
+    declarative = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir)
+
+    assert str(root / "services") in declarative.add_dirs
+    assert declarative.add_dirs == legacy.add_dirs
+    assert declarative.hooks == legacy.hooks
+
+
+def test_gitops_context_dirs_are_read_only_for_edit_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    root = _gitops_root(tmp_path)
+    monkeypatch.setenv("MCTL_GITOPS_ROOT", str(root))
+    repo_dir = tmp_path / "mctl-api"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-537"
+    proposal_dir.mkdir(parents=True)
+
+    built = options.build_issue_investigator_options(repo_dir, model="m", proposal_dir=proposal_dir)
+    guards = [
+        h for m in built.hooks["PreToolUse"] if m.matcher == "Write|Edit|MultiEdit|NotebookEdit"
+        for h in m.hooks
+    ]
+    assert len(guards) == 1
+    guard = guards[0]
+
+    values = root / "services" / "admins" / "mctl-web" / "values.yaml"
+    for tool, tool_input in (
+        ("Write", {"file_path": str(values), "content": "x"}),
+        ("Edit", {"file_path": str(values), "old_string": "a", "new_string": "b"}),
+        ("NotebookEdit", {"notebook_path": str(root / "tenants" / "admins" / "n.ipynb")}),
+        # `..` cannot walk back in from outside.
+        ("Write", {"file_path": str(proposal_dir / ".." / ".." / "mctl-gitops" / "platform-gitops"
+                                    / "tenants" / "admins" / "x.yaml")}),
+        # Unreadable input fails closed.
+        ("Write", {}),
+    ):
+        decision = _call_hook(guard, tool, tool_input)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny", (tool, tool_input)
+
+    # The proposal directory stays writable.
+    assert _call_hook(guard, "Write", {"file_path": str(proposal_dir / "design.md")}) == {}
+    # A sibling whose name merely starts with a guarded dir is not inside it.
+    assert _call_hook(guard, "Write", {"file_path": str(root / "services-notes.md")}) == {}

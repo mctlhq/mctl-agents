@@ -1995,6 +1995,50 @@ def _copy_human_input_mode(staging: Path, replaced: Path | None, fallback: Path)
         _copy_mode_nofollow(fallback, human_dir)
 
 
+#: Rendered by `_build_prompt` right after the "## Your working context"
+#: bullets, as one contiguous code-owned block (the issue body sits ABOVE it
+#: and is attacker-writable, so nothing here is spliced by text anchor).
+#: Why it exists: the clone shows how a service is BUILT, not how it is
+#: DEPLOYED. An investigation of mctl-api#537 grounded its design "in the
+#: clone" only and asserted tenant names ("admins/platform") that exist
+#: nowhere in mctl-gitops — the mctl tools that would have refuted them were
+#: connected the whole time and the prompt never mentioned them.
+#: "Could not observe" stays distinct from "observed absent" (AGENTS.md,
+#: Detectors/Reconcilers): an unavailable source is reported, never guessed.
+_DEPLOYED_STATE_GROUNDING_BLOCK = """\
+
+## Ground in the deployed state
+
+The clone shows how `{service}` is built, not how it is deployed. Before you
+assert anything about a service's deployed configuration — its tenant,
+hostnames, env vars, replicas, resources, or runtime behaviour — check it,
+and never invent a tenant, hostname or service name:
+
+- The mctl MCP tools, when this run has them, are read-only here (the
+  policy checkpoint only lets get/list/read/search/describe calls through).
+  Useful ones: `mctl_list_tenants`, `mctl_get_tenant`, `mctl_list_services`,
+  `mctl_get_service_config`, `mctl_get_service_status`,
+  `mctl_get_service_logs`. If a "Capability discovery" section below says
+  this run reaches mctl through a gateway, search for them there.
+- `$MCTL_GITOPS_ROOT` (env var), when set, is a checkout of mctl-gitops'
+  `platform-gitops/` directory: `services/<tenant>/<service>/values.yaml`
+  is a tenant service's deployed config and `tenants/<tenant>/` its tenant.
+  Read it; never edit it — only `$PROPOSAL_DIR` is yours to write.
+- In design.md's `## Current state`, add a `Deployed state checked:` list
+  naming each tool call or gitops path you used and what it showed.
+- If a source is unavailable, errors, or returns nothing usable, say so
+  explicitly in that list and record the gap under `## Open questions`.
+  Could not observe is never observed absent: do not fill the gap with a
+  guess, and do not treat a failed read as "not configured".
+"""
+
+
+def _deployed_state_grounding_block(service: str) -> str:
+    """`_DEPLOYED_STATE_GROUNDING_BLOCK` for `service`. `str.replace`, not
+    `str.format`: the block is prose that may grow braces of its own."""
+    return _DEPLOYED_STATE_GROUNDING_BLOCK.replace("{service}", service)
+
+
 _PRESENCE_LINE = "**No human is present. Do not ask for input. Work with what you have.**"
 _PRESENCE_LINE_GRANTED = (
     "**No human is waiting on this run: never block or wait for input, and work with what\n"
@@ -2054,6 +2098,7 @@ def _build_prompt(
     `service_skills_block` above, rendered right after it so the eager-mode
     prompt's bytes are unaffected byte-for-byte.
     """
+    grounding_section = _deployed_state_grounding_block(service)
     skills_section = f"\n{service_skills_block}\n" if service_skills_block else ""
     capability_section = f"\n{capability_discovery_block}\n" if capability_discovery_block else ""
     # mctlhq/mctl-agents#473: when `human.request_input` is granted and a
@@ -2106,7 +2151,7 @@ outside the tags.
   design. Ground every design decision in code you actually read.
 - Read the repo's `CLAUDE.md` (cwd root, if present) for conventions.
 - `$PROPOSAL_DIR` (env var) is where you write the proposal files.
-{skills_section}{capability_section}
+{grounding_section}{skills_section}{capability_section}
 ## What to produce
 
 Write exactly three files into `$PROPOSAL_DIR`:

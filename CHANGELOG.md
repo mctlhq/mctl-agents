@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.72.0](https://github.com/mctlhq/mctl-agents/compare/1.71.0...1.72.0) (2026-10-10)
+
+
+### Features
+
+* **tracing:** stamp trace ids on worker logs and pod anchor lines ([c7e8f97](https://github.com/mctlhq/mctl-agents/commit/c7e8f972076ef6878aeee4a5c7bf4560f67eb725))
+* **tracing:** stamp trace ids on worker logs and pod anchor lines ([0825893](https://github.com/mctlhq/mctl-agents/commit/0825893479ff63c90ba122eecc78b62cfe14ed48))
+
 ## [1.71.0](https://github.com/mctlhq/mctl-agents/compare/1.70.1...1.71.0) (2026-10-10)
 
 
