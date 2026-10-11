@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.74.0](https://github.com/mctlhq/mctl-agents/compare/1.73.0...1.74.0) (2026-10-11)
+
+
+### Features
+
+* **agents:** issue-623-tracing-record-cache-read-write-token-us ([64c0551](https://github.com/mctlhq/mctl-agents/commit/64c0551b742fc5f3fa5c16e809e00b7122aec3f0))
+* **agents:** issue-623-tracing-record-cache-read-write-token-us ([ddbb5d4](https://github.com/mctlhq/mctl-agents/commit/ddbb5d4612401e76467efed1ea58b143ab719741))
+* **gateway:** governed paid invocation with simulated commerce ([472f1ca](https://github.com/mctlhq/mctl-agents/commit/472f1ca3da90a6853b43a9f95e611c3de6cb5d40))
+* **gateway:** governed paid invocation with simulated commerce ([0152cb9](https://github.com/mctlhq/mctl-agents/commit/0152cb946e520ba1b95f194b42a8af523e63e7dd))
+
+
+### Bug Fixes
+
+* **commerce:** answer retries from the in-flight row; check replayed accepts ([298c547](https://github.com/mctlhq/mctl-agents/commit/298c547fc2c928b806e324a50fbb7b599875d59b))
+* **commerce:** answer retries from the in-flight row; check replayed accepts ([d58ed8f](https://github.com/mctlhq/mctl-agents/commit/d58ed8f40a6207bbe71e2035c26df8dcba8b88ba))
+* **commerce:** gather discovery terms reads, close [#626](https://github.com/mctlhq/mctl-agents/issues/626) gateway tails ([e18f7e9](https://github.com/mctlhq/mctl-agents/commit/e18f7e905c3a99fe2f042659531746b2335ce0e1))
+* **commerce:** gather discovery terms reads, close [#626](https://github.com/mctlhq/mctl-agents/issues/626) gateway tails ([9c2871d](https://github.com/mctlhq/mctl-agents/commit/9c2871d6b3252bf0f5116960e40e54efb1978e9c))
+* **gateway:** attribute every approved audit line ([888490a](https://github.com/mctlhq/mctl-agents/commit/888490a7f37d40222f862660b3306147659af8ff))
+* **gateway:** audit resumed approvals, verify resumed rows ([9051e6f](https://github.com/mctlhq/mctl-agents/commit/9051e6fa717061d0b1caf5da507413c10e1d876f))
+* **gateway:** bind stored outcomes to their tenant, audit crash verdict ([5333220](https://github.com/mctlhq/mctl-agents/commit/533322036ba4978e3c3c9acde181c55355a27036))
+* **gateway:** guard the paid path against non-object arguments ([9a49358](https://github.com/mctlhq/mctl-agents/commit/9a49358acac399f6a22bcd2f94fdcee095602b59))
+* **gateway:** keep approved audit consistent across retries ([ace159c](https://github.com/mctlhq/mctl-agents/commit/ace159c956a0a6e2a925f218a6b5f250b163b59f))
+* **gateway:** say when a settled success has no result ([7782195](https://github.com/mctlhq/mctl-agents/commit/7782195a106c9ba1c28c6987d8234b40d8245cb5))
+* **manifest:** point mentor sandbox at the mctl-agents-run template ([9a3e007](https://github.com/mctlhq/mctl-agents/commit/9a3e0076ce5f5e8c76bfb0860d03d46aa2a7800a))
+* **manifest:** point mentor sandbox at the mctl-agents-run template ([ee3071e](https://github.com/mctlhq/mctl-agents/commit/ee3071ee3fbcf19c5a7816d5adad690ca3b51a4c))
+* **tracing:** keep input/output parity on the invoke_agent root ([0d1b20b](https://github.com/mctlhq/mctl-agents/commit/0d1b20b425347de1800cb6667e6e6e36baf8715c))
+* **validate:** read every document of a cwft-*.yaml file ([b242572](https://github.com/mctlhq/mctl-agents/commit/b242572646b9f6572cfa53553dcd003b9ff29a0b))
+* **validate:** read every document of a cwft-*.yaml file ([e8c432f](https://github.com/mctlhq/mctl-agents/commit/e8c432fd910df64846e0bb5e22d9ee6a769b337f))
+
 ## [1.73.0](https://github.com/mctlhq/mctl-agents/compare/1.72.0...1.73.0) (2026-10-11)
 
 
