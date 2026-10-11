@@ -789,7 +789,8 @@ def s14(env: Env) -> Result:
     read, so a sweep that silently missed the run's rows cannot pass; a run
     whose scenarios created none (S6 alone, or a live rerun where every
     budget-bound scenario skipped) and a clean tenant pass. With no world
-    opened yet (`--only S14`) it opens one, so the reads always run."""
+    opened yet it opens one, so the reads always run; the CLI always opens
+    the terms world first, so that branch serves direct `run_suite` calls."""
     if not env.worlds:
         with env.new_world():
             pass
@@ -913,6 +914,8 @@ def render_markdown(bundle: Mapping[str, Any]) -> str:
                   f"mctl-api {bundle['mctl_api_sha']}.",
               f"Contract: {', '.join(bundle['provider_contract'].values())}. "
               f"Terms {bundle['terms']['terms_id']} v{bundle['terms']['terms_version']}."]
+    if bundle["summary"]["created_unreadable"]:
+        lines.append(f"Unreadable worlds: {bundle['summary']['created_unreadable']}.")
     return "\n".join(lines)
 
 
@@ -948,6 +951,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         env = offline_env() if args.backend == "offline" else live_env()
         terms = _terms_of(env)
+        if env.created_unreadable:
+            # The terms world holds no liability, but an unread close here
+            # would fail the finished run, so stop before any budget is spent.
+            raise ProofError(f"the terms world could not be read on close: {env.created_unreadable}")
         results = run_suite(env, args.only)
         # S14 sweeps the worlds the others opened, so it runs after them above.
         bundle = build_bundle(

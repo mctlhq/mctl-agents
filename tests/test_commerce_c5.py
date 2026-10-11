@@ -724,6 +724,30 @@ def test_terms_are_read_before_the_suite_so_a_failure_discards_no_run(monkeypatc
     assert ran == []
 
 
+def test_an_unread_terms_world_stops_the_run_before_any_scenario(monkeypatch):
+    """Review of #634: the terms world holds no liability, so its failed close
+    read must not let the suite spend budget and then fail the finished run."""
+    ran = []
+
+    def unreadable(world):
+        raise proof.ProofError("invocations could not be listed: 503")
+
+    monkeypatch.setattr(proof, "_rows", unreadable)
+    monkeypatch.setattr(proof, "run_suite", lambda env, only: ran.append(1) or [])
+    assert proof.main(["--backend", "offline", "--only", "S3"]) == 2
+    assert ran == []
+
+
+def test_the_markdown_names_unreadable_worlds():
+    """Review of #634: --markdown has no row for a world that went unread."""
+    ok = proof.Result("S3", "x", proof.PASSED, {}, {}, [])
+    terms = {"terms_id": "ctm_1", "terms_version": 1}
+    clean = proof.build_bundle([ok], backend="live", terms=terms, mctl_agents_sha="s")
+    assert "Unreadable" not in proof.render_markdown(clean)
+    bundle = proof.build_bundle([ok], backend="live", terms=terms, mctl_agents_sha="s",
+                                created_unreadable=["ProofError: 503"])
+    assert "Unreadable worlds: ['ProofError: 503']" in proof.render_markdown(bundle)
+
 def test_the_investigator_has_one_enable_gate(monkeypatch):
     from orchestrator import run_issue_investigator as rii
 

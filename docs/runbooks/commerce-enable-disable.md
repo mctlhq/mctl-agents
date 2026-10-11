@@ -27,11 +27,15 @@ the owner's approval. Never `admins`.
    are never read, so confirm the worker runs in `discovery` mode.
 4. Run the live proof (`uv run python tools/commerce_proof.py --backend live
    --out evidence/commerce-proof-<utc>.json`; `--out` is required), attach the
-   bundle to #620, and confirm S14 shows zero non-terminal invocations. The
+   bundle to #620, and confirm `summary.ok` is true,
+   `summary.created_unreadable` is empty and S14 shows zero non-terminal
+   invocations. The
    scenarios share the proof tenant's budget, so the full run drives S3-S7 and
    skips S1 and S2, which each need an unspent EUR 1.00 budget: reset the
    budget and run `--only S1`, then reset again and run `--only S2`, each into
-   its own bundle. S8-S13 are not driven live; `summary.not_driven` gives the
+   its own bundle. Those reruns do not select S14, so in them
+   `summary.created_unreadable` is the only record of a world whose rows could
+   not be read. S8-S13 are not driven live; `summary.not_driven` gives the
    reason for each, and S11 is offline-only by owner decision.
 
 ## Disable (the reverse)
