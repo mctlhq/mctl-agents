@@ -364,6 +364,11 @@ BUILTIN_POLICY = Policy(
         Rule("github-pr-merge", GITHUB_PR_MERGE, MERGE_OPERATION, ALLOW),
         # The shepherd's `@claude review` trigger after a fix-up push.
         Rule("github-pr-review-trigger", GITHUB_PR_COMMENT, "comment:review-trigger", ALLOW),
+        # The shepherd's reply to a reviewer when the implementer declined a
+        # finding (exit 47): the reason, on the finding's thread or as one PR
+        # comment. Mentions are defanged before posting, so it cannot itself
+        # trigger a review.
+        Rule("github-pr-refusal-reply", GITHUB_PR_COMMENT, "comment:refusal-reply", ALLOW),
         Rule("github-run-rerun-failed", GITHUB_RUN_RERUN, "rerun:failed", ALLOW),
         Rule("github-issue-label-remove", GITHUB_ISSUE_LABEL, "remove", ALLOW),
         Rule("mctl-investigate", MCTL_OPERATION_EXECUTE, "execute:mctl-agents-investigate", ALLOW),

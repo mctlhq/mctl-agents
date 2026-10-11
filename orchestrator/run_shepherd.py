@@ -1148,6 +1148,11 @@ class ProposalRef:
         self.status_path = self.proposal_dir / ".status.yaml"
 
 
+COMMENT_KIND_INLINE = "review_comment"
+COMMENT_KIND_REVIEW_BODY = "review_body"
+COMMENT_KIND_ISSUE = "issue_comment"
+
+
 @dataclass
 class CodexFinding:
     """A single P1 or P2 finding parsed out of a code review comment.
@@ -1164,6 +1169,21 @@ class CodexFinding:
     created_at: str | None
     severity: str  # "P1" or "P2"
     author: str | None = None  # bot login; None in fixtures predating #67
+    # Where the finding lives on GitHub, so the shepherd can answer it there
+    # (a declined follow-up replies on the thread instead of leaving the
+    # reviewer to re-raise the same point every round). Optional with
+    # defaults: every fixture that predates them still constructs.
+    #   comment_kind: COMMENT_KIND_INLINE (a line-anchored review comment),
+    #                 COMMENT_KIND_REVIEW_BODY (a review's top-level body) or
+    #                 COMMENT_KIND_ISSUE (a top-level PR conversation comment).
+    #   comment_id:   that object's GitHub id.
+    #   thread_id:    inline only -- the id of the thread's ROOT comment
+    #                 (`in_reply_to_id`, else the comment's own id). GitHub's
+    #                 replies endpoint rejects a reply-to-a-reply, so this,
+    #                 not `comment_id`, is what a reply must target.
+    comment_id: int | None = None
+    comment_kind: str | None = None
+    thread_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1477,6 +1497,36 @@ def _gh_api_json(args: list[str]) -> Any:
     if not out:
         return None
     return json.loads(out)
+
+
+def _gh_api_list(path: str) -> list[dict]:
+    """Every item of a paginated GitHub REST listing, or an exception.
+
+    `_gh_api_json([path, "--paginate"])` is NOT safe for a listing that can
+    span pages: `gh api --paginate` then prints several JSON arrays back to
+    back, which `json.loads` rejects, so the read fails on exactly the
+    long-lived PRs with 31+ comments. `--jq '.[]'` streams one compact object
+    per line instead (bodies keep their newlines escaped, so one line is one
+    item) -- the pattern run_issue_directive_poller already uses.
+
+    Raises (CalledProcessError, OSError, ValueError) on any failed or
+    malformed read; a line that is not a JSON object is a malformed read,
+    not an item to skip. Empty output is an empty listing.
+    """
+    proc = _run(["gh", "api", "--paginate", "--jq", ".[]", path])
+    items: list[dict] = []
+    # split("\n"), not splitlines(): the latter also breaks on U+0085,
+    # U+2028 and U+2029, which JSON leaves unescaped inside a string, so one
+    # comment carrying them would split an object and fail the read forever.
+    for line in (proc.stdout or "").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        item = json.loads(line)
+        if not isinstance(item, dict):
+            raise ValueError(f"listing item is not an object: {type(item).__name__}")
+        items.append(item)
+    return items
 
 
 def _find_pr_url_by_branch(service: str, slug: str) -> str | None:
@@ -2081,6 +2131,8 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
                 created_at=r.get("submitted_at"),
                 severity=sev,
                 author=login,
+                comment_id=r.get("id"),
+                comment_kind=COMMENT_KIND_REVIEW_BODY,
             ))
 
     # 2. Line-anchored review comments — `gh api repos/.../pulls/<n>/comments`.
@@ -2110,6 +2162,9 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
                 created_at=c.get("created_at"),
                 severity=sev,
                 author=login,
+                comment_id=c.get("id"),
+                comment_kind=COMMENT_KIND_INLINE,
+                thread_id=c.get("in_reply_to_id") or c.get("id"),
             ))
 
     # 3. Issue comments — top-level `No P1/P2 findings` newer
@@ -2164,6 +2219,8 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
                     created_at=created_at,
                     severity=sev,
                     author=login,
+                    comment_id=c.get("id"),
+                    comment_kind=COMMENT_KIND_ISSUE,
                 ))
         elif login == CODEX_CONNECTOR_BOT:
             # Connector findings gate, but its presence/absence never
@@ -2180,6 +2237,8 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
                     created_at=created_at,
                     severity=sev,
                     author=login,
+                    comment_id=c.get("id"),
+                    comment_kind=COMMENT_KIND_ISSUE,
                 ))
 
     # +1 reaction by claude review bot on the latest @claude review trigger.
@@ -2579,6 +2638,74 @@ def _fallback_bundle(findings: list[CodexFinding]) -> dict:
 # Address-review followup — subprocess into run_implementer.py with
 # --review-feedback (Task 3, landed in this branch).
 # ---------------------------------------------------------------------------
+# Per-finding cap on the reviewer text handed to the implementer verbatim.
+# Generous on purpose: the point of `bundle["findings"]` is that the
+# implementer stops working from a one-sentence paraphrase. A real review
+# comment with a code suggestion and a rationale runs 1-3k chars; 6000 keeps
+# all of those whole while still bounding what one hostile or runaway comment
+# can add to the prompt.
+FINDING_BODY_CAP = 6000
+
+
+def _cap_finding_body(body: str, cap: int = FINDING_BODY_CAP) -> tuple[str, bool]:
+    """``body`` cut to ``cap`` chars, with a visible marker when it was cut.
+
+    Capped BEFORE tag neutralisation (see `_augment_bundle_with_findings`):
+    a cut can split a tag, and neutralising the cut text means whatever is
+    left can never be re-joined into a delimiter by what follows it.
+    """
+    body = body or ""
+    if len(body) <= cap:
+        return body, False
+    return (
+        body[:cap] + f"\n[... truncated by the shepherd: {cap} of {len(body)} chars shown]",
+        True,
+    )
+
+
+def _augment_bundle_with_findings(bundle: dict, findings: list[CodexFinding]) -> dict:
+    """Attach the FULL text of every finding to the bundle, deterministically.
+
+    `summaries` is a one-sentence-per-finding paraphrase produced by the
+    summariser SDK (or `_fallback_bundle`'s first line). Working from that
+    alone, the implementer kept making lossy fixes — the reviewer's actual
+    argument, its code suggestion and its edge cases never reached it — and a
+    PR spent extra rounds, or got stuck, on one P2. `findings` carries what the
+    reviewer actually wrote, one record per finding, in the same order as
+    `findings` (and so as the summaries, which index it).
+
+    Never routed through the SDK: these records are built here from the
+    parsed GitHub objects, so nothing in them is model-rewritten, and a
+    ``findings`` key the summariser might have emitted is overwritten rather
+    than trusted. The body is review-bot text, i.e. attacker-influenceable,
+    so it is tag-neutralised exactly like the text the summariser sees, and
+    capped per finding (`FINDING_BODY_CAP`).
+    """
+    if not findings:
+        return bundle
+    bundle = dict(bundle)
+    records: list[dict] = []
+    for f in findings:
+        capped, truncated = _cap_finding_body(f.body)
+        records.append({
+            "severity": f.severity,
+            "author": f.author,
+            "path": f.path,
+            "line": f.line,
+            "comment_id": f.comment_id,
+            "comment_kind": f.comment_kind,
+            "body": _neutralize_findings_tags(capped),
+            "truncated": truncated,
+        })
+    bundle["findings"] = records
+    # Per-finding cap only; the aggregate is reported so an oversized prompt
+    # is diagnosable from the tick log (the CI side has `budget_report`).
+    total = sum(len(r["body"]) for r in records)
+    bundle["findings_chars_total"] = total
+    print(f"info: bundle carries {len(records)} finding(s) verbatim, {total} chars")
+    return bundle
+
+
 def _augment_bundle_with_ci(bundle: dict, checks: list[CheckBlocker]) -> dict:
     """Append deterministic CI blocker records to a bundle (mctl-agents#411).
 
@@ -2617,7 +2744,10 @@ def _augment_bundle_with_ci(bundle: dict, checks: list[CheckBlocker]) -> dict:
         }
         for c in checks
     ]
-    bundle["work_class"] = "mixed" if (bundle.get("summaries") or []) else "ci-remediation"
+    # `findings` counts too: a summariser that returns `summaries: []` for real
+    # findings must not turn a mixed bundle into a CI-only one.
+    has_review = bool(bundle.get("summaries") or bundle.get("findings"))
+    bundle["work_class"] = "mixed" if has_review else "ci-remediation"
     bundle["budget_report"] = {
         "n_checks": len(checks),
         "log_statuses": [c.log_status for c in checks],
@@ -2696,6 +2826,7 @@ def apply_followup(
         # block, whose ungrounded output would otherwise be rendered to
         # the implementer as if it were real review findings.
         bundle = _fallback_bundle(findings)
+    bundle = _augment_bundle_with_findings(bundle, findings)
     bundle = _augment_bundle_with_ci(bundle, checks)
 
     if skip_subprocess:
@@ -2895,6 +3026,200 @@ def trigger_review(pr: PRSnapshot) -> None:
             f"warn: failed to post `@claude review` on {pr.repo}#{pr.number} "
             f"({msg}); next tick stalls until trigger is posted manually"
         )
+
+
+# ---------------------------------------------------------------------------
+# Refusal replies — answer the reviewer where it asked.
+#
+# A deliberate refusal (exit 47) used to be recorded only in `.status.yaml`.
+# The reviewer never saw it, so on the next push it raised the same point
+# again, the implementer declined again, and the PR walked to review-stuck on
+# a standoff neither side could see. The reason now goes back to GitHub: as a
+# reply on each inline thread, and as one PR comment for the findings that
+# have no thread (a review body, a top-level comment).
+# ---------------------------------------------------------------------------
+REFUSAL_REPLY_PREFIX = "Shepherd: declined, reason: "
+# The reason is the implementer's own text, already bounded at the source
+# (`MAX_REFUSAL_MARKER_BYTES`), but that bound is 64 KiB. GitHub caps a
+# comment at 65536 chars, and a reply the length of a file reads as noise.
+REFUSAL_REPLY_REASON_CAP = 3000
+# One line per answered finding in the PR-level comment.
+_REFUSAL_REPLY_QUOTE_CAP = 200
+
+
+def _refusal_reply_marker(head_sha: str) -> str:
+    return f"<!-- shepherd-refusal-reply head={head_sha} -->"
+
+
+def _defang_mentions(text: str) -> str:
+    """Break every ``@name`` so a posted reply can never be a trigger.
+
+    The reason is model-written and quotes review text. A literal
+    ``@claude review`` in it would start a paid review session on a head
+    nobody changed (the workflow fires on any comment carrying the mention),
+    and any other ``@login`` would notify a person who never asked to be
+    pinged. A zero-width space after the ``@`` keeps the text readable.
+    """
+    return re.sub(r"@(?=[A-Za-z0-9])", "@​", text or "")
+
+
+def _refusal_reply_body(reason: str, head_sha: str, extra: str = "") -> str:
+    reason = (reason or "").strip()
+    if len(reason) > REFUSAL_REPLY_REASON_CAP:
+        reason = reason[:REFUSAL_REPLY_REASON_CAP] + " [... truncated]"
+        # Reasons quote code; a cut inside a ``` fence would leave the rest
+        # of the reply (and the footer) rendered as code. Close it on a line
+        # of its own: a fence followed by text is content, not a closer.
+        if reason.count("```") % 2:
+            reason += "\n```"
+    text = (
+        f"{REFUSAL_REPLY_PREFIX}{reason}\n\n"
+        f"{extra}"
+        f"_The DevLoop implementer reviewed this finding on head `{head_sha[:7]}` "
+        f"and deliberately made no change. If the finding still stands, say why "
+        f"on this thread; the next follow-up reads the full reviewer text._"
+    )
+    return _defang_mentions(text) + "\n" + _refusal_reply_marker(head_sha)
+
+
+def _quote_finding_line(f: CodexFinding) -> str:
+    first = ""
+    for ln in (f.body or "").splitlines():
+        ln = ln.strip()
+        if ln and not ln.startswith("![") and not ln.startswith("<!--"):
+            first = ln
+            break
+    if len(first) > _REFUSAL_REPLY_QUOTE_CAP:
+        first = first[:_REFUSAL_REPLY_QUOTE_CAP] + "..."
+    where = {
+        COMMENT_KIND_REVIEW_BODY: "review",
+        COMMENT_KIND_ISSUE: "comment",
+    }.get(f.comment_kind or "", "finding")
+    ident = f" {f.comment_id}" if f.comment_id else ""
+    return f"- [{f.severity}] {f.author or 'reviewer'} {where}{ident}: {first}"
+
+
+def _post_refusal_reply(pr: PRSnapshot, cmd: list[str], body: str, in_reply_to: str) -> bool:
+    """One governed, best-effort post. True iff `gh` ran and succeeded."""
+    pr_ref = f"https://github.com/{pr.repo}/pull/{pr.number}"
+    try:
+        policy_checkpoint.require(policy_checkpoint.checkpoint(
+            policy_checkpoint.GITHUB_PR_COMMENT,
+            "comment:refusal-reply",
+            pr_ref,
+            {"body": body, "head_sha": pr.head_sha, "in_reply_to": in_reply_to},
+            metadata={"repo": pr.repo, "pr": str(pr.number)},
+        ))
+        _run(cmd)
+        return True
+    except policy_checkpoint.PolicyRefused as e:
+        print(f"warn: not posting refusal reply on {pr.repo}#{pr.number} ({in_reply_to}): {e}")
+    except (subprocess.CalledProcessError, OSError) as e:
+        msg = (getattr(e, "stderr", None) or "").strip() or str(e)
+        print(f"warn: failed to post refusal reply on {pr.repo}#{pr.number} ({in_reply_to}): {msg}")
+    return False
+
+
+def post_refusal_replies(pr: PRSnapshot, findings: list[CodexFinding], reason: str) -> None:
+    """Post the implementer's refusal reason where each finding was raised.
+
+    - Inline review comments: one reply per THREAD (findings are grouped by
+      `thread_id`, so two findings on one thread get one reply), via
+      ``POST repos/{repo}/pulls/{n}/comments/{thread_id}/replies``.
+    - Everything else (review bodies, top-level comments, findings with no
+      recorded location): ONE PR comment that quotes which findings it
+      answers.
+
+    Idempotent per head: every post carries `_refusal_reply_marker(head)`,
+    and a thread (or the PR) that already holds a reply with this head's
+    marker is skipped. A refusal is re-run on every tick while the head stays
+    put (up to MAX_REFUSALS), and posting "only on the first refusal" would
+    silently lose the reply whenever that one post failed; the marker check
+    costs one listing call and survives both. A new head is a new question,
+    so it gets a new reply.
+
+    "Could not observe" is not "observed absent": if the listing that the
+    idempotency check rests on cannot be read, that group is NOT posted --
+    an unknown is not proof that no reply exists, and a duplicate on every
+    tick is the failure this check exists to prevent. The next refusal tick
+    retries.
+
+    Best-effort end to end: every failure is logged and swallowed. This runs
+    in the middle of `process_one`'s refusal arm, and nothing about telling a
+    reviewer why may change what the shepherd records or crash the tick.
+    """
+    try:
+        _post_refusal_replies(pr, findings, reason)
+    except Exception as e:  # noqa: BLE001 — best-effort by contract, see docstring
+        print(
+            f"warn: refusal replies on {pr.repo}#{pr.number} aborted "
+            f"({type(e).__name__}: {e}); the reason is still in .status.yaml"
+        )
+
+
+def _post_refusal_replies(pr: PRSnapshot, findings: list[CodexFinding], reason: str) -> None:
+    if not findings or not (reason or "").strip():
+        return
+    marker = _refusal_reply_marker(pr.head_sha)
+
+    threads: list[int] = []
+    loose: list[CodexFinding] = []
+    for f in findings:
+        if f.comment_kind == COMMENT_KIND_INLINE and f.thread_id:
+            if f.thread_id not in threads:
+                threads.append(f.thread_id)
+        else:
+            loose.append(f)
+
+    if threads:
+        try:
+            existing = _gh_api_list(f"repos/{pr.repo}/pulls/{pr.number}/comments")
+            answered = {
+                c.get("in_reply_to_id") for c in existing
+                if marker in (c.get("body") or "")
+            }
+        except (subprocess.CalledProcessError, OSError, ValueError) as e:
+            msg = (getattr(e, "stderr", None) or "").strip() or str(e)
+            print(
+                f"warn: cannot read review threads on {pr.repo}#{pr.number} "
+                f"({msg}); not posting {len(threads)} refusal reply(ies) "
+                f"blind -- next refusal tick retries"
+            )
+        else:
+            body = _refusal_reply_body(reason, pr.head_sha)
+            for tid in threads:
+                if tid in answered:
+                    print(f"info: refusal reply already on thread {tid} for head {pr.head_sha[:7]}; skipping")
+                    continue
+                if _post_refusal_reply(pr, [
+                    "gh", "api", "--method", "POST",
+                    f"repos/{pr.repo}/pulls/{pr.number}/comments/{tid}/replies",
+                    "-f", f"body={body}",
+                ], body, f"thread:{tid}"):
+                    print(f"info: posted refusal reply on {pr.repo}#{pr.number} thread {tid}")
+
+    if loose:
+        try:
+            existing = _gh_api_list(f"repos/{pr.repo}/issues/{pr.number}/comments")
+            already = any(marker in (c.get("body") or "") for c in existing)
+        except (subprocess.CalledProcessError, OSError, ValueError) as e:
+            msg = (getattr(e, "stderr", None) or "").strip() or str(e)
+            print(
+                f"warn: cannot read PR comments on {pr.repo}#{pr.number} "
+                f"({msg}); not posting the refusal comment blind -- next "
+                f"refusal tick retries"
+            )
+            return
+        if already:
+            print(f"info: refusal comment already on {pr.repo}#{pr.number} for head {pr.head_sha[:7]}; skipping")
+            return
+        answers = "\n".join(_quote_finding_line(f) for f in loose)
+        body = _refusal_reply_body(
+            reason, pr.head_sha, extra=f"Answers these findings:\n{answers}\n\n",
+        )
+        pr_ref = f"https://github.com/{pr.repo}/pull/{pr.number}"
+        if _post_refusal_reply(pr, ["gh", "pr", "comment", pr_ref, "--body", body], body, "pr"):
+            print(f"info: posted refusal comment on {pr.repo}#{pr.number} ({len(loose)} finding(s))")
 
 
 # ---------------------------------------------------------------------------
@@ -3428,6 +3753,17 @@ def process_one(
                 # durable — it is the only record of why this tick was a no-op.
                 reason = e.reason or "no reason recorded by the implementer"
                 note = _declined_note(reason)
+                # Tell the reviewer, on the thread itself, why nothing changed
+                # -- otherwise it re-raises the same finding and the standoff
+                # is invisible to both sides. Only with a real reason: the
+                # placeholder above is our wording, not an answer. Best-effort
+                # and idempotent per head (see post_refusal_replies); it never
+                # raises, so the state transitions below are unchanged.
+                if e.reason:
+                    refused_findings = (
+                        payload.findings if isinstance(payload, Blockers) else list(payload)
+                    )
+                    post_refusal_replies(pr, refused_findings, e.reason)
                 # Consecutive on ONE head: a push moves the branch, so the
                 # next bundle is about different code and deserves a fresh
                 # budget. Without this the counter would be lifetime-per-PR and

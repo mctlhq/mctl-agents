@@ -99,6 +99,7 @@ LEASE = "a" * 40
     (pc.GITHUB_PR_CREATE, "create", "github-pr-create"),
     (pc.GITHUB_PR_MERGE, "merge", "github-pr-merge"),
     (pc.GITHUB_PR_COMMENT, "comment:review-trigger", "github-pr-review-trigger"),
+    (pc.GITHUB_PR_COMMENT, "comment:refusal-reply", "github-pr-refusal-reply"),
     (pc.GITHUB_RUN_RERUN, "rerun:failed", "github-run-rerun-failed"),
     (pc.GITHUB_ISSUE_LABEL, "remove", "github-issue-label-remove"),
     (pc.GITHUB_ISSUE_COMMENT, "comment", "github-issue-comment"),

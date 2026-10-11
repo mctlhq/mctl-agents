@@ -211,7 +211,7 @@ def test_the_findings_prompt_is_not_disturbed() -> None:
     prompt = run_implementer._build_prompt(_ref(), review_feedback=_FINDINGS_ONLY)
 
     assert "Code review left P1/P2 findings on this PR" in prompt
-    assert "Read the codex findings (below)" in prompt
+    assert "Read EVERY finding's full reviewer text" in prompt
     assert "fixing the codex findings only" in prompt
     assert "fix(agents): address P1/P2 codex findings on issue-1-x" in prompt
     assert "A required CI check is FAILING" not in prompt
