@@ -602,3 +602,31 @@ def test_review_prompt_with_advisory_gets_the_advisory_lines() -> None:
     prompt = run_implementer._build_prompt(_ref(), review_feedback=bundle)
     assert "does not stop a valid advisory fix in another file" in prompt
     assert "refute each advisory item in the reason" in prompt
+
+
+# Review round 5: the Ground rules scope line must admit the advisory items
+# too, and a malformed advisory list that renders nothing changes nothing.
+def test_ground_rules_scope_admits_advisory_on_both_paths() -> None:
+    prompt = run_implementer._build_prompt(_ref(), review_feedback=_ci_only_bundle(advisory=True))
+    assert "fixing the failing required checks only." not in prompt
+    assert (
+        "fixing the failing required checks only, plus the advisory reviewer's "
+        "items you judge valid." in prompt
+    )
+
+    plain = run_implementer._build_prompt(_ref(), review_feedback=_ci_only_bundle(advisory=False))
+    assert "fixing the failing required checks only." in plain
+
+    review = run_implementer._build_prompt(_ref(), review_feedback={
+        "p2": True, "summaries": ["[P2] a.py:3: s"],
+        "advisory_findings": [{"reviewer": "agy", "severity": "P1", "body": "adv"}],
+    })
+    assert "fixing the codex findings only, plus the advisory reviewer's items" in review
+
+
+def test_malformed_advisory_list_leaves_prompt_unchanged() -> None:
+    bundle = _ci_only_bundle(advisory=False)
+    bundle["advisory_findings"] = ["not a dict"]
+    prompt = run_implementer._build_prompt(_ref(), review_feedback=bundle)
+    assert prompt == run_implementer._build_prompt(
+        _ref(), review_feedback=_ci_only_bundle(advisory=False))

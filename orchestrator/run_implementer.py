@@ -1859,13 +1859,19 @@ def _build_prompt(
         # What the run is actually about. Every one of these was hardcoded to
         # the code-review framing; a CI-only bundle then read as a
         # self-contradiction (mctl-agents#411 review).
-        work_items = "failing required checks" if ci_only else "codex findings"
         # agy's advisory items ride along on either path but never change its
         # classification (`_bundle_is_ci_only` ignores them). The wording
         # below must still admit they exist: on the CI-only path the default
-        # lines deny any P1/P2 and confine the change to the touched files,
-        # which would contradict the advisory section the agent reads next.
-        has_advisory = bool(review_feedback.get("advisory_findings"))
+        # lines deny any P1/P2, and on both paths the scope rules (apply line
+        # and Ground rules) would exclude them, contradicting the advisory
+        # section the agent reads. Keyed on whether the section renders, not
+        # on the bundle key, so a malformed list that renders nothing changes
+        # nothing (and reviewer text quoting the heading cannot set it).
+        has_advisory = bool(_render_advisory_section(review_feedback.get("advisory_findings") or []))
+        work_items = "failing required checks" if ci_only else "codex findings"
+        advisory_scope = (
+            ", plus the advisory reviewer's items you judge valid" if has_advisory else ""
+        )
         advisory_apply = (
             "\n   Then handle each item under \"Advisory reviewer (agy)\": fix it "
             "if it is valid\n   (the scope rule above does not stop a valid "
@@ -2042,7 +2048,7 @@ Workflow:
 {skills_section}
 Ground rules:
 - One commit per run is fine; multiple small commits are also fine.
-- Stay strictly within scope — fixing the {work_items} only.
+- Stay strictly within scope — fixing the {work_items} only{advisory_scope}.
 - Work ONLY inside the current working directory (the cloned target repo).
   NEVER create, edit, commit, or push files anywhere else — in particular
   the mounted gitops worktree under `/workdir`. If a finding implies a
