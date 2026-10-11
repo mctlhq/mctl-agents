@@ -516,7 +516,8 @@ def test_process_one_fix_only_still_applies_review_feedback(tmp_path) -> None:
     apply_calls: list[tuple] = []
     trigger_calls: list[PRSnapshot] = []
 
-    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None, repo=None):
+    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None, repo=None,
+                            advisory_findings=None):
         apply_calls.append((service, slug))
         return {"p1": True, "p2": False, "summaries": ["fix it"]}
 
@@ -1978,7 +1979,8 @@ def test_process_one_ci_blockers_head_clears_when_fixed(tmp_path) -> None:
 
     apply_calls: list = []
 
-    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None, repo=None):
+    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None, repo=None,
+                            advisory_findings=None):
         apply_calls.append(payload)
         return {"p1": False, "p2": False, "summaries": []}
 
@@ -2027,7 +2029,8 @@ def test_process_one_probe_outage_preserves_prior_ci_blockers_projection(tmp_pat
 
     apply_calls: list = []
 
-    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None, repo=None):
+    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None, repo=None,
+                            advisory_findings=None):
         apply_calls.append(payload)
         return {"p1": False, "p2": False, "summaries": []}
 
@@ -2337,7 +2340,8 @@ def test_outer_loop_review_stuck_at_max_review_attempts(tmp_path, monkeypatch) -
     apply_calls: list[tuple] = []
     trigger_calls: list[PRSnapshot] = []
 
-    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None, repo=None):
+    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None, repo=None,
+                            advisory_findings=None):
         apply_calls.append((service, slug, payload, skip_subprocess, state_dir))
         return {"p1": True, "p2": False, "summaries": ["fix it"]}
 
@@ -2454,7 +2458,8 @@ def test_loop_path_p1_then_followup_then_merge(tmp_path) -> None:
     apply_calls: list[tuple] = []
     trigger_calls: list[PRSnapshot] = []
 
-    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None, repo=None):
+    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None, repo=None,
+                            advisory_findings=None):
         # payload is now a Blockers (mctl-agents#411) whenever process_one
         # calls decide() with a CIStatus, which it always does.
         n_blockers = len(payload.findings) + len(payload.checks)
