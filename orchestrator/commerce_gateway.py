@@ -563,6 +563,9 @@ class PaidInvocation:
             got = await asyncio.to_thread(store.get, approval_id)
             rec = got.record
             if got.status == aa.CONSUMED and rec is not None and rec.intent_hash == fresh:
+                # Spent for this invocation, so this attempt is the one that
+                # consumed it: the recheck before dispatch writes its line too.
+                self._approval_record = rec
                 self._record_approved(approval_id, rec)
                 return None
             if got.status == aa.UNKNOWN or (spent.status == aa.UNKNOWN and got.status == aa.APPROVED):

@@ -66,6 +66,9 @@ class PaidTool:
     input_schema: Mapping[str, Any]
     handler: Handler
     annotations: Mapping[str, Any] = field(default_factory=dict)
+    #: MCP `Tool.execution.taskSupport`, listed as `ProviderTool.task_support`;
+    #: the gateway refuses a paid call to a tool that requires it.
+    task_support: str = ""
 
     @property
     def input_schema_hash(self) -> str:
@@ -126,7 +129,7 @@ class ProviderIngress:
     def tools(self) -> list[ProviderTool]:
         return [
             ProviderTool(name=t.name, description=t.description, input_schema=t.input_schema,
-                         annotations=t.annotations)
+                         annotations=t.annotations, task_support=t.task_support)
             for t in self._tools.values()
         ]
 

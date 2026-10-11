@@ -47,7 +47,7 @@ import re
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
@@ -505,6 +505,9 @@ async def _discover(
     schemas_by_id: dict[str, Mapping[str, Any]] = {}
     dispatch_by_id: dict[str, tuple[ProviderRef, str]] = {}
     excluded_count = 0
+    # (descriptor index, capability_id, schema_hash, provider) for every
+    # matched tool whose terms are read once all providers are listed.
+    terms_reads: list[tuple[int, str, str, ProviderRef]] = []
 
     for provider in providers:
         _reject_unusable_provider_ref(provider)
@@ -541,7 +544,6 @@ async def _discover(
             capability_id = f"mctl://{provider.type}/{provider.id}/{info.name}"
             schema_bytes = canonical_json(dict(info.input_schema))
             schema_hash = hash_bytes(schema_bytes)
-            summary = await _commerce_summary(commerce, capability_id, schema_hash, provider) if commerce else None
             annotations = _bounded_annotations(info.annotations)
             # Either a coercion failure at the session (ProviderTool.
             # annotations_unparseable, set per-tool by
@@ -561,8 +563,9 @@ async def _discover(
                 consequence=classify_consequence(info.name, table, provider_id=provider.id),
                 matched_tool_pattern=matched_pattern,
                 annotations=annotations,
-                commerce=summary,
             )
+            if commerce is not None:
+                terms_reads.append((len(descriptors), capability_id, schema_hash, provider))
             descriptors.append(descriptor)
             if task_support_out is not None:
                 task_support_out[capability_id] = info.task_support
@@ -578,7 +581,40 @@ async def _discover(
                 "annotations_dropped": annotations_dropped,
             }, event="provider_degraded")
 
+    if commerce is not None and terms_reads:
+        summaries = await _commerce_summaries(commerce, terms_reads)
+        for (index, _, _, _), summary in zip(terms_reads, summaries, strict=True):
+            if summary is not None:
+                descriptors[index] = replace(descriptors[index], commerce=summary)
+
     return descriptors, excluded_count, schemas_by_id, dispatch_by_id
+
+
+#: How many terms reads discovery keeps in flight at once.
+_TERMS_READ_CONCURRENCY = 8
+
+
+async def _commerce_summaries(
+    commerce: CommerceRuntime, reads: Sequence[tuple[int, str, str, ProviderRef]],
+) -> list[CommerceSummary | None]:
+    """Every matched tool's terms, read concurrently (at most
+    `_TERMS_READ_CONCURRENCY` at a time) so discovery waits about one
+    client timeout, not one per matched tool. Every read is awaited before
+    anything is raised, and the failure raised is the first in discovery
+    order, so which capability fails discovery does not depend on timing."""
+    import asyncio
+
+    gate = asyncio.Semaphore(_TERMS_READ_CONCURRENCY)
+
+    async def one(capability_id: str, schema_hash: str, provider: ProviderRef) -> CommerceSummary | None:
+        async with gate:
+            return await _commerce_summary(commerce, capability_id, schema_hash, provider)
+
+    answers = await asyncio.gather(*(one(c, h, p) for _, c, h, p in reads), return_exceptions=True)
+    for answer in answers:
+        if isinstance(answer, BaseException):
+            raise answer
+    return list(answers)  # type: ignore[arg-type]
 
 
 async def _commerce_summary(
@@ -586,11 +622,7 @@ async def _commerce_summary(
 ) -> CommerceSummary | None:
     """The descriptor's `commerce` field: a read-only summary of the terms
     in force. `None` only on mctl-api's typed `commerce-terms-unknown`.
-
-    One sequential mctl-api read per matched tool, free ones included, so
-    with a commerce runtime discovery cost is linear in the matched tools
-    (worst case N x the client timeout). Batching or gathering these reads
-    is tracked for before C5 enables the runtime anywhere real."""
+    One mctl-api read; `_commerce_summaries` runs them concurrently."""
     import asyncio
 
     answer = await asyncio.to_thread(commerce.client.current_terms, capability_id, schema_hash)
@@ -762,13 +794,13 @@ _MAX_TRACED_ID_LENGTH = 256
 #: `CAPABILITY_POLICY_CHECKPOINT_FAILED` trace line.
 _MAX_CHECKPOINT_ERROR_LENGTH = 300
 
-#: What the model is told when a dispatch fails. Provider/transport exception
-#: text can carry URLs or upstream response fragments, so it never reaches the
-#: model; the reason code is the whole answer, and the trace line records it.
 #: A caller's own idempotency key for `capability_invoke` (ADR 020 sec. 6).
 #: The gateway derives the ledger key from it, so it never reaches mctl-api.
 _CLIENT_IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 
+#: What the model is told when a dispatch fails. Provider/transport exception
+#: text can carry URLs or upstream response fragments, so it never reaches the
+#: model; the reason code is the whole answer, and the trace line records it.
 _FIXED_ERRORS = MappingProxyType({
     "timeout": "the provider did not answer in time",
     "provider-unavailable": "the provider could not be reached",
