@@ -1335,3 +1335,62 @@ def test_the_paid_path_refuses_non_object_arguments_on_its_own(world, arguments)
     g = run(world.gateway())
     out = run(g._invoke_paid(g.descriptors_by_id[PILOT_CAP], arguments, "", 0.0))
     assert out["reason_code"] == "invalid-arguments" and world.ledger.writes() == []
+
+
+# ---------------------------------------------------------------------------
+# Review of 9a49358
+# ---------------------------------------------------------------------------
+
+
+def test_a_resumed_attempt_writes_no_unattributed_approval_line(world, capsys):
+    """Resumed from reserved, this attempt did not consume the approval: it
+    writes no `approved` line it cannot attribute, and every approved line
+    pairs an approver with its timestamp."""
+    world.policy = APPROVE_PAID
+    ref = run(_invoke(world))["approval_ref"]
+    world.approvals.decide(ref, "approved")
+    world.ledger.inject("reserve", "crash-after")
+    with pytest.raises(Crash):
+        _restart(world)
+    first = _policy_decisions(capsys.readouterr().out)
+    assert any(d["code"] == pc.CODE_APPROVED for d in first)
+    assert _restart(world)["reason_code"] == "ok"
+    out = capsys.readouterr().out
+    resumed = _policy_decisions(out)
+    assert not [d for d in resumed if d["code"] == pc.CODE_APPROVED]
+    assert '"policy_checkpoint": "allowed"' in _invocation_records(out)[-1]
+    for d in first:
+        assert bool(d["approver"]) == bool(d["decided_at"])
+
+
+def test_a_release_by_any_other_writer_keeps_the_spent_approval_verdict(world, capsys):
+    """A release whose reason is not a revocation (the reconciler may write
+    its own code) reports the verdict of the approval it spent."""
+    world.policy = APPROVE_PAID
+    ref = run(_invoke(world))["approval_ref"]
+    world.approvals.decide(ref, "approved")
+    assert _restart(world)["reason_code"] == "ok"
+    inv = world.ledger.only()
+    inv["phase"], inv["reason_code"] = "released", "dispatch-expired"
+    capsys.readouterr()
+    _restart(world)
+    assert '"policy_checkpoint": "allowed"' in _invocation_records(capsys.readouterr().out)[-1]
+
+
+def test_an_approval_spent_without_its_record_carries_no_timestamp(world, capsys, monkeypatch):
+    """A store that confirms the spend but returns no record: the approved
+    line names no approver, so it carries no observation time either."""
+    world.policy = APPROVE_PAID
+    ref = run(_invoke(world))["approval_ref"]
+    world.approvals.decide(ref, "approved")
+    real = world.approvals.consume
+
+    def spent_without_record(approval_id, presented_hash):
+        answer = real(approval_id, presented_hash)
+        return aa.ApprovalAnswer(aa.SPENT) if answer.status == aa.SPENT else answer
+
+    monkeypatch.setattr(world.approvals, "consume", spent_without_record)
+    capsys.readouterr()
+    assert _restart(world)["reason_code"] == "ok"
+    approved = [d for d in _policy_decisions(capsys.readouterr().out) if d["code"] == pc.CODE_APPROVED]
+    assert approved and all(d["approver"] == "" and d["decided_at"] == "" for d in approved)

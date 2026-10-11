@@ -475,7 +475,11 @@ class PaidInvocation:
                     # decision in force before dispatch is the approved one,
                     # so the audit trail does not end on approval_required.
                     self._approved_earlier = True
-                    self._record_approved(str(inv["approval_id"]), self._approval_record)
+                    if self._approval_record is not None:
+                        # Only the attempt that consumed the approval knows
+                        # who decided it; a resumed attempt writes no
+                        # approval line it cannot attribute.
+                        self._record_approved(str(inv["approval_id"]), self._approval_record)
                 return None
         else:
             refusal = self._refusal("policy-denied", decided.reason)
@@ -533,10 +537,12 @@ class PaidInvocation:
         # keeps the rule's verdict and carries `code: approved`, which is
         # exactly what `pc.decide` writes when it redeems an approval itself.
         # Whether the action ran is read from `code`, not from `decision`.
+        # `decided_at` is set only alongside an approver, as `pc.decide` does.
+        approver = rec.decided_by if rec is not None else ""
         approved = pc.Decision(
             self._decision.verdict, pc.CODE_APPROVED, f"approval {approval_id} consumed for this invocation",
             self._decision.policy_version, self._decision.rule_id, self._request.action_digest(), approval_id,
-            rec.decided_by if rec is not None else "", self.runtime.now().isoformat(),
+            approver, self.runtime.now().isoformat() if approver else "",
         )
         self._decision = approved
         pc.emit(self._request, approved)
@@ -744,10 +750,12 @@ _RESULT_UNAVAILABLE = "the capability succeeded, but its result could not be ret
 #: Phases a row reaches only after its approval was consumed and the policy
 #: rechecked before dispatch (`reserved` is excluded: its recheck still runs).
 _APPROVAL_SPENT_PHASES = frozenset({DISPATCHING, DISPATCHED, OUTCOME_UNKNOWN, FINALIZED})
-#: The only reason a row is released after dispatch began. A release from
-#: `reserved` (a revocation at the recheck) carries `policy-denied` or
-#: `identity-unresolved`, and that verdict is the right one to report.
-_RELEASED_AFTER_DISPATCH = "provider-error"
+#: A row with an approval reaches `released` only after the approval was
+#: consumed (`reserved` is reached through the consume). The one release
+#: whose verdict is not "allowed" is the revocation at the recheck, which
+#: carries one of these codes; any other release, including one written by
+#: mctl-api's reconciler, keeps the spent approval's verdict.
+_RELEASED_BY_REVOCATION = frozenset({"policy-denied", "identity-unresolved"})
 
 
 def _approval_spent(inv: Mapping[str, Any]) -> bool:
@@ -757,4 +765,4 @@ def _approval_spent(inv: Mapping[str, Any]) -> bool:
         return False
     phase = inv.get("phase")
     return phase in _APPROVAL_SPENT_PHASES or (
-        phase == RELEASED and inv.get("reason_code") == _RELEASED_AFTER_DISPATCH)
+        phase == RELEASED and inv.get("reason_code") not in _RELEASED_BY_REVOCATION)
