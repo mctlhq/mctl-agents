@@ -517,3 +517,27 @@ sentence (sec. 9).
   mode-aware `validate_manifest.py` change must land before the mctl-gitops
   `spec.capabilityDiscovery` field is added to any profile, so the
   cross-repo equality check can never go red on `main` in either repository.
+
+## Amendment 2026-10-11 — ADR 020 commerce extension (mctlhq/mctl-api#546)
+
+ADR 020 (`docs/adr/020-capability-commerce-contract.md`) extends this
+contract in two additive places, which the implementation map above
+otherwise names as closed:
+
+- **Sec. 1, `CapabilityDescriptor`:** one optional field, `commerce`, a
+  read-only price summary. It is omitted from `to_dict()` when absent, so
+  every set sealed before the extension recomputes to its original
+  `content_hash`; when present it is part of the hash. It carries no
+  allow/deny/permit/grant/authorized token, and execution never reads it:
+  the price that is charged comes from mctl-api's terms, never from the
+  descriptor. Discovery still narrows and never grants.
+- **Sec. 7, reason codes:** ADR 020 sec. 13 adds commerce-specific codes.
+  The nine codes above keep their meaning; a commerce code is never used in
+  their place.
+
+Nothing else in this ADR is reopened: the hash derivation, the narrowing
+invariant, the collision rule, the gateway's routing and failure semantics,
+the `PolicyCheckpoint` seam and the consequence fail-safe default are
+unchanged. The checkpoint path for a paid invocation stays `mcp.tool.call`;
+ADR 020 sec. 8 binds the price into the checkpoint arguments rather than
+adding an action kind.
