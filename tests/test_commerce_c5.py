@@ -724,7 +724,7 @@ def test_terms_are_read_before_the_suite_so_a_failure_discards_no_run(monkeypatc
     assert ran == []
 
 
-def test_an_unread_terms_world_stops_the_run_before_any_scenario(monkeypatch):
+def test_an_unread_terms_world_stops_the_run_before_any_scenario(monkeypatch, capsys):
     """Review of #634: the terms world holds no liability, so its failed close
     read must not let the suite spend budget and then fail the finished run."""
     ran = []
@@ -736,7 +736,24 @@ def test_an_unread_terms_world_stops_the_run_before_any_scenario(monkeypatch):
     monkeypatch.setattr(proof, "run_suite", lambda env, only: ran.append(1) or [])
     assert proof.main(["--backend", "offline", "--only", "S3"]) == 2
     assert ran == []
+    err = capsys.readouterr().err
+    assert "terms world could not be read on close: ProofError: invocations could not be listed: 503" in err
 
+
+
+def test_the_terms_guard_names_only_the_terms_worlds_failure(monkeypatch):
+    """Review of #634: the guard reads what the terms world added, not any
+    earlier entry, so its message cannot misattribute one."""
+    real = proof.offline_env
+
+    def seeded():
+        env = real()
+        env.created_unreadable.append("ProofError: an earlier world")
+        return env
+
+    monkeypatch.setattr(proof, "offline_env", seeded)
+    monkeypatch.setattr(proof, "run_suite", lambda env, only: [])
+    assert proof.main(["--backend", "offline", "--only", "S3"]) != 2
 
 def test_the_markdown_names_unreadable_worlds():
     """Review of #634: --markdown has no row for a world that went unread."""
@@ -746,7 +763,10 @@ def test_the_markdown_names_unreadable_worlds():
     assert "Unreadable" not in proof.render_markdown(clean)
     bundle = proof.build_bundle([ok], backend="live", terms=terms, mctl_agents_sha="s",
                                 created_unreadable=["ProofError: 503"])
-    assert "Unreadable worlds: ['ProofError: 503']" in proof.render_markdown(bundle)
+    assert "Unreadable worlds: ProofError: 503." in proof.render_markdown(bundle)
+    del bundle["summary"]["created_unreadable"]  # a bundle written before the field existed
+    assert "Unreadable" not in proof.render_markdown(bundle)
+
 
 def test_the_investigator_has_one_enable_gate(monkeypatch):
     from orchestrator import run_issue_investigator as rii

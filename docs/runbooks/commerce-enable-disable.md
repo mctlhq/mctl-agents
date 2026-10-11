@@ -29,7 +29,9 @@ the owner's approval. Never `admins`.
    --out evidence/commerce-proof-<utc>.json`; `--out` is required), attach the
    bundle to #620, and confirm `summary.ok` is true,
    `summary.created_unreadable` is empty and S14 shows zero non-terminal
-   invocations. The
+   invocations. A failed read on the terms world, which runs first, exits 2
+   before any scenario runs and writes no bundle: nothing was spent, so rerun.
+   The
    scenarios share the proof tenant's budget, so the full run drives S3-S7 and
    skips S1 and S2, which each need an unspent EUR 1.00 budget: reset the
    budget and run `--only S1`, then reset again and run `--only S2`, each into
