@@ -1394,3 +1394,90 @@ def test_an_approval_spent_without_its_record_carries_no_timestamp(world, capsys
     assert _restart(world)["reason_code"] == "ok"
     approved = [d for d in _policy_decisions(capsys.readouterr().out) if d["code"] == pc.CODE_APPROVED]
     assert approved and all(d["approver"] == "" and d["decided_at"] == "" for d in approved)
+
+
+# ---------------------------------------------------------------------------
+# mctlhq/mctl-agents#626: retries without usable terms, replayed accepts
+# ---------------------------------------------------------------------------
+
+
+def _terms_unusable(world: World, how: str) -> None:
+    if how == "unreadable":
+        world.ledger.terms_failure = True
+    elif how == "withdrawn":
+        world.ledger.terms.clear()
+    else:
+        world.ledger.publish(PILOT_CAP, world.schema_hash(), price_mode="free", amount=0)
+
+
+@pytest.mark.parametrize("how", ["unreadable", "withdrawn", "free"])
+def test_a_retry_without_terms_settles_a_dispatched_call(world, capsys, how):
+    async def slow():
+        g = await world.gateway()
+        world.gate = asyncio.Event()
+        first = await g.invoke(PILOT_CAP, {"ticket": "OPS-1"})
+        world.gate.set()
+        await asyncio.sleep(0.01)
+        _terms_unusable(world, how)
+        capsys.readouterr()
+        return first, await g.invoke(PILOT_CAP, {"ticket": "OPS-1"})
+
+    first, second = run(slow())
+    assert first["reason_code"] == "outcome-unknown"
+    assert second["reason_code"] == "ok" and second["text"] == "OPS-1: open"
+    assert second["invocation_id"] == world.ledger.only()["invocation_id"]
+    assert len(world.executions) == 1 and world.ledger.budget["committed"] == 12
+    # The verdict is the one the dispatching attempt reached, not "denied".
+    assert '"policy_checkpoint": "allowed"' in _invocation_records(capsys.readouterr().out)[-1]
+
+
+@pytest.mark.parametrize("how", ["unreadable", "withdrawn", "free"])
+@pytest.mark.parametrize("stage", ["accept", "reserve"])
+def test_a_retry_without_terms_names_the_held_invocation_and_never_advances_it(world, how, stage):
+    world.ledger.inject(stage, "crash-after")
+    with pytest.raises(Crash):
+        run(_invoke(world))
+    held = dict(world.ledger.only())
+    g = run(world.gateway())  # a fresh process discovered the terms, then lost them
+    _terms_unusable(world, how)
+    world.ledger.calls.clear()
+    out = run(g.invoke(PILOT_CAP, {"ticket": "OPS-1"}))
+    assert out["reason_code"] == "commerce-terms-unknown"
+    assert out["invocation_id"] == held["invocation_id"] and held["phase"] in out["error"]
+    assert world.ledger.writes() == [] and world.executions == []
+    assert world.ledger.only()["phase"] == held["phase"]
+
+
+def test_a_first_call_without_terms_names_no_invocation(world):
+    g = run(world.gateway())
+    world.ledger.terms_failure = True
+    out = run(g.invoke(PILOT_CAP, {"ticket": "OPS-1"}))
+    assert out["reason_code"] == "commerce-terms-unknown" and "invocation_id" not in out
+    assert world.ledger.writes() == [] and world.ledger.invocations == {}
+
+
+def test_a_retry_without_terms_does_not_adopt_a_row_naming_another_call(world):
+    world.ledger.inject("reserve", "crash-after")
+    with pytest.raises(Crash):
+        run(_invoke(world))
+    world.ledger.only()["args_digest"] = "something-else"
+    g = run(world.gateway())
+    world.ledger.terms_failure = True
+    out = run(g.invoke(PILOT_CAP, {"ticket": "OPS-1"}))
+    assert out["reason_code"] == "outcome-unknown" and world.executions == []
+    assert "dispatch" not in world.ledger.calls
+
+
+@pytest.mark.parametrize("field", ["capability_id", "args_digest", "execution_id", "tenant_id"])
+def test_a_replayed_accept_naming_another_call_is_not_adopted(world, monkeypatch, field):
+    accept = world.ledger.accept
+
+    def replayed_elsewhere(*args, **kwargs):
+        answer = accept(*args, **kwargs)
+        return _ok({**answer.body, field: "something-else", "replayed": True})
+
+    monkeypatch.setattr(world.ledger, "accept", replayed_elsewhere)
+    out = run(_invoke(world))
+    assert out["reason_code"] == "outcome-unknown"
+    assert out["invocation_id"] == world.ledger.only()["invocation_id"]
+    assert "reserve" not in world.ledger.calls and world.executions == []

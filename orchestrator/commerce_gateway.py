@@ -177,6 +177,9 @@ class PaidInvocation:
     _approved_earlier: bool = False
     #: The approval record this attempt consumed, for the audit line.
     _approval_record: aa.ApprovalRecord | None = None
+    #: A row resumed without terms (`_terms_refused`) is past the
+    #: pre-dispatch recheck of an earlier attempt.
+    _past_recheck: bool = False
     _trace: dict[str, Any] = field(default_factory=dict)
 
     # -- plumbing ------------------------------------------------------------
@@ -194,7 +197,9 @@ class PaidInvocation:
     def policy_status(self) -> str:
         d = self._decision
         if d is None:
-            return "denied"
+            # No decision this attempt: a row resumed without terms reports
+            # the verdict of the attempt that took it past the recheck.
+            return "allowed" if self._past_recheck else "denied"
         if d.code in (pc.CODE_ALLOWED, pc.CODE_APPROVED):
             return "allowed"
         return "allowed" if d.code == pc.CODE_APPROVAL_REQUIRED and self._approved_earlier else "denied"
@@ -254,21 +259,21 @@ class PaidInvocation:
         terms = await self._ledger("current_terms", self.descriptor.capability_id,
                                    self.descriptor.input_schema_hash)
         if not terms.ok:
-            return self._refusal("commerce-terms-unknown", "the terms in force could not be resolved")
+            return await self._terms_refused("the terms in force could not be resolved")
         doc = terms.body
         if (doc.get("capability_id") != self.descriptor.capability_id
                 or doc.get("input_schema_hash") != self.descriptor.input_schema_hash
                 or doc.get("provider_id") != self.descriptor.provider.id):
-            return self._refusal("commerce-terms-unknown", "the terms in force name another capability version")
+            return await self._terms_refused("the terms in force name another capability version")
         if doc.get("price_mode") == "free":
-            return self._refusal("commerce-terms-unknown", "the terms in force changed to free; rediscover")
+            return await self._terms_refused("the terms in force changed to free; rediscover")
         try:
             self._binding = cm.terms_binding(doc, tenant_id=self._tenant,
                                              payer_account_id=self.runtime.payer_account_id)
             price = doc["price"]
             currency, amount = price["currency"], price["amount_minor"]
         except (cm.CommerceError, KeyError, TypeError):
-            return self._refusal("commerce-terms-unknown", "the terms in force are malformed")
+            return await self._terms_refused("the terms in force are malformed")
 
         # Step 3: the checkpoint, over the arguments AND the binding.
         decided = self._decide()
@@ -286,7 +291,7 @@ class PaidInvocation:
         )
 
         # Resume: the same call in the same execution already has a row.
-        found = await self._find(key, arguments_digest)
+        found = await self._find(key, arguments_digest, self._request.execution_id)
         if isinstance(found, PaidResult):
             return found
         if found is not None:
@@ -331,12 +336,17 @@ class PaidInvocation:
             terms_binding_value=self._binding,
         )
         if accepted.ok:
+            # A replayed accept hands back an existing row: it gets the same
+            # identity check a row found by key does.
+            other = self._names_another_call(accepted.body, arguments_digest, self._request.execution_id)
+            if other is not None:
+                return other
             self._note(accepted.body, "commerce_accepted")
             return await self._advance(dict(accepted.body))
         # A concurrent attempt accepted first (idempotency-conflict), or the
         # answer was lost: the ledger says which.
         if accepted.status == cm.UNKNOWN or accepted.code == "idempotency-conflict":
-            again = await self._find(key, arguments_digest)
+            again = await self._find(key, arguments_digest, self._request.execution_id)
             if isinstance(again, PaidResult):
                 return again
             if again is not None:
@@ -346,7 +356,57 @@ class PaidInvocation:
         return self._refusal(_code(accepted.code, "policy-denied"), "the invocation was not accepted",
                              approval_ref=approval_id)
 
-    async def _find(self, key: str, arguments_digest: str) -> dict[str, Any] | PaidResult | None:
+    async def _terms_refused(self, why: str) -> PaidResult:
+        """The terms in force cannot be used. A first attempt is refused with
+        nothing created. A retry may find this call's row already in flight:
+        a row past dispatch is settled from the provider's record, which needs
+        no terms and no policy decision, and a row before dispatch is named in
+        the refusal instead of reading as "nothing happened". Neither is
+        advanced toward dispatch: that needs a recheck over the terms."""
+        refusal = self._refusal("commerce-terms-unknown", why)
+        try:
+            execution_id = pc.current_identity().execution_id
+            arguments_digest = cm.args_digest(self.arguments)
+        except Exception:  # noqa: BLE001 — no key can be built, so no row can be named
+            return refusal
+        if not execution_id:
+            return refusal
+        key = cm.gateway_idempotency_key(
+            execution_id=execution_id, capability_id=self.descriptor.capability_id,
+            arguments_digest=arguments_digest, client_key=self.client_key,
+        )
+        found = await self._find(key, arguments_digest, execution_id)
+        if found is None:
+            return refusal
+        if isinstance(found, PaidResult):
+            # The ledger could not be read, or holds a row naming another
+            # call: both outrank "the terms are unknown".
+            return found
+        phase = found.get("phase")
+        if phase in (ACCEPTED, RESERVED):
+            refusal.invocation_id = str(found.get("invocation_id", ""))
+            refusal.phase = str(phase)
+            refusal.error = f"{why}; this call's invocation is {phase} and was not advanced"
+            return refusal
+        # Past the pre-dispatch recheck: that attempt's verdict stands.
+        self._past_recheck = _past_recheck(found)
+        return await self._advance(found)
+
+    def _names_another_call(self, row: Mapping[str, Any], arguments_digest: str,
+                            execution_id: str) -> PaidResult | None:
+        """A row is resumed only if it names exactly this call: the same
+        identity checks a fresh quote gets."""
+        expected = {
+            "capability_id": self.descriptor.capability_id, "args_digest": arguments_digest,
+            "execution_id": execution_id, "tenant_id": self._tenant,
+        }
+        if any(row.get(field) != value for field, value in expected.items()):
+            return self._refusal("outcome-unknown", "the ledger's record for this key names another call",
+                                 invocation_id=str(row.get("invocation_id", "")))
+        return None
+
+    async def _find(self, key: str, arguments_digest: str,
+                    execution_id: str) -> dict[str, Any] | PaidResult | None:
         ans = await self._ledger("find_invocation", self._tenant, key)
         if not ans.ok:
             # Could not observe whether a row exists: never "absent".
@@ -359,18 +419,8 @@ class PaidInvocation:
         if len(rows) != 1 or not isinstance(rows[0], dict):
             return self._refusal("outcome-unknown", "the ledger holds an ambiguous record for this call")
         row = rows[0]
-        # The same identity checks a fresh quote gets: a row is resumed only
-        # if it names exactly this call.
-        if self._request is None:
-            raise RuntimeError("the policy request was not built")
-        expected = {
-            "capability_id": self.descriptor.capability_id, "args_digest": arguments_digest,
-            "execution_id": self._request.execution_id, "tenant_id": self._tenant,
-        }
-        if any(row.get(field) != value for field, value in expected.items()):
-            return self._refusal("outcome-unknown", "the ledger's record for this key names another call",
-                                 invocation_id=str(row.get("invocation_id", "")))
-        return row
+        other = self._names_another_call(row, arguments_digest, execution_id)
+        return other if other is not None else row
 
     def _verify_quote(self, quote: Mapping[str, Any], arguments_digest: str) -> PaidResult | None:
         if self._request is None:
@@ -758,11 +808,15 @@ _APPROVAL_SPENT_PHASES = frozenset({DISPATCHING, DISPATCHED, OUTCOME_UNKNOWN, FI
 _RELEASED_BY_REVOCATION = frozenset({"policy-denied", "identity-unresolved"})
 
 
-def _approval_spent(inv: Mapping[str, Any]) -> bool:
-    """Whether this row's approval was consumed and its policy rechecked
-    by the attempt that moved it here."""
-    if not inv.get("approval_id"):
-        return False
+def _past_recheck(inv: Mapping[str, Any]) -> bool:
+    """Whether an earlier attempt took this row past the pre-dispatch policy
+    recheck (and, for a row with an approval, consumed it)."""
     phase = inv.get("phase")
     return phase in _APPROVAL_SPENT_PHASES or (
         phase == RELEASED and inv.get("reason_code") not in _RELEASED_BY_REVOCATION)
+
+
+def _approval_spent(inv: Mapping[str, Any]) -> bool:
+    """Whether this row's approval was consumed and its policy rechecked
+    by the attempt that moved it here."""
+    return bool(inv.get("approval_id")) and _past_recheck(inv)
