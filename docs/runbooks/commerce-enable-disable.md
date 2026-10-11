@@ -42,7 +42,11 @@ the owner's approval. Never `admins`.
    reconciler keep running. This is the authoritative stop and covers clients
    that ignore the env flag.
 2. mctl-agents: unset `MCTL_COMMERCE_ENABLED`. No runtime is constructed and
-   every paid descriptor is refused at invocation.
+   no terms are read, so a paid capability is dispatched as a legacy tool with
+   no quote, ledger row or budget check. The provider ingress fence refuses it
+   (no signed dispatch authorization: `provider-error`). That is a provider
+   obligation, not this process's, so step 1 is what actually stops paid
+   work; a provider without the fence must never be admitted.
 3. Keep the reconciler running. Never delete ledger rows.
 
 ## Check for outstanding liability

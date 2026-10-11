@@ -28,20 +28,27 @@ each scenario. It contains no arguments, results, tokens or payment proofs.
 
 | id | scenario | expected | offline | live |
 |---|---|---|---|---|
-| S1 | 12 concurrent distinct calls | at most 8 captured, the rest `budget-exhausted`, committed at most 96 | yes | yes |
-| S2 | 9th sequential call after 8 captures | `budget-exhausted`, committed 96 | yes | yes |
+| S1 | 12 concurrent distinct calls | at most 8 captured, the rest `budget-exhausted`, committed at most 96 | yes | `--only S1` on an unspent budget |
+| S2 | 9th sequential call after 8 captures | `budget-exhausted`, committed 96 | yes | `--only S2` on an unspent budget |
 | S3 | provider confirms failure | reservation released, available restored | yes | yes |
 | S4 | same key, same arguments | one invocation, one capture, one execution | yes | yes |
 | S5 | same key, changed arguments | `idempotency-conflict`, original unchanged | yes | yes |
 | S6 | provider called without or with a forged authorization | refused, nothing executed | yes | yes |
 | S7 | second tenant reads and invokes against the first | `not-found`, nothing changed | yes | needs a second token |
-| S8 | permission revoked after accept and after reserve | refused / released, no dispatch | yes | offline-only |
-| S9 | approval pending, then denied | no funds held, refused with no reservation | yes | offline-only |
-| S10 | gateway killed after accept, reserve, the fence, the provider run | at most one execution and one capture | yes | offline-only |
+| S8 | permission revoked after accept and after reserve | refused / released, no dispatch | yes | skipped |
+| S9 | approval pending, then denied | no funds held, refused with no reservation | yes | skipped |
+| S10 | gateway killed after accept, reserve, the fence, the provider run | at most one execution and one capture | yes | skipped |
 | S11 | capture settlement `unknown` after success | `settlement_status: pending`, retried on settlement only, never re-dispatched | yes | offline-only (owner decision 2026-10-11) |
-| S12 | telemetry on and off | identical ledger totals and receipts | yes | offline-only |
-| S13 | commerce disabled with one `outcome_unknown` invocation | new call refused, the pending one reconciles | yes | offline-only |
+| S12 | telemetry on and off | identical ledger totals and receipts | yes | skipped |
+| S13 | commerce disabled with one `outcome_unknown` invocation | flag off: `provider-error` from the fence; switch on: `unsupported-execution`; the pending one reconciles | yes | skipped |
 | S14 | liability sweep | zero non-terminal invocations, or each one named | yes | yes |
+
+Live, every scenario shares the proof tenant's budget and ledger. Each sees
+only the invocations it created and compares budgets as deltas, and each live
+world gets its own execution id so two scenarios never share an idempotency
+key. A full live run drives S3-S7 and S14; S1 and S2 each need an unspent EUR
+1.00 budget and run separately with `--only`. A `skipped` scenario carries its
+reason in the bundle (`summary.not_driven`) and is never read as passed.
 
 Notes on what each backend proves:
 
@@ -56,7 +63,13 @@ Notes on what each backend proves:
   the settlement-only retry is proven offline only, and the bundle records it
   as `offline-only`, never as passed live.
 - S13: while the accept-only switch is on, the expected reason code is
-  `unsupported-execution` (no ADR 020 amendment).
+  `unsupported-execution` (no ADR 020 amendment). With the mctl-agents flag
+  off, no terms are read and the call goes down the legacy path; the provider
+  ingress fence refuses it with `provider-error`, which the scenario asserts
+  exactly.
+- S14: complement test (`phase` not terminal) over every row this run
+  created, plus tenant-wide reads of each known non-terminal phase. A read
+  that fills a page fails the scenario rather than passing on a partial list.
 
 ## Result
 

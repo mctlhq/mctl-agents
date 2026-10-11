@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import itertools
 import json
 import os
 import subprocess
@@ -164,7 +165,7 @@ def live_env() -> Env:
     if not answer.ok:
         raise ProofError(f"dispatch keys could not be read: {answer.reason}")
     keys = _public_keys(answer.body)
-    nonce = format(int(time.time() * 1000), "X").rjust(26, "0")[-26:]
+    worlds_opened = itertools.count()
     other = None
     other_token = os.environ.get("MCTL_TOKEN_OTHER_TENANT", "").strip()
     if other_token:
@@ -188,16 +189,24 @@ def live_env() -> Env:
                 clock=_RealClock(), ledger=client, approvals=aa.ActionApprovalClient(), tmp=Path(tmp),
                 statuses={f"OPS-{i}": "open" for i in range(1, 60)}, tenant=tenant, public_keys=keys,
             )
+            # One execution id per world: two scenarios sharing one would
+            # share idempotency keys (S7 and S1 both call OPS-1).
+            execution_id = "we_" + _world_nonce(next(worlds_opened))
             stack.enter_context(mock.patch.object(
                 pc, "current_identity",
-                lambda: pc.ExecutionIdentity(execution_id="we_" + nonce[:26], trace_id="tr-proof",
-                                             actor="agent:proof")))
+                lambda: pc.ExecutionIdentity(execution_id=execution_id, trace_id="tr-proof", actor="agent:proof")))
             _mark(world)
             env.worlds.append(world)
             yield world
 
     env.new_world = new_world
     return env
+
+
+def _world_nonce(counter: int) -> str:
+    """26 uppercase hex characters, unique per world and per run: the run's
+    start in milliseconds, then the world's index."""
+    return (format(int(time.time() * 1000), "X") + format(counter, "04X")).rjust(26, "0")[-26:]
 
 
 def _public_keys(body: Mapping[str, Any]) -> dict[str, bytes]:
@@ -708,7 +717,8 @@ def s13(env: Env) -> Result:
 
         first = _run(slow())
         phase_before = _rows(w)[0]["phase"]
-        # Layer 2 (mctl-agents): no runtime, so a paid descriptor is refused.
+        # Layer 2 (mctl-agents): no runtime, no terms read, so the call is
+        # dispatched as legacy and the provider ingress fence refuses it.
         flag_off = _call(w, "OPS-2", gateway=_run(w.gateway(commerce=False)))
         # Layer 1 (mctl-api): the accept-only switch.
         w.ledger.accepting = False
@@ -723,7 +733,8 @@ def s13(env: Env) -> Result:
         return _finish("S13", NAMES["S13"], {"new_call": "refused", "pending": "terminal"}, observed, [
             ("one invocation is outstanding", first["reason_code"] == "outcome-unknown"
              and phase_before == "outcome_unknown"),
-            ("with the flag off a paid call is refused", flag_off["reason_code"] != "ok"),
+            ("with the flag off the provider fence refuses the unsigned dispatch",
+             flag_off["reason_code"] == "provider-error"),
             ("with the accept switch on a new call is refused unsupported-execution",
              switched["reason_code"] == "unsupported-execution"),
             ("no new invocation was opened", observed["invocations"] == 1),
@@ -736,30 +747,44 @@ def s13(env: Env) -> Result:
 
 @scenario("S14", "end-of-run liability sweep")
 def s14(env: Env) -> Result:
-    """Tenant-wide, not scoped to this run: every ledger the run touched is
-    read phase by phase, and a page that fills is a failed read. With no
-    world opened yet (`--only S14`) it opens one, so a sweep of nothing
-    cannot pass."""
+    """A complement test, not an enumeration: every invocation this run
+    created is read unfiltered (since the earliest world opened) and any
+    phase outside `TERMINAL`, known or not, is outstanding. Tenant-wide reads
+    of each known non-terminal phase cross-check it, so a stale row from an
+    earlier run is caught too. Any read that fills a page fails rather than
+    passing on a partial list. With no world opened yet (`--only S14`) it
+    opens one, so a sweep of nothing cannot pass."""
     if not env.worlds:
         with env.new_world():
             pass
-    outstanding: list[dict[str, str]] = []
-    swept = 0
-    seen: set[tuple[int, str]] = set()
+    groups: dict[tuple[int, str], list[Any]] = {}
     for w in env.worlds:
-        if (id(w.ledger), w.tenant) in seen:
-            continue  # live worlds share one client and tenant
-        seen.add((id(w.ledger), w.tenant))
-        swept += len(_list(w))
+        groups.setdefault((id(w.ledger), w.tenant), []).append(w)  # live worlds share one client and tenant
+    outstanding: dict[str, dict[str, str]] = {}
+    swept = 0
+
+    def flag(row: Mapping[str, Any]) -> None:
+        outstanding.setdefault(str(row["invocation_id"]), {
+            "invocation_id": str(row["invocation_id"]), "phase": str(row.get("phase")),
+            "reason_code": row.get("reason_code", "") or "unexplained"})
+
+    for worlds in groups.values():
+        w = worlds[0]
+        since = min(x.proof_since for x in worlds)
+        rows = _list(w, since=since)
+        swept += len(rows)
+        for row in rows:
+            if row.get("phase") not in TERMINAL:
+                flag(row)
         for phase in NON_TERMINAL:
             for row in _list(w, phase=phase):
-                outstanding.append({"invocation_id": row["invocation_id"], "phase": row["phase"],
-                                    "reason_code": row.get("reason_code", "") or "unexplained"})
-    observed = {"ledgers": len(seen), "invocations_swept": swept, "non_terminal": outstanding}
+                flag(row)
+    observed = {"ledgers": len(groups), "invocations_swept": swept, "non_terminal": list(outstanding.values())}
     return _finish("S14", NAMES["S14"], {"non_terminal": 0}, observed, [
         ("the sweep read at least one invocation", swept > 0),
-        ("zero invocations in a non-terminal phase", not outstanding),
-        ("every outstanding one carries a reason", all(o["reason_code"] != "unexplained" for o in outstanding)),
+        ("zero invocations outside a terminal phase", not outstanding),
+        ("every outstanding one carries a reason",
+         all(o["reason_code"] != "unexplained" for o in outstanding.values())),
     ])
 
 

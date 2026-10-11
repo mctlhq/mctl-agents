@@ -140,10 +140,12 @@ class CommerceRuntime:
         """The one production construction site (mctlhq/mctl-agents#620).
 
         `MCTL_COMMERCE_ENABLED` must be exactly `true`; anything else
-        (including unset) returns None and the process behaves as before:
-        every paid descriptor is refused at invocation. When enabled it
+        (including unset) returns None and the process behaves as before: no
+        terms are read, so a paid capability is a legacy tool and only the
+        provider ingress fence refuses it (`provider-error`). When enabled it
         raises `CommerceConfigError` where the runtime is built (the
-        gateway's construction), never at the first paid call, if the funds mode is not `simulated`, the admission list
+        gateway's construction), never at the first paid call, if the funds
+        mode is not `simulated`, the admission list
         (`MCTL_COMMERCE_ADMITTED_PROVIDERS`, comma separated) is empty, or no
         tenant is named (`tenant_id` or `MCTL_COMMERCE_TENANT_ID`)."""
         source = os.environ if env is None else env

@@ -492,19 +492,23 @@ def _read_money(value: Any, *, where: str) -> dict[str, Any]:
     return {"currency": currency, "amount_minor": _read_int(value.get("amount_minor"), where=f"{where}.amount_minor")}
 
 
-def _read_policy_decision(value: Any) -> dict[str, str]:
+def _read_policy_decision(value: Any) -> dict[str, str] | None:
+    """The receipt's policy summary, or None when it cannot be trusted as
+    one: a status this client does not know, or a malformed sub-field, drops
+    the sub-object instead of making the whole (otherwise valid) receipt
+    UNKNOWN. mctl-api may add a status before this client learns it."""
     if not isinstance(value, Mapping):
-        raise CommerceError("receipt.policy_decision must be an object")
+        return None
     out: dict[str, str] = {}
     for name in _POLICY_DECISION_FIELDS:
         field = value.get(name)
         if field is None:
             continue
         if not isinstance(field, str):
-            raise CommerceError(f"receipt.policy_decision.{name} must be a string")
+            return None
         out[name] = field
     if out.get("status") not in _POLICY_DECISION_STATUSES:
-        raise CommerceError(f"receipt.policy_decision.status {out.get('status')!r} is not recognised")
+        return None
     return out
 
 
@@ -571,8 +575,9 @@ class ReceiptView:
             out["terms_version"] = _read_int(data.get("terms_version"), where="receipt.terms_version")
         if data.get("usage_quantity") is not None:
             out["usage_quantity"] = _read_int(data.get("usage_quantity"), where="receipt.usage_quantity")
-        if data.get("policy_decision") is not None:
-            out["policy_decision"] = _read_policy_decision(data.get("policy_decision"))
+        policy_decision = _read_policy_decision(data.get("policy_decision"))
+        if policy_decision is not None:
+            out["policy_decision"] = policy_decision
         for name in _RECEIPT_MONEY_FIELDS:
             if data.get(name) is not None:
                 out[name] = _read_money(data.get(name), where=f"receipt.{name}")

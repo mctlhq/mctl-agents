@@ -111,8 +111,9 @@ def test_discovery_shows_no_price_where_this_execution_cannot_charge(world):
     off = run(world.gateway(commerce=False))
     assert legacy_shaped(off)
     assert run(world.gateway(commerce=False)).search("")["results"] == off.search("")["results"]
-    # Off: the paid provider refuses an unauthorized call and nothing touches the ledger.
-    assert run(_invoke(world, gateway=off))["reason_code"] != "ok" and world.ledger.writes() == []
+    # Off: no terms are read, the call goes down the legacy path and the
+    # provider ingress fence refuses the unsigned dispatch; the ledger is untouched.
+    assert run(_invoke(world, gateway=off))["reason_code"] == "provider-error" and world.ledger.writes() == []
     world.admitted = frozenset({"someone-else"})
     unadmitted = run(world.gateway())
     assert legacy_shaped(unadmitted)
@@ -254,6 +255,17 @@ def test_t4_a_budget_with_unsuffixed_names_is_unreadable_not_zero():
     assert _Wire(body=legacy).get_budget("t").status == cm.UNKNOWN
 
 
+def test_discovery_shows_a_free_summary_without_a_paid_runtime(world):
+    """Review of #634: the availability check guards charging, so a free
+    summary is shown even where a paid call could not run."""
+    world.ledger.publish(PILOT_CAP, world.schema_hash(), price_mode="free", amount=0, version=2)
+    world.admitted = frozenset({"someone-else"})
+    g = run(world.gateway())
+    row = {r["capability_id"]: r for r in g.search("")["results"]}[PILOT_CAP]
+    entry = g.describe([PILOT_CAP])["results"][PILOT_CAP]
+    assert row["commerce"]["price_mode"] == "free" and entry["commerce"]["price_mode"] == "free"
+
+
 def test_t4_the_receipt_carries_usage_and_a_whitelisted_policy_reference():
     body = _Wire(body={**RECEIPT, "policy_decision": {
         "status": "recorded", "approval_id": "apr_1", "policy_rule_id": "paid", "policy_version": "v3",
@@ -261,8 +273,11 @@ def test_t4_the_receipt_carries_usage_and_a_whitelisted_policy_reference():
     assert body["usage_quantity"] == 1
     assert body["policy_decision"] == {"status": "recorded", "approval_id": "apr_1", "policy_rule_id": "paid",
                                        "policy_version": "v3"}
+    # Review of #634: a status this client does not know, or a malformed
+    # sub-field, drops the summary; the receipt itself stays readable.
     for bad in ({"status": "approved"}, {}, "recorded", {"status": "none", "approval_id": 7}):
-        assert _Wire(body={**RECEIPT, "policy_decision": bad}).get_receipt("t", "i").status == cm.UNKNOWN
+        answer = _Wire(body={**RECEIPT, "policy_decision": bad}).get_receipt("t", "i")
+        assert answer.ok and "policy_decision" not in answer.body and answer.body["usage_quantity"] == 1
     assert _Wire(body={**RECEIPT, "usage_quantity": 1.0}).get_receipt("t", "i").status == cm.UNKNOWN
 
 
@@ -441,7 +456,7 @@ def test_t10_settlement_unknown_stays_pending_then_settles_without_redispatch(su
 def test_t11_disable_refuses_new_calls_and_the_pending_one_reconciles(suite):
     o = suite["S13"].observed
     assert o["phase_before"] == "outcome_unknown" and o["phase_after"] == "finalized"
-    assert o["flag_off"] != "ok" and o["switch_on"] == "unsupported-execution" and o["invocations"] == 1
+    assert o["flag_off"] == "provider-error" and o["switch_on"] == "unsupported-execution" and o["invocations"] == 1
 
 
 def test_t12_direct_provider_calls_without_authorization_execute_nothing(suite):
@@ -549,6 +564,24 @@ def test_a_full_page_is_a_failed_read_never_a_complete_one(monkeypatch):
     monkeypatch.setattr(proof, "PAGE", 1)
     [s3] = proof.run_suite(env, ["S3"])  # its one row fills the page
     assert s3.status == proof.FAILED and "truncated" in s3.note
+
+
+def test_s14_is_a_complement_test_so_an_unlisted_phase_is_outstanding(monkeypatch):
+    """Review of #634: a phase S14 does not enumerate (mctl-api adds one)
+    is outside `TERMINAL`, so it is outstanding, never swept past."""
+    env, ledger = _shared_env(monkeypatch)
+    [s3] = proof.run_suite(env, ["S3"])
+    assert s3.status == proof.PASSED
+    stuck = next(iter(ledger.invocations.values()))
+    stuck["phase"] = "settling"
+    [s14] = proof.run_suite(env, ["S14"])
+    assert s14.status == proof.FAILED
+    assert [o["phase"] for o in s14.observed["non_terminal"]] == ["settling"]
+
+
+def test_each_live_world_gets_its_own_execution_id():
+    ids = {proof._world_nonce(i) for i in range(3)}
+    assert len(ids) == 3 and all(len(n) == 26 and n == n.upper() for n in ids)
 
 
 def test_s14_alone_cannot_pass_by_sweeping_nothing():

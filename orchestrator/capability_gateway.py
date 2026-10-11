@@ -973,8 +973,13 @@ class CapabilityGateway:
 
     def _offered_commerce(self, descriptor: CapabilityDescriptor) -> CommerceSummary | None:
         """The summary discovery may show: None for a legacy descriptor and
-        for one this execution could not charge."""
-        if descriptor.commerce is None or self._paid_unavailable(descriptor.capability_id) is not None:
+        for a paid one this execution could not charge. A free summary needs
+        no runtime, so it is shown as sealed."""
+        if descriptor.commerce is None:
+            return None
+        if descriptor.commerce.price_mode == "free":
+            return descriptor.commerce
+        if self._paid_unavailable(descriptor.capability_id) is not None:
             return None
         return descriptor.commerce
 

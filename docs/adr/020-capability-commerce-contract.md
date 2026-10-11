@@ -768,10 +768,14 @@ change no encoding, reason code or state.
   same `not-found`. An unreachable ledger is `unknown`, never a zero balance
   or an empty list.
 - `CommerceRuntime.from_env` is the only production construction site.
-  `MCTL_COMMERCE_ENABLED` must be exactly `true`; otherwise no runtime exists
-  and every paid descriptor is refused at invocation. Enabling it with a
+  `MCTL_COMMERCE_ENABLED` must be exactly `true`; otherwise no runtime exists,
+  no terms are read and a paid capability is sealed and dispatched as a legacy
+  tool: no quote, no ledger row, no budget check. What refuses it is the
+  provider ingress fence (section 9: no signed dispatch authorization, so
+  `provider-error`), a provider-side obligation, which is why the mctl-api
+  accept-only switch is the authoritative stop. Enabling it with a
   `funds_mode` other than `simulated`, an empty `MCTL_COMMERCE_ADMITTED_PROVIDERS`
-  or no tenant refuses to start.
+  or no tenant fails when the gateway is built, before any paid call.
 - The accept-only kill switch is mctl-api's (mctl-api#570). While it is on,
   a new acceptance is refused with `unsupported-execution`, so section 13
   needs no new code. Reconciliation keeps resolving outstanding invocations.

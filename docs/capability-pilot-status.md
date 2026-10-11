@@ -112,8 +112,10 @@ pilot does not make. It needs the CWFT to set both env vars.
 adds an advisory `approval_expected`. The block appears only where this
 execution could actually charge the call: commerce enabled, the policy
 checkpoint configured, the provider admitted and not long-running. Otherwise
-the capability is listed as legacy and `capability_invoke` refuses it, so with
-commerce disabled (today) no price is shown. Legacy capabilities are unchanged. The
+the capability is listed as legacy, so with commerce disabled (today) no
+price is shown. With commerce disabled no terms are read at all and a paid
+capability is dispatched as a legacy tool; the provider ingress fence refuses
+it (`provider-error`). Legacy capabilities are unchanged. The
 tenant reads (`CommerceClient.get_budget`, `get_receipt`, `list_invocations`)
 and the commerce metrics exist in code. Nothing is enabled: no deployed
 values file sets `MCTL_COMMERCE_ENABLED`.
@@ -128,8 +130,10 @@ mctlhq/mctl-agents#631.
 
 **Evidence:** `docs/benchmarks/paid-capabilities-proof.md`.
 
-**Rollback:** unset `MCTL_COMMERCE_ENABLED`. Keep mctl-api's reconciler
-running until no invocation is outstanding.
+**Rollback:** turn on mctl-api's accept-only switch first (the
+authoritative stop), then unset `MCTL_COMMERCE_ENABLED`; after that the
+provider fence is what refuses a paid tool. Keep mctl-api's reconciler running
+until no invocation is outstanding.
 
 ## Rollback
 
