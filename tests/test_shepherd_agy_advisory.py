@@ -556,3 +556,49 @@ def test_a_fail_verdict_with_nothing_parsed_is_flagged(capsys) -> None:
     p3_only = AGY_STAR_BULLETS.replace("P1", "P3")
     assert _read([_agy(1, p3_only, "2026-04-29T11:30:00Z")]) == []
     assert "layout not recognised" not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Review round 4 on mctl-agents#617: the CI-only prompt must not deny the
+# advisory items it renders.
+# ---------------------------------------------------------------------------
+def _ci_only_bundle(advisory: bool) -> dict:
+    bundle: dict = {
+        "p1": False, "p2": False, "summaries": [],
+        "ci_failures": [{"name": "tests", "conclusion": "failure", "log_excerpt": "boom"}],
+    }
+    if advisory:
+        bundle["advisory_findings"] = [
+            {"reviewer": "agy", "severity": "P2", "comment_id": 9, "commit": SHA7, "body": "adv"},
+        ]
+    return bundle
+
+
+def test_ci_only_prompt_with_advisory_admits_the_items() -> None:
+    bundle = _ci_only_bundle(advisory=True)
+    assert run_implementer._bundle_is_ci_only(bundle)
+    prompt = run_implementer._build_prompt(_ref(), review_feedback=bundle)
+
+    assert "there are no P1/P2 review findings to address" not in prompt
+    assert "An advisory reviewer (agy) also left non-blocking P1/P2 items" in prompt
+    assert "does not stop a valid advisory fix in another file" in prompt
+    assert "`fix(review): address advisory reviewer items`" in prompt
+    assert "Declining advisory items is never by itself a reason to refuse" in prompt
+    # The CI fix keeps its own subject.
+    assert "`fix(ci): fix failing required checks on issue-1-x`" in prompt
+
+
+def test_ci_only_prompt_without_advisory_is_unchanged() -> None:
+    prompt = run_implementer._build_prompt(_ref(), review_feedback=_ci_only_bundle(advisory=False))
+    assert "there are no P1/P2 review findings to address" in prompt
+    assert "Advisory" not in prompt
+
+
+def test_review_prompt_with_advisory_gets_the_advisory_lines() -> None:
+    bundle = {
+        "p1": False, "p2": True, "summaries": ["[P2] a.py:3: s"],
+        "advisory_findings": [{"reviewer": "agy", "severity": "P1", "body": "adv"}],
+    }
+    prompt = run_implementer._build_prompt(_ref(), review_feedback=bundle)
+    assert "does not stop a valid advisory fix in another file" in prompt
+    assert "refute each advisory item in the reason" in prompt

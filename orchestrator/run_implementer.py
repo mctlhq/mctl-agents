@@ -1860,9 +1860,39 @@ def _build_prompt(
         # the code-review framing; a CI-only bundle then read as a
         # self-contradiction (mctl-agents#411 review).
         work_items = "failing required checks" if ci_only else "codex findings"
+        # agy's advisory items ride along on either path but never change its
+        # classification (`_bundle_is_ci_only` ignores them). The wording
+        # below must still admit they exist: on the CI-only path the default
+        # lines deny any P1/P2 and confine the change to the touched files,
+        # which would contradict the advisory section the agent reads next.
+        has_advisory = bool(review_feedback.get("advisory_findings"))
+        advisory_apply = (
+            "\n   Then handle each item under \"Advisory reviewer (agy)\": fix it "
+            "if it is valid\n   (the scope rule above does not stop a valid "
+            "advisory fix in another file),\n   otherwise refute it in the "
+            "commit body, per item (by its \"Advisory\" number),\n   with "
+            "evidence. An advisory fix goes in its own commit with the "
+            "subject\n   `fix(review): address advisory reviewer items`, not "
+            "under the subject below."
+            if has_advisory
+            else ""
+        )
+        advisory_refusal = (
+            "\n   Declining advisory items is never by itself a reason to "
+            "refuse; when you do\n   refuse, refute each advisory item in the "
+            "reason by its \"Advisory\" number."
+            if has_advisory
+            else ""
+        )
         if ci_only:
             trigger_line = (
-                "- A required CI check is FAILING on this PR. The code review "
+                "- A required CI check is FAILING on this PR. The gating code "
+                "review is clean — no gating reviewer left P1/P2 findings. The "
+                "failing-check evidence is below. An advisory reviewer (agy) "
+                "also left non-blocking P1/P2 items, listed last; they are not "
+                "why this run started."
+                if has_advisory
+                else "- A required CI check is FAILING on this PR. The code review "
                 "is clean — there are no P1/P2 review findings to address. The "
                 "failing-check evidence is below."
             )
@@ -1873,12 +1903,14 @@ def _build_prompt(
             apply_line = (
                 "Apply the MINIMAL change that makes each failing check pass. "
                 "Stay in scope —\n   do not refactor outside the touched files."
+                + advisory_apply
             )
             refusal_line = (
                 "5. If a failing check is not something a code change can fix "
                 "(an infrastructure\n   outage, a flake), is already fixed in "
                 "the working tree, or must NOT be acted\n   on because of an "
                 "explicit operator decision recorded on the PR, do not commit."
+                + advisory_refusal
             )
         else:
             trigger_line = (
@@ -1896,6 +1928,7 @@ def _build_prompt(
                 "decline others, commit the fixes and say in the commit\n   "
                 "body, per declined finding (by its \"Reviewer text\" number), "
                 "why, with evidence."
+                + advisory_apply
             )
             refusal_line = (
                 "5. If a finding is invalid, is already addressed, or must NOT "
@@ -1907,6 +1940,7 @@ def _build_prompt(
                 "that\n   refutes it (file:line of the code that already handles "
                 "it, the operator\n   note) — a bare \"not applicable\" will "
                 "just be raised again."
+                + advisory_refusal
             )
         if adopted:
             number = _adopted_pr_number(ref)
