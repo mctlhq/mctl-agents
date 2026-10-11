@@ -244,8 +244,6 @@ class PaidInvocation:
     # -- entry -----------------------------------------------------------------
 
     async def run(self) -> PaidResult:
-        if self.runtime.client is None:
-            return self._refusal("commerce-terms-unknown", "no commerce runtime is configured")
         if cm.TERMS_BINDING_ARGUMENT in self.arguments:
             return self._refusal("invalid-arguments", f"{cm.TERMS_BINDING_ARGUMENT} is reserved")
 
@@ -408,7 +406,7 @@ class PaidInvocation:
         fresh = aa.intent_hash(intent)
         answer = await asyncio.to_thread(
             store.create, intent, key=aa.idempotency_key(intent, 0),
-            expires_at=self.runtime.now() + timedelta(seconds=aa._ttl_s()),
+            expires_at=self.runtime.now() + timedelta(seconds=aa.ttl_s()),
         )
         rec = answer.record
         if rec is None:
@@ -420,7 +418,7 @@ class PaidInvocation:
             return self._refusal("policy-denied", "awaiting human approval; nothing is held", approval_ref=rec.id)
         if answer.status != aa.APPROVED:
             return self._refusal("policy-denied", f"approval {answer.status}", approval_ref=rec.id)
-        expires = aa._parse_time(rec.expires_at)
+        expires = aa.parse_time(rec.expires_at)
         if expires is None or expires <= self.runtime.now():
             return self._refusal("policy-denied", "approval expired", approval_ref=rec.id)
         return rec.id

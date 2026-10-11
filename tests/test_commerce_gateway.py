@@ -478,7 +478,7 @@ def world(tmp_path, monkeypatch, capsys):
     w.ledger.publish(PILOT_CAP, w.schema_hash())
     monkeypatch.setattr(pc, "current_identity",
                         lambda: pc.ExecutionIdentity(execution_id=EXECUTION, trace_id="tr-1", actor="agent:test"))
-    monkeypatch.setattr(aa, "_ttl_s", lambda: 3600)
+    monkeypatch.setattr(aa, "ttl_s", lambda: 3600)
     return w
 
 
