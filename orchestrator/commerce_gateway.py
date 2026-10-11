@@ -305,14 +305,25 @@ class PaidInvocation:
 
     async def run(self) -> PaidResult:
         started = time.monotonic()
-        result = await self._run()
         summary = self.descriptor.commerce
-        commerce_metrics.record_invocation(
-            admitted_providers=self.runtime.admitted_providers, phase=result.phase,
-            reason_code=result.reason_code, price_mode=summary.price_mode if summary else "",
-            funds_mode=summary.funds_mode if summary else "", provider_id=self.descriptor.provider.id,
-            duration_s=time.monotonic() - started,
-        )
+
+        def record(phase: str, reason_code: str) -> None:
+            commerce_metrics.record_invocation(
+                admitted_providers=self.runtime.admitted_providers, phase=phase,
+                reason_code=reason_code, price_mode=summary.price_mode if summary else "",
+                funds_mode=summary.funds_mode if summary else "", provider_id=self.descriptor.provider.id,
+                duration_s=time.monotonic() - started,
+            )
+
+        try:
+            result = await self._run()
+        except Exception:
+            # The caller turns this into outcome-unknown; the metrics must see it.
+            record("", "outcome-unknown")
+            commerce_metrics.record_outcome_unknown(
+                admitted_providers=self.runtime.admitted_providers, provider_id=self.descriptor.provider.id)
+            raise
+        record(result.phase, result.reason_code)
         return result
 
     async def _run(self) -> PaidResult:

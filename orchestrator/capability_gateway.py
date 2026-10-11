@@ -943,12 +943,25 @@ class CapabilityGateway:
                 "summary": descriptor.summary,
                 "consequence": descriptor.consequence,
             }
-            if descriptor.commerce is not None:
+            if descriptor.commerce is not None and self._can_charge(descriptor):
                 row["commerce"] = _commerce_search_view(descriptor.commerce)
             rows.append(row)
         return {"results": rows[:row_limit], "reason_code": "ok"}
 
-    def _approval_expected(self, descriptor: CapabilityDescriptor) -> str:
+    def _can_charge(self, descriptor: CapabilityDescriptor) -> bool:
+        """Mirror of the `_invoke_paid` gates: a price is advertised only when
+        this execution could actually charge it."""
+        if self.commerce is None or not isinstance(self.checkpoint, PolicyDecidePolicyCheckpoint):
+            return False
+        dispatch = self.dispatch_by_id.get(descriptor.capability_id)
+        if dispatch is None:
+            return False
+        provider = dispatch[0]
+        if provider.id not in self.commerce.admitted_providers:
+            return False
+        return self.task_support_by_id.get(descriptor.capability_id) != "required"
+
+    def _approval_expected(self,descriptor: CapabilityDescriptor) -> str:
         """Advisory (mctlhq/mctl-agents#620): `required` | `not_required` |
         `unknown`, from the configured policy's rule for this tool. Reads no
         arguments and contacts nothing; `capability_invoke` re-decides."""
@@ -1000,7 +1013,7 @@ class CapabilityGateway:
                 "consequence": descriptor.consequence,
                 "input_schema": dict(self.schemas_by_id.get(capability_id, {})),
             }
-            if descriptor.commerce is not None:
+            if descriptor.commerce is not None and self._can_charge(descriptor):
                 entry["commerce"] = _commerce_view(descriptor.commerce)
                 entry["approval_expected"] = self._approval_expected(descriptor)
             results[capability_id] = entry
