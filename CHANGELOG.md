@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.74.1](https://github.com/mctlhq/mctl-agents/compare/1.74.0...1.74.1) (2026-10-11)
+
+
+### Bug Fixes
+
+* **shepherd:** bound the wait on an UNKNOWN merge state ([c36de23](https://github.com/mctlhq/mctl-agents/commit/c36de23b8b134a23ad91b1d53937d1385d18710d))
+* **shepherd:** bound the wait on an UNKNOWN merge state ([ff2bd0f](https://github.com/mctlhq/mctl-agents/commit/ff2bd0f27f12ac36fe355b2aeaf7bab3fca41b5f)), closes [#633](https://github.com/mctlhq/mctl-agents/issues/633)
+
 ## [1.74.0](https://github.com/mctlhq/mctl-agents/compare/1.73.0...1.74.0) (2026-10-11)
 
 
