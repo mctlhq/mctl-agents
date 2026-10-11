@@ -104,6 +104,7 @@ workflow, so the recorded activity input is unchanged.
 | `gen_ai.response.model` | `chat` | upstream | `AssistantMessage.model` |
 | `gen_ai.agent.name` | `invoke_agent` | upstream | the agent name |
 | `gen_ai.usage.input_tokens` / `output_tokens` | `chat` (per message), `invoke_agent` (summed over result frames) | catalog (reserved) | SDK `usage` |
+| `gen_ai.usage.cache_read.input_tokens` / `cache_creation.input_tokens` | `chat` (per message), `invoke_agent` (summed over result frames; present only if reported) | upstream GenAI (development) | SDK `usage` `cache_read_input_tokens` / `cache_creation_input_tokens`; never added to `input_tokens` |
 | `gen_ai.tool.name` / `mctl.tool.name` | `execute_tool` | upstream / catalog (shipped) | `ToolUseBlock.name` |
 | `mctl.tool.status` | `execute_tool` | catalog (shipped) | `ok`, `error`, `incomplete` |
 | `mcp.method.name` | `execute_tool mcp__*` | upstream | `tools/call` |
@@ -326,6 +327,8 @@ each item with a link or a screenshot, and it adds no gate the issue does not ha
    not a prerequisite for closing #195.
 2. [ ] **Token counters survive the Collector** (mctl-gitops#1332 closed).
    `gen_ai.usage.input_tokens` arrives as an integer, not `****`.
+   The same holds for `gen_ai.usage.cache_read.input_tokens` and
+   `gen_ai.usage.cache_creation.input_tokens` on `chat` spans.
 3. [ ] **Catalog updated.** The mctl-docs reservation PR for the proposed names
    is merged.
 4. [ ] **Worker env.** `otel.enabled: true` is live on the worker

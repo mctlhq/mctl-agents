@@ -64,7 +64,8 @@ _ALLOWED_KEY = re.compile(
     r"^(?:"
     r"mctl\.[a-z0-9_]+(?:\.[a-z0-9_]+)*"  # the mctl catalog namespace
     r"|gen_ai\.(?:operation\.name|provider\.name|request\.model|response\.model|agent\.name|tool\.name"
-    r"|usage\.input_tokens|usage\.output_tokens)"
+    r"|usage\.input_tokens|usage\.output_tokens"
+    r"|usage\.cache_read\.input_tokens|usage\.cache_creation\.input_tokens)"
     r"|mcp\.method\.name"
     r"|error\.type"
     r"|exception\.(?:type|escaped)"
@@ -78,7 +79,14 @@ _ALLOWED_KEY = re.compile(
 _ERROR_DETAIL_KEY = re.compile(r"^exception\.(?:message|stacktrace)$")
 # The two usage counters are the only keys allowed to contain "token": they
 # are integers, and an integer cannot hold a credential.
-_USAGE_TOKEN_KEYS = frozenset({"gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens"})
+_USAGE_TOKEN_KEYS = frozenset(
+    {
+        "gen_ai.usage.input_tokens",
+        "gen_ai.usage.output_tokens",
+        "gen_ai.usage.cache_read.input_tokens",
+        "gen_ai.usage.cache_creation.input_tokens",
+    }
+)
 # `_CREDENTIAL_VALUE`, `_DENIED_KEY`, `_TOKEN_KEY` and `MAX_ATTRIBUTE_CHARS`
 # now live in `orchestrator/redaction.py` (mctl-agents#520) so they can be
 # shared with the stdlib-only evidence module; imported above unchanged.
