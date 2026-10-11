@@ -302,13 +302,27 @@ def _check_legacy_env_override(manifest: AgentManifest) -> list[str]:
     return []
 
 
+def cluster_workflow_template_names(directory: Path) -> set[str]:
+    """The `metadata.name` of every document in `directory`'s `cwft-*.yaml`
+    files. A file may hold several documents: since mctl-gitops fc958d6
+    (templateReferencing: Strict) a CronWorkflow and the template it
+    references share one file, and reading only the first document failed
+    every manifest. The names are not filtered by `kind`, which keeps the
+    check exactly as permissive as before: the mentor manifest names the
+    CronWorkflow `mctl-agents-daily`, not a template. A file that does not
+    parse raises: it is never read as "defines nothing"."""
+    names: set[str] = set()
+    for path in sorted(directory.glob("cwft-*.yaml")):
+        for document in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+            if document is not None:
+                names.add(document["metadata"]["name"])
+    return names
+
+
 def _check_cluster_workflow_template(manifest: AgentManifest) -> list[str]:
     if not GITOPS_CWFT_DIR.is_dir():
         return _gitops_missing(GITOPS_CWFT_DIR, "clusterWorkflowTemplate references")
-    names = {
-        yaml.safe_load(p.read_text(encoding="utf-8"))["metadata"]["name"]
-        for p in GITOPS_CWFT_DIR.glob("cwft-*.yaml")
-    }
+    names = cluster_workflow_template_names(GITOPS_CWFT_DIR)
     if manifest.cluster_workflow_template not in names:
         return [
             f"execution.sandbox.clusterWorkflowTemplate {manifest.cluster_workflow_template!r} "
