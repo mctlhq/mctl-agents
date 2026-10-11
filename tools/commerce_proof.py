@@ -122,7 +122,9 @@ class Env:
     other_tenant: str = "tenant-b"
     other_ledger: Any = None
     #: Invocation ids every closed world created (`_close`), for S14.
-    reported: set[str] = field(default_factory=set)
+    created: set[str] = field(default_factory=set)
+    #: Why a world's invocations could not be read on close; fails S14.
+    created_unreadable: list[str] = field(default_factory=list)
 
 
 def _fakes() -> Any:
@@ -152,8 +154,10 @@ def offline_env() -> Env:
             stack.enter_context(mock.patch.object(aa, "ttl_s", lambda: 3600))
             _mark(world)
             env.worlds.append(world)
-            yield world
-            _close(env, world)
+            try:
+                yield world
+            finally:
+                _close(env, world)
 
     env.new_world = new_world
     env.other_ledger = None
@@ -204,8 +208,10 @@ def live_env() -> Env:
                 lambda: pc.ExecutionIdentity(execution_id=execution_id, trace_id="tr-proof", actor="agent:proof")))
             _mark(world)
             env.worlds.append(world)
-            yield world
-            _close(env, world)
+            try:
+                yield world
+            finally:
+                _close(env, world)
 
     env.new_world = new_world
     return env
@@ -271,10 +277,16 @@ def _mark(world: Any) -> None:
 
 
 def _close(env: Env, world: Any) -> None:
-    """On a world's normal exit, record the invocations it created for S14,
-    whatever its scenario passed as `receipts=` (S8, S10, S12 and S13 pass
-    none). A world that raised is a failed scenario already."""
-    env.reported.update(str(r["invocation_id"]) for r in _rows(world))
+    """On every exit of a world (pass, failure or `Skip`), record the
+    invocations it created for S14, whatever its scenario passed as
+    `receipts=`. Never raises: a failed bookkeeping read must not turn a
+    scenario whose checks held into a failure, or mask the exception it is
+    unwinding. The read failure is S14's instead, the scenario the ids are
+    for."""
+    try:
+        env.created.update(str(r["invocation_id"]) for r in _rows(world))
+    except Exception as exc:  # noqa: BLE001 — recorded for S14, never raised here
+        env.created_unreadable.append(f"{type(exc).__name__}: {exc}")
 
 
 def _rows(world: Any) -> list[dict[str, Any]]:
@@ -327,6 +339,8 @@ class Result:
     expected: dict[str, Any]
     observed: dict[str, Any]
     checks: list[dict[str, Any]]
+    #: Informational: the receipts a scenario chose to cite. S14 checks
+    #: `Env.created`, every row every world wrote, not these.
     receipt_ids: list[str] = field(default_factory=list)
     note: str = ""
 
@@ -770,7 +784,7 @@ def s14(env: Env) -> Result:
     passing on a partial list. `invocations_swept` counts the rows read
     since the earliest world's `proof_since` (rows from the lookback window
     before it included, so a stale one is caught) plus the cross-check rows.
-    Every invocation an earlier scenario reported must be in that scoped
+    Every invocation any closed world created must be in that scoped
     read, so a sweep that silently missed the run's rows cannot pass; a run
     whose scenarios created none (S6 alone, or a live rerun where every
     budget-bound scenario skipped) and a clean tenant pass. With no world
@@ -806,11 +820,13 @@ def s14(env: Env) -> Result:
             swept += len(phase_rows)
             for row in phase_rows:
                 flag(row)
-    missed = sorted(env.reported - scoped_ids)
+    missed = sorted(env.created - scoped_ids)
     observed = {"ledgers": len(groups), "reads": reads, "invocations_swept": swept,
-                "reported": len(env.reported), "missed": missed, "non_terminal": list(outstanding.values())}
+                "created": len(env.created), "created_unreadable": list(env.created_unreadable),
+                "missed": missed, "non_terminal": list(outstanding.values())}
     return _finish("S14", NAMES["S14"], {"non_terminal": 0}, observed, [
-        ("every invocation the scenarios reported was swept", not missed),
+        ("every world's invocations were read when it closed", not env.created_unreadable),
+        ("every invocation this run created was swept", not missed),
         ("zero invocations outside a terminal phase", not outstanding),
         ("every outstanding one carries a reason",
          all(o["reason_code"] != "unexplained" for o in outstanding.values())),

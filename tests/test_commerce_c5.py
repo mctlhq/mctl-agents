@@ -567,8 +567,10 @@ def _shared_env(monkeypatch):
                 ledger.publish(fk.PILOT_CAP, w.schema_hash())
             proof._mark(w)
             env.worlds.append(w)
-            yield w
-            proof._close(env, w)
+            try:
+                yield w
+            finally:
+                proof._close(env, w)
 
     env.new_world = new_world
     return env, ledger
@@ -644,7 +646,7 @@ def test_s14_covers_scenarios_that_report_no_receipts():
     assert s13.status == proof.PASSED and s13.receipt_ids == []
     [world] = env.worlds
     created = {r["invocation_id"] for r in proof._rows(world)}
-    assert created and created <= env.reported
+    assert created and created <= env.created
     world.ledger.invocations.clear()
     [s14] = proof.run_suite(env, ["S14"])
     assert s14.status == proof.FAILED and set(s14.observed["missed"]) == created
@@ -658,13 +660,56 @@ def test_the_fake_ledger_honours_since_like_mctl_api(monkeypatch):
     assert ledger.list_invocations(ledger.tenant, since=later).body["invocations"] == []
 
 
+def test_a_failed_read_on_close_fails_s14_not_the_scenario(monkeypatch):
+    """Review of #634: the close-time bookkeeping read never flips a
+    scenario whose checks held; S14 owns the failure."""
+    env, _ = _shared_env(monkeypatch)
+    real = proof._rows
+
+    def flaky(world):
+        if getattr(world, "closing", False):
+            raise proof.ProofError("invocations could not be listed: 503")
+        return real(world)
+
+    real_close = proof._close
+
+    def close(env_, world):
+        world.closing = True
+        real_close(env_, world)
+
+    monkeypatch.setattr(proof, "_rows", flaky)
+    monkeypatch.setattr(proof, "_close", close)
+    s3, s14 = proof.run_suite(env, ["S3", "S14"])
+    assert s3.status == proof.PASSED
+    assert s14.status == proof.FAILED and "503" in s14.observed["created_unreadable"][0]
+
+
+def test_a_skipped_world_still_reports_what_it_created(monkeypatch):
+    env, _ = _shared_env(monkeypatch)
+    with pytest.raises(proof.Skip), env.new_world() as w:
+        proof._call(w, "OPS-1")
+        raise proof.Skip("after a row was written")
+    assert env.created and env.created == {r["invocation_id"] for r in proof._rows(w)}
+
+
+def test_scoping_excludes_an_earlier_scenario_by_time_not_only_by_preexisting_ids(monkeypatch):
+    """Review of #634: offline rows on the older side of a world's
+    `proof_since` are excluded by the `since` read itself."""
+    env, ledger = _shared_env(monkeypatch)
+    proof.run_suite(env, ["S3"])
+    ledger.clock.advance(proof.LOOKBACK_S + 1)
+    with env.new_world() as later:
+        assert later.proof_preexisting == frozenset()  # the read already left S3's rows out
+        assert proof._list(later, since=later.proof_since) == []
+
+
 def test_s14_passes_when_the_scenarios_that_ran_created_no_invocation(monkeypatch):
     """Review of #634: S6 opens a world but creates no row; that is not a
     vacuous sweep."""
     env, _ = _shared_env(monkeypatch)
     s6, s14 = proof.run_suite(env, ["S6", "S14"])
     assert s6.status == proof.PASSED and s6.receipt_ids == []
-    assert s14.status == proof.PASSED and s14.observed["reported"] == 0
+    assert s14.status == proof.PASSED and s14.observed["created"] == 0
 
 
 def test_the_cli_refuses_a_live_run_without_a_bundle_and_a_malformed_image_tag():
