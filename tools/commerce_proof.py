@@ -121,6 +121,8 @@ class Env:
     order: tuple[str, ...] = ()
     other_tenant: str = "tenant-b"
     other_ledger: Any = None
+    #: Invocation ids the scenarios reported, collected by `run_suite` for S14.
+    reported: set[str] = field(default_factory=set)
 
 
 def _fakes() -> Any:
@@ -759,12 +761,12 @@ def s14(env: Env) -> Result:
     passing on a partial list. `invocations_swept` counts the rows read
     since the earliest world's `proof_since` (rows from the lookback window
     before it included, so a stale one is caught) plus the cross-check rows.
-    With no world opened yet (`--only S14`) it opens one, so every read
-    runs and a sweep that read nothing cannot pass; a clean tenant is then a
-    pass, not a failure. After other scenarios ran, their rows must show up
-    in the run-scoped read, so there `swept > 0` is required too."""
-    opened_own = not env.worlds
-    if opened_own:
+    Every invocation an earlier scenario reported must be in that scoped
+    read, so a sweep that silently missed the run's rows cannot pass; a run
+    whose scenarios created none (S6 alone, or a live rerun where every
+    budget-bound scenario skipped) and a clean tenant pass. With no world
+    opened yet (`--only S14`) it opens one, so the reads always run."""
+    if not env.worlds:
         with env.new_world():
             pass
     groups: dict[tuple[int, str], list[Any]] = {}
@@ -772,6 +774,7 @@ def s14(env: Env) -> Result:
         groups.setdefault((id(w.ledger), w.tenant), []).append(w)  # live worlds share one client and tenant
     outstanding: dict[str, dict[str, str]] = {}
     swept = reads = 0
+    scoped_ids: set[str] = set()
 
     def flag(row: Mapping[str, Any]) -> None:
         outstanding.setdefault(str(row["invocation_id"]), {
@@ -784,6 +787,7 @@ def s14(env: Env) -> Result:
         rows = _list(w, since=since)
         reads += 1
         swept += len(rows)
+        scoped_ids.update(str(r["invocation_id"]) for r in rows)
         for row in rows:
             if row.get("phase") not in TERMINAL:
                 flag(row)
@@ -793,11 +797,11 @@ def s14(env: Env) -> Result:
             swept += len(phase_rows)
             for row in phase_rows:
                 flag(row)
+    missed = sorted(env.reported - scoped_ids)
     observed = {"ledgers": len(groups), "reads": reads, "invocations_swept": swept,
-                "non_terminal": list(outstanding.values())}
+                "reported": len(env.reported), "missed": missed, "non_terminal": list(outstanding.values())}
     return _finish("S14", NAMES["S14"], {"non_terminal": 0}, observed, [
-        ("every ledger was read in full", len(groups) > 0 and reads == len(groups) * (1 + len(NON_TERMINAL))),
-        ("the scenarios' invocations were swept", opened_own or swept > 0),
+        ("every invocation the scenarios reported was swept", not missed),
         ("zero invocations outside a terminal phase", not outstanding),
         ("every outstanding one carries a reason",
          all(o["reason_code"] != "unexplained" for o in outstanding.values())),
@@ -823,7 +827,10 @@ def run_suite(env: Env, only: list[str] | None = None) -> list[Result]:
                                   {}, {}, [], note=note))
             continue
         try:
-            results.append(SCENARIOS[sid](env))
+            result = SCENARIOS[sid](env)
+            results.append(result)
+            if sid != "S14":
+                env.reported.update(result.receipt_ids)
         except Skip as exc:
             results.append(Result(sid, NAMES[sid], SKIPPED, {}, {}, [], note=str(exc)))
         except Exception as exc:  # noqa: BLE001 — an unobservable scenario fails, never passes

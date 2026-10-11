@@ -37,6 +37,7 @@ has no payment rail to call.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from collections.abc import Callable, Mapping
@@ -92,15 +93,25 @@ def _utcnow() -> datetime:
 
 
 ENV_ENABLED = "MCTL_COMMERCE_ENABLED"
+ENV_ADMITTED_PROVIDERS = "MCTL_COMMERCE_ADMITTED_PROVIDERS"
+ENV_FUNDS_MODE = "MCTL_COMMERCE_FUNDS_MODE"
+ENV_TENANT_ID = "MCTL_COMMERCE_TENANT_ID"
+
+logger = logging.getLogger(__name__)
 
 
 def commerce_enabled(source: Mapping[str, str]) -> bool:
     """The one enable gate: the value must be exactly `true` (no case
-    folding, no trimming), so only a deliberate setting enables paid work."""
-    return source.get(ENV_ENABLED, "") == "true"
-ENV_ADMITTED_PROVIDERS = "MCTL_COMMERCE_ADMITTED_PROVIDERS"
-ENV_FUNDS_MODE = "MCTL_COMMERCE_FUNDS_MODE"
-ENV_TENANT_ID = "MCTL_COMMERCE_TENANT_ID"
+    folding, no trimming), so only a deliberate setting enables paid work.
+    A value that is set but not exactly `true` is a mistake, not a default,
+    so it stays off and says so: otherwise it would look exactly like
+    commerce deliberately off."""
+    value = source.get(ENV_ENABLED, "")
+    if value == "true":
+        return True
+    if value.strip():
+        logger.warning("%s=%r is not exactly 'true'; commerce stays disabled", ENV_ENABLED, value)
+    return False
 
 
 class CommerceConfigError(RuntimeError):

@@ -70,8 +70,9 @@ Notes on what each backend proves:
 - S14: complement test (`phase` not terminal) over every row this run
   created, plus tenant-wide reads of each known non-terminal phase. A read
   that fills a page fails the scenario rather than passing on a partial list.
-  Every read must run; after other scenarios, their rows must appear in the
-  run-scoped read. `--only S14` on a clean tenant passes.
+  Every invocation an earlier scenario reported must appear in the
+  run-scoped read; a run that created none, or `--only S14` on a clean
+  tenant, passes.
 
 ## Result
 

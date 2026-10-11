@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -267,6 +268,13 @@ def test_discovery_shows_a_free_summary_without_a_paid_runtime(world):
     assert row["commerce"]["price_mode"] == "free" and entry["commerce"]["price_mode"] == "free"
 
 
+def test_a_non_object_invocation_list_is_unknown_never_an_exception():
+    """agy review of #634: every reader returns UNKNOWN on a body it cannot
+    read; `list_invocations` must not raise on a JSON array."""
+    for body in ([{"invocation_id": "i"}], "rows", 7):
+        assert _Wire(body=body).list_invocations("t").status == cm.UNKNOWN
+
+
 def test_t4_the_receipt_carries_usage_and_a_whitelisted_policy_reference():
     body = _Wire(body={**RECEIPT, "policy_decision": {
         "status": "recorded", "approval_id": "apr_1", "policy_rule_id": "paid", "policy_version": "v3",
@@ -312,10 +320,17 @@ ON = {"MCTL_COMMERCE_ENABLED": "true", "MCTL_COMMERCE_ADMITTED_PROVIDERS": "pilo
       "MCTL_COMMERCE_FUNDS_MODE": "simulated", "MCTL_COMMERCE_TENANT_ID": "commerce-proof"}
 
 
-def test_t5_from_env_is_off_by_default_and_fails_closed_when_misconfigured():
+def test_t5_from_env_is_off_by_default_and_fails_closed_when_misconfigured(caplog):
     client = cm.CommerceClient(base_url="https://api.example", token="t")  # noqa: S106
     for value in ("false", "1", "True", "TRUE", " true", "true "):
         assert cg.CommerceRuntime.from_env(env={**ON, "MCTL_COMMERCE_ENABLED": value}, client=client) is None
+    with caplog.at_level(logging.WARNING, logger=cg.__name__):
+        caplog.clear()
+        assert not cg.commerce_enabled({"MCTL_COMMERCE_ENABLED": "True"})
+        assert "not exactly 'true'" in caplog.text
+        caplog.clear()
+        assert not cg.commerce_enabled({}) and not cg.commerce_enabled({"MCTL_COMMERCE_ENABLED": ""})
+        assert caplog.text == ""
     for env in ({}, {**ON, "MCTL_COMMERCE_ENABLED": "false"}):
         assert cg.CommerceRuntime.from_env(env=env, client=client) is None
     runtime = cg.CommerceRuntime.from_env(env=ON, client=client)
@@ -614,7 +629,16 @@ def test_s14_after_scenarios_fails_when_their_rows_are_not_in_the_scoped_read(mo
     assert s3.status == proof.PASSED
     ledger.invocations.clear()  # the scoped read now sees none of S3's rows
     [s14] = proof.run_suite(env, ["S14"])
-    assert s14.status == proof.FAILED and s14.observed["invocations_swept"] == 0
+    assert s14.status == proof.FAILED and s14.observed["missed"] == sorted(s3.receipt_ids) != []
+
+
+def test_s14_passes_when_the_scenarios_that_ran_created_no_invocation(monkeypatch):
+    """Review of #634: S6 opens a world but creates no row; that is not a
+    vacuous sweep."""
+    env, _ = _shared_env(monkeypatch)
+    s6, s14 = proof.run_suite(env, ["S6", "S14"])
+    assert s6.status == proof.PASSED and s6.receipt_ids == []
+    assert s14.status == proof.PASSED and s14.observed["reported"] == 0
 
 
 def test_the_cli_refuses_a_live_run_without_a_bundle_and_a_malformed_image_tag():

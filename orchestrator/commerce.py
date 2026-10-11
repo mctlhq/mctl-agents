@@ -753,6 +753,8 @@ class CommerceClient:
         query["limit"] = str(max(1, min(int(limit), 200)))
 
         def parse(body: Mapping[str, Any]) -> Mapping[str, Any]:
+            if not isinstance(body, Mapping):
+                raise CommerceError("invocations response must be an object")
             rows = body.get("invocations")
             if not isinstance(rows, list):
                 raise CommerceError("invocations must be a list")
