@@ -743,3 +743,48 @@ These record how C4 meets the sections above. They add no new contract.
 - A dispatch answer marked `replayed` belongs to another attempt. The
   gateway never calls the provider with it and goes to the outcome lookup.
 - Trace events carry ids and phases only, never amounts or payloads.
+
+### C5 implementation notes (mctl-agents#620)
+
+These record how C5 meets sections 12 and 14. They add no new contract and
+change no encoding, reason code or state.
+
+- `capability_search` rows and `capability_describe` entries carry the sealed
+  descriptor's `commerce` summary plus `price_display`, a decimal string for
+  humans built from the checked-in exponent table (`MINOR_UNIT_EXPONENTS`).
+  `capability_describe` also returns `approval_expected` (`required`,
+  `not_required` or `unknown`), computed from the configured policy's rule
+  for the tool without reading arguments. Both values are advisory:
+  `capability_invoke` re-runs identity, policy, quote and budget checks. A
+  descriptor with no `commerce` summary produces the same rows as before, and
+  so does a paid descriptor this execution could not charge (commerce off, no
+  policy checkpoint, provider not admitted, or long-running): discovery and
+  invocation share one availability check.
+- `CommerceClient.get_budget`, `get_receipt` and `list_invocations` read the
+  tenant routes of section 12. They return integer minor units only, refuse a
+  float or an unknown `schema_version`, drop any field outside the receipt
+  whitelist (so arguments, results, payment proofs and `external_ref` never
+  surface), and answer a foreign tenant's resource and a missing one with the
+  same `not-found`. An unreachable ledger is `unknown`, never a zero balance
+  or an empty list.
+- `CommerceRuntime.from_env` is the only production construction site.
+  `MCTL_COMMERCE_ENABLED` must be exactly `true`; otherwise no runtime exists,
+  no terms are read and a paid capability is sealed and dispatched as a legacy
+  tool: no quote, no ledger row, no budget check. What refuses it is the
+  provider ingress fence (section 9: no signed dispatch authorization, so
+  `provider-error`), a provider-side obligation, which is why the mctl-api
+  accept-only switch is the authoritative stop. Enabling it with a
+  `funds_mode` other than `simulated`, an empty `MCTL_COMMERCE_ADMITTED_PROVIDERS`
+  or no tenant fails when the gateway is built, before any paid call.
+- The accept-only kill switch is mctl-api's (mctl-api#570). While it is on,
+  a new acceptance is refused with `unsupported-execution`, so section 13
+  needs no new code. Reconciliation keeps resolving outstanding invocations.
+- The gateway idempotency key includes the arguments digest, so the same
+  client key with changed arguments through `capability_invoke` is a different
+  call. The `idempotency-conflict` of section 6 is mctl-api's, and the proof
+  exercises it at the ledger with the key the first call was accepted under.
+- The proof is `tools/commerce_proof.py`; its results are summarized in
+  `docs/benchmarks/paid-capabilities-proof.md`. The settlement-only retry is
+  proven offline only (owner decision 2026-10-11); mctl-api has no fault
+  injection hook.
+

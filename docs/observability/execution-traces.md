@@ -208,6 +208,28 @@ standing deployment.
 | `MCTL_TRACE_WORKFLOW_TYPES` | worker | unset (every type) | Rollout scope. A comma-separated list of Temporal workflow type names. A run of any other type gets an unsampled virtual root, so nothing under it is recorded: its activities, its Argo span, or a pod that inherits the unsampled `traceparent`. Set but empty traces nothing. |
 | `MCTL_TRACE_REQUIRE_PARENT` | pods | off | Rollout scope. When true, a pod whose `TRACEPARENT` is absent, malformed or unsampled stays inert and does not import the SDK. A CWFT with the OTLP env then exports only for runs a traced worker submitted, never for a manual or sweep submit of the same template. |
 
+## Commerce metrics
+
+Paid capability invocations (ADR 020, `orchestrator/commerce_metrics.py`,
+mctlhq/mctl-agents#620) emit three OpenTelemetry metrics once tracing is
+configured. They are no-ops otherwise, and the ledger never depends on them.
+
+| Metric | Type, unit | Attributes |
+|---|---|---|
+| `mctl.commerce.invocations` | counter, `{invocation}` | `phase`, `reason_code`, `price_mode`, `funds_mode`, `provider_id` |
+| `mctl.commerce.invocation.duration` | histogram, `s` | `phase`, `price_mode`, `provider_id` |
+| `mctl.commerce.outcome_unknown` | counter, `{attempt}` | `provider_id` |
+
+The attribute set is closed. Values come from fixed vocabularies, and a
+`provider_id` outside the admission list is recorded as `other`. Invocation,
+quote, approval, execution and tenant ids are never attributes, and neither
+are monetary amounts (ADR 012). `mctl.commerce.outcome_unknown` counts
+attempts: one invocation held in `outcome_unknown` and retried N times adds N.
+Distinct invocations are `mctl.commerce.invocations{phase="outcome_unknown"}`.
+An exception inside the paid path is recorded as `reason_code=outcome-unknown`
+with an empty phase. Per-tenant spend is answered by the budget
+read, not by a metric. Trace events keep ids, as before, and carry no amounts.
+
 ## Bounded rollout
 
 The first live rollout traces the DevLoop only, not every workflow the workers

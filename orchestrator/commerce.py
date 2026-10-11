@@ -27,10 +27,10 @@ import os
 import re
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypeGuard
 from urllib.parse import quote, urlencode
 
 QUOTE_ENCODING_VERSION = "mctl-commerce-quote/v1"
@@ -44,6 +44,28 @@ MAX_CLOCK_SKEW_S = 60
 #: The argument a paid call carries into the policy checkpoint so the
 #: approval binds the price (ADR 020 sec. 8). A caller can never supply it.
 TERMS_BINDING_ARGUMENT = "commerce_terms_binding"
+
+#: ISO 4217 minor-unit exponents, for DISPLAY only (ADR 020 sec. 2): money
+#: stays an integer count of minor units everywhere else.
+MINOR_UNIT_EXPONENTS: Mapping[str, int] = {
+    "EUR": 2, "USD": 2, "GBP": 2, "CHF": 2, "CAD": 2, "AUD": 2, "PLN": 2, "CZK": 2, "SEK": 2, "NOK": 2,
+    "DKK": 2, "UAH": 2, "JPY": 0, "KRW": 0, "HUF": 2, "BHD": 3, "KWD": 3,
+}
+
+
+def price_display(currency: str, amount_minor: int) -> str:
+    """`"EUR 0.12"`. Display only. An unlisted currency is shown in minor
+    units (`"XYZ 12 minor"`) rather than guessing an exponent."""
+    if isinstance(amount_minor, bool) or not isinstance(amount_minor, int) or amount_minor < 0:
+        raise ValueError("amount_minor must be a non-negative integer")
+    exponent = MINOR_UNIT_EXPONENTS.get(currency)
+    if exponent is None:
+        return f"{currency} {amount_minor} minor"
+    if exponent == 0:
+        return f"{currency} {amount_minor}"
+    whole, frac = divmod(amount_minor, 10 ** exponent)
+    return f"{currency} {whole}.{frac:0{exponent}d}"
+
 
 IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _HASHED_TIME_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
@@ -421,6 +443,169 @@ def _classify(status: int, payload: Mapping[str, Any]) -> CommerceAnswer:
     return CommerceAnswer(REFUSED, status, code or f"http-{status}", reason=reason)
 
 
+# ---------------------------------------------------------------------------
+# Tenant reads (ADR 020 sec. 12; mctlhq/mctl-agents#620)
+# ---------------------------------------------------------------------------
+
+READ_SCHEMA_VERSION = 1
+
+_RECEIPT_TEXT_FIELDS = (
+    "invocation_id", "capability_id", "terms_id", "quote_id", "quote_digest", "price_mode", "funds_mode",
+    "provider_id", "execution_outcome", "charge_status", "payment_status", "settlement_status", "phase",
+    "reason_code", "created_at", "updated_at", "approval_id", "execution_id",
+)
+# mctl-api's `policy_decision` object (mctlhq/mctl-api#569): a reference to the
+# decision, never the policy text or the approver's free-form note.
+_POLICY_DECISION_FIELDS = ("status", "approval_id", "policy_rule_id", "policy_version")
+_POLICY_DECISION_STATUSES = frozenset({"none", "recorded", "missing", "unavailable"})
+# mctl-api `commerce.Balance` field names (integer minor units).
+_BUDGET_FIELDS = ("available_minor", "reserved_minor", "committed_minor", "pending_liability_minor")
+_RECEIPT_MONEY_FIELDS = ("price",)
+
+
+def _read_int(value: Any, *, where: str) -> int:
+    """An integer count of minor units or of anything else. A float (even
+    `12.0`), a bool, a string and a negative are all malformed: ADR 020
+    invariant 2 forbids binary floating point for money."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CommerceError(f"{where} must be a non-negative integer")
+    return value
+
+
+def _read_schema(doc: Mapping[str, Any], *, where: str) -> None:
+    if doc.get("schema_version") != READ_SCHEMA_VERSION:
+        raise CommerceError(f"{where} has unsupported schema_version {doc.get('schema_version')!r}")
+
+
+def _is_currency(value: Any) -> TypeGuard[str]:
+    """The same ISO 4217 shape `CommerceSummary` requires of a sealed
+    descriptor: three ASCII capital letters."""
+    return isinstance(value, str) and len(value) == 3 and value.isascii() and value.isupper() and value.isalpha()
+
+
+def _read_money(value: Any, *, where: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise CommerceError(f"{where} must be an object")
+    currency = value.get("currency")
+    if not _is_currency(currency):
+        raise CommerceError(f"{where}.currency must be an ISO 4217 code")
+    return {"currency": currency, "amount_minor": _read_int(value.get("amount_minor"), where=f"{where}.amount_minor")}
+
+
+def _read_policy_decision(value: Any) -> dict[str, str] | None:
+    """The receipt's policy summary, or None when it cannot be trusted as
+    one: a status this client does not know, or a malformed sub-field, drops
+    the sub-object instead of making the whole (otherwise valid) receipt
+    UNKNOWN. mctl-api may add a status before this client learns it."""
+    if not isinstance(value, Mapping):
+        return None
+    out: dict[str, str] = {}
+    for name in _POLICY_DECISION_FIELDS:
+        field = value.get(name)
+        if field is None:
+            continue
+        if not isinstance(field, str):
+            return None
+        out[name] = field
+    if out.get("status") not in _POLICY_DECISION_STATUSES:
+        return None
+    return out
+
+
+@dataclass(frozen=True)
+class BudgetView:
+    """A tenant's simulated budget, integer minor units only. Field names are
+    mctl-api's `commerce.Balance` wire names, so a body and its view agree."""
+
+    currency: str
+    funds_mode: str
+    available_minor: int
+    reserved_minor: int
+    committed_minor: int
+    pending_liability_minor: int
+
+    @classmethod
+    def from_dict(cls, data: Any) -> BudgetView:
+        if not isinstance(data, Mapping):
+            raise CommerceError("budget must be an object")
+        _read_schema(data, where="budget")
+        currency, funds_mode = data.get("currency"), data.get("funds_mode")
+        if not _is_currency(currency):
+            raise CommerceError("budget.currency must be an ISO 4217 code")
+        if not isinstance(funds_mode, str) or not funds_mode:
+            raise CommerceError("budget.funds_mode is missing")
+        return cls(
+            currency=currency, funds_mode=funds_mode,
+            **{name: _read_int(data.get(name), where=f"budget.{name}")
+               for name in _BUDGET_FIELDS},
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": READ_SCHEMA_VERSION, "currency": self.currency, "funds_mode": self.funds_mode,
+            **{name: getattr(self, name) for name in _BUDGET_FIELDS},
+        }
+
+
+@dataclass(frozen=True)
+class ReceiptView:
+    """The ADR 020 sec. 12 receipt. A whitelist: arguments, results, payment
+    proofs and `external_ref` contents are never copied, whatever mctl-api
+    sends, so no caller of this client can surface them."""
+
+    fields: Mapping[str, Any]
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ReceiptView:
+        if not isinstance(data, Mapping):
+            raise CommerceError("receipt must be an object")
+        _read_schema(data, where="receipt")
+        out: dict[str, Any] = {"schema_version": READ_SCHEMA_VERSION}
+        for name in _RECEIPT_TEXT_FIELDS:
+            value = data.get(name)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise CommerceError(f"receipt.{name} must be a string")
+            out[name] = value
+        for name in ("invocation_id", "phase"):
+            if not out.get(name):
+                raise CommerceError(f"receipt.{name} is missing")
+        if data.get("terms_version") is not None:
+            out["terms_version"] = _read_int(data.get("terms_version"), where="receipt.terms_version")
+        if data.get("usage_quantity") is not None:
+            out["usage_quantity"] = _read_int(data.get("usage_quantity"), where="receipt.usage_quantity")
+        policy_decision = _read_policy_decision(data.get("policy_decision"))
+        if policy_decision is not None:
+            out["policy_decision"] = policy_decision
+        for name in _RECEIPT_MONEY_FIELDS:
+            if data.get(name) is not None:
+                out[name] = _read_money(data.get(name), where=f"receipt.{name}")
+        return cls(out)
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.fields)
+
+
+def _not_found() -> CommerceAnswer:
+    """The one answer for a foreign tenant's resource and a missing one
+    (ADR 020 invariant 17): identical in every field."""
+    return CommerceAnswer(REFUSED, 404, "not-found", reason="HTTP 404 not-found")
+
+
+def _parsed(answer: CommerceAnswer, parse: Callable[[Mapping[str, Any]], Mapping[str, Any]]) -> CommerceAnswer:
+    if answer.status == REFUSED and answer.http_status == 404:
+        return _not_found()
+    if not answer.ok:
+        return answer
+    try:
+        return CommerceAnswer(OK, answer.http_status, body=parse(answer.body))
+    except CommerceError as exc:
+        # A body this client cannot read is an unobserved answer, never a
+        # zero balance and never an empty list.
+        return CommerceAnswer(UNKNOWN, answer.http_status, reason=f"unreadable response: {exc}")
+
+
 class CommerceClient:
     """Synchronous client for `/api/v1/commerce`. Every method returns a
     `CommerceAnswer`; none raises on a remote failure."""
@@ -543,3 +728,36 @@ class CommerceClient:
 
     def dispatch_keys(self) -> CommerceAnswer:
         return self.call("GET", "/api/v1/commerce/dispatch-keys")
+
+    # -- tenant reads (read-only; sanitized to the ADR 020 sec. 12 fields) ----
+
+    def get_budget(self, tenant_id: str) -> CommerceAnswer:
+        """`body` is `BudgetView.to_dict()`. Unreachable is UNKNOWN, never a
+        zero balance."""
+        return _parsed(self.call("GET", self._tenant(tenant_id, "/budget")),
+                       lambda body: BudgetView.from_dict(body).to_dict())
+
+    def get_receipt(self, tenant_id: str, invocation_id: str) -> CommerceAnswer:
+        """`body` is `ReceiptView.to_dict()`. A foreign tenant's invocation
+        and a missing one answer identically."""
+        return _parsed(self.call("GET", self._invocation(tenant_id, invocation_id, "/receipt")),
+                       lambda body: ReceiptView.from_dict(body).to_dict())
+
+    def list_invocations(
+        self, tenant_id: str, *, capability_id: str | None = None, phase: str | None = None,
+        since: str | None = None, limit: int = 50,
+    ) -> CommerceAnswer:
+        """`body` is `{"invocations": [receipt rows]}`. Unreachable is
+        UNKNOWN, never an empty list."""
+        query = {k: v for k, v in (("capability_id", capability_id), ("phase", phase), ("since", since)) if v}
+        query["limit"] = str(max(1, min(int(limit), 200)))
+
+        def parse(body: Mapping[str, Any]) -> Mapping[str, Any]:
+            if not isinstance(body, Mapping):
+                raise CommerceError("invocations response must be an object")
+            rows = body.get("invocations")
+            if not isinstance(rows, list):
+                raise CommerceError("invocations must be a list")
+            return {"invocations": [ReceiptView.from_dict(row).to_dict() for row in rows]}
+
+        return _parsed(self.call("GET", self._tenant(tenant_id, f"/invocations?{urlencode(query)}")), parse)

@@ -182,6 +182,18 @@ def _context_mode() -> str:
 _CAPABILITY_MODES = ("eager", "discovery")
 
 
+def _commerce_runtime() -> Any:
+    """`CommerceRuntime.from_env()`: None unless `MCTL_COMMERCE_ENABLED=true`,
+    so the default path is today's. Imported here, not at module scope.
+    Called only from the discovery branch of `_run_agent`, when the gateway is
+    built: an unsafe configuration raises `CommerceConfigError` there, before
+    any paid call. In `eager` mode nothing reads these variables at all."""
+    from orchestrator import action_approvals
+    from orchestrator.commerce_gateway import CommerceRuntime
+
+    return CommerceRuntime.from_env(approvals=action_approvals.ActionApprovalClient())
+
+
 def _capability_mode() -> str:
     mode = os.getenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "eager").strip().lower()
     if mode not in _CAPABILITY_MODES:
@@ -2457,6 +2469,7 @@ async def _run_agent(
             gateway = await CapabilityGateway.build(
                 plan, correlation, list(plan.capability_providers),
                 checkpoint=PolicyDecidePolicyCheckpoint(grants=grants),
+                commerce=_commerce_runtime(),
             )
             options = build_issue_investigator_options_from_plan(
                 plan, repo_dir, proposal_dir, gateway=gateway,

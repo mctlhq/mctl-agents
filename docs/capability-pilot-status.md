@@ -104,6 +104,37 @@ measuring.
 Turning discovery on in production is a separate owner decision that this
 pilot does not make. It needs the CWFT to set both env vars.
 
+## Paid capabilities (C5, mctlhq/mctl-agents#620)
+
+**What is live:** discovery shows the price. `capability_search` rows and
+`capability_describe` entries of a paid capability carry a `commerce` block
+(price, currency, mode, quote requirement, `billable_on`) and `describe`
+adds an advisory `approval_expected`. The block appears only where this
+execution could actually charge the call: commerce enabled, the policy
+checkpoint configured, the provider admitted and not long-running. Otherwise
+the capability is listed as legacy, so with commerce disabled (today) no
+price is shown. With commerce disabled no terms are read at all and a paid
+capability is dispatched as a legacy tool; the provider ingress fence refuses
+it (`provider-error`). Legacy capabilities are unchanged. The
+tenant reads (`CommerceClient.get_budget`, `get_receipt`, `list_invocations`)
+and the commerce metrics exist in code. Nothing is enabled: no deployed
+values file sets `MCTL_COMMERCE_ENABLED`.
+
+**What activates it:** `MCTL_COMMERCE_ENABLED=true` with
+`MCTL_COMMERCE_ADMITTED_PROVIDERS`, `MCTL_COMMERCE_FUNDS_MODE=simulated` and
+`MCTL_COMMERCE_TENANT_ID` on one worker, after mctl-api's side is ready. The
+order, the disable procedure and the liability check are in
+`docs/runbooks/commerce-enable-disable.md`. Only simulated credits and only
+the dedicated `commerce-proof` tenant are in scope; shared tenants wait for
+mctlhq/mctl-agents#631.
+
+**Evidence:** `docs/benchmarks/paid-capabilities-proof.md`.
+
+**Rollback:** turn on mctl-api's accept-only switch first (the
+authoritative stop), then unset `MCTL_COMMERCE_ENABLED`; after that the
+provider fence is what refuses a paid tool. Keep mctl-api's reconciler running
+until no invocation is outstanding.
+
 ## Rollback
 
 Unset `ISSUE_INVESTIGATOR_CAPABILITY_MODE` (or set it to `eager`, the

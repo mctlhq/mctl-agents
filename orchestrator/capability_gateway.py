@@ -733,6 +733,25 @@ def _emit_trace(payload: Mapping[str, Any], *, event: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _commerce_view(summary: Any) -> dict[str, Any]:
+    """The sealed `commerce` summary plus a display price. Display only
+    (ADR 020 sec. 2): `price.amount_minor` is the integer that counts. Taken
+    from the sealed descriptor, never from mctl-api."""
+    from orchestrator.commerce import price_display
+
+    view = summary.to_dict()
+    view["price_display"] = price_display(summary.currency, summary.amount_minor)
+    return view
+
+
+def _commerce_search_view(summary: Any) -> dict[str, Any]:
+    full = _commerce_view(summary)
+    return {key: full[key] for key in (
+        "price_mode", "price", "price_display", "funds_mode", "meter", "quote_required", "billable_on",
+        "terms_id", "terms_version",
+    )}
+
+
 @dataclass(frozen=True)
 class PolicyDecidePolicyCheckpoint:
     """A `PolicyCheckpoint` (orchestrator/capability.py) adapter wrapping
@@ -918,13 +937,71 @@ class CapabilityGateway:
             haystack = " ".join((descriptor.title, descriptor.summary, *descriptor.keywords)).lower()
             if needle and needle not in haystack:
                 continue
-            rows.append({
+            row: dict[str, Any] = {
                 "capability_id": descriptor.capability_id,
                 "title": descriptor.title,
                 "summary": descriptor.summary,
                 "consequence": descriptor.consequence,
-            })
+            }
+            summary = self._offered_commerce(descriptor)
+            if summary is not None:
+                row["commerce"] = _commerce_search_view(summary)
+            rows.append(row)
         return {"results": rows[:row_limit], "reason_code": "ok"}
+
+    def _paid_unavailable(self, capability_id: str) -> tuple[str, str] | None:
+        """Why this execution cannot charge `capability_id`, or None when it
+        can. Discovery and `capability_invoke` share it, so a price is shown
+        only where a paid call could actually be made."""
+        if self.commerce is None:
+            return "commerce-terms-unknown", "paid capabilities are not available in this execution"
+        from orchestrator import commerce_gateway as cg
+
+        if not isinstance(self.checkpoint, PolicyDecidePolicyCheckpoint):
+            return "policy-denied", "a paid capability requires the policy checkpoint"
+        dispatch = self.dispatch_by_id.get(capability_id)
+        if dispatch is None:
+            return "provider-error", f"{capability_id!r} has no dispatch target"
+        provider, _ = dispatch
+        session = None if provider.type == "mcp-remote" else self.local_sessions.get(provider.id)
+        if (provider.id not in self.commerce.admitted_providers or session is None
+                or not isinstance(session, cg.PaidProviderSession)):
+            return "unsupported-execution", "this provider is not admitted for paid execution"
+        if self.task_support_by_id.get(capability_id) == "required":
+            return "unsupported-execution", "paid long-running execution is not supported"
+        return None
+
+    def _offered_commerce(self, descriptor: CapabilityDescriptor) -> CommerceSummary | None:
+        """The summary discovery may show: None for a legacy descriptor and
+        for a paid one this execution could not charge. A free summary is
+        shown even when the paid path is unavailable (provider not admitted,
+        no policy adapter): it is advisory. A free descriptor is invoked down
+        the legacy path, so whether that call succeeds depends on the
+        provider session; a provider behind the ingress fence refuses an
+        unsigned legacy dispatch (`provider-error`)."""
+        if descriptor.commerce is None:
+            return None
+        if descriptor.commerce.price_mode == "free":
+            return descriptor.commerce
+        if self._paid_unavailable(descriptor.capability_id) is not None:
+            return None
+        return descriptor.commerce
+
+    def _approval_expected(self, descriptor: CapabilityDescriptor) -> str:
+        """Advisory (mctlhq/mctl-agents#620): `required` | `not_required` |
+        `unknown`, from the configured policy's rule for this tool. Reads no
+        arguments and contacts nothing; `capability_invoke` re-decides."""
+        from orchestrator import policy_checkpoint
+
+        if not isinstance(self.checkpoint, PolicyDecidePolicyCheckpoint):
+            return policy_checkpoint.EXPECTED_UNKNOWN
+        try:
+            return policy_checkpoint.expected_verdict(
+                self.checkpoint.resolved_policy(), policy_checkpoint.MCP_TOOL_CALL,
+                descriptor.tool_name, self.checkpoint.grants,
+            )
+        except Exception:  # noqa: BLE001 — a hint must never fail discovery
+            return policy_checkpoint.EXPECTED_UNKNOWN
 
     # -- capability_describe -------------------------------------------------
 
@@ -955,13 +1032,18 @@ class CapabilityGateway:
             if descriptor is None:
                 results[capability_id] = {"reason_code": "not-found"}
                 continue
-            results[capability_id] = {
+            entry: dict[str, Any] = {
                 "reason_code": "ok",
                 "title": descriptor.title,
                 "summary": descriptor.summary,
                 "consequence": descriptor.consequence,
                 "input_schema": dict(self.schemas_by_id.get(capability_id, {})),
             }
+            summary = self._offered_commerce(descriptor)
+            if summary is not None:
+                entry["commerce"] = _commerce_view(summary)
+                entry["approval_expected"] = self._approval_expected(descriptor)
+            results[capability_id] = entry
         return {"results": results, "reason_code": "ok"}
 
     # -- capability_invoke ---------------------------------------------------
@@ -1137,25 +1219,21 @@ class CapabilityGateway:
             self._trace(self._record(capability_id, "refused", "invalid-arguments", start, {},
                                      policy_checkpoint="absent"))
             return {"reason_code": "invalid-arguments", "error": "arguments must be a JSON object"}
-        if self.commerce is None:
-            return refuse("commerce-terms-unknown", "paid capabilities are not available in this execution")
-        if not isinstance(self.checkpoint, PolicyDecidePolicyCheckpoint):
-            return refuse("policy-denied", "a paid capability requires the policy checkpoint")
-        dispatch = self.dispatch_by_id.get(capability_id)
-        if dispatch is None:
-            return refuse("provider-error", f"{capability_id!r} has no dispatch target")
-        provider, bare_tool_name = dispatch
-        session = None if provider.type == "mcp-remote" else self.local_sessions.get(provider.id)
-        if (provider.id not in self.commerce.admitted_providers or session is None
+        unavailable = self._paid_unavailable(capability_id)
+        if unavailable is not None:
+            return refuse(*unavailable)
+        runtime, checkpoint = self.commerce, self.checkpoint
+        provider, bare_tool_name = self.dispatch_by_id[capability_id]
+        session = self.local_sessions.get(provider.id)
+        if (runtime is None or not isinstance(checkpoint, PolicyDecidePolicyCheckpoint)
                 or not isinstance(session, cg.PaidProviderSession)):
+            # Unreachable after `_paid_unavailable`; restated so the types narrow.
             return refuse("unsupported-execution", "this provider is not admitted for paid execution")
-        if self.task_support_by_id.get(capability_id) == "required":
-            return refuse("unsupported-execution", "paid long-running execution is not supported")
 
         paid = cg.PaidInvocation(
-            runtime=self.commerce, descriptor=descriptor, session=session, tool=bare_tool_name,
-            arguments=dict(arguments), grants=tuple(self.checkpoint.grants),
-            policy=self.checkpoint.resolved_policy(), client_key=client_key,
+            runtime=runtime, descriptor=descriptor, session=session, tool=bare_tool_name,
+            arguments=dict(arguments), grants=tuple(checkpoint.grants),
+            policy=checkpoint.resolved_policy(), client_key=client_key,
             emit=lambda payload, event: _emit_trace(payload, event=event),
         )
         try:
@@ -1233,7 +1311,10 @@ class CapabilityGateway:
 
         return [
             sdk_tool(
-                "capability_search", "Search the capabilities eligible for this execution.",
+                "capability_search",
+                "Search the capabilities eligible for this execution. A paid capability's row carries a "
+                "`commerce` block (price, mode, quote requirement). The price is advisory: "
+                "capability_invoke re-checks identity, policy, quote and budget.",
                 {
                     "type": "object",
                     "properties": {
@@ -1243,7 +1324,10 @@ class CapabilityGateway:
                 },
             )(_search),
             sdk_tool(
-                "capability_describe", "Return full input schemas for eligible capability ids.",
+                "capability_describe",
+                "Return full input schemas for eligible capability ids. A paid capability also shows its "
+                "full `commerce` terms and an advisory `approval_expected` (required, not_required or "
+                "unknown); capability_invoke re-checks identity, policy, quote and budget.",
                 {
                     "type": "object",
                     "properties": {
