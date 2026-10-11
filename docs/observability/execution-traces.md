@@ -218,12 +218,16 @@ configured. They are no-ops otherwise, and the ledger never depends on them.
 |---|---|---|
 | `mctl.commerce.invocations` | counter, `{invocation}` | `phase`, `reason_code`, `price_mode`, `funds_mode`, `provider_id` |
 | `mctl.commerce.invocation.duration` | histogram, `s` | `phase`, `price_mode`, `provider_id` |
-| `mctl.commerce.outcome_unknown` | counter, `{invocation}` | `provider_id` |
+| `mctl.commerce.outcome_unknown` | counter, `{attempt}` | `provider_id` |
 
 The attribute set is closed. Values come from fixed vocabularies, and a
 `provider_id` outside the admission list is recorded as `other`. Invocation,
 quote, approval, execution and tenant ids are never attributes, and neither
-are monetary amounts (ADR 012). Per-tenant spend is answered by the budget
+are monetary amounts (ADR 012). `mctl.commerce.outcome_unknown` counts
+attempts: one invocation held in `outcome_unknown` and retried N times adds N.
+Distinct invocations are `mctl.commerce.invocations{phase="outcome_unknown"}`.
+An exception inside the paid path is recorded as `reason_code=outcome-unknown`
+with an empty phase. Per-tenant spend is answered by the budget
 read, not by a metric. Trace events keep ids, as before, and carry no amounts.
 
 ## Bounded rollout

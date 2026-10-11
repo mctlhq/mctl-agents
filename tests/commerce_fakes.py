@@ -180,6 +180,9 @@ class FakeLedger:
     def mint_quote(self, tenant_id: str, *, capability_id: str, input_schema_hash: str, args_digest: str,
                    execution_id: str) -> cm.CommerceAnswer:
         def op():
+            if not self.accepting:
+                # mctl-api#570: COMMERCE_ACCEPT_DISABLED refuses new quotes too.
+                return _no(422, "unsupported-execution")
             terms = self.terms.get((capability_id, input_schema_hash))
             if terms is None:
                 return _no(422, "commerce-terms-unknown")
@@ -371,45 +374,61 @@ class FakeLedger:
         return self.budget["available"] - self.budget["reserved"] - self.budget["committed"]
 
     def get_budget(self, tenant_id: str) -> cm.CommerceAnswer:
+        """mctl-api `commerce.Balance`, parsed by the production client's
+        `BudgetView` so a drift between the two fails here, not live."""
         def op():
             if self.budget is None or tenant_id != self.tenant:
                 return _no(404, "not-found")
+            # mctl-api counts only held reservations whose outcome is unknown.
             pending = sum(i["price"]["amount_minor"] for i in self.invocations.values()
-                          if i["phase"] == "outcome_unknown" or i.get("settlement_status") == "pending")
-            return _ok({"schema_version": 1, "currency": "EUR", "funds_mode": "simulated",
-                        "available": self.free(), "reserved": self.budget["reserved"],
-                        "committed": self.budget["committed"], "pending_liability": pending})
-        return self._route("get_budget", op)
+                          if i["phase"] == "outcome_unknown")
+            return _ok({"schema_version": 1, "tenant_id": tenant_id, "payer_account_id": f"pa_{tenant_id}",
+                        "currency": "EUR", "funds_mode": "simulated", "period": "2026-10",
+                        "monthly_limit_minor": self.budget["available"], "per_request_max_minor": 100,
+                        "committed_minor": self.budget["committed"], "reserved_minor": self.budget["reserved"],
+                        "pending_liability_minor": pending, "available_minor": self.free(),
+                        "as_of": "2026-10-11T00:00:00Z"})
+        return cm._parsed(self._route("get_budget", op), lambda body: cm.BudgetView.from_dict(body).to_dict())
 
-    def _receipt(self, inv: dict) -> dict:
-        captured = inv["charge_status"] == "captured"
+    def _row(self, inv: dict) -> dict:
+        """One mctl-api `commerce.Invocation` row as the list endpoint sends
+        it, including fields the client must not copy."""
         return {
             "schema_version": 1, **{k: inv[k] for k in (
                 "invocation_id", "capability_id", "terms_id", "terms_version", "quote_id", "quote_digest",
                 "price_mode", "funds_mode", "provider_id", "execution_outcome", "charge_status",
-                "settlement_status", "phase", "reason_code", "approval_id", "execution_id", "price")},
+                "settlement_status", "phase", "reason_code", "approval_id", "execution_id", "price",
+                "tenant_id")},
+            **({"usage_quantity": 1} if inv["charge_status"] == "captured" else {}),
             "payment_status": "authorized" if inv["charge_status"] in ("reserved", "captured") else "none",
-            **({"charge": dict(inv["price"])} if captured else {}),
+            "idempotency_key": inv.get("idempotency_key", ""), "args_digest": inv.get("args_digest", ""),
+            "provider_operation_key": inv.get("provider_operation_key", ""),
         }
 
     def get_receipt(self, tenant_id: str, invocation_id: str) -> cm.CommerceAnswer:
+        """mctl-api#569 `commerce.Receipt`, parsed by `ReceiptView`."""
         def op():
             inv = self.invocations.get(invocation_id)
             if inv is None or inv["tenant_id"] != tenant_id or tenant_id != self.tenant:
                 return _no(404, "not-found")
-            return _ok(self._receipt(inv))
-        return self._route("get_receipt", op)
+            policy = ({"status": "recorded", "approval_id": inv["approval_id"]} if inv["approval_id"]
+                      else {"status": "none"})
+            return _ok({**self._row(inv), "policy_decision": policy})
+        return cm._parsed(self._route("get_receipt", op), lambda body: cm.ReceiptView.from_dict(body).to_dict())
 
     def list_invocations(self, tenant_id: str, *, capability_id: str | None = None, phase: str | None = None,
                          since: str | None = None, limit: int = 50) -> cm.CommerceAnswer:
         def op():
             if tenant_id != self.tenant:
                 return _no(404, "not-found")
-            rows = [self._receipt(i) for i in self.invocations.values() if i["tenant_id"] == tenant_id
+            rows = [self._row(i) for i in self.invocations.values() if i["tenant_id"] == tenant_id
                     and (not capability_id or i["capability_id"] == capability_id)
                     and (not phase or i["phase"] == phase)]
             return _ok({"invocations": rows[:limit]})
-        return self._route("list_invocations", op)
+
+        def parse(body):
+            return {"invocations": [cm.ReceiptView.from_dict(row).to_dict() for row in body["invocations"]]}
+        return cm._parsed(self._route("list_invocations", op), parse)
 
     def settle_pending(self) -> int:
         """Settlement-only retry on the same derived key: moves no funds a

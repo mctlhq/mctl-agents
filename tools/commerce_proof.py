@@ -16,8 +16,13 @@ against a EUR 1.00 budget, through every fault and denial case in the issue.
   dispatch keys. Operator-run. Needs `MCTL_TOKEN` (tenant admin of the proof
   tenant), `MCTL_COMMERCE_TENANT_ID`, and for S7 a second tenant's token in
   `MCTL_TOKEN_OTHER_TENANT` with `MCTL_OTHER_TENANT_ID`. Scenarios that need
-  a fault injected into mctl-api or a human approval are not driven live and
-  are recorded as `offline-only` / `skipped`, never as passed live.
+  a fault injected into mctl-api, a test hook or a human approval are not
+  driven live and are recorded as `skipped` with the reason (S11:
+  `offline-only`), never as passed live. Live scenarios share one tenant and
+  one budget: each sees only the invocations it created (rows listed since
+  its start, minus the ones that already existed) and compares budgets as
+  deltas. S1 and S2 need an unspent EUR 1.00 budget and are skipped
+  otherwise; run each with `--only` on a fresh budget.
 
 Every scenario function is pure over an `Env` (a way to get a fresh world);
 the I/O wrappers are `main()` and `write_bundle()`. The evidence bundle names
@@ -43,7 +48,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -63,12 +68,34 @@ PRICE_MINOR = 12
 BUDGET_MINOR = 100
 OFFLINE_ONLY_SETTLEMENT = "offline-only (owner decision 2026-10-11)"
 TERMINAL = frozenset({"refused", "released", "finalized"})
+NON_TERMINAL = ("accepted", "reserved", "dispatching", "dispatched", "outcome_unknown")
+#: `CommerceClient.list_invocations` caps a page here; a full page is a
+#: truncated read, never a complete one.
+PAGE = 200
+#: A live scenario lists rows created since this long before it started.
+LOOKBACK_S = 120
+#: Scenarios that need an unspent EUR 1.00 budget.
+FRESH_BUDGET = frozenset({"S1", "S2"})
+#: Why each scenario is not driven against mctl-api.
+LIVE_NOT_DRIVEN: dict[str, str] = {
+    "S8": "needs the grant revoked between two ledger calls; that hook exists only in the offline fake",
+    "S9": "needs a human approval decision mid-run; not automated against the live approval store",
+    "S10": "needs the gateway killed after specific ledger calls; that hook exists only in the offline fake",
+    "S11": OFFLINE_ONLY_SETTLEMENT,
+    "S12": "replays S1, S3-S5 and S8-S11 twice: it would spend the live budget again and needs the offline hooks",
+    "S13": "needs the accept-only switch flipped and the reconciler driven mid-run: an operator procedure "
+           "(docs/runbooks/commerce-enable-disable.md), with no fault hook in mctl-api (owner decision 2026-10-11)",
+}
 
 PASSED, FAILED, SKIPPED, OFFLINE_ONLY = "passed", "failed", "skipped", "offline-only"
 
 
 class ProofError(RuntimeError):
     """The proof could not observe what it needs (never a pass)."""
+
+
+class Skip(Exception):
+    """A precondition of this backend does not hold: recorded as skipped."""
 
 
 # ---------------------------------------------------------------------------
@@ -84,9 +111,9 @@ class Env:
     name: str
     new_world: Callable[[], contextlib.AbstractContextManager[Any]]
     worlds: list[Any] = field(default_factory=list)
-    #: Scenario ids this backend drives; the rest are recorded as not driven.
-    drives: frozenset[str] = frozenset()
-    undriven_status: str = SKIPPED
+    #: Scenario id -> why this backend does not drive it.
+    not_driven: Mapping[str, str] = field(default_factory=dict)
+    order: tuple[str, ...] = ()
     other_tenant: str = "tenant-b"
     other_ledger: Any = None
 
@@ -99,7 +126,7 @@ def _fakes() -> Any:
 
 def offline_env() -> Env:
     fk = _fakes()
-    env = Env(name="offline", new_world=contextlib.nullcontext, drives=frozenset(SCENARIOS))
+    env = Env(name="offline", new_world=contextlib.nullcontext, order=ORDER)
 
     @contextlib.contextmanager
     def new_world() -> Iterator[Any]:
@@ -116,6 +143,7 @@ def offline_env() -> Env:
                 pc, "current_identity",
                 lambda: pc.ExecutionIdentity(execution_id=fk.EXECUTION, trace_id="tr-proof", actor="agent:proof")))
             stack.enter_context(mock.patch.object(aa, "ttl_s", lambda: 3600))
+            _mark(world)
             env.worlds.append(world)
             yield world
 
@@ -143,8 +171,10 @@ def live_env() -> Env:
         other = cm.CommerceClient(token=other_token)
     env = Env(
         name="live", new_world=contextlib.nullcontext, other_tenant=os.environ.get("MCTL_OTHER_TENANT_ID", "tenant-b"),
-        drives=frozenset({"S1", "S2", "S3", "S4", "S5", "S6", "S7", "S14"}), undriven_status=OFFLINE_ONLY,
-        other_ledger=other,
+        not_driven=LIVE_NOT_DRIVEN, other_ledger=other,
+        # Scenarios that need headroom first; S1 and S2 then run only on an
+        # unspent budget (see the module docstring).
+        order=("S6", "S7", "S3", "S4", "S5", "S1", "S2", *(f"S{i}" for i in range(8, 15))),
     )
 
     class _RealClock:
@@ -162,6 +192,7 @@ def live_env() -> Env:
                 pc, "current_identity",
                 lambda: pc.ExecutionIdentity(execution_id="we_" + nonce[:26], trace_id="tr-proof",
                                              actor="agent:proof")))
+            _mark(world)
             env.worlds.append(world)
             yield world
 
@@ -197,17 +228,48 @@ def _run(coro: Any) -> Any:
 
 
 def _budget(world: Any) -> dict[str, Any]:
+    """`BudgetView.to_dict()`: the `*_minor` fields, no timestamp."""
     answer = world.ledger.get_budget(world.tenant)
     if not answer.ok:
         raise ProofError(f"budget could not be read: {answer.status} {answer.reason}")
     return dict(answer.body)
 
 
-def _rows(world: Any) -> list[dict[str, Any]]:
-    answer = world.ledger.list_invocations(world.tenant, limit=200)
+def _list(world: Any, *, phase: str | None = None, since: str | None = None) -> list[dict[str, Any]]:
+    answer = world.ledger.list_invocations(world.tenant, phase=phase, since=since, limit=PAGE)
     if not answer.ok:
         raise ProofError(f"invocations could not be listed: {answer.status} {answer.reason}")
-    return list(answer.body["invocations"])
+    rows = list(answer.body["invocations"])
+    if len(rows) >= PAGE:
+        raise ProofError(f"the invocation list filled a page of {PAGE} (phase={phase!r}, since={since!r}); "
+                         "a truncated read cannot prove completeness")
+    return rows
+
+
+def _mark(world: Any) -> None:
+    """Scope a world to the invocations it creates: on a shared live tenant,
+    rows that existed when it opened are never this scenario's."""
+    world.proof_since = (datetime.now(UTC) - timedelta(seconds=LOOKBACK_S)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    world.proof_preexisting = frozenset(r["invocation_id"] for r in _list(world, since=world.proof_since))
+
+
+def _rows(world: Any) -> list[dict[str, Any]]:
+    """The invocations this world created, oldest first."""
+    rows = [r for r in _list(world, since=world.proof_since)
+            if r["invocation_id"] not in world.proof_preexisting]
+    return sorted(rows, key=lambda r: (r.get("created_at", ""), r["invocation_id"]))
+
+
+def _need_headroom(budget: Mapping[str, Any], minor: int) -> None:
+    if budget["available_minor"] < minor:
+        raise Skip(f"needs at least {minor} minor available (available_minor={budget['available_minor']})")
+
+
+def _need_unspent(budget: Mapping[str, Any], sid: str) -> None:
+    if (budget["available_minor"] != BUDGET_MINOR or budget["reserved_minor"]
+            or budget["pending_liability_minor"]):
+        raise Skip(f"needs an unspent EUR 1.00 budget (available_minor={budget['available_minor']}, "
+                   f"reserved_minor={budget['reserved_minor']}); reset it and rerun with --only {sid}")
 
 
 def _receipt(world: Any, invocation_id: str) -> dict[str, Any]:
@@ -279,6 +341,7 @@ def scenario(sid: str, name: str) -> Callable[[Callable[[Env], Result]], Callabl
 def s1(env: Env) -> Result:
     with env.new_world() as w:
         before = _budget(w)
+        _need_unspent(before, "S1")
 
         async def go() -> list[dict[str, Any]]:
             g = await w.gateway()
@@ -288,17 +351,19 @@ def s1(env: Env) -> Result:
         after = _budget(w)
         ok = [o for o in outs if o["reason_code"] == "ok"]
         refused = [o for o in outs if o["reason_code"] == "budget-exhausted"]
+        spent = after["committed_minor"] - before["committed_minor"]
         observed = {"calls": len(outs), "captured": _captured(w), "budget_exhausted": len(refused),
-                    "other": len(outs) - len(ok) - len(refused), "committed": after["committed"],
-                    "reserved": after["reserved"], "available": after["available"], "executions": len(w.executions)}
+                    "other": len(outs) - len(ok) - len(refused), "committed": spent,
+                    "reserved": after["reserved_minor"], "available": after["available_minor"],
+                    "executions": len(w.executions)}
         return _finish("S1", NAMES["S1"],
                        {"captured_at_most": 8, "committed_at_most": 96, "available_at_least": 4,
                         "all_others": "budget-exhausted"}, observed, [
-            ("budget starts at 100 minor", before["available"] == BUDGET_MINOR),
             ("at most 8 captured", observed["captured"] <= 8 and len(ok) <= 8),
             ("every other call is budget-exhausted", observed["other"] == 0),
-            ("committed <= 96 and available >= 4", after["committed"] <= 96 and after["available"] >= 4),
-            ("nothing left reserved", after["reserved"] == 0),
+            ("this run committed <= 96 and available >= 4", spent <= 96 and after["available_minor"] >= 4),
+            ("each capture committed exactly the price", spent == PRICE_MINOR * observed["captured"]),
+            ("nothing left reserved", after["reserved_minor"] == 0),
             ("provider ran once per captured call", observed["executions"] == len(ok)),
         ], receipts=[r["invocation_id"] for r in _rows(w)])
 
@@ -306,19 +371,21 @@ def s1(env: Env) -> Result:
 @scenario("S2", "the 9th sequential invocation after 8 captures")
 def s2(env: Env) -> Result:
     with env.new_world() as w:
+        before = _budget(w)
+        _need_unspent(before, "S2")
         n = 1
-        while _budget(w)["available"] >= PRICE_MINOR and n < 40:
+        while _budget(w)["available_minor"] >= PRICE_MINOR and n < 40:
             _call(w, f"OPS-{n}")
             n += 1
         captured_before = _captured(w)
         out = _call(w, f"OPS-{n}")
         after = _budget(w)
         observed = {"captured_before_ninth": captured_before, "ninth": out["reason_code"],
-                    "committed": after["committed"]}
+                    "committed": after["committed_minor"] - before["committed_minor"]}
         return _finish("S2", NAMES["S2"], {"ninth": "budget-exhausted", "committed": 96}, observed, [
             ("8 captures before the 9th", captured_before == 8),
             ("the 9th is budget-exhausted", out["reason_code"] == "budget-exhausted"),
-            ("committed is 96 minor", after["committed"] == 96),
+            ("this run committed 96 minor", observed["committed"] == 96),
         ], receipts=[r["invocation_id"] for r in _rows(w)])
 
 
@@ -326,16 +393,18 @@ def s2(env: Env) -> Result:
 def s3(env: Env) -> Result:
     with env.new_world() as w:
         before = _budget(w)
+        _need_headroom(before, PRICE_MINOR)
         out = _call(w, "OPS-404")  # the pilot records an unknown ticket as a failure
         after = _budget(w)
         rows = _rows(w)
-        observed = {"reason_code": out["reason_code"], "available_before": before["available"],
-                    "available_after": after["available"], "committed": after["committed"],
+        observed = {"reason_code": out["reason_code"], "available_before": before["available_minor"],
+                    "available_after": after["available_minor"],
+                    "committed": after["committed_minor"] - before["committed_minor"],
                     "charge_status": rows[-1].get("charge_status") if rows else None}
         return _finish("S3", NAMES["S3"], {"reason_code": "provider-error", "available_restored": True}, observed, [
             ("the call fails", out["reason_code"] == "provider-error"),
-            ("available returns to its prior value", after["available"] == before["available"]),
-            ("nothing committed", after["committed"] == before["committed"]),
+            ("available returns to its prior value", after["available_minor"] == before["available_minor"]),
+            ("nothing committed", observed["committed"] == 0),
             ("the charge is released", observed["charge_status"] == "released"),
         ], receipts=[r["invocation_id"] for r in rows])
 
@@ -343,6 +412,7 @@ def s3(env: Env) -> Result:
 @scenario("S4", "the same key and arguments retried")
 def s4(env: Env) -> Result:
     with env.new_world() as w:
+        _need_headroom(_budget(w), PRICE_MINOR)
         first = _call(w, "OPS-1", "retry-1")
         second = _call(w, "OPS-1", "retry-1")
         rows = _rows(w)
@@ -365,6 +435,7 @@ def s5(env: Env) -> Result:
     arguments."""
     fk = _fakes()
     with env.new_world() as w:
+        _need_headroom(_budget(w), PRICE_MINOR)
         first = _call(w, "OPS-1", "k5")
         rows_before = _rows(w)
         receipt_before = _receipt(w, first["invocation_id"])
@@ -425,13 +496,14 @@ def s6(env: Env) -> Result:
 @scenario("S7", "a second tenant reads and invokes against the first tenant's invocation and budget")
 def s7(env: Env) -> Result:
     with env.new_world() as w:
+        if env.name == "live" and env.other_ledger is None:
+            raise Skip("MCTL_TOKEN_OTHER_TENANT is not set")
+        _need_headroom(_budget(w), PRICE_MINOR)
         out = _call(w, "OPS-1")
         inv_id = out["invocation_id"]
         budget_before, rows_before = _budget(w), _rows(w)
         other = env.other_ledger or w.ledger
         b = env.other_tenant
-        if env.name == "live" and env.other_ledger is None:
-            return Result("S7", NAMES["S7"], SKIPPED, {}, {}, [], note="MCTL_TOKEN_OTHER_TENANT is not set")
         foreign = other.get_receipt(b, inv_id)
         missing = other.get_receipt(b, "inv_00000000000000000000000000")
         own_missing = w.ledger.get_receipt(w.tenant, "inv_00000000000000000000000000")
@@ -520,15 +592,15 @@ def s9(env: Env) -> Result:
         w.approvals.decide(first["approval_ref"], "denied")
         second = _call(w, "OPS-1")
         after = _budget(w)
-        observed = {"pending": first["reason_code"], "reserved_while_pending": pending["reserved"],
+        observed = {"pending": first["reason_code"], "reserved_while_pending": pending["reserved_minor"],
                     "after_denial": second["reason_code"], "invocations": len(_rows(w)),
-                    "executions": len(w.executions), "reserved_after": after["reserved"]}
+                    "executions": len(w.executions), "reserved_after": after["reserved_minor"]}
         return _finish("S9", NAMES["S9"], {"reserved_while_pending": 0, "after_denial": "policy-denied"}, observed, [
             ("a pending approval needs a human", bool(first.get("approval_ref"))),
-            ("no funds held while pending", pending["reserved"] == 0 and pending == before),
+            ("no funds held while pending", pending["reserved_minor"] == 0 and pending == before),
             ("denial refuses the call", second["reason_code"] == "policy-denied"),
             ("no invocation and no reservation after denial", observed["invocations"] == 0
-             and after["reserved"] == 0),
+             and after["reserved_minor"] == 0),
             ("the provider executed nothing", not w.executions),
         ])
 
@@ -553,17 +625,17 @@ def s10(env: Env) -> Result:
             out = _call(w, "OPS-1")
             b = _budget(w)
             observed[label] = {"crashed": crashed, "after_restart": out["reason_code"],
-                               "executions": len(w.executions), "committed": b["committed"],
-                               "reserved": b["reserved"]}
+                               "executions": len(w.executions), "committed": b["committed_minor"],
+                               "reserved": b["reserved_minor"]}
             checks += [
                 (f"{label}: the kill happened", crashed),
                 (f"{label}: the provider ran at most once", len(w.executions) <= 1),
-                (f"{label}: captured at most once", b["committed"] in (0, PRICE_MINOR)),
-                (f"{label}: nothing left reserved", b["reserved"] == 0),
+                (f"{label}: captured at most once", b["committed_minor"] in (0, PRICE_MINOR)),
+                (f"{label}: nothing left reserved", b["reserved_minor"] == 0),
             ]
             if label != "after_fence":
                 checks.append((f"{label}: resumed to a captured success",
-                               out["reason_code"] == "ok" and b["committed"] == PRICE_MINOR))
+                               out["reason_code"] == "ok" and b["committed_minor"] == PRICE_MINOR))
     return _finish("S10", NAMES["S10"], {"executions_at_most": 1, "captures_at_most": 1}, observed, checks)
 
 
@@ -581,7 +653,7 @@ def s11(env: Env) -> Result:
         observed = {"first": out["reason_code"], "settlement_before": pending["settlement_status"],
                     "retry": again["reason_code"], "settled": settled_n,
                     "settlement_after": settled["settlement_status"], "executions": len(w.executions),
-                    "dispatches": w.ledger.calls.count("dispatch"), "committed": _budget(w)["committed"]}
+                    "dispatches": w.ledger.calls.count("dispatch"), "committed": _budget(w)["committed_minor"]}
         return _finish("S11", NAMES["S11"], {"settlement_before": "pending", "settlement_after": "settled",
                                              "executions": 1}, observed, [
             ("the call succeeded", out["reason_code"] == "ok"),
@@ -646,34 +718,46 @@ def s13(env: Env) -> Result:
         budget = _budget(w)  # tenant reads keep working
         observed = {"first": first["reason_code"], "phase_before": phase_before, "flag_off": flag_off["reason_code"],
                     "switch_on": switched["reason_code"], "reconciled": reconciled, "phase_after": phase_after,
-                    "committed": budget["committed"], "reserved": budget["reserved"],
+                    "committed": budget["committed_minor"], "reserved": budget["reserved_minor"],
                     "executions": len(w.executions), "invocations": len(_rows(w))}
         return _finish("S13", NAMES["S13"], {"new_call": "refused", "pending": "terminal"}, observed, [
             ("one invocation is outstanding", first["reason_code"] == "outcome-unknown"
              and phase_before == "outcome_unknown"),
             ("with the flag off a paid call is refused", flag_off["reason_code"] != "ok"),
             ("with the accept switch on a new call is refused unsupported-execution",
-             switched["reason_code"] in ("unsupported-execution", "provider-unavailable")),
+             switched["reason_code"] == "unsupported-execution"),
             ("no new invocation was opened", observed["invocations"] == 1),
             ("the reconciler resolves the outstanding invocation", reconciled == 1 and phase_after in TERMINAL),
-            ("the tenant reads keep working and nothing is stranded", budget["reserved"] == 0
-             and budget["committed"] == PRICE_MINOR),
+            ("the tenant reads keep working and nothing is stranded", budget["reserved_minor"] == 0
+             and budget["committed_minor"] == PRICE_MINOR),
             ("the provider ran once", observed["executions"] == 1),
         ])
 
 
 @scenario("S14", "end-of-run liability sweep")
 def s14(env: Env) -> Result:
+    """Tenant-wide, not scoped to this run: every ledger the run touched is
+    read phase by phase, and a page that fills is a failed read. With no
+    world opened yet (`--only S14`) it opens one, so a sweep of nothing
+    cannot pass."""
+    if not env.worlds:
+        with env.new_world():
+            pass
     outstanding: list[dict[str, str]] = []
     swept = 0
+    seen: set[tuple[int, str]] = set()
     for w in env.worlds:
-        for row in _rows(w):
-            swept += 1
-            if row.get("phase") not in TERMINAL:
+        if (id(w.ledger), w.tenant) in seen:
+            continue  # live worlds share one client and tenant
+        seen.add((id(w.ledger), w.tenant))
+        swept += len(_list(w))
+        for phase in NON_TERMINAL:
+            for row in _list(w, phase=phase):
                 outstanding.append({"invocation_id": row["invocation_id"], "phase": row["phase"],
                                     "reason_code": row.get("reason_code", "") or "unexplained"})
-    observed = {"worlds": len(env.worlds), "invocations_swept": swept, "non_terminal": outstanding}
+    observed = {"ledgers": len(seen), "invocations_swept": swept, "non_terminal": outstanding}
     return _finish("S14", NAMES["S14"], {"non_terminal": 0}, observed, [
+        ("the sweep read at least one invocation", swept > 0),
         ("zero invocations in a non-terminal phase", not outstanding),
         ("every outstanding one carries a reason", all(o["reason_code"] != "unexplained" for o in outstanding)),
     ])
@@ -689,16 +773,18 @@ ORDER = tuple(f"S{i}" for i in range(1, 15))
 def run_suite(env: Env, only: list[str] | None = None) -> list[Result]:
     """S14 always runs last, over every world the other scenarios opened."""
     results: list[Result] = []
-    for sid in ORDER:
+    for sid in env.order or ORDER:
         if only and sid not in only:
             continue
-        if sid not in env.drives:
-            results.append(Result(sid, NAMES[sid], env.undriven_status, {}, {}, [],
-                                  note="not driven on this backend: needs a fault injected into mctl-api, "
-                                       "a human approval, or an operator switch"))
+        if sid in env.not_driven:
+            note = env.not_driven[sid]
+            results.append(Result(sid, NAMES[sid], OFFLINE_ONLY if note == OFFLINE_ONLY_SETTLEMENT else SKIPPED,
+                                  {}, {}, [], note=note))
             continue
         try:
             results.append(SCENARIOS[sid](env))
+        except Skip as exc:
+            results.append(Result(sid, NAMES[sid], SKIPPED, {}, {}, [], note=str(exc)))
         except Exception as exc:  # noqa: BLE001 — an unobservable scenario fails, never passes
             results.append(Result(sid, NAMES[sid], FAILED, {}, {"error": type(exc).__name__}, [],
                                   note=f"{type(exc).__name__}: {exc}"))
@@ -736,6 +822,8 @@ def build_bundle(
                    "budget_minor": BUDGET_MINOR, "funds_mode": "simulated", "provider_id": cp.PILOT_PROVIDER_ID},
         "scenarios": [r.to_dict() for r in results],
         "summary": {"counts": counts, "failed": [r.id for r in results if r.status == FAILED],
+                    # Never read as passed: each with the reason it was not driven here.
+                    "not_driven": {r.id: r.note for r in results if r.status in (SKIPPED, OFFLINE_ONLY)},
                     "ok": not any(r.status == FAILED for r in results)},
     }
 
@@ -768,12 +856,17 @@ def _terms_of(env: Env) -> Mapping[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--backend", choices=("offline", "live"), default="offline")
-    parser.add_argument("--out", help="write the evidence bundle here (evidence/commerce-proof-<utc>.json)")
+    parser.add_argument("--out", help="write the evidence bundle to this path (required with --backend live)")
     parser.add_argument("--only", nargs="*", help="scenario ids, e.g. S1 S4")
     parser.add_argument("--mctl-api-sha", default=os.environ.get("MCTL_API_SHA", "not-recorded"))
     parser.add_argument("--image-tag", action="append", default=[], metavar="NAME=TAG")
     parser.add_argument("--markdown", action="store_true", help="print the summary table")
     args = parser.parse_args(argv)
+    if args.backend == "live" and not args.out:
+        parser.error("--backend live needs --out: a live run without its evidence bundle proves nothing")
+    bad_tags = [item for item in args.image_tag if "=" not in item or not item.split("=", 1)[1]]
+    if bad_tags:
+        parser.error(f"--image-tag takes NAME=TAG, got {bad_tags!r}")
 
     try:
         env = offline_env() if args.backend == "offline" else live_env()
@@ -782,7 +875,7 @@ def main(argv: list[str] | None = None) -> int:
         bundle = build_bundle(
             results, backend=args.backend, terms=_terms_of(env), mctl_agents_sha=_git("rev-parse", "HEAD"),
             mctl_api_sha=args.mctl_api_sha,
-            image_tags=dict(item.split("=", 1) for item in args.image_tag if "=" in item),
+            image_tags=dict(item.split("=", 1) for item in args.image_tag),
         )
     except ProofError as exc:
         print(f"commerce_proof: {exc}", file=sys.stderr)

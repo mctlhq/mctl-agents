@@ -105,7 +105,9 @@ class CommerceConfigError(RuntimeError):
 class CommerceRuntime:
     """What a gateway needs to serve paid capabilities. Without one, every
     capability is legacy at discovery and a paid descriptor is refused with
-    `commerce-terms-unknown` at invocation (fail closed).
+    `commerce-terms-unknown` at invocation (fail closed). With one, a paid
+    capability still shows no price at discovery unless the gateway could
+    charge it (`CapabilityGateway._paid_unavailable`).
 
     `admitted_providers` is the sec. 9 admission list: a provider id is on it
     only once its ingress has passed C4's fault tests. A paid capability of
@@ -140,8 +142,8 @@ class CommerceRuntime:
         `MCTL_COMMERCE_ENABLED` must be exactly `true`; anything else
         (including unset) returns None and the process behaves as before:
         every paid descriptor is refused at invocation. When enabled it
-        raises `CommerceConfigError` at startup, never at the first paid
-        call, if the funds mode is not `simulated`, the admission list
+        raises `CommerceConfigError` where the runtime is built (the
+        gateway's construction), never at the first paid call, if the funds mode is not `simulated`, the admission list
         (`MCTL_COMMERCE_ADMITTED_PROVIDERS`, comma separated) is empty, or no
         tenant is named (`tenant_id` or `MCTL_COMMERCE_TENANT_ID`)."""
         source = os.environ if env is None else env
@@ -305,26 +307,25 @@ class PaidInvocation:
 
     async def run(self) -> PaidResult:
         started = time.monotonic()
-        summary = self.descriptor.commerce
-
-        def record(phase: str, reason_code: str) -> None:
+        # An exception out of `_run` is what the caller turns into
+        # `outcome-unknown`, so the metrics record it as exactly that.
+        phase, reason_code = "", "outcome-unknown"
+        try:
+            result = await self._run()
+            phase, reason_code = result.phase, result.reason_code
+            return result
+        except Exception:
+            commerce_metrics.record_outcome_unknown(
+                admitted_providers=self.runtime.admitted_providers, provider_id=self.descriptor.provider.id)
+            raise
+        finally:
+            summary = self.descriptor.commerce
             commerce_metrics.record_invocation(
                 admitted_providers=self.runtime.admitted_providers, phase=phase,
                 reason_code=reason_code, price_mode=summary.price_mode if summary else "",
                 funds_mode=summary.funds_mode if summary else "", provider_id=self.descriptor.provider.id,
                 duration_s=time.monotonic() - started,
             )
-
-        try:
-            result = await self._run()
-        except Exception:
-            # The caller turns this into outcome-unknown; the metrics must see it.
-            record("", "outcome-unknown")
-            commerce_metrics.record_outcome_unknown(
-                admitted_providers=self.runtime.admitted_providers, provider_id=self.descriptor.provider.id)
-            raise
-        record(result.phase, result.reason_code)
-        return result
 
     async def _run(self) -> PaidResult:
         if cm.TERMS_BINDING_ARGUMENT in self.arguments:

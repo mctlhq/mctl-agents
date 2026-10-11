@@ -6,8 +6,10 @@ Instruments:
   `reason_code`, `price_mode`, `funds_mode`, `provider_id`;
 - `mctl.commerce.invocation.duration` (histogram, `s`): attributes `phase`,
   `price_mode`, `provider_id`;
-- `mctl.commerce.outcome_unknown` (counter, `{invocation}`): attribute
-  `provider_id`.
+- `mctl.commerce.outcome_unknown` (counter, `{attempt}`): attribute
+  `provider_id`. It counts attempts, not invocations: one invocation held in
+  `outcome_unknown` and retried N times adds N. Distinct invocations are
+  `mctl.commerce.invocations{phase="outcome_unknown"}` and the ledger.
 
 The attribute set is closed and bounded. Every value comes from a closed
 vocabulary; `provider_id` is limited to the admission list and anything else
@@ -22,6 +24,7 @@ tracing is configured, so it is safe in the long-lived Temporal worker.
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Collection, Mapping
 from typing import Any, Protocol
 
@@ -77,8 +80,9 @@ class _OtelBackend:
         self._counters = {
             INVOCATIONS: meter.create_counter(INVOCATIONS, unit="{invocation}",
                                               description="Paid capability invocations by terminal phase"),
-            OUTCOME_UNKNOWN: meter.create_counter(OUTCOME_UNKNOWN, unit="{invocation}",
-                                                  description="Paid invocations left with an unknown outcome"),
+            OUTCOME_UNKNOWN: meter.create_counter(OUTCOME_UNKNOWN, unit="{attempt}",
+                                                  description="Paid invocation attempts that ended with an "
+                                                              "unknown outcome"),
         }
         self._histogram = meter.create_histogram(DURATION, unit="s",
                                                  description="Wall time of one paid capability_invoke")
@@ -92,13 +96,17 @@ class _OtelBackend:
 
 _backend: Backend | None = None
 _resolved = False
+# Paid calls can resolve the backend concurrently in the Temporal worker; one
+# resolution means one set of instruments.
+_lock = threading.Lock()
 
 
 def set_backend(backend: Backend | None) -> None:
     """Install `backend` (tests, or an operator harness). None restores the
     default: OpenTelemetry when tracing is on, otherwise nothing."""
     global _backend, _resolved
-    _backend, _resolved = backend, backend is not None
+    with _lock:
+        _backend, _resolved = backend, backend is not None
 
 
 def _current() -> Backend | None:
@@ -107,13 +115,16 @@ def _current() -> Backend | None:
         return _backend
     if not tracing.enabled():
         return None  # not cached: tracing may be initialised later
-    try:
-        _backend = _OtelBackend()
-    except Exception as exc:  # noqa: BLE001 — metrics are optional
-        logger.warning("commerce metrics: OpenTelemetry metrics unavailable (%s)", type(exc).__name__)
-        _backend = None
-    _resolved = True
-    return _backend
+    with _lock:
+        if _resolved:
+            return _backend
+        try:
+            _backend = _OtelBackend()
+        except Exception as exc:  # noqa: BLE001 — metrics are optional
+            logger.warning("commerce metrics: OpenTelemetry metrics unavailable (%s)", type(exc).__name__)
+            _backend = None
+        _resolved = True
+        return _backend
 
 
 def record_invocation(

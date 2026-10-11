@@ -30,7 +30,7 @@ import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypeGuard
 from urllib.parse import quote, urlencode
 
 QUOTE_ENCODING_VERSION = "mctl-commerce-quote/v1"
@@ -56,6 +56,8 @@ MINOR_UNIT_EXPONENTS: Mapping[str, int] = {
 def price_display(currency: str, amount_minor: int) -> str:
     """`"EUR 0.12"`. Display only. An unlisted currency is shown in minor
     units (`"XYZ 12 minor"`) rather than guessing an exponent."""
+    if isinstance(amount_minor, bool) or not isinstance(amount_minor, int) or amount_minor < 0:
+        raise ValueError("amount_minor must be a non-negative integer")
     exponent = MINOR_UNIT_EXPONENTS.get(currency)
     if exponent is None:
         return f"{currency} {amount_minor} minor"
@@ -450,9 +452,15 @@ READ_SCHEMA_VERSION = 1
 _RECEIPT_TEXT_FIELDS = (
     "invocation_id", "capability_id", "terms_id", "quote_id", "quote_digest", "price_mode", "funds_mode",
     "provider_id", "execution_outcome", "charge_status", "payment_status", "settlement_status", "phase",
-    "reason_code", "created_at", "updated_at", "approval_id", "execution_id", "policy_decision_ref",
+    "reason_code", "created_at", "updated_at", "approval_id", "execution_id",
 )
-_RECEIPT_MONEY_FIELDS = ("price", "charge")
+# mctl-api's `policy_decision` object (mctlhq/mctl-api#569): a reference to the
+# decision, never the policy text or the approver's free-form note.
+_POLICY_DECISION_FIELDS = ("status", "approval_id", "policy_rule_id", "policy_version")
+_POLICY_DECISION_STATUSES = frozenset({"none", "recorded", "missing", "unavailable"})
+# mctl-api `commerce.Balance` field names (integer minor units).
+_BUDGET_FIELDS = ("available_minor", "reserved_minor", "committed_minor", "pending_liability_minor")
+_RECEIPT_MONEY_FIELDS = ("price",)
 
 
 def _read_int(value: Any, *, where: str) -> int:
@@ -469,25 +477,48 @@ def _read_schema(doc: Mapping[str, Any], *, where: str) -> None:
         raise CommerceError(f"{where} has unsupported schema_version {doc.get('schema_version')!r}")
 
 
+def _is_currency(value: Any) -> TypeGuard[str]:
+    """The same ISO 4217 shape `CommerceSummary` requires of a sealed
+    descriptor: three ASCII capital letters."""
+    return isinstance(value, str) and len(value) == 3 and value.isascii() and value.isupper() and value.isalpha()
+
+
 def _read_money(value: Any, *, where: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise CommerceError(f"{where} must be an object")
     currency = value.get("currency")
-    if not (isinstance(currency, str) and len(currency) == 3 and currency.isascii() and currency.isupper()):
+    if not _is_currency(currency):
         raise CommerceError(f"{where}.currency must be an ISO 4217 code")
     return {"currency": currency, "amount_minor": _read_int(value.get("amount_minor"), where=f"{where}.amount_minor")}
 
 
+def _read_policy_decision(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise CommerceError("receipt.policy_decision must be an object")
+    out: dict[str, str] = {}
+    for name in _POLICY_DECISION_FIELDS:
+        field = value.get(name)
+        if field is None:
+            continue
+        if not isinstance(field, str):
+            raise CommerceError(f"receipt.policy_decision.{name} must be a string")
+        out[name] = field
+    if out.get("status") not in _POLICY_DECISION_STATUSES:
+        raise CommerceError(f"receipt.policy_decision.status {out.get('status')!r} is not recognised")
+    return out
+
+
 @dataclass(frozen=True)
 class BudgetView:
-    """A tenant's simulated budget, integer minor units only."""
+    """A tenant's simulated budget, integer minor units only. Field names are
+    mctl-api's `commerce.Balance` wire names, so a body and its view agree."""
 
     currency: str
     funds_mode: str
-    available: int
-    reserved: int
-    committed: int
-    pending_liability: int
+    available_minor: int
+    reserved_minor: int
+    committed_minor: int
+    pending_liability_minor: int
 
     @classmethod
     def from_dict(cls, data: Any) -> BudgetView:
@@ -495,21 +526,20 @@ class BudgetView:
             raise CommerceError("budget must be an object")
         _read_schema(data, where="budget")
         currency, funds_mode = data.get("currency"), data.get("funds_mode")
-        if not (isinstance(currency, str) and len(currency) == 3 and currency.isascii() and currency.isupper()):
+        if not _is_currency(currency):
             raise CommerceError("budget.currency must be an ISO 4217 code")
         if not isinstance(funds_mode, str) or not funds_mode:
             raise CommerceError("budget.funds_mode is missing")
         return cls(
             currency=currency, funds_mode=funds_mode,
             **{name: _read_int(data.get(name), where=f"budget.{name}")
-               for name in ("available", "reserved", "committed", "pending_liability")},
+               for name in _BUDGET_FIELDS},
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": READ_SCHEMA_VERSION, "currency": self.currency, "funds_mode": self.funds_mode,
-            "available": self.available, "reserved": self.reserved, "committed": self.committed,
-            "pending_liability": self.pending_liability,
+            **{name: getattr(self, name) for name in _BUDGET_FIELDS},
         }
 
 
@@ -539,8 +569,10 @@ class ReceiptView:
                 raise CommerceError(f"receipt.{name} is missing")
         if data.get("terms_version") is not None:
             out["terms_version"] = _read_int(data.get("terms_version"), where="receipt.terms_version")
-        if data.get("metered_quantity") is not None:
-            out["metered_quantity"] = _read_int(data.get("metered_quantity"), where="receipt.metered_quantity")
+        if data.get("usage_quantity") is not None:
+            out["usage_quantity"] = _read_int(data.get("usage_quantity"), where="receipt.usage_quantity")
+        if data.get("policy_decision") is not None:
+            out["policy_decision"] = _read_policy_decision(data.get("policy_decision"))
         for name in _RECEIPT_MONEY_FIELDS:
             if data.get(name) is not None:
                 out[name] = _read_money(data.get(name), where=f"receipt.{name}")

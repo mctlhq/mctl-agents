@@ -3,6 +3,7 @@ hint, tenant reads, the enablement switch, commerce metrics and the offline
 proof. T1-T12 of the proposal."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -74,6 +75,54 @@ def test_t1_search_and_describe_show_the_price_only_for_paid_descriptors(world):
     assert not [k for k in keys if any(b in k.lower() for b in BANNED)]
 
 
+# The rows a descriptor without commerce produced before #620, byte for byte.
+LEGACY_SEARCH_BYTES = (b'{"capability_id":"mctl://mcp-local/free-provider/echo","consequence":"consequential",'
+                       b'"summary":"Echo.","title":"echo"}')
+LEGACY_DESCRIBE_BYTES = (b'{"reason_code":"ok","results":{"mctl://mcp-local/free-provider/echo":{"consequence":'
+                         b'"consequential","input_schema":{"type":"object"},"reason_code":"ok","summary":"Echo.",'
+                         b'"title":"echo"}}}')
+LEGACY_KEYS_SEARCH = ["capability_id", "consequence", "summary", "title"]
+LEGACY_KEYS_DESCRIBE = ["consequence", "input_schema", "reason_code", "summary", "title"]
+
+
+def _bytes(value) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def test_legacy_rows_are_byte_identical_with_commerce_on_and_off(world):
+    on, off = run(world.gateway()), run(world.gateway(commerce=False))
+    for g in (on, off):
+        row = {r["capability_id"]: r for r in g.search("")["results"]}[FREE_CAP]
+        assert sorted(row) == LEGACY_KEYS_SEARCH
+        assert sorted(g.describe([FREE_CAP])["results"][FREE_CAP]) == LEGACY_KEYS_DESCRIBE
+        assert _bytes(row) == LEGACY_SEARCH_BYTES
+        assert _bytes(g.describe([FREE_CAP])) == LEGACY_DESCRIBE_BYTES
+
+
+def test_discovery_shows_no_price_where_this_execution_cannot_charge(world):
+    """Review of #634: discovery and invocation share one availability
+    check, so a price is never advertised for a call that is always refused."""
+    def legacy_shaped(g):
+        row = {r["capability_id"]: r for r in g.search("")["results"]}[PILOT_CAP]
+        entry = g.describe([PILOT_CAP])["results"][PILOT_CAP]
+        return sorted(row) == LEGACY_KEYS_SEARCH and sorted(entry) == LEGACY_KEYS_DESCRIBE
+
+    assert not legacy_shaped(run(world.gateway()))
+    off = run(world.gateway(commerce=False))
+    assert legacy_shaped(off)
+    assert run(world.gateway(commerce=False)).search("")["results"] == off.search("")["results"]
+    # Off: the paid provider refuses an unauthorized call and nothing touches the ledger.
+    assert run(_invoke(world, gateway=off))["reason_code"] != "ok" and world.ledger.writes() == []
+    world.admitted = frozenset({"someone-else"})
+    unadmitted = run(world.gateway())
+    assert legacy_shaped(unadmitted)
+    assert run(_invoke(world, gateway=unadmitted))["reason_code"] == "unsupported-execution"
+    world.admitted = frozenset({cp.PILOT_PROVIDER_ID})
+    no_checkpoint = run(world.gateway())
+    no_checkpoint.checkpoint = SimpleNamespace(grants=())
+    assert legacy_shaped(no_checkpoint)
+
+
 def test_t2_an_id_outside_the_sealed_set_shows_no_price_and_no_approval(world):
     g = run(world.gateway())
     other = "mctl://mcp-local/pilot-provider/other"
@@ -89,9 +138,15 @@ def test_describe_approval_expected_follows_the_configured_policy(world, policy,
     assert world.ledger.writes() == [] and world.approvals.by_id == {}
 
 
-def test_describe_approval_expected_is_unknown_without_the_policy_adapter(world):
+def test_describe_approval_expected_is_unknown_when_the_policy_cannot_be_read(world, monkeypatch):
+    # Without the policy adapter the capability is not offered at all
+    # (test_discovery_shows_no_price_where_this_execution_cannot_charge).
     g = run(world.gateway())
-    g.checkpoint = SimpleNamespace(grants=())
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("policy unreadable")
+
+    monkeypatch.setattr(pc, "expected_verdict", broken)
     assert g.describe([PILOT_CAP])["results"][PILOT_CAP]["approval_expected"] == "unknown"
 
 
@@ -135,21 +190,27 @@ class _Wire(cm.CommerceClient):
         return self.reply
 
 
-BUDGET = {"schema_version": 1, "currency": "EUR", "funds_mode": "simulated", "available": 4, "reserved": 0,
-          "committed": 96, "pending_liability": 0}
+# mctl-api `commerce.Balance` exactly as GET .../budget sends it.
+BUDGET = {"schema_version": 1, "tenant_id": "proof", "payer_account_id": "pa_proof", "currency": "EUR",
+          "funds_mode": "simulated", "period": "2026-10", "monthly_limit_minor": 100, "per_request_max_minor": 100,
+          "committed_minor": 96, "reserved_minor": 0, "pending_liability_minor": 0, "available_minor": 4,
+          "as_of": "2026-10-11T12:00:00Z"}
 RECEIPT = {
     "schema_version": 1, "invocation_id": "inv_1", "capability_id": PILOT_CAP, "terms_id": "ctm_1",
     "terms_version": 1, "quote_id": "cq_1", "quote_digest": "sha256:" + "0" * 64, "price_mode": "per_call",
     "price": {"currency": "EUR", "amount_minor": 12}, "funds_mode": "simulated", "phase": "finalized",
     "execution_outcome": "succeeded", "charge_status": "captured", "settlement_status": "settled",
-    "approval_id": "", "execution_id": "we_1",
+    "approval_id": "", "execution_id": "we_1", "usage_quantity": 1,
+    "policy_decision": {"status": "none"},
 }
 
 
 def test_t4_reads_use_the_tenant_scoped_routes_and_return_integer_money():
     wire = _Wire(body=BUDGET)
     answer = wire.get_budget("proof")
-    assert answer.ok and answer.body["committed"] == 96 and wire.paths == ["/api/v1/commerce/tenants/proof/budget"]
+    assert answer.ok and wire.paths == ["/api/v1/commerce/tenants/proof/budget"]
+    assert answer.body == {"schema_version": 1, "currency": "EUR", "funds_mode": "simulated", "available_minor": 4,
+                           "reserved_minor": 0, "committed_minor": 96, "pending_liability_minor": 0}
     wire = _Wire(body=RECEIPT)
     assert wire.get_receipt("proof", "inv_1").body["price"] == {"currency": "EUR", "amount_minor": 12}
     assert wire.paths == ["/api/v1/commerce/tenants/proof/invocations/inv_1/receipt"]
@@ -175,14 +236,34 @@ def test_t4_unreachable_is_unknown_never_zero_or_empty():
 
 
 @pytest.mark.parametrize("patch", [
-    {"available": 4.0}, {"available": -1}, {"committed": "96"}, {"reserved": True}, {"schema_version": 2},
-    {"currency": "eur"},
+    {"available_minor": 4.0}, {"available_minor": -1}, {"committed_minor": "96"}, {"reserved_minor": True},
+    {"pending_liability_minor": None}, {"schema_version": 2}, {"currency": "eur"}, {"currency": "1A2"},
 ])
 def test_t4_a_float_or_malformed_amount_is_rejected(patch):
     answer = _Wire(body={**BUDGET, **patch}).get_budget("t")
     assert answer.status == cm.UNKNOWN
     with pytest.raises(cm.CommerceError):
         cm.BudgetView.from_dict({**BUDGET, **patch})
+
+
+def test_t4_a_budget_with_unsuffixed_names_is_unreadable_not_zero():
+    # The pre-#620 field names are not mctl-api's: reading them must fail
+    # closed, never surface as a balance.
+    legacy = {k: v for k, v in BUDGET.items() if not k.endswith("_minor")}
+    legacy.update({"available": 4, "reserved": 0, "committed": 96, "pending_liability": 0})
+    assert _Wire(body=legacy).get_budget("t").status == cm.UNKNOWN
+
+
+def test_t4_the_receipt_carries_usage_and_a_whitelisted_policy_reference():
+    body = _Wire(body={**RECEIPT, "policy_decision": {
+        "status": "recorded", "approval_id": "apr_1", "policy_rule_id": "paid", "policy_version": "v3",
+        "note": "approver's free text", "policy_text": "rules..."}}).get_receipt("t", "i").body
+    assert body["usage_quantity"] == 1
+    assert body["policy_decision"] == {"status": "recorded", "approval_id": "apr_1", "policy_rule_id": "paid",
+                                       "policy_version": "v3"}
+    for bad in ({"status": "approved"}, {}, "recorded", {"status": "none", "approval_id": 7}):
+        assert _Wire(body={**RECEIPT, "policy_decision": bad}).get_receipt("t", "i").status == cm.UNKNOWN
+    assert _Wire(body={**RECEIPT, "usage_quantity": 1.0}).get_receipt("t", "i").status == cm.UNKNOWN
 
 
 def test_t4_a_float_in_a_receipt_is_rejected_and_nothing_secret_is_surfaced():
@@ -202,6 +283,9 @@ def test_price_display_is_display_only_and_exact():
     assert cm.price_display("EUR", 100) == "EUR 1.00" and cm.price_display("EUR", 5) == "EUR 0.05"
     assert cm.price_display("JPY", 12) == "JPY 12"
     assert cm.price_display("XYZ", 12) == "XYZ 12 minor"
+    for bad in (-5, 1.5, True):
+        with pytest.raises(ValueError):
+            cm.price_display("EUR", bad)
 
 
 # ---------------------------------------------------------------------------
@@ -387,3 +471,102 @@ def test_the_live_backend_refuses_the_admins_tenant(monkeypatch):
     monkeypatch.delenv("MCTL_COMMERCE_TENANT_ID")
     with pytest.raises(proof.ProofError):
         proof.live_env()
+
+
+# ---------------------------------------------------------------------------
+# Review of #634
+# ---------------------------------------------------------------------------
+
+
+def test_an_exception_inside_the_paid_path_is_recorded_as_outcome_unknown(world, recorder, monkeypatch):
+    async def boom(self):
+        raise RuntimeError("gateway bug")
+
+    monkeypatch.setattr(cg.PaidInvocation, "_run", boom)
+    assert run(_invoke(world))["reason_code"] == "outcome-unknown"
+    invocations = [a for n, a in recorder.points if n == metrics.INVOCATIONS]
+    assert invocations == [{"phase": "", "reason_code": "outcome-unknown", "price_mode": "per_successful_call",
+                            "funds_mode": "simulated", "provider_id": cp.PILOT_PROVIDER_ID}]
+    assert [n for n, _a in recorder.points].count(metrics.OUTCOME_UNKNOWN) == 1
+    assert [n for n, _a in recorder.points].count(metrics.DURATION) == 1
+
+
+def _shared_env(monkeypatch):
+    """The live shape offline: every world shares one ledger and one budget,
+    and the live order and not-driven list apply."""
+    import contextlib
+    import tempfile
+
+    from tests import commerce_fakes as fk
+
+    clock = fk.Clock()
+    ledger = fk.FakeLedger(clock, price_mode="per_successful_call", amount=proof.PRICE_MINOR,
+                           budget=proof.BUDGET_MINOR)
+    approvals = fk.FakeApprovals(clock)
+    env = proof.Env(name="shared", new_world=contextlib.nullcontext, not_driven=proof.LIVE_NOT_DRIVEN,
+                    order=("S6", "S7", "S3", "S4", "S5", "S1", "S2", *(f"S{i}" for i in range(8, 15))))
+    monkeypatch.setattr(pc, "current_identity", lambda: pc.ExecutionIdentity(
+        execution_id=fk.EXECUTION, trace_id="tr", actor="agent:proof"))
+    monkeypatch.setattr(proof.aa, "ttl_s", lambda: 3600)
+
+    @contextlib.contextmanager
+    def new_world():
+        with tempfile.TemporaryDirectory() as tmp:
+            w = fk.World(clock=clock, ledger=ledger, approvals=approvals, tmp=Path(tmp),
+                         statuses={f"OPS-{i}": "open" for i in range(1, 60)})
+            if not ledger.terms:
+                ledger.publish(fk.PILOT_CAP, w.schema_hash())
+            proof._mark(w)
+            env.worlds.append(w)
+            yield w
+
+    env.new_world = new_world
+    return env, ledger
+
+
+def test_live_shaped_scenarios_see_only_their_own_invocations_and_budget_deltas(monkeypatch):
+    env, _ = _shared_env(monkeypatch)
+    results = {r.id: r for r in proof.run_suite(env)}
+    assert {sid for sid, r in results.items() if r.status == proof.PASSED} == {"S3", "S4", "S5", "S6", "S7", "S14"}
+    assert results["S4"].observed["invocations"] == 1  # despite S7's row on the same tenant
+    assert "unspent" in results["S1"].note and "--only S1" in results["S1"].note
+    assert "unspent" in results["S2"].note
+    assert results["S11"].status == proof.OFFLINE_ONLY and results["S11"].note == proof.OFFLINE_ONLY_SETTLEMENT
+    for sid in ("S8", "S9", "S10", "S12", "S13"):
+        assert results[sid].status == proof.SKIPPED and results[sid].note == proof.LIVE_NOT_DRIVEN[sid]
+    bundle = proof.build_bundle(list(results.values()), backend="live", terms={}, mctl_agents_sha="a")
+    assert set(bundle["summary"]["not_driven"]) == {"S1", "S2", "S8", "S9", "S10", "S11", "S12", "S13"}
+
+
+def test_a_fresh_shared_budget_runs_s1_alone(monkeypatch):
+    env, _ = _shared_env(monkeypatch)
+    [s1] = proof.run_suite(env, ["S1"])
+    assert s1.status == proof.PASSED and s1.observed["committed"] == 96
+
+
+def test_a_full_page_is_a_failed_read_never_a_complete_one(monkeypatch):
+    env, _ = _shared_env(monkeypatch)
+    monkeypatch.setattr(proof, "PAGE", 1)
+    [s3] = proof.run_suite(env, ["S3"])  # its one row fills the page
+    assert s3.status == proof.FAILED and "truncated" in s3.note
+
+
+def test_s14_alone_cannot_pass_by_sweeping_nothing():
+    [s14] = proof.run_suite(proof.offline_env(), ["S14"])
+    assert s14.status == proof.FAILED and s14.observed["invocations_swept"] == 0
+
+
+def test_the_cli_refuses_a_live_run_without_a_bundle_and_a_malformed_image_tag():
+    with pytest.raises(SystemExit) as no_out:
+        proof.main(["--backend", "live"])
+    assert no_out.value.code == 2
+    with pytest.raises(SystemExit) as bad_tag:
+        proof.main(["--image-tag", "mctl-api:v1"])
+    assert bad_tag.value.code == 2
+
+
+def test_the_fake_accept_switch_refuses_new_quotes_like_mctl_api_570(world):
+    world.ledger.accepting = False
+    answer = world.ledger.mint_quote(world.tenant, capability_id=PILOT_CAP, input_schema_hash=world.schema_hash(),
+                                     args_digest=cm.args_digest({"ticket": "OPS-1"}), execution_id="we_1")
+    assert (answer.status, answer.http_status, answer.code) == (cm.REFUSED, 422, "unsupported-execution")

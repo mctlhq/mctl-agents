@@ -756,7 +756,10 @@ change no encoding, reason code or state.
   `not_required` or `unknown`), computed from the configured policy's rule
   for the tool without reading arguments. Both values are advisory:
   `capability_invoke` re-runs identity, policy, quote and budget checks. A
-  descriptor with no `commerce` summary produces the same rows as before.
+  descriptor with no `commerce` summary produces the same rows as before, and
+  so does a paid descriptor this execution could not charge (commerce off, no
+  policy checkpoint, provider not admitted, or long-running): discovery and
+  invocation share one availability check.
 - `CommerceClient.get_budget`, `get_receipt` and `list_invocations` read the
   tenant routes of section 12. They return integer minor units only, refuse a
   float or an unknown `schema_version`, drop any field outside the receipt

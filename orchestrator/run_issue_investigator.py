@@ -185,7 +185,9 @@ _CAPABILITY_MODES = ("eager", "discovery")
 def _commerce_runtime() -> Any:
     """`CommerceRuntime.from_env()`: None unless `MCTL_COMMERCE_ENABLED=true`,
     so the default path is today's. Imported here, not at module scope.
-    Raises `CommerceConfigError` at startup on an unsafe configuration."""
+    Called only from the discovery branch of `_run_agent`, when the gateway is
+    built: an unsafe configuration raises `CommerceConfigError` there, before
+    any paid call. In `eager` mode nothing reads these variables at all."""
     from orchestrator import action_approvals
     from orchestrator.commerce_gateway import CommerceRuntime
 

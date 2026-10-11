@@ -109,7 +109,11 @@ pilot does not make. It needs the CWFT to set both env vars.
 **What is live:** discovery shows the price. `capability_search` rows and
 `capability_describe` entries of a paid capability carry a `commerce` block
 (price, currency, mode, quote requirement, `billable_on`) and `describe`
-adds an advisory `approval_expected`. Legacy capabilities are unchanged. The
+adds an advisory `approval_expected`. The block appears only where this
+execution could actually charge the call: commerce enabled, the policy
+checkpoint configured, the provider admitted and not long-running. Otherwise
+the capability is listed as legacy and `capability_invoke` refuses it, so with
+commerce disabled (today) no price is shown. Legacy capabilities are unchanged. The
 tenant reads (`CommerceClient.get_budget`, `get_receipt`, `list_invocations`)
 and the commerce metrics exist in code. Nothing is enabled: no deployed
 values file sets `MCTL_COMMERCE_ENABLED`.
