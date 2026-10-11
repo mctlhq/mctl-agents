@@ -43,13 +43,14 @@ a provider.
 from __future__ import annotations
 
 import fnmatch
+import re
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from orchestrator.capability import (
     MAX_ANNOTATIONS_JSON_LENGTH,
@@ -61,6 +62,7 @@ from orchestrator.capability import (
     CapabilitySet,
     CapabilityStrategy,
     CheckpointVerdict,
+    CommerceSummary,
     ExecutionCorrelation,
     InvocationRecord,
     PolicyCheckpoint,
@@ -73,6 +75,9 @@ from orchestrator.capability import (
 )
 from orchestrator.context_snapshot import ContextSnapshotError, canonical_json, hash_bytes
 from orchestrator.resolver import ExecutionPlan
+
+if TYPE_CHECKING:
+    from orchestrator.commerce_gateway import CommerceRuntime
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -154,6 +159,12 @@ class ProviderTool:
     #: one denominator with the oversized-annotations half of that count
     #: instead of counting excluded tools' drops that half never sees.
     annotations_unparseable: bool = False
+    #: MCP `Tool.execution.taskSupport` (`forbidden`, `optional`,
+    #: `required`), empty when the provider does not say. A paid capability
+    #: whose tool REQUIRES task-based execution is refused with
+    #: `unsupported-execution` (ADR 020 sec. 7): the milestone has no paid
+    #: long-running execution.
+    task_support: str = ""
 
 
 @dataclass(frozen=True)
@@ -261,6 +272,7 @@ class _McpProviderSession:
                 # `annotations: {}` (or every hint unset) converts to {} and
                 # is not a drop — see ProviderTool.annotations_unparseable.
                 annotations_unparseable=converted is None,
+                task_support=_task_support(t),
             ))
         return tools
 
@@ -273,6 +285,12 @@ class _McpProviderSession:
             raise GatewayError(f"provider {self.provider.id!r}: call_tool failed: {exc}") from exc
         text = "\n".join(str(getattr(block, "text", "")) for block in (result.content or []))
         return ToolCallResult(is_error=bool(result.isError), text=text)
+
+
+def _task_support(tool: Any) -> str:
+    execution = getattr(tool, "execution", None)
+    value = getattr(execution, "taskSupport", None) if execution is not None else None
+    return value if isinstance(value, str) else ""
 
 
 def _annotations_to_dict(annotations: Any) -> dict[str, Any] | None:
@@ -452,6 +470,8 @@ async def _discover(
     connector: ProviderConnector | None,
     headers: Mapping[str, str] | None,
     consequence_table: Mapping[str, str] | None,
+    commerce: CommerceRuntime | None = None,
+    task_support_out: dict[str, str] | None = None,
 ) -> tuple[list[CapabilityDescriptor], int, dict[str, Mapping[str, Any]], dict[str, tuple[ProviderRef, str]]]:
     """Connect every declared provider once, in order, list its tools,
     match each against `plan.tools`, and build one `CapabilityDescriptor`
@@ -466,6 +486,12 @@ async def _discover(
     caller's local session raises) propagates unchanged: this function
     never catches a provider failure to seal a shorter set instead (ADR 017
     sec. 5, the `orchestrator/mcp_guard.py` lesson restated at set level).
+
+    With a `commerce` runtime, each eligible capability's current terms are
+    read from mctl-api (ADR 020 sec. 12): terms in force become the
+    descriptor's `commerce` summary, mctl-api's typed "no terms" answer
+    leaves it legacy, and any other answer fails discovery, for the same
+    reason a provider failure does. Without one, every capability is legacy.
     """
     resolved_connector = connector if connector is not None else _default_remote_connector
     resolved_headers = dict(headers) if headers is not None else _default_remote_headers()
@@ -514,6 +540,8 @@ async def _discover(
                 continue
             capability_id = f"mctl://{provider.type}/{provider.id}/{info.name}"
             schema_bytes = canonical_json(dict(info.input_schema))
+            schema_hash = hash_bytes(schema_bytes)
+            summary = await _commerce_summary(commerce, capability_id, schema_hash, provider) if commerce else None
             annotations = _bounded_annotations(info.annotations)
             # Either a coercion failure at the session (ProviderTool.
             # annotations_unparseable, set per-tool by
@@ -528,13 +556,16 @@ async def _discover(
                 title=_bounded_title(info.name),
                 summary=_one_line(info.description),
                 keywords=_derive_keywords(info.name),
-                input_schema_hash=hash_bytes(schema_bytes),
+                input_schema_hash=schema_hash,
                 input_schema_bytes=len(schema_bytes),
                 consequence=classify_consequence(info.name, table, provider_id=provider.id),
                 matched_tool_pattern=matched_pattern,
                 annotations=annotations,
+                commerce=summary,
             )
             descriptors.append(descriptor)
+            if task_support_out is not None:
+                task_support_out[capability_id] = info.task_support
             schemas_by_id[capability_id] = info.input_schema
             dispatch_by_id[capability_id] = (provider, info.name)
 
@@ -550,6 +581,36 @@ async def _discover(
     return descriptors, excluded_count, schemas_by_id, dispatch_by_id
 
 
+async def _commerce_summary(
+    commerce: CommerceRuntime, capability_id: str, schema_hash: str, provider: ProviderRef,
+) -> CommerceSummary | None:
+    """The descriptor's `commerce` field: a read-only summary of the terms
+    in force. `None` only on mctl-api's typed `commerce-terms-unknown`."""
+    import asyncio
+
+    answer = await asyncio.to_thread(commerce.client.current_terms, capability_id, schema_hash)
+    if not answer.ok:
+        if answer.status == "refused" and answer.code == "commerce-terms-unknown":
+            return None
+        raise GatewayError(
+            f"capability {capability_id!r}: commerce terms could not be read ({answer.reason or answer.status})"
+        )
+    doc: Any = answer.body
+    if (doc.get("capability_id") != capability_id or doc.get("input_schema_hash") != schema_hash
+            or doc.get("provider_id") != provider.id):
+        raise GatewayError(f"capability {capability_id!r}: the terms in force name another capability version")
+    price: Any = doc.get("price") if isinstance(doc.get("price"), Mapping) else {}
+    try:
+        return CommerceSummary(
+            terms_id=doc.get("terms_id"), terms_version=doc.get("terms_version"),
+            price_mode=doc.get("price_mode"), currency=price.get("currency"),
+            amount_minor=price.get("amount_minor"), funds_mode=doc.get("funds_mode"),
+            meter=doc.get("meter") or "invocation",
+        )
+    except Exception as exc:
+        raise GatewayError(f"capability {capability_id!r}: the terms in force are malformed: {exc}") from exc
+
+
 async def resolve_eligible(
     plan: ExecutionPlan,
     correlation: ExecutionCorrelation,
@@ -562,6 +623,7 @@ async def resolve_eligible(
     strategy: CapabilityStrategy | None = None,
     retention: RetentionPolicy | None = None,
     created_at: str | None = None,
+    commerce: CommerceRuntime | None = None,
 ) -> CapabilitySet:
     """Resolve one sealed `CapabilitySet` for one execution (ADR 017
     sec. 5, task 5). `providers` is an explicit, ordered list — alias
@@ -586,6 +648,7 @@ async def resolve_eligible(
     descriptors, excluded_count, _schemas, _dispatch = await _discover(
         plan, correlation, providers,
         local_sessions=local_sessions, connector=connector, headers=headers, consequence_table=consequence_table,
+        commerce=commerce,
     )
     return seal(
         execution=correlation,
@@ -651,6 +714,15 @@ class PolicyDecidePolicyCheckpoint:
     """
 
     grants: tuple[str, ...] = ()
+    #: The policy `decide()` evaluates; None is `BUILTIN_POLICY`. The paid
+    #: path (ADR 020 sec. 8) evaluates the same policy, over the call's
+    #: arguments plus the terms binding.
+    policy: Any = None
+
+    def resolved_policy(self) -> Any:
+        from orchestrator import policy_checkpoint
+
+        return self.policy if self.policy is not None else policy_checkpoint.BUILTIN_POLICY
 
     def check(self, descriptor: CapabilityDescriptor, correlation: ExecutionCorrelation) -> CheckpointVerdict:
         from orchestrator import policy_checkpoint
@@ -662,6 +734,7 @@ class PolicyDecidePolicyCheckpoint:
             {},
             grants=self.grants,
             metadata={"capability_id": descriptor.capability_id, "agent": correlation.agent},
+            policy=self.resolved_policy(),
         )
         return CheckpointVerdict(
             decision="allowed" if decision.permitted else "denied",
@@ -685,6 +758,10 @@ _MAX_CHECKPOINT_ERROR_LENGTH = 300
 #: What the model is told when a dispatch fails. Provider/transport exception
 #: text can carry URLs or upstream response fragments, so it never reaches the
 #: model; the reason code is the whole answer, and the trace line records it.
+#: A caller's own idempotency key for `capability_invoke` (ADR 020 sec. 6).
+#: The gateway derives the ledger key from it, so it never reaches mctl-api.
+_CLIENT_IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
 _FIXED_ERRORS = MappingProxyType({
     "timeout": "the provider did not answer in time",
     "provider-unavailable": "the provider could not be reached",
@@ -717,6 +794,10 @@ class CapabilityGateway:
     local_sessions: Mapping[str, ProviderSession] = field(default_factory=dict)
     connector: ProviderConnector | None = None
     headers: Mapping[str, str] = field(default_factory=dict)
+    #: ADR 020: None serves every capability as legacy and refuses a paid
+    #: descriptor with `commerce-terms-unknown`.
+    commerce: CommerceRuntime | None = None
+    task_support_by_id: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     async def build(
@@ -733,16 +814,18 @@ class CapabilityGateway:
         strategy: CapabilityStrategy | None = None,
         retention: RetentionPolicy | None = None,
         created_at: str | None = None,
+        commerce: CommerceRuntime | None = None,
     ) -> CapabilityGateway:
         """Discover, seal, and emit the set-sealing trace line — one
         provider round trip, shared with the private schema/dispatch
         caches this gateway serves `capability_describe`/`capability_invoke`
         from."""
         resolved_headers = dict(headers) if headers is not None else _default_remote_headers()
+        task_support: dict[str, str] = {}
         descriptors, excluded_count, schemas_by_id, dispatch_by_id = await _discover(
             plan, correlation, providers,
             local_sessions=local_sessions, connector=connector, headers=resolved_headers,
-            consequence_table=consequence_table,
+            consequence_table=consequence_table, commerce=commerce, task_support_out=task_support,
         )
         capability_set = seal(
             execution=correlation,
@@ -768,6 +851,8 @@ class CapabilityGateway:
             local_sessions=dict(local_sessions),
             connector=connector,
             headers=resolved_headers,
+            commerce=commerce,
+            task_support_by_id=task_support,
         )
 
     # -- capability_search --------------------------------------------------
@@ -842,14 +927,20 @@ class CapabilityGateway:
 
     # -- capability_invoke ---------------------------------------------------
 
-    async def invoke(self, capability_id: Any, arguments: Any) -> dict[str, Any]:
+    async def invoke(self, capability_id: Any, arguments: Any, idempotency_key: Any = None) -> dict[str, Any]:
         """Membership check against the sealed set, then the
         `PolicyCheckpoint` (every capability, whatever its consequence tier
         — ADR 017 sec. 8, option B), then dispatch — remote via the provider
         connector, local in process, with zero network hop (ADR 017 sec. 5).
         Returns exactly one reason code from
         `orchestrator.capability.REASON_CODES` on every path, and emits one
-        invocation trace line regardless of outcome."""
+        invocation trace line regardless of outcome.
+
+        A capability whose descriptor carries a paid `commerce` summary goes
+        through `orchestrator.commerce_gateway.PaidInvocation` instead (ADR
+        020 secs. 7-9). `idempotency_key` matters only there: the same call
+        with the same arguments in the same execution is one invocation, and
+        a caller that really wants a second one passes a new key."""
         start = time.monotonic()
 
         if not isinstance(capability_id, str):
@@ -876,6 +967,17 @@ class CapabilityGateway:
             )
             self._trace(record)
             return {"reason_code": "not-eligible", "error": f"{capability_id!r} is not eligible for this execution"}
+
+        if idempotency_key is not None and not (
+            isinstance(idempotency_key, str) and _CLIENT_IDEMPOTENCY_KEY.match(idempotency_key)
+        ):
+            record = self._record(capability_id, "refused", "invalid-arguments", start, arguments,
+                                  policy_checkpoint="absent")
+            self._trace(record)
+            return {"reason_code": "invalid-arguments", "error": "idempotency_key must be 1..64 of [A-Za-z0-9._:-]"}
+
+        if descriptor.commerce is not None and descriptor.commerce.price_mode != "free":
+            return await self._invoke_paid(descriptor, arguments, idempotency_key or "", start)
 
         # ADR 017 sec. 8, option B (dated owner decision, 2026-09-26): every
         # capability goes through the PolicyCheckpoint before dispatch,
@@ -976,6 +1078,56 @@ class CapabilityGateway:
         self._trace(record)
         return {"reason_code": reason_code, "text": call_result.text}
 
+    async def _invoke_paid(
+        self, descriptor: CapabilityDescriptor, arguments: Mapping[str, Any], client_key: str, start: float,
+    ) -> dict[str, Any]:
+        """ADR 020: the paid path. Everything that would make the call
+        unsafe to charge is refused here, before any quote or ledger row
+        exists."""
+        from orchestrator import commerce_gateway as cg
+
+        capability_id = descriptor.capability_id
+
+        def refuse(code: str, error: str) -> dict[str, Any]:
+            self._trace(self._record(capability_id, "refused", code, start, arguments, policy_checkpoint="absent"))
+            return {"reason_code": code, "error": error}
+
+        if self.commerce is None:
+            return refuse("commerce-terms-unknown", "paid capabilities are not available in this execution")
+        if not isinstance(self.checkpoint, PolicyDecidePolicyCheckpoint):
+            return refuse("policy-denied", "a paid capability requires the policy checkpoint")
+        dispatch = self.dispatch_by_id.get(capability_id)
+        if dispatch is None:
+            return refuse("provider-error", f"{capability_id!r} has no dispatch target")
+        provider, bare_tool_name = dispatch
+        session = None if provider.type == "mcp-remote" else self.local_sessions.get(provider.id)
+        if (provider.id not in self.commerce.admitted_providers or session is None
+                or not isinstance(session, cg.PaidProviderSession)):
+            return refuse("unsupported-execution", "this provider is not admitted for paid execution")
+        if self.task_support_by_id.get(capability_id) == "required":
+            return refuse("unsupported-execution", "paid long-running execution is not supported")
+
+        paid = cg.PaidInvocation(
+            runtime=self.commerce, descriptor=descriptor, session=session, tool=bare_tool_name,
+            arguments=dict(arguments), grants=tuple(self.checkpoint.grants),
+            policy=self.checkpoint.resolved_policy(), client_key=client_key,
+            emit=lambda payload, event: _emit_trace(payload, event=event),
+        )
+        try:
+            result = await paid.run()
+        except Exception as exc:  # noqa: BLE001 — a bug here must not look like a definite answer
+            _emit_trace({"capability_id": capability_id, "error_type": type(exc).__name__}, event="commerce_failed")
+            result = cg.PaidResult("outcome-unknown", error="the paid call's state is unknown")
+        outcome = "ok" if result.reason_code == "ok" else (
+            "error" if result.reason_code in ("provider-error", "outcome-unknown", "timeout") else "refused")
+        result_hash = (
+            hash_bytes(canonical_json({"text": result.result_hash_source}))
+            if result.result_hash_source is not None else None
+        )
+        self._trace(self._record(capability_id, outcome, result.reason_code, start, arguments,
+                                 policy_checkpoint=result.policy_checkpoint, result_hash=result_hash))
+        return result.to_answer()
+
     def _record(
         self,
         capability_id: str,
@@ -1027,7 +1179,8 @@ class CapabilityGateway:
 
         async def _invoke(args: dict[str, Any]) -> dict[str, Any]:
             arguments = args.get("arguments")
-            result = await self.invoke(args.get("capability_id"), arguments if arguments is not None else {})
+            result = await self.invoke(args.get("capability_id"), arguments if arguments is not None else {},
+                                       args.get("idempotency_key"))
             return _as_tool_result(result)
 
         return [
@@ -1060,6 +1213,7 @@ class CapabilityGateway:
                     "properties": {
                         "capability_id": {"type": "string"},
                         "arguments": {"type": "object"},
+                        "idempotency_key": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,64}$"},
                     },
                     "required": ["capability_id"],
                 },

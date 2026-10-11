@@ -115,7 +115,35 @@ REASON_CODES = frozenset({
     "provider-error",
     "timeout",
     "collision",
+    # ADR 020 sec. 13: the additive commerce extension (ADR 017 amendment).
+    *(
+        "identity-unresolved",
+        "commerce-terms-unknown",
+        "quote-expired",
+        "quote-stale",
+        "quote-mismatch",
+        "idempotency-conflict",
+        "currency-mismatch",
+        "funds-mode-unavailable",
+        "budget-exhausted",
+        "payment-denied",
+        "unsupported-execution",
+        "outcome-unknown",
+        "too-late-to-cancel",
+    ),
 })
+#: ADR 020 sec. 4: the only price modes the milestone knows.
+PRICE_MODES = frozenset({"free", "per_call", "per_successful_call"})
+#: ADR 020 sec. 2. `live` is a valid VALUE (so a summary can say what the
+#: terms say) but nothing in the milestone accepts it.
+FUNDS_MODES = frozenset({"simulated", "live"})
+#: ADR 020 sec. 12: what each price mode bills on; derived, never free-form.
+BILLABLE_ON = MappingProxyType({
+    "free": "never",
+    "per_call": "accepted_dispatch",
+    "per_successful_call": "confirmed_success",
+})
+COMMERCE_METERS = frozenset({"invocation"})
 POLICY_CHECKPOINT_STATUSES = frozenset({"absent", "allowed", "denied"})
 CHECKPOINT_DECISIONS = frozenset({"allowed", "denied"})
 OUTCOME_VALUES = frozenset({"ok", "refused", "error"})
@@ -301,6 +329,101 @@ class ProviderRef:
 
 
 # ---------------------------------------------------------------------------
+# CommerceSummary — ADR 020 sec. 12's optional descriptor extension
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CommerceSummary:
+    """What a capability costs, as a read-only summary for the model and the
+    user (ADR 020 sec. 12). Execution never reads it: the gateway resolves
+    the terms in force from mctl-api on every paid call, and mctl-api is the
+    only authority on a price. Money is an integer count of minor units in
+    one ISO 4217 currency, never a float (ADR 020 sec. 2).
+
+    `quote_required` and `billable_on` are derived from `price_mode`, so a
+    summary cannot claim a paid mode bills on nothing."""
+
+    terms_id: str
+    terms_version: int
+    price_mode: str
+    currency: str
+    amount_minor: int
+    funds_mode: str
+    meter: str = "invocation"
+
+    def __post_init__(self) -> None:
+        where = "capability.commerce"
+        if not isinstance(self.terms_id, str) or not self.terms_id.startswith("ctm_") or len(self.terms_id) > 64:
+            raise CapabilityError(f"{where}.terms_id must be a ctm_ id")
+        if _require_int(self.terms_version, where=f"{where}.terms_version") < 1:
+            raise CapabilityError(f"{where}.terms_version must be >= 1")
+        if self.price_mode not in PRICE_MODES:
+            raise CapabilityError(f"{where}.price_mode {self.price_mode!r} is not one of {sorted(PRICE_MODES)!r}")
+        if not (isinstance(self.currency, str) and len(self.currency) == 3 and self.currency.isascii()
+                and self.currency.isupper() and self.currency.isalpha()):
+            raise CapabilityError(f"{where}.price.currency must be an ISO 4217 code")
+        if _require_int(self.amount_minor, where=f"{where}.price.amount_minor") < 0:
+            raise CapabilityError(f"{where}.price.amount_minor must be >= 0")
+        if (self.price_mode == "free") != (self.amount_minor == 0):
+            raise CapabilityError(f"{where}: a free capability has amount 0 and only a free one does")
+        if self.funds_mode not in FUNDS_MODES:
+            raise CapabilityError(f"{where}.funds_mode {self.funds_mode!r} is not one of {sorted(FUNDS_MODES)!r}")
+        if self.meter not in COMMERCE_METERS:
+            raise CapabilityError(f"{where}.meter {self.meter!r} is not one of {sorted(COMMERCE_METERS)!r}")
+
+    @property
+    def quote_required(self) -> bool:
+        return self.price_mode != "free"
+
+    @property
+    def billable_on(self) -> str:
+        return BILLABLE_ON[self.price_mode]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "terms_id": self.terms_id,
+            "terms_version": self.terms_version,
+            "price_mode": self.price_mode,
+            "price": {"currency": self.currency, "amount_minor": self.amount_minor},
+            "funds_mode": self.funds_mode,
+            "meter": self.meter,
+            "quote_required": self.quote_required,
+            "billable_on": self.billable_on,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CommerceSummary:
+        where = "capability.commerce"
+        mapping = _require_mapping(data, where=where)
+        _reject_unknown_keys(
+            mapping,
+            frozenset({"terms_id", "terms_version", "price_mode", "price", "funds_mode", "meter",
+                       "quote_required", "billable_on"}),
+            where=where,
+        )
+        price = _require_mapping(mapping.get("price"), where=f"{where}.price")
+        _reject_unknown_keys(price, frozenset({"currency", "amount_minor"}), where=f"{where}.price")
+        summary = cls(
+            terms_id=_require_str(mapping.get("terms_id"), where=f"{where}.terms_id"),
+            terms_version=_require_int(mapping.get("terms_version"), where=f"{where}.terms_version"),
+            price_mode=_require_str(mapping.get("price_mode"), where=f"{where}.price_mode"),
+            currency=_require_str(price.get("currency"), where=f"{where}.price.currency"),
+            amount_minor=_require_int(price.get("amount_minor"), where=f"{where}.price.amount_minor"),
+            funds_mode=_require_str(mapping.get("funds_mode"), where=f"{where}.funds_mode"),
+            meter=_require_str(mapping.get("meter"), where=f"{where}.meter"),
+        )
+        # The derived fields are part of the hashed document, so a stored
+        # value that disagrees with its price mode is a different document,
+        # not one to silently correct.
+        if _require_bool(mapping.get("quote_required"), where=f"{where}.quote_required") != summary.quote_required:
+            raise CapabilityError(f"{where}.quote_required does not match price_mode {summary.price_mode!r}")
+        if mapping.get("billable_on") != summary.billable_on:
+            raise CapabilityError(f"{where}.billable_on does not match price_mode {summary.price_mode!r}")
+        return summary
+
+
+# ---------------------------------------------------------------------------
 # CapabilityDescriptor — the canonical shape shared by every provider
 # ---------------------------------------------------------------------------
 
@@ -328,8 +451,16 @@ class CapabilityDescriptor:
     consequence: str
     matched_tool_pattern: str
     annotations: Mapping[str, Any] = field(default_factory=dict)
+    #: ADR 020 sec. 12. None is a legacy capability: unchanged behaviour,
+    #: and absent from `to_dict()` so every pre-C4 sealed set keeps its
+    #: content_hash.
+    commerce: CommerceSummary | None = None
 
     def __post_init__(self) -> None:
+        if self.commerce is not None and not isinstance(self.commerce, CommerceSummary):
+            raise CapabilityError(
+                f"capability.commerce must be a CommerceSummary, got {type(self.commerce).__name__}"
+            )
         # Type-checked BEFORE any conversion touches them, so a wrong-typed
         # keywords/annotations value raises CapabilityError (fail-closed)
         # rather than a bare TypeError from tuple()/dict() (R3, review
@@ -404,6 +535,7 @@ class CapabilityDescriptor:
             and self.consequence == other.consequence
             and self.matched_tool_pattern == other.matched_tool_pattern
             and _canonical_json(dict(self.annotations)) == _canonical_json(dict(other.annotations))
+            and self.commerce == other.commerce
         )
 
     def __hash__(self) -> int:
@@ -419,10 +551,11 @@ class CapabilityDescriptor:
             self.consequence,
             self.matched_tool_pattern,
             _canonical_json(dict(self.annotations)),
+            self.commerce,
         ))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "capability_id": self.capability_id,
             "tool_name": self.tool_name,
             "provider": self.provider.to_dict(),
@@ -435,6 +568,10 @@ class CapabilityDescriptor:
             "matched_tool_pattern": self.matched_tool_pattern,
             "annotations": dict(self.annotations),
         }
+        if self.commerce is not None:
+            # Omitted, never null, when absent (ADR 020 sec. 12).
+            out["commerce"] = self.commerce.to_dict()
+        return out
 
     @classmethod
     def from_dict(cls, data: Any) -> CapabilityDescriptor:
@@ -444,7 +581,7 @@ class CapabilityDescriptor:
             frozenset({
                 "capability_id", "tool_name", "provider", "title", "summary", "keywords",
                 "input_schema_hash", "input_schema_bytes", "consequence", "matched_tool_pattern",
-                "annotations",
+                "annotations", "commerce",
             }),
             where="capability",
         )
@@ -470,6 +607,9 @@ class CapabilityDescriptor:
                 mapping.get("matched_tool_pattern"), where="capability.matched_tool_pattern"
             ),
             annotations=_require_mapping(annotations_raw, where="capability.annotations"),
+            # A present-but-null key is not "absent": the serializer never
+            # writes null, so a null here is a document it did not produce.
+            commerce=CommerceSummary.from_dict(mapping["commerce"]) if "commerce" in mapping else None,
         )
 
 

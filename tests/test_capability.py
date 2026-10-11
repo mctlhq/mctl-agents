@@ -1001,3 +1001,89 @@ def test_to_log_dict_carries_ids_hashes_and_counts_only():
         for leaked in (capability.tool_name, capability.title, capability.summary, capability.provider.alias):
             if leaked:
                 assert leaked not in rendered
+
+
+# ---------------------------------------------------------------------------
+# ADR 020 sec. 12 — the descriptor's optional `commerce` summary
+# (mctlhq/mctl-agents#619, C4).
+# ---------------------------------------------------------------------------
+
+
+def _summary(**overrides) -> cap.CommerceSummary:
+    fields = dict(terms_id="ctm_01JZ8PZ0000000000000000000", terms_version=3, price_mode="per_successful_call",
+                  currency="EUR", amount_minor=12, funds_mode="simulated")
+    fields.update(overrides)
+    return cap.CommerceSummary(**fields)
+
+
+def test_commerce_summary_derives_quote_and_billing_from_price_mode():
+    assert _summary().quote_required is True and _summary().billable_on == "confirmed_success"
+    per_call = _summary(price_mode="per_call")
+    assert per_call.quote_required is True and per_call.billable_on == "accepted_dispatch"
+    free = _summary(price_mode="free", amount_minor=0)
+    assert free.quote_required is False and free.billable_on == "never"
+
+
+def test_commerce_summary_serializes_money_as_integer_minor_units():
+    assert _summary().to_dict() == {
+        "terms_id": "ctm_01JZ8PZ0000000000000000000", "terms_version": 3, "price_mode": "per_successful_call",
+        "price": {"currency": "EUR", "amount_minor": 12}, "funds_mode": "simulated", "meter": "invocation",
+        "quote_required": True, "billable_on": "confirmed_success",
+    }
+    assert cap.CommerceSummary.from_dict(_summary().to_dict()) == _summary()
+
+
+@pytest.mark.parametrize("overrides", [
+    {"terms_id": "terms-1"}, {"terms_version": 0}, {"price_mode": "per_token"}, {"currency": "eur"},
+    {"amount_minor": -1}, {"amount_minor": 1.5}, {"amount_minor": True}, {"price_mode": "free"},
+    {"amount_minor": 0}, {"funds_mode": "credit"}, {"meter": "token"},
+])
+def test_commerce_summary_rejects_invalid_terms(overrides):
+    with pytest.raises(cap.CapabilityError):
+        _summary(**overrides)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d.update(quote_required=False),
+    lambda d: d.update(billable_on="never"),
+    lambda d: d.update(extra=1),
+    lambda d: d.pop("price"),
+    lambda d: d.update(price={"currency": "EUR", "amount_minor": "12"}),
+])
+def test_commerce_summary_from_dict_is_strict(mutate):
+    doc = _summary().to_dict()
+    mutate(doc)
+    with pytest.raises(cap.CapabilityError):
+        cap.CommerceSummary.from_dict(doc)
+
+
+def test_descriptor_without_commerce_serializes_exactly_as_before():
+    """The key is omitted, never `null`, so every set sealed before C4
+    recomputes to its original content_hash (the golden fixture above)."""
+    provider = _provider()
+    assert "commerce" not in _descriptor(provider).to_dict()
+
+
+def test_descriptor_commerce_is_hashed_and_round_trips():
+    provider = _provider()
+    legacy = _sealed_set()
+    paid = _sealed_set(capabilities=[_descriptor(provider, commerce=_summary())])
+    assert paid.content_hash != legacy.content_hash
+    repriced = _sealed_set(capabilities=[_descriptor(provider, commerce=_summary(amount_minor=13))])
+    assert repriced.content_hash != paid.content_hash
+    reloaded = cap.CapabilitySet.from_dict(json.loads(json.dumps(paid.to_dict())))
+    assert reloaded.capabilities[0].commerce == _summary()
+    assert cap.recompute_content_hash(reloaded) == paid.content_hash
+
+
+def test_descriptor_commerce_must_be_a_summary():
+    with pytest.raises(cap.CapabilityError):
+        _descriptor(_provider(), commerce={"price_mode": "per_call"})
+
+
+def test_commerce_summary_carries_no_authorization_vocabulary():
+    """ADR 017's rule, applied to the new field (ADR 020 sec. 12): a price
+    summary never looks like a grant."""
+    banned = ("allow", "deny", "permit", "grant", "authoriz")
+    keys = set(_summary().to_dict()) | set(_summary().to_dict()["price"])
+    assert not [k for k in keys if any(b in k.lower() for b in banned)]

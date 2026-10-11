@@ -41,6 +41,11 @@ requires-python = ">=3.12,<3.13"
 # imports mcp.client.streamable_http and mcp.ClientSession directly to
 # connect a remote MCP capability provider. Pinned at the version already
 # resolved in uv.lock so this promotion changes no resolved version.
+#
+# cryptography: promoted from a transitive dep for the same reason --
+# orchestrator/commerce.py (mctlhq/mctl-agents#619, ADR 020 sec. 9) verifies
+# mctl-api's Ed25519 dispatch authorizations with it. Pinned at the version
+# uv.lock already resolves, imported lazily inside the verify/sign helpers.
 dependencies = [
     "claude-agent-sdk==0.2.163",
     "anyio==4.14.2",
@@ -49,6 +54,7 @@ dependencies = [
     "temporalio==1.31.0",
     "httpx==0.28.1",
     "mcp==1.29.0",
+    "cryptography==50.0.0",
     "opentelemetry-api==1.44.0",
     "opentelemetry-sdk==1.44.0",
     "opentelemetry-exporter-otlp-proto-http==1.44.0",
