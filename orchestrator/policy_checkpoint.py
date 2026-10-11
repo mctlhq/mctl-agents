@@ -467,6 +467,31 @@ def evaluate(policy: Policy, request: ActionRequest) -> tuple[Rule | None, str, 
     return None, CODE_NO_RULE, f"no rule covers {request.action_kind} {request.operation}"
 
 
+EXPECTED_REQUIRED = "required"
+EXPECTED_NOT_REQUIRED = "not_required"
+EXPECTED_UNKNOWN = "unknown"
+
+
+def expected_verdict(policy: Policy, action_kind: str, operation: str, grants: tuple[str, ...] = ()) -> str:
+    """Advisory only (mctlhq/mctl-agents#620): would a call to `operation`
+    need a human approval under `policy`? `required`, `not_required` or
+    `unknown`. Pure: no argument digest, no execution identity, no approval
+    store, no network, nothing emitted. Rules here match on the operation
+    only, so the answer is the rule's verdict; a missing rule, a missing
+    grant, a DENY or a malformed policy is `unknown`, never a guess. The
+    real decision is re-made by `decide` at invocation time."""
+    try:
+        _rule, code, _reason = evaluate(
+            policy, ActionRequest(action_kind, operation, "", "-", grants=tuple(grants)))
+    except Exception:  # noqa: BLE001 — an unreadable policy is no hint
+        return EXPECTED_UNKNOWN
+    if code == CODE_APPROVAL_REQUIRED:
+        return EXPECTED_REQUIRED
+    if code == CODE_ALLOWED:
+        return EXPECTED_NOT_REQUIRED
+    return EXPECTED_UNKNOWN
+
+
 _APPROVAL_FLOW_CODES = frozenset({
     CODE_APPROVAL_REQUIRED, CODE_APPROVED, CODE_APPROVAL_PENDING, CODE_APPROVAL_DENIED, CODE_APPROVAL_EXPIRED,
     CODE_APPROVAL_CONSUMED, CODE_APPROVAL_INTENT_MISMATCH, CODE_APPROVAL_REFUSED,

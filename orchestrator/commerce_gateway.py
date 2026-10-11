@@ -37,6 +37,8 @@ has no payment rail to call.
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -44,6 +46,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from orchestrator import action_approvals as aa
 from orchestrator import commerce as cm
+from orchestrator import commerce_metrics
 from orchestrator import policy_checkpoint as pc
 from orchestrator.capability import REASON_CODES, CapabilityDescriptor
 
@@ -88,6 +91,16 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+ENV_ENABLED = "MCTL_COMMERCE_ENABLED"
+ENV_ADMITTED_PROVIDERS = "MCTL_COMMERCE_ADMITTED_PROVIDERS"
+ENV_FUNDS_MODE = "MCTL_COMMERCE_FUNDS_MODE"
+ENV_TENANT_ID = "MCTL_COMMERCE_TENANT_ID"
+
+
+class CommerceConfigError(RuntimeError):
+    """Commerce is switched on with a configuration that must not run."""
+
+
 @dataclass(frozen=True)
 class CommerceRuntime:
     """What a gateway needs to serve paid capabilities. Without one, every
@@ -112,6 +125,43 @@ class CommerceRuntime:
     @property
     def payer_account_id(self) -> str:
         return cm.payer_account_for(self.tenant_id)
+
+    @classmethod
+    def from_env(
+        cls,
+        tenant_id: str = "",
+        approvals: aa.ActionApprovalClient | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        client: cm.CommerceClient | None = None,
+    ) -> CommerceRuntime | None:
+        """The one production construction site (mctlhq/mctl-agents#620).
+
+        `MCTL_COMMERCE_ENABLED` must be exactly `true`; anything else
+        (including unset) returns None and the process behaves as before:
+        every paid descriptor is refused at invocation. When enabled it
+        raises `CommerceConfigError` at startup, never at the first paid
+        call, if the funds mode is not `simulated`, the admission list
+        (`MCTL_COMMERCE_ADMITTED_PROVIDERS`, comma separated) is empty, or no
+        tenant is named (`tenant_id` or `MCTL_COMMERCE_TENANT_ID`)."""
+        source = os.environ if env is None else env
+        if source.get(ENV_ENABLED, "").strip().lower() != "true":
+            return None
+        funds_mode = source.get(ENV_FUNDS_MODE, "simulated").strip()
+        if funds_mode != "simulated":
+            raise CommerceConfigError(f"{ENV_FUNDS_MODE} must be 'simulated' (got {funds_mode!r}); no live funds")
+        providers = frozenset(
+            part.strip() for part in source.get(ENV_ADMITTED_PROVIDERS, "").split(",") if part.strip()
+        )
+        if not providers:
+            raise CommerceConfigError(f"{ENV_ADMITTED_PROVIDERS} must name at least one admitted provider")
+        tenant = (tenant_id or source.get(ENV_TENANT_ID, "")).strip()
+        if not tenant:
+            raise CommerceConfigError(f"{ENV_TENANT_ID} must name the paying tenant")
+        return cls(
+            client=client if client is not None else cm.CommerceClient(),
+            tenant_id=tenant, admitted_providers=providers, approvals=approvals,
+        )
 
 
 @dataclass
@@ -213,6 +263,9 @@ class PaidInvocation:
             "reason_code": inv.get("reason_code", ""),
             "execution_outcome": inv.get("execution_outcome", ""),
         }, event)
+        if event == "commerce_outcome_unknown":
+            commerce_metrics.record_outcome_unknown(
+                admitted_providers=self.runtime.admitted_providers, provider_id=self.descriptor.provider.id)
 
     # -- policy ----------------------------------------------------------------
 
@@ -251,6 +304,18 @@ class PaidInvocation:
     # -- entry -----------------------------------------------------------------
 
     async def run(self) -> PaidResult:
+        started = time.monotonic()
+        result = await self._run()
+        summary = self.descriptor.commerce
+        commerce_metrics.record_invocation(
+            admitted_providers=self.runtime.admitted_providers, phase=result.phase,
+            reason_code=result.reason_code, price_mode=summary.price_mode if summary else "",
+            funds_mode=summary.funds_mode if summary else "", provider_id=self.descriptor.provider.id,
+            duration_s=time.monotonic() - started,
+        )
+        return result
+
+    async def _run(self) -> PaidResult:
         if cm.TERMS_BINDING_ARGUMENT in self.arguments:
             return self._refusal("invalid-arguments", f"{cm.TERMS_BINDING_ARGUMENT} is reserved")
 

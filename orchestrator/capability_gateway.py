@@ -733,6 +733,25 @@ def _emit_trace(payload: Mapping[str, Any], *, event: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _commerce_view(summary: Any) -> dict[str, Any]:
+    """The sealed `commerce` summary plus a display price. Display only
+    (ADR 020 sec. 2): `price.amount_minor` is the integer that counts. Taken
+    from the sealed descriptor, never from mctl-api."""
+    from orchestrator.commerce import price_display
+
+    view = summary.to_dict()
+    view["price_display"] = price_display(summary.currency, summary.amount_minor)
+    return view
+
+
+def _commerce_search_view(summary: Any) -> dict[str, Any]:
+    full = _commerce_view(summary)
+    return {key: full[key] for key in (
+        "price_mode", "price", "price_display", "funds_mode", "meter", "quote_required", "billable_on",
+        "terms_id", "terms_version",
+    )}
+
+
 @dataclass(frozen=True)
 class PolicyDecidePolicyCheckpoint:
     """A `PolicyCheckpoint` (orchestrator/capability.py) adapter wrapping
@@ -918,13 +937,32 @@ class CapabilityGateway:
             haystack = " ".join((descriptor.title, descriptor.summary, *descriptor.keywords)).lower()
             if needle and needle not in haystack:
                 continue
-            rows.append({
+            row: dict[str, Any] = {
                 "capability_id": descriptor.capability_id,
                 "title": descriptor.title,
                 "summary": descriptor.summary,
                 "consequence": descriptor.consequence,
-            })
+            }
+            if descriptor.commerce is not None:
+                row["commerce"] = _commerce_search_view(descriptor.commerce)
+            rows.append(row)
         return {"results": rows[:row_limit], "reason_code": "ok"}
+
+    def _approval_expected(self, descriptor: CapabilityDescriptor) -> str:
+        """Advisory (mctlhq/mctl-agents#620): `required` | `not_required` |
+        `unknown`, from the configured policy's rule for this tool. Reads no
+        arguments and contacts nothing; `capability_invoke` re-decides."""
+        from orchestrator import policy_checkpoint
+
+        if not isinstance(self.checkpoint, PolicyDecidePolicyCheckpoint):
+            return policy_checkpoint.EXPECTED_UNKNOWN
+        try:
+            return policy_checkpoint.expected_verdict(
+                self.checkpoint.resolved_policy(), policy_checkpoint.MCP_TOOL_CALL,
+                descriptor.tool_name, self.checkpoint.grants,
+            )
+        except Exception:  # noqa: BLE001 — a hint must never fail discovery
+            return policy_checkpoint.EXPECTED_UNKNOWN
 
     # -- capability_describe -------------------------------------------------
 
@@ -955,13 +993,17 @@ class CapabilityGateway:
             if descriptor is None:
                 results[capability_id] = {"reason_code": "not-found"}
                 continue
-            results[capability_id] = {
+            entry: dict[str, Any] = {
                 "reason_code": "ok",
                 "title": descriptor.title,
                 "summary": descriptor.summary,
                 "consequence": descriptor.consequence,
                 "input_schema": dict(self.schemas_by_id.get(capability_id, {})),
             }
+            if descriptor.commerce is not None:
+                entry["commerce"] = _commerce_view(descriptor.commerce)
+                entry["approval_expected"] = self._approval_expected(descriptor)
+            results[capability_id] = entry
         return {"results": results, "reason_code": "ok"}
 
     # -- capability_invoke ---------------------------------------------------
@@ -1233,7 +1275,10 @@ class CapabilityGateway:
 
         return [
             sdk_tool(
-                "capability_search", "Search the capabilities eligible for this execution.",
+                "capability_search",
+                "Search the capabilities eligible for this execution. A paid capability's row carries a "
+                "`commerce` block (price, mode, quote requirement). The price is advisory: "
+                "capability_invoke re-checks identity, policy, quote and budget.",
                 {
                     "type": "object",
                     "properties": {
@@ -1243,7 +1288,10 @@ class CapabilityGateway:
                 },
             )(_search),
             sdk_tool(
-                "capability_describe", "Return full input schemas for eligible capability ids.",
+                "capability_describe",
+                "Return full input schemas for eligible capability ids. A paid capability also shows its "
+                "full `commerce` terms and an advisory `approval_expected` (required, not_required or "
+                "unknown); capability_invoke re-checks identity, policy, quote and budget.",
                 {
                     "type": "object",
                     "properties": {
