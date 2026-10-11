@@ -17,7 +17,7 @@ The order is ADR 020 sec. 7's:
   consumed here. No quote exists and no funds are held while it waits;
 - step 6: mint and verify the quote, accept the invocation under a
   deterministic idempotency key, naming the approval;
-- step 7: consume the approval for that invocation, re-check policy;
+- step 7: re-check policy, then consume the approval for that invocation;
 - step 8: reserve;
 - step 9: fence and sign the dispatch in mctl-api, then call the provider
   through its ingress with that authorization;
@@ -175,6 +175,8 @@ class PaidInvocation:
     #: The invocation being resumed already spent its approval in an
     #: earlier attempt (it is past `accepted`).
     _approved_earlier: bool = False
+    #: The approval record this attempt consumed, for the audit line.
+    _approval_record: aa.ApprovalRecord | None = None
     _trace: dict[str, Any] = field(default_factory=dict)
 
     # -- plumbing ------------------------------------------------------------
@@ -428,7 +430,7 @@ class PaidInvocation:
     async def _advance(self, inv: dict[str, Any]) -> PaidResult:
         for _ in range(_MAX_STEPS):
             phase = inv.get("phase")
-            if inv.get("approval_id") and phase in _APPROVAL_SPENT_PHASES:
+            if _approval_spent(inv):
                 # Past reserved, the approval was consumed and the policy
                 # rechecked by the attempt that moved the row: a resumed or
                 # replayed call reports that verdict, not "denied".
@@ -469,7 +471,11 @@ class PaidInvocation:
                 refusal = self._refusal("policy-denied", "policy now requires an approval")
             else:
                 if decided.code == pc.CODE_APPROVAL_REQUIRED and inv.get("phase") != ACCEPTED:
+                    # Past accepted the approval is spent for this row: the
+                    # decision in force before dispatch is the approved one,
+                    # so the audit trail does not end on approval_required.
                     self._approved_earlier = True
+                    self._record_approved(str(inv["approval_id"]), self._approval_record)
                 return None
         else:
             refusal = self._refusal("policy-denied", decided.reason)
@@ -492,6 +498,7 @@ class PaidInvocation:
         fresh = aa.intent_hash(self._intent())
         spent = await asyncio.to_thread(store.consume, approval_id, fresh)
         if spent.status == aa.SPENT:
+            self._approval_record = spent.record
             self._record_approved(approval_id, spent.record)
             return None
         if spent.status in (aa.CONSUMED, aa.UNKNOWN):
@@ -731,3 +738,17 @@ _RESULT_UNAVAILABLE = "the capability succeeded, but its result could not be ret
 #: Phases a row reaches only after its approval was consumed and the policy
 #: rechecked before dispatch (`reserved` is excluded: its recheck still runs).
 _APPROVAL_SPENT_PHASES = frozenset({DISPATCHING, DISPATCHED, OUTCOME_UNKNOWN, FINALIZED})
+#: The only reason a row is released after dispatch began. A release from
+#: `reserved` (a revocation at the recheck) carries `policy-denied` or
+#: `identity-unresolved`, and that verdict is the right one to report.
+_RELEASED_AFTER_DISPATCH = "provider-error"
+
+
+def _approval_spent(inv: Mapping[str, Any]) -> bool:
+    """Whether this row's approval was consumed and its policy rechecked
+    by the attempt that moved it here."""
+    if not inv.get("approval_id"):
+        return False
+    phase = inv.get("phase")
+    return phase in _APPROVAL_SPENT_PHASES or (
+        phase == RELEASED and inv.get("reason_code") == _RELEASED_AFTER_DISPATCH)

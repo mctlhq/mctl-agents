@@ -1267,13 +1267,17 @@ def test_a_consumed_approval_is_audited_like_policy_checkpoint_audits_it(world, 
     world.approvals.decide(ref, "approved")
     capsys.readouterr()
     assert run(_invoke(world))["reason_code"] == "ok"
-    approved = [d for d in _policy_decisions(capsys.readouterr().out) if d["code"] == pc.CODE_APPROVED]
-    assert len(approved) == 1
-    # The same shape `policy_checkpoint.decide` writes when it redeems an
-    # approval itself: the rule's REQUIRE_APPROVAL verdict, code approved,
-    # the receipt and the approver. Never DENY, and not ALLOW either.
-    assert approved[0]["decision"] == pc.REQUIRE_APPROVAL == pc._verdict_for(pc.CODE_APPROVED)
-    assert approved[0]["approval_ref"] == ref and approved[0]["approver"]
+    decisions = _policy_decisions(capsys.readouterr().out)
+    approved = [d for d in decisions if d["code"] == pc.CODE_APPROVED]
+    # Once at the consume and once at the recheck before dispatch: the
+    # decision in force when the provider runs is the approved one.
+    assert len(approved) == 2 and decisions[-1]["code"] == pc.CODE_APPROVED
+    for d in approved:
+        # The same shape `policy_checkpoint.decide` writes when it redeems
+        # an approval itself: the rule's REQUIRE_APPROVAL verdict, code
+        # approved, the receipt and the approver. Never DENY, nor ALLOW.
+        assert d["decision"] == pc.REQUIRE_APPROVAL == pc._verdict_for(pc.CODE_APPROVED)
+        assert d["approval_ref"] == ref and d["approver"]
 
 
 def test_a_settled_success_whose_result_is_lost_says_so(world):
@@ -1284,3 +1288,43 @@ def test_a_settled_success_whose_result_is_lost_says_so(world):
     assert out["reason_code"] == "ok" and "text" not in out
     assert out["error"] == cg._RESULT_UNAVAILABLE
     assert len(world.executions) == 1
+
+
+def test_a_retry_of_a_released_approved_call_keeps_its_verdict(world, capsys):
+    """Released after dispatch (the not_found margin): the approval was spent,
+    so every later read of the row reports the same verdict."""
+    world.policy = APPROVE_PAID
+    ref = run(_invoke(world))["approval_ref"]
+    world.approvals.decide(ref, "approved")
+    world.ledger.inject("dispatch", "crash-after")
+    with pytest.raises(Crash):
+        _restart(world)
+    world.clock.advance(3600)
+    capsys.readouterr()
+    assert _restart(world)["reason_code"] == "provider-error"
+    assert '"policy_checkpoint": "allowed"' in _invocation_records(capsys.readouterr().out)[-1]
+    assert _restart(world)["reason_code"] == "provider-error"
+    assert '"policy_checkpoint": "allowed"' in _invocation_records(capsys.readouterr().out)[-1]
+    assert world.executions == []
+
+
+def test_a_call_revoked_before_dispatch_stays_denied_on_retry(world, capsys):
+    """Released from reserved by a revocation: the verdict is denied, and a
+    retry of the released row must not report it as allowed."""
+    world.policy = APPROVE_PAID
+    ref = run(_invoke(world))["approval_ref"]
+    world.approvals.decide(ref, "approved")
+    world.ledger.inject("reserve", "crash-after")
+    with pytest.raises(Crash):
+        _restart(world)
+    world.policy = pc.Policy("test/paid-deny/v1", (
+        pc.Rule("paid-deny", pc.MCP_TOOL_CALL, "mcp__pilot__*", pc.DENY, requires_grant=True),
+    ))
+    capsys.readouterr()
+    assert _restart(world)["reason_code"] == "policy-denied"
+    inv = world.ledger.only()
+    assert inv["phase"] == "released" and inv["approval_id"] == ref
+    world.policy = APPROVE_PAID
+    _restart(world)
+    assert '"policy_checkpoint": "denied"' in _invocation_records(capsys.readouterr().out)[-1]
+    assert world.executions == []
