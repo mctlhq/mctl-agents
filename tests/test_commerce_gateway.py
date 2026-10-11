@@ -1401,16 +1401,26 @@ def test_an_approval_spent_without_its_record_carries_no_timestamp(world, capsys
 # ---------------------------------------------------------------------------
 
 
+_UNUSABLE_TERMS = ["unreadable", "withdrawn", "mismatched", "free", "malformed"]
+
+
 def _terms_unusable(world: World, how: str) -> None:
+    """Each refusal site in `run()` before the checkpoint: the read failed,
+    no terms are in force, the terms name another capability version, the
+    capability was repriced to free, or the terms are malformed."""
     if how == "unreadable":
         world.ledger.terms_failure = True
     elif how == "withdrawn":
         world.ledger.terms.clear()
-    else:
+    elif how == "mismatched":
+        world.ledger.publish(PILOT_CAP, world.schema_hash(), provider_id="another-provider")
+    elif how == "free":
         world.ledger.publish(PILOT_CAP, world.schema_hash(), price_mode="free", amount=0)
+    else:
+        world.ledger.publish(PILOT_CAP, world.schema_hash())["price"] = None
 
 
-@pytest.mark.parametrize("how", ["unreadable", "withdrawn", "free"])
+@pytest.mark.parametrize("how", _UNUSABLE_TERMS)
 def test_a_retry_without_terms_settles_a_dispatched_call(world, capsys, how):
     async def slow():
         g = await world.gateway()
@@ -1431,7 +1441,7 @@ def test_a_retry_without_terms_settles_a_dispatched_call(world, capsys, how):
     assert '"policy_checkpoint": "allowed"' in _invocation_records(capsys.readouterr().out)[-1]
 
 
-@pytest.mark.parametrize("how", ["unreadable", "withdrawn", "free"])
+@pytest.mark.parametrize("how", _UNUSABLE_TERMS)
 @pytest.mark.parametrize("stage", ["accept", "reserve"])
 def test_a_retry_without_terms_names_the_held_invocation_and_never_advances_it(world, how, stage):
     world.ledger.inject(stage, "crash-after")
@@ -1481,3 +1491,97 @@ def test_a_replayed_accept_naming_another_call_is_not_adopted(world, monkeypatch
     assert out["reason_code"] == "outcome-unknown"
     assert out["invocation_id"] == world.ledger.only()["invocation_id"]
     assert "reserve" not in world.ledger.calls and world.executions == []
+
+
+# ---------------------------------------------------------------------------
+# mctlhq/mctl-agents#626: discovery reads, the lost consume, task support
+# ---------------------------------------------------------------------------
+
+
+class _ManyTools:
+    """A free provider listing `n` tools, each with paid terms."""
+
+    def __init__(self, n: int) -> None:
+        self.names = [f"tool{i}" for i in range(n)]
+
+    async def list_tools(self):
+        return [gw.ProviderTool(name=n, description="", input_schema={"type": "object"}) for n in self.names]
+
+    async def call_tool(self, tool, arguments):
+        raise AssertionError("discovery only")
+
+
+class _MeetingTerms:
+    """Answers a terms read only once `parties` reads are in flight together,
+    so sequential reads time out."""
+
+    def __init__(self, ledger: FakeLedger, parties: int) -> None:
+        self.ledger = ledger
+        self.barrier = threading.Barrier(parties, timeout=2)
+
+    def current_terms(self, capability_id: str, input_schema_hash: str) -> cm.CommerceAnswer:
+        self.barrier.wait()
+        return self.ledger.current_terms(capability_id, input_schema_hash)
+
+
+def _discover_many(world: World, client: Any, n: int) -> gw.CapabilityGateway:
+    many = _ManyTools(n)
+    schema = gw.hash_bytes(gw.canonical_json({"type": "object"}))
+    for name in many.names:
+        world.ledger.publish(f"mctl://mcp-local/many/{name}", schema, provider_id="many")
+    runtime = cg.CommerceRuntime(client=client, tenant_id=TENANT, admitted_providers=frozenset(),
+                                 approvals=world.approvals, now=world.clock)  # type: ignore[arg-type]
+    provider = cap.ProviderRef(type="mcp-local", id="many", alias="many")
+    return run(gw.CapabilityGateway.build(
+        SimpleNamespace(tools=("mcp__many__*",)), _correlation(), [provider],
+        checkpoint=gw.PolicyDecidePolicyCheckpoint(grants=GRANTS, policy=world.policy),
+        local_sessions={"many": many}, headers={}, consequence_table={}, created_at="2026-10-11T12:00:00Z",
+        commerce=runtime,
+    ))
+
+
+def test_discovery_reads_the_terms_of_every_matched_tool_concurrently(world):
+    g = _discover_many(world, _MeetingTerms(world.ledger, 3), 3)
+    summaries = [d.commerce for d in g.descriptors_by_id.values()]
+    assert len(summaries) == 3 and all(s is not None and s.amount_minor == 12 for s in summaries)
+
+
+def test_discovery_fails_on_the_first_unreadable_terms_in_discovery_order(world):
+    class FailSome:
+        def current_terms(self, capability_id, input_schema_hash):
+            if capability_id.endswith(("tool1", "tool2")):
+                return _no(503, capability_id.rsplit("/", 1)[1])
+            return world.ledger.current_terms(capability_id, input_schema_hash)
+
+    with pytest.raises(gw.GatewayError, match="tool1"):
+        _discover_many(world, FailSome(), 3)
+
+
+def test_a_lost_consume_answer_still_writes_the_approved_line_before_dispatch(world, capsys):
+    world.policy = APPROVE_PAID
+    ref = run(_invoke(world))["approval_ref"]
+    world.approvals.decide(ref, "approved")
+    world.approvals.lose_consume = 1
+    capsys.readouterr()
+    assert run(_invoke(world))["reason_code"] == "ok"
+    decisions = _policy_decisions(capsys.readouterr().out)
+    approved = [d for d in decisions if d["code"] == pc.CODE_APPROVED]
+    # As on the answered path: once at the consume, once at the recheck.
+    assert len(approved) == 2 and decisions[-1]["code"] == pc.CODE_APPROVED
+    assert all(d["approval_ref"] == ref and d["approver"] for d in approved)
+
+
+def test_a_paid_tool_that_lists_required_task_support_is_unsupported(world):
+    real = world.new_ingress
+
+    def required() -> cp.ProviderIngress:
+        ingress = real()
+        spec = ingress._tools[cp.PILOT_TOOL]
+        ingress._tools[cp.PILOT_TOOL] = dataclasses.replace(spec, task_support="required")
+        return ingress
+
+    world.new_ingress = required  # type: ignore[method-assign]
+    g = run(world.gateway())
+    assert g.task_support_by_id[PILOT_CAP] == "required"
+    assert run(g.invoke(PILOT_CAP, {"ticket": "OPS-1"}))["reason_code"] == "unsupported-execution"
+    assert world.ledger.writes() == [] and world.executions == []
