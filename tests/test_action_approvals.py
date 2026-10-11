@@ -516,7 +516,7 @@ def test_the_ttl_env_var_is_parsed_and_clamped(monkeypatch, ttl, want):
         monkeypatch.delenv(aa.TTL_ENV, raising=False)
     else:
         monkeypatch.setenv(aa.TTL_ENV, ttl)
-    assert aa._ttl_s() == want
+    assert aa.ttl_s() == want
 
 
 def test_an_over_cap_ttl_still_opens_a_request(api, clock, monkeypatch):

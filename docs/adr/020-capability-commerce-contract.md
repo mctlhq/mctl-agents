@@ -710,3 +710,36 @@ immutability (sec. 4), the quote encoding and golden vector (sec. 5), the
 idempotency scope and derived keys (sec. 6), the approval binding (sec. 8),
 the provider outcome rules (sec. 9), "payment proof is never authorization"
 (sec. 10), or "time never releases unknown liability" (sec. 11).
+
+### C4 implementation notes (mctl-agents#619)
+
+These record how C4 meets the sections above. They add no new contract.
+
+- `orchestrator/commerce.py` holds the encodings, both golden vectors, the
+  dispatch authorization verifier and the mctl-api client.
+  `orchestrator/commerce_gateway.py` runs steps 2-9 and the state machine
+  of section 11. `orchestrator/commerce_provider.py` is the provider ingress
+  of section 9 and the read-only pilot `lookup_status`.
+- The dispatch authorization is signed by mctl-api at the dispatch fence
+  (mctl-api#558). Its message is version-tagged and length-prefixed like the
+  quote encoding, and the Go and Python tests pin the same vector.
+- Admission (`commerce_support`, section 9) is an explicit allowlist of
+  provider ids on the gateway's commerce runtime. The milestone admits only
+  execution-local (`mcp-local`) providers built on `ProviderIngress`. A remote
+  provider, or a tool whose MCP `taskSupport` is `required`, is refused with
+  `unsupported-execution`.
+- The gateway idempotency key is derived from the execution id, the
+  capability id, the arguments digest and an optional client key. It uses
+  the prefix `mctl-gw.v1:` because mctl-api's key pattern has no `/`. Two
+  identical calls in one execution are therefore one invocation. A caller
+  that wants a second paid call passes a distinct `idempotency_key`.
+- The approval is checked before accept and consumed after accept (sec. 8).
+  The gateway therefore decides with no approvals loaded, reads or creates
+  the approval itself, and emits the approved decision only once the consume
+  succeeded. A lost consume answer is resolved by reading the approval back.
+- A dispatch call that mctl-api does not answer leaves the row `reserved`.
+  The gateway does not release it, because a concurrent attempt may hold the
+  fence. The row is settled by a retry or by C2's reconciler.
+- A dispatch answer marked `replayed` belongs to another attempt. The
+  gateway never calls the provider with it and goes to the outcome lookup.
+- Trace events carry ids and phases only, never amounts or payloads.

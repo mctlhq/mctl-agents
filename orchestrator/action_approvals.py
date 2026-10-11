@@ -353,7 +353,7 @@ def _outcome(answer: ApprovalAnswer, ref: str = "") -> pc.ApprovalOutcome:
     return pc.ApprovalOutcome(status, approval_ref=ref, reason=answer.reason or answer.code, decided_by=decided_by)
 
 
-def _ttl_s() -> int:
+def ttl_s() -> int:
     try:
         ttl = int(os.environ.get(TTL_ENV, "") or DEFAULT_TTL_S)
     except ValueError:
@@ -361,7 +361,7 @@ def _ttl_s() -> int:
     return min(max(ttl, MIN_TTL_S), MAX_TTL_S)
 
 
-def _parse_time(value: str) -> datetime | None:
+def parse_time(value: str) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
@@ -424,7 +424,7 @@ class MctlApiApprovals:
         else:
             answer = self._client.create(
                 intent, key=idempotency_key(intent, self._attempt),
-                expires_at=self._now() + timedelta(seconds=_ttl_s()),
+                expires_at=self._now() + timedelta(seconds=ttl_s()),
             )
         rec = answer.record
         if rec is None:
@@ -436,7 +436,7 @@ class MctlApiApprovals:
             )
         if answer.status != APPROVED:
             return _outcome(answer, rec.id)
-        expires = _parse_time(rec.expires_at)
+        expires = parse_time(rec.expires_at)
         if expires is None:
             return pc.ApprovalOutcome(pc.APPROVAL_UNKNOWN, approval_ref=rec.id, reason="unreadable expires_at")
         if expires <= self._now():
