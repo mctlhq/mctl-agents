@@ -203,7 +203,10 @@ def test_verification_refuses_unknown_key_padding_version_and_foreign_opkey():
         padded = dataclasses.replace(signed, signature=signed.signature + "==")
         cm.verify_dispatch_authorization({"kid-test-1": pub}, padded)
     with pytest.raises(cm.AuthorizationRejected, match="version"):
-        cm.verify_dispatch_authorization({"kid-test-1": pub}, dataclasses.replace(signed, schema_version="v2"))
+        cm.verify_dispatch_authorization({"kid-test-1": pub}, dataclasses.replace(signed, schema_version=2))
+    with pytest.raises(cm.AuthorizationRejected, match="version"):
+        cm.verify_dispatch_authorization({"kid-test-1": pub},
+                                         dataclasses.replace(signed, schema_version=cm.DISPATCH_AUTHORIZATION_VERSION))
     with pytest.raises(cm.AuthorizationRejected, match="derive"):
         cm.verify_dispatch_authorization({"kid-test-1": pub},
                                          dataclasses.replace(signed, provider_operation_key="mctl-op/v1:inv_other"))
