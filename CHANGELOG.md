@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.75.1](https://github.com/mctlhq/mctl-agents/compare/1.75.0...1.75.1) (2026-10-12)
+
+
+### Bug Fixes
+
+* **commerce:** accept mctl-api's integer authorization schema_version ([1d5f345](https://github.com/mctlhq/mctl-agents/commit/1d5f34556539b2db58477ef4812f683d75564146))
+* **commerce:** read the dispatch authorization's integer schema_version ([88bf192](https://github.com/mctlhq/mctl-agents/commit/88bf192b9a59f66d900c9554b26daea2fda335a5))
+* **commerce:** send a User-Agent on mctl-api commerce calls ([952ddf9](https://github.com/mctlhq/mctl-agents/commit/952ddf9f4e26a875b516527956e62769d1eb0f16))
+
 ## [1.75.0](https://github.com/mctlhq/mctl-agents/compare/1.74.1...1.75.0) (2026-10-11)
 
 
