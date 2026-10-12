@@ -275,6 +275,8 @@ def test_client_ok_sends_bearer_and_json():
     assert ans.ok and ans.body == {"quote_id": "cq_1"} and ans.http_status == 201
     req = c._opener.requests[0]
     assert req.get_header("Authorization") == "Bearer t0k"
+    # Never urllib's default: Cloudflare refuses `Python-urllib/*` with 403.
+    assert req.get_header("User-agent") == cm.CLIENT_USER_AGENT
     assert req.full_url == "https://api.example/api/v1/commerce/tenants/acme/quotes"
     assert json.loads(req.data) == {"capability_id": "mctl://a/b/c", "input_schema_hash": "h",
                                     "args_digest": "d", "execution_id": "we"}

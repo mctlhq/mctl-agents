@@ -44,6 +44,8 @@ DISPATCH_AUTHORIZATION_VERSION = "mctl-commerce-dispatch/v1"
 #: authorization (mctlhq/mctl-agents#620 live proof, 2026-10-12).
 DISPATCH_AUTHORIZATION_SCHEMA_VERSION = 1
 DISPATCH_SIGNATURE_ALGORITHM = "ed25519"
+#: Sent on every mctl-api commerce request (see `CommerceClient.call`).
+CLIENT_USER_AGENT = "mctl-agents-commerce-client/1"
 #: ADR 020 sec. 9: `not_found` is definitive only this long after the
 #: dispatch deadline.
 MAX_CLOCK_SKEW_S = 60
@@ -639,6 +641,11 @@ class CommerceClient:
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(url, data=data, method=method)  # noqa: S310 — scheme checked above
         req.add_header("Authorization", f"Bearer {self._token}")
+        # Cloudflare in front of api.mctl.ai answers 403 to urllib's default
+        # `Python-urllib/*`, which is what an operator-run client (the live
+        # proof, tools/commerce_proof.py) reaches; in-cluster callers never
+        # crossed it, so nothing noticed until the #620 live run.
+        req.add_header("User-Agent", CLIENT_USER_AGENT)
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:
