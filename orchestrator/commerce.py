@@ -36,7 +36,16 @@ from urllib.parse import quote, urlencode
 QUOTE_ENCODING_VERSION = "mctl-commerce-quote/v1"
 TERMS_ENCODING_VERSION = "mctl-commerce-terms/v1"
 DISPATCH_AUTHORIZATION_VERSION = "mctl-commerce-dispatch/v1"
+#: The authorization's wire `schema_version` (ADR 020: every record carries
+#: the integer `schema_version: 1`). Distinct from
+#: DISPATCH_AUTHORIZATION_VERSION, which names the signed encoding and is
+#: never on the wire. mctl-api sends the integer (internal/commerce/dispatch.go
+#: `SchemaVersion int`); reading it as the encoding string refused every live
+#: authorization (mctlhq/mctl-agents#620 live proof, 2026-10-12).
+DISPATCH_AUTHORIZATION_SCHEMA_VERSION = 1
 DISPATCH_SIGNATURE_ALGORITHM = "ed25519"
+#: Sent on every mctl-api commerce request (see `CommerceClient.call`).
+CLIENT_USER_AGENT = "mctl-agents-commerce-client/1"
 #: ADR 020 sec. 9: `not_found` is definitive only this long after the
 #: dispatch deadline.
 MAX_CLOCK_SKEW_S = 60
@@ -274,7 +283,7 @@ class DispatchAuthorization:
     tenant_id: str
     dispatch_deadline: str
     signature: str = ""
-    schema_version: str = DISPATCH_AUTHORIZATION_VERSION
+    schema_version: int = DISPATCH_AUTHORIZATION_SCHEMA_VERSION
 
     def signing_message(self) -> bytes:
         return length_prefixed(
@@ -284,7 +293,7 @@ class DispatchAuthorization:
     def deadline(self) -> datetime:
         return parse_time(hashed_time(self.dispatch_deadline))
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
             **{name: getattr(self, name) for name in DISPATCH_SIGNED_FIELDS},
@@ -295,12 +304,18 @@ class DispatchAuthorization:
     def from_dict(cls, data: Any) -> DispatchAuthorization:
         if not isinstance(data, Mapping):
             raise AuthorizationRejected("authorization must be an object")
-        allowed = {"schema_version", "signature", *DISPATCH_SIGNED_FIELDS}
-        unknown = set(data) - allowed
+        strings = {"signature", *DISPATCH_SIGNED_FIELDS}
+        unknown = set(data) - strings - {"schema_version"}
         if unknown:
             raise AuthorizationRejected(f"authorization carries unknown fields {sorted(unknown)!r}")
-        values: dict[str, str] = {}
-        for name in allowed:
+        version = data.get("schema_version")
+        # bool is an int subclass: `true` must not pass as version 1.
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise AuthorizationRejected(f"authorization.schema_version must be an integer, got {version!r}")
+        if version != DISPATCH_AUTHORIZATION_SCHEMA_VERSION:
+            raise AuthorizationRejected(f"unknown authorization schema_version {version!r}")
+        values: dict[str, Any] = {"schema_version": version}
+        for name in strings:
             value = data.get(name)
             if not isinstance(value, str) or not value:
                 raise AuthorizationRejected(f"authorization.{name} is missing")
@@ -335,7 +350,8 @@ def verify_dispatch_authorization(
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-    if authorization.schema_version != DISPATCH_AUTHORIZATION_VERSION:
+    if (not isinstance(authorization.schema_version, int) or isinstance(authorization.schema_version, bool)
+            or authorization.schema_version != DISPATCH_AUTHORIZATION_SCHEMA_VERSION):
         raise AuthorizationRejected(f"unknown authorization version {authorization.schema_version!r}")
     if authorization.provider_operation_key != provider_operation_key(authorization.invocation_id):
         raise AuthorizationRejected("provider_operation_key does not derive from invocation_id")
@@ -625,6 +641,11 @@ class CommerceClient:
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(url, data=data, method=method)  # noqa: S310 — scheme checked above
         req.add_header("Authorization", f"Bearer {self._token}")
+        # Cloudflare in front of api.mctl.ai answers 403 to urllib's default
+        # `Python-urllib/*`, which is what an operator-run client (the live
+        # proof, tools/commerce_proof.py) reaches; in-cluster callers never
+        # crossed it, so nothing noticed until the #620 live run.
+        req.add_header("User-Agent", CLIENT_USER_AGENT)
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:

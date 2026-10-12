@@ -1,0 +1,17 @@
+{
+  "authorization": {
+    "schema_version": 1,
+    "key_id": "kid-vector-1",
+    "invocation_id": "inv_01JZ8Q0000000000000000000V",
+    "provider_operation_key": "mctl-op/v1:inv_01JZ8Q0000000000000000000V",
+    "provider_id": "pilot-provider",
+    "capability_id": "mctl://mcp-local/pilot-provider/lookup_status",
+    "input_schema_hash": "sha256:09814b6a4df2a6538128342d127a0f2ce3e3f737140e037f1b7235945e7a6aa3",
+    "args_digest": "sha256:faaa41c90c9961b5e2676949763983b479849ed587cf1a8a5c1eaca003beb93b",
+    "tenant_id": "commerce-proof",
+    "dispatch_deadline": "2026-10-12T06:39:32Z",
+    "signature": "wlm6U_qCzIImsrN4VYouPVs2y-9AKnVVCrf3kedypRAKtlWAOGygcenF5b-8mp7ixPw99SjIIXGt2H3JZZbhBA"
+  },
+  "public_key_b64url": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ",
+  "seed_b64": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+}
