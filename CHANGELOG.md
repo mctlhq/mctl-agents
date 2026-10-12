@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.75.0](https://github.com/mctlhq/mctl-agents/compare/1.74.1...1.75.0) (2026-10-11)
+
+
+### Features
+
+* **agents:** issue-620-expose-commerce-discovery-and-prove-paid ([1904c81](https://github.com/mctlhq/mctl-agents/commit/1904c810a6a9e1629068bf940caf72c1051b3202))
+
+
+### Bug Fixes
+
+* **commerce:** an unread terms world stops the proof before it spends ([e499953](https://github.com/mctlhq/mctl-agents/commit/e49995323fe4cee1e7faec82f24f5d0a8f82d5ec))
+* **commerce:** failed reads never vanish from or discard a run ([1656e61](https://github.com/mctlhq/mctl-agents/commit/1656e6105fd78a5118b353c04f2d22e27da5f1ea))
+* **commerce:** name the terms world's unread close and render it plainly ([545c33c](https://github.com/mctlhq/mctl-agents/commit/545c33c73d23f1eb014c62745efb90435176f0a9))
+* **commerce:** name the terms world's unread close and render it plainly ([cd140c4](https://github.com/mctlhq/mctl-agents/commit/cd140c41988c73d1d13bb618e523b2616422c21b))
+
 ## [1.74.1](https://github.com/mctlhq/mctl-agents/compare/1.74.0...1.74.1) (2026-10-11)
 
 
