@@ -837,7 +837,12 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         "https://mock-provider",
         transport=httpx.MockTransport(
             lambda req: httpx.Response(
-                200, json={"jsonrpc": "2.0", "id": 1, "error": {"message": "dispatch authorization signature invalid"}}
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"message": "authorization rejected: signature does not verify"},
+                },
             )
         ),
     )
@@ -1098,6 +1103,10 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         "syntax error in src/authorization.ts",
         "Query execution failed: backend service requires database authorization.",
         "Syntax error near token authorization.",
+        "search error: no results for query 'unknown tool'",
+        "invalid syntax in query: unknown tool",
+        "timestamp validation failed: event must be timezone-aware",
+        "webhook signature invalid for payload",
     ]
     s_app_errors = [
         cp.HttpProjectsMcpPaidSession(
@@ -1161,7 +1170,7 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
 
     async def run():
         # Pre-dispatch refusals
-        with pytest.raises(cm.DispatchRefused, match="signature invalid"):
+        with pytest.raises(cm.DispatchRefused, match="signature does not verify"):
             await s_sig_err.call_paid_tool("projects_search", args, auth)
 
         with pytest.raises(cm.DispatchRefused, match="dispatch deadline has passed"):
@@ -2124,6 +2133,37 @@ def test_unit_paid_invocation_domain_refusal_releases_hold(monkeypatch):
         await session.close()
 
     asyncio.run(run())
+
+
+def test_unit_refusal_hints_table_integrity():
+    """PRE_DISPATCH_REFUSAL_HINTS and POST_ACCEPTANCE_HINTS don't false-positive on application errors."""
+    sample_key = cm.provider_operation_key("inv_01j8m4k_abcdef")
+    assert cp.PROVIDER_OPERATION_KEY_PATTERN.fullmatch(sample_key)
+    uuid_key = cm.provider_operation_key("0192e428-1234-7abc-def0-000000000001")
+    assert cp.PROVIDER_OPERATION_KEY_PATTERN.fullmatch(uuid_key)
+
+    app_errors = [
+        "document index is missing",
+        "parameter 'limit' must be an integer",
+        "metadata is missing from passage",
+        "cluster is configured for v2",
+        "syntax error in lucene query",
+        "failed to read docs/authorization.md",
+        "syntax error in src/authorization.ts",
+        "Query execution failed: backend service requires database authorization.",
+        "Syntax error near token authorization.",
+        "search error: no results for query 'unknown tool'",
+        "invalid syntax in query: unknown tool",
+        "timestamp validation failed: event must be timezone-aware",
+        "webhook signature invalid for payload",
+    ]
+    for msg in app_errors:
+        low = msg.lower()
+        for hint in cp.PRE_DISPATCH_REFUSAL_HINTS:
+            assert hint not in low, f"PRE_DISPATCH_REFUSAL_HINTS hint {hint!r} falsely matched {msg!r}"
+        for hint in cp.POST_ACCEPTANCE_HINTS:
+            assert hint not in low, f"POST_ACCEPTANCE_HINTS hint {hint!r} falsely matched {msg!r}"
+
 
 
 
