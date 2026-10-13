@@ -28,15 +28,21 @@ drive and what C5 later exposes.
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import sqlite3
 import threading
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote, urlparse
+
+import httpx
 
 from orchestrator.capability_gateway import ProviderTool, ToolCallResult
 from orchestrator.commerce import (
+    DISPATCH_SIGNED_FIELDS,
     FAILED,
     IN_PROGRESS,
     NOT_FOUND,
@@ -325,3 +331,433 @@ def pilot_lookup_status_ingress(
         tenant_id=tenant_id,
         now=now,
     )
+
+
+# ---------------------------------------------------------------------------
+# projects-mcp: Paid Capability Alpha (ADR 020 sec. 9, projects_search)
+# ---------------------------------------------------------------------------
+
+PROJECTS_MCP_PROVIDER_ID = "projects-mcp"
+PROJECTS_SEARCH_TOOL = "projects_search"
+PROJECTS_SEARCH_CAPABILITY_ID = "mctl://mcp-remote/projects-mcp/projects_search"
+PROJECTS_SEARCH_INPUT_SCHEMA: Mapping[str, Any] = {
+    "type": "object",
+    "properties": {
+        "project": {"type": "string", "description": "The project slug, as returned by projects_list", "minLength": 1},
+        "query": {"type": "string", "description": "Words to look for", "minLength": 1},
+        "limit": {
+            "type": "integer",
+            "default": 8,
+            "description": "How many passages to return",
+            "minimum": 1,
+            "maximum": 25,
+        },
+    },
+    "required": ["project", "query"],
+}
+PROJECTS_SEARCH_SCHEMA_HASH: str = hash_bytes(canonical_json(dict(PROJECTS_SEARCH_INPUT_SCHEMA)))
+
+
+def _parse_mcp_response(raw_text: str) -> dict[str, Any]:
+    def _is_response_obj(o: Any) -> bool:
+        return isinstance(o, dict) and ("result" in o or "error" in o) and "method" not in o
+
+    text = raw_text.strip()
+    if text.startswith(("{", "[")):
+        try:
+            obj = json.loads(text)
+            if _is_response_obj(obj):
+                return obj
+            if isinstance(obj, list):
+                for item in reversed(obj):
+                    if _is_response_obj(item):
+                        return item
+            raise OutcomeUnavailable("malformed JSON-RPC response: neither 'result' nor 'error' present")
+        except json.JSONDecodeError as exc:
+            raise OutcomeUnavailable(f"malformed JSON response: {exc}") from exc
+
+    text_norm = text.replace("\r\n", "\n").replace("\r", "\n")
+    if "data:" in text_norm:
+        # Split into SSE frames by double newline to handle multiline events and pings
+        frames = [f.strip() for f in text_norm.split("\n\n") if f.strip()]
+        for frame in reversed(frames):
+            frame_data_lines = []
+            for line in frame.splitlines():
+                line_str = line.strip()
+                if line_str.startswith("data:"):
+                    payload = line_str[len("data:"):].lstrip()
+                    frame_data_lines.append(payload)
+            if frame_data_lines:
+                combined_payload = "\n".join(frame_data_lines).strip()
+                try:
+                    obj = json.loads(combined_payload)
+                    if _is_response_obj(obj):
+                        return obj
+                    if isinstance(obj, list):
+                        for item in reversed(obj):
+                            if _is_response_obj(item):
+                                return item
+                except json.JSONDecodeError:
+                    continue
+
+        # If no frame matched with double newline, try all data: lines together
+        all_data_lines = []
+        for line in text_norm.splitlines():
+            line_str = line.strip()
+            if line_str.startswith("data:"):
+                all_data_lines.append(line_str[len("data:"):].lstrip())
+        if all_data_lines:
+            try:
+                obj = json.loads("\n".join(all_data_lines).strip())
+                if _is_response_obj(obj):
+                    return obj
+                if isinstance(obj, list):
+                    for item in reversed(obj):
+                        if _is_response_obj(item):
+                            return item
+            except json.JSONDecodeError as exc:
+                raise OutcomeUnavailable(f"malformed SSE data payload: {exc}") from exc
+        raise OutcomeUnavailable("no JSON-RPC response found in SSE stream")
+
+    try:
+        obj = json.loads(text)
+        if _is_response_obj(obj):
+            return obj
+        raise OutcomeUnavailable("malformed JSON-RPC response: neither 'result' nor 'error' present")
+    except json.JSONDecodeError as exc:
+        raise OutcomeUnavailable(f"malformed JSON response: {exc}") from exc
+
+
+PROVIDER_OPERATION_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
+
+POST_ACCEPTANCE_HINTS: tuple[str, ...] = (
+    "still in progress",
+    "failed on previous attempt",
+    "already accepted",
+    "concurrent dispatch",
+)
+
+PRE_DISPATCH_REFUSAL_HINTS: tuple[str, ...] = (
+    # 1. Authorization & ingress verification phrases (commerce.py & ProviderIngress)
+    "authorization rejected:",
+    *(f"authorization.{name} is missing" for name in ("signature", *DISPATCH_SIGNED_FIELDS)),
+    "authorization must be an object",
+    "authorization.schema_version must be an integer",
+    "unknown authorization schema_version",
+    "unknown authorization version",
+    "authorization carries unknown fields",
+    "names another provider",
+    "names another capability",
+    "names another input schema",
+    "signed for other arguments",
+    "names another tenant",
+    "requires a dispatch authorization",
+    "requires a valid dispatch authorization",
+    "invalid authorization structure",
+    "invalid authorization json",
+    "signature does not verify",
+    "signature is not base64url",
+    "unknown signing key",
+    "provider_operation_key does not derive",
+    "invalid dispatch_deadline",
+    "invalid signature length",
+    "public key must be 32 bytes",
+    "dispatch deadline has passed",
+    "is not a yyyy-mm-ddthh:mm:ssz time",
+    "a hashed time must be timezone-aware",
+    # 2. JSON-RPC tool dispatch errors (pre-execution protocol rejections)
+    "unknown tool '",
+    'unknown tool "',
+    "unknown tool: ",
+    "arguments cannot be digested",
+    "provider operation key is bound to another invocation",
+)
+
+# Provenance: Fastify projects-mcp domain non-visibility refusals (pre-acceptance 404).
+# Only observed, live-verified patterns are included. Matching opening and closing
+# delimiters are strictly required.
+DOMAIN_REFUSAL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r'no project\s+(["\'])[^"\']+\1\s+is available to you', re.IGNORECASE),
+    re.compile(r'project\s+(["\'])[^"\']+\1\s+is not configured for tenant', re.IGNORECASE),
+)
+
+
+def is_pre_dispatch_refusal(text: str) -> bool:
+    """True if text indicates a pre-acceptance refusal where execution never ran."""
+    text_low = text.lower()
+    if any(hint in text_low for hint in PRE_DISPATCH_REFUSAL_HINTS):
+        return True
+    return any(pat.search(text) for pat in DOMAIN_REFUSAL_PATTERNS)
+
+
+@dataclass
+class HttpProjectsMcpPaidSession:
+    """A paid provider session connecting to `projects-mcp` over HTTP/MCP.
+    Implements PaidProviderSession protocol (ADR 020 sec. 9).
+
+    Note: CapabilityGateway currently registers local_sessions for in-process
+    providers; remote HTTP session dispatch will be wired once dynamic remote
+    discovery registration is configured.
+    """
+
+    base_url: str
+    access_token: str = field(default="", repr=False)
+    timeout_s: float = 30.0
+    transport: httpx.AsyncBaseTransport | None = None
+    _client: httpx.AsyncClient | None = field(default=None, init=False, repr=False, compare=False)
+    _client_loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        parsed = urlparse(self.base_url)
+        loopback_hosts = ("localhost", "127.0.0.1", "::1")
+        if parsed.scheme != "https" and parsed.hostname not in loopback_hosts:
+            raise ValueError(
+                f"base_url must use https scheme for remote providers to protect access tokens, got: {self.base_url}"
+            )
+
+    def _get_client(self) -> httpx.AsyncClient:
+        current_loop = None
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        if (
+            self._client is None
+            or self._client.is_closed
+            or (self._client_loop is not None and self._client_loop is not current_loop)
+        ):
+            # A session is bound to a single event loop. An AsyncClient cannot be safely
+            # awaited or closed from a foreign event loop (its transport pool belongs to the
+            # loop that created it). If this session is invoked across different event loops,
+            # we discard the stale client handle and instantiate a fresh client on the active loop.
+            self._client = httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport)
+            self._client_loop = current_loop
+        return self._client
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client if open on the active event loop.
+
+        An AsyncClient cannot be cleanly closed from an event loop different from the one
+        that created its transport; in that cross-loop case, drop the reference directly.
+        """
+        try:
+            if self._client is not None and not self._client.is_closed:
+                current_loop = None
+                try:
+                    current_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+                if self._client_loop is None or self._client_loop is current_loop:
+                    await self._client.aclose()
+        finally:
+            self._client = None
+            self._client_loop = None
+
+    async def __aenter__(self) -> HttpProjectsMcpPaidSession:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.close()
+
+    async def list_tools(self) -> list[ProviderTool]:
+        url = f"{self.base_url.rstrip('/')}/mcp"
+        headers = {
+            "accept": "application/json, text/event-stream",
+            "content-type": "application/json",
+        }
+        if self.access_token:
+            headers["cf-access-jwt-assertion"] = self.access_token
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+
+        try:
+            client = self._get_client()
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code != 200:
+                raise OutcomeUnavailable(f"tools/list failed: HTTP {resp.status_code}")
+            data = _parse_mcp_response(resp.text)
+            # Discovery does not carry money liability, so inspect JSON-RPC error first
+            # to preserve upstream/middleware diagnostics even if response id is null.
+            if "error" in data:
+                raise OutcomeUnavailable(f"tools/list JSON-RPC error: {data['error']}")
+            raw_id = data.get("id")
+            if raw_id is True or raw_id not in (1, "1"):
+                raise OutcomeUnavailable(f"tools/list response id mismatch: expected 1, got {raw_id}")
+            if "result" not in data:
+                raise OutcomeUnavailable(f"tools/list response missing 'result': {data}")
+            result = data.get("result")
+            if not isinstance(result, dict):
+                raise OutcomeUnavailable(f"tools/list result is not a mapping: {result}")
+            raw_tools = result.get("tools")
+            if not isinstance(raw_tools, list):
+                raise OutcomeUnavailable(f"tools/list result 'tools' is not a list: {raw_tools}")
+            tools = []
+            for t in raw_tools:
+                if isinstance(t, dict):
+                    name = t.get("name")
+                    if not isinstance(name, str) or not name.strip():
+                        continue
+                    execution = t.get("execution")
+                    task_support = ""
+                    if isinstance(execution, dict):
+                        raw_ts = execution.get("taskSupport")
+                        if isinstance(raw_ts, str):
+                            task_support = raw_ts
+                    desc = t.get("description", "")
+                    inp = t.get("inputSchema", {})
+                    ann = t.get("annotations", {})
+                    tools.append(ProviderTool(
+                        name=name,
+                        description=desc if isinstance(desc, str) else "",
+                        input_schema=inp if isinstance(inp, dict) else {},
+                        annotations=ann if isinstance(ann, dict) else {},
+                        task_support=task_support,
+                    ))
+            return tools
+        except httpx.RequestError as exc:
+            raise OutcomeUnavailable(f"tools/list network error: {exc}") from exc
+
+    async def call_tool(self, tool: str, arguments: Mapping[str, Any]) -> ToolCallResult:
+        raise DispatchRefused("a paid capability requires a dispatch authorization")
+
+    async def call_paid_tool(
+        self, tool: str, arguments: Mapping[str, Any], authorization: DispatchAuthorization,
+    ) -> ToolCallResult:
+        url = f"{self.base_url.rstrip('/')}/mcp"
+        headers = {
+            "accept": "application/json, text/event-stream",
+            "content-type": "application/json",
+        }
+        if self.access_token:
+            headers["cf-access-jwt-assertion"] = self.access_token
+
+        # Note: per projects-mcp ingress contract, _mctl_dispatch_authorization is passed
+        # in-band and stripped by the remote ingress before computing args_digest.
+        args = dict(arguments)
+        args["_mctl_dispatch_authorization"] = authorization.to_dict()
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": args},
+        }
+
+        try:
+            client = self._get_client()
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code in (401, 403):
+                detail = resp.text[:128].strip()
+                raise DispatchRefused(f"HTTP {resp.status_code}: {detail}" if detail else f"HTTP {resp.status_code}")
+            if resp.status_code != 200:
+                raise OutcomeUnavailable(f"tools/call failed: HTTP {resp.status_code}")
+            data = _parse_mcp_response(resp.text)
+            # Paid capability execution binds an authorization and ledger liability:
+            # validate response id first to ensure unattributable error frames (e.g. id: null)
+            # cannot trigger an unverified pre-acceptance refusal release.
+            raw_id = data.get("id")
+            if raw_id is True or raw_id not in (1, "1"):
+                raise OutcomeUnavailable(f"tools/call response id mismatch: expected 1, got {raw_id}")
+
+            # 1. JSON-RPC protocol error branch
+            if "error" in data:
+                err = data["error"]
+                err_data = err.get("data") if isinstance(err, dict) else None
+                refusal_marker = (
+                    (err_data.get("_mctl_refusal") or err_data.get("mctl_refusal"))
+                    if isinstance(err_data, dict)
+                    else None
+                )
+                err_msg = str(err.get("message", err) if isinstance(err, dict) else err)
+                if refusal_marker == "pre_acceptance":
+                    raise DispatchRefused(err_msg)
+                if refusal_marker == "post_acceptance":
+                    raise OutcomeUnavailable(f"provider operation state: {err_msg}")
+                if any(hint in err_msg.lower() for hint in POST_ACCEPTANCE_HINTS):
+                    raise OutcomeUnavailable(f"provider operation state: {err_msg}")
+                if is_pre_dispatch_refusal(err_msg):
+                    raise DispatchRefused(err_msg)
+                raise OutcomeUnavailable(f"tools/call JSON-RPC error: {err_msg}")
+
+            # 2. Result structure check
+            if "result" not in data:
+                raise OutcomeUnavailable(f"tools/call response missing 'result': {data}")
+            result = data["result"]
+            if not isinstance(result, dict):
+                raise OutcomeUnavailable(f"tools/call result is not a mapping: {result}")
+
+            # 3. Structured refusal marker from ingress (ADR 020 payment boundary)
+            refusal_marker = result.get("_mctl_refusal") or result.get("mctl_refusal")
+            content = result.get("content", [])
+            if not isinstance(content, list):
+                content = [content]
+            text_parts = []
+            for c in content:
+                if isinstance(c, str):
+                    text_parts.append(c)
+                elif isinstance(c, dict) and "text" in c:
+                    text_parts.append(str(c["text"]))
+            text = "\n".join(text_parts)
+
+            if refusal_marker == "pre_acceptance":
+                raise DispatchRefused(text)
+            if refusal_marker == "post_acceptance":
+                raise OutcomeUnavailable(f"provider operation state: {text}")
+
+            is_error = bool(result.get("isError", False))
+            if is_error:
+                # Precedence rule: post-acceptance markers take priority over refusal hints
+                # so that any post-acceptance errors raise OutcomeUnavailable.
+                if any(hint in text.lower() for hint in POST_ACCEPTANCE_HINTS):
+                    raise OutcomeUnavailable(f"provider operation state: {text}")
+                if is_pre_dispatch_refusal(text):
+                    raise DispatchRefused(text)
+                raise OutcomeUnavailable(f"provider operation state: {text}")
+
+            # Note: An executed error (is_error=True) that did not match pre-acceptance
+            # refusal hints raises OutcomeUnavailable above to be definitively resolved
+            # through the provider's /commerce/outcome/{key} endpoint. Reaching here
+            # guarantees a successful, executed tool result (is_error=False).
+            return ToolCallResult(is_error=False, text=text)
+        except httpx.RequestError as exc:
+            raise OutcomeUnavailable(f"tools/call network error: {exc}") from exc
+
+    async def outcome(self, provider_operation_key: str) -> ProviderOutcome:
+        if (
+            not PROVIDER_OPERATION_KEY_PATTERN.fullmatch(provider_operation_key)
+            or ".." in provider_operation_key
+        ):
+            raise OutcomeUnavailable(f"invalid provider_operation_key: {provider_operation_key!r}")
+        safe_key = quote(provider_operation_key, safe="/:")
+        url = f"{self.base_url.rstrip('/')}/commerce/outcome/{safe_key}"
+        headers = {"accept": "application/json"}
+        if self.access_token:
+            headers["cf-access-jwt-assertion"] = self.access_token
+
+        try:
+            client = self._get_client()
+            resp = await client.get(url, headers=headers)
+            if resp.status_code not in (200, 404):
+                raise OutcomeUnavailable(f"outcome lookup failed: HTTP {resp.status_code}")
+            try:
+                data = resp.json()
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise OutcomeUnavailable(
+                    f"malformed outcome JSON response (HTTP {resp.status_code}): {exc}"
+                ) from exc
+            if not isinstance(data, dict):
+                raise OutcomeUnavailable(f"outcome response is not a mapping: {data!r}")
+            if resp.status_code == 404:
+                status = data.get("status", "")
+                if status == NOT_FOUND:
+                    return ProviderOutcome(NOT_FOUND)
+                raise OutcomeUnavailable(f"HTTP 404 returned unexpected status: {status!r}")
+            status = data.get("status", "")
+            if status not in (SUCCEEDED, FAILED, IN_PROGRESS, NOT_FOUND):
+                raise OutcomeUnavailable(f"unknown outcome status {status!r}")
+            return ProviderOutcome(
+                status=status,
+                is_error=bool(data.get("is_error", False)),
+                text=str(data.get("text", "")),
+            )
+        except httpx.RequestError as exc:
+            raise OutcomeUnavailable(f"outcome lookup network error: {exc}") from exc
+
