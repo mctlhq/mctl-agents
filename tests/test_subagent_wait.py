@@ -7,11 +7,15 @@ follow-up commits".
 """
 from __future__ import annotations
 
+import time
+
 import anyio
 import pytest
 from claude_agent_sdk import (
+    AssistantMessage,
     ResultMessage,
     TaskNotificationMessage,
+    TaskProgressMessage,
     TaskStartedMessage,
     TaskUpdatedMessage,
 )
@@ -282,6 +286,108 @@ def test_drain_raises_on_sub_deadline() -> None:
         )
 
 
+def progress(task_id: str) -> TaskProgressMessage:
+    return TaskProgressMessage(
+        subtype="task_progress",
+        data={},
+        task_id=task_id,
+        description="go test ./...",
+        usage={"total_tokens": 1, "tool_uses": 1, "duration_ms": 1},
+        uuid="u",
+        session_id="s",
+        last_tool_name="Bash",
+    )
+
+
+def child_turn(parent_tool_use_id: str | None) -> AssistantMessage:
+    return AssistantMessage(content=[], model="m", parent_tool_use_id=parent_tool_use_id)
+
+
+def test_drain_waits_for_a_child_that_keeps_reporting_progress() -> None:
+    """mctl-agents#645: the sub-deadline is for a SILENT child, not a busy one.
+
+    Twice the timeout of steady progress, then completion. An absolute deadline
+    orphaned exactly this child at 300s, mid `go test`, in two DevLoop runs.
+    """
+    ledger = LiveTaskLedger()
+    ledger.observe(started("t1"))
+
+    async def stream():
+        for _ in range(10):
+            await anyio.sleep(0.02)
+            yield progress("t1")
+        yield notified("t1", "completed")
+        yield result_message()
+
+    anyio.run(
+        lambda: drain_until_settled(
+            stream(), ledger, timeout_s=0.1, on_message=lambda _m: None,
+        )
+    )
+    assert ledger.live == set()
+
+
+def test_drain_still_orphans_a_child_that_goes_silent() -> None:
+    """Progress buys time only while it keeps coming (mctl-agents#366)."""
+    ledger = LiveTaskLedger()
+    ledger.observe(started("t1"))
+
+    async def stream():
+        for _ in range(3):
+            await anyio.sleep(0.02)
+            yield progress("t1")
+        await anyio.sleep(10)
+        yield "unreachable"
+
+    with pytest.raises(OrphanedSubagentError, match=r"within 0\.1s"):
+        anyio.run(
+            lambda: drain_until_settled(
+                stream(), ledger, timeout_s=0.1, on_message=lambda _m: None,
+            )
+        )
+
+
+def test_parent_chatter_does_not_extend_the_wait_for_a_silent_child() -> None:
+    ledger = LiveTaskLedger()
+    ledger.observe(started("t1"))
+
+    async def stream():
+        # Finite, and longer than the timeout: if chatter counted, the drain
+        # would outlast it and fail on "unreachable" instead of orphaning.
+        for _ in range(15):
+            await anyio.sleep(0.02)
+            yield child_turn(None)
+            yield progress("someone-else")
+        await anyio.sleep(10)
+        yield "unreachable"
+
+    started_at = time.monotonic()
+    with pytest.raises(OrphanedSubagentError):
+        anyio.run(
+            lambda: drain_until_settled(
+                stream(), ledger, timeout_s=0.1, on_message=lambda _m: None,
+            )
+        )
+    assert time.monotonic() - started_at < 0.3
+
+
+def test_shows_progress_attributes_child_messages_by_tool_use_id() -> None:
+    ledger = LiveTaskLedger()
+    launch = started("t1")
+    launch.tool_use_id = "toolu_1"
+    ledger.observe(launch)
+    assert ledger.shows_progress(launch)
+    assert ledger.shows_progress(progress("t1"))
+    assert ledger.shows_progress(child_turn("toolu_1"))
+    assert not ledger.shows_progress(child_turn("toolu_other"))
+    assert not ledger.shows_progress(child_turn(None))
+    assert not ledger.shows_progress("plain string from a fake")
+    done = notified("t1", "completed")
+    ledger.observe(done)
+    assert not ledger.shows_progress(progress("t1"))
+    assert not ledger.shows_progress(child_turn("toolu_1"))
+
+
 def test_drain_defaults_to_printing_each_message(capsys) -> None:
     """The archived Argo log was the only forensic trail this incident left."""
     ledger = LiveTaskLedger()
@@ -332,8 +438,8 @@ def test_settle_ignores_tasks_the_ledger_never_adopted() -> None:
 
 
 def test_drain_returns_early_when_nothing_is_live() -> None:
-    """Otherwise it raises the self-contradicting "never reported a terminal
-    status ... no outstanding tasks"."""
+    """Otherwise it raises the self-contradicting "reported neither progress
+    nor a terminal status ... no outstanding tasks"."""
     async def stream():
         return
         yield  # pragma: no cover — makes this an async generator

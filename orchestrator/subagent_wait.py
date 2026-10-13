@@ -81,10 +81,11 @@ _MIN_USEFUL_GRACE_S = 0.5
 class OrphanedSubagentError(RuntimeError):
     """A run ended while a delegated sub-agent was still live.
 
-    Raised when the child neither reported a terminal status before the drain
-    deadline nor was still reachable on the stream. Callers map this to a
-    harness-failure exit code: the agent never got its attempt, so the work is
-    lost through no fault of the proposal being implemented.
+    Raised when the child went silent -- neither progress nor a terminal
+    status -- for the whole drain timeout, or the stream ended under it.
+    Callers map this to a harness-failure exit code: the agent never got its
+    attempt, so the work is lost through no fault of the proposal being
+    implemented.
     """
 
 
@@ -101,6 +102,9 @@ class LiveTaskLedger:
 
     def __init__(self) -> None:
         self._live: set[str] = set()
+        # tool_use_id of the launching Agent/Task call -> task_id, so a child's
+        # own assistant/user messages (parent_tool_use_id) count as its progress.
+        self._by_tool_use: dict[str, str] = {}
         self._settled: dict[str, str] = {}
         self._warned_types: set[str] = set()
 
@@ -146,6 +150,8 @@ class LiveTaskLedger:
             # to wait for.
             if message.task_type in AWAITED_TASK_TYPES:
                 self._live.add(message.task_id)
+                if message.tool_use_id:
+                    self._by_tool_use[message.tool_use_id] = message.task_id
             elif (_type := message.task_type or "") not in self._warned_types:
                 # Once per distinct type, not once per task. This filter is the
                 # single assumption the whole fix rests on -- a delegated launch
@@ -174,6 +180,26 @@ class LiveTaskLedger:
             if status is None and isinstance(message.patch, dict):
                 status = message.patch.get("status")
             self._settle(message.task_id, status)
+
+    def shows_progress(self, message: Any) -> bool:
+        """True iff ``message`` is evidence that a live task is still working.
+
+        Call AFTER `observe`, so a launch counts and a terminal status does not.
+        Only work attributable to a task this ledger awaits counts: the parent's
+        own chatter says nothing about whether the child is wedged.
+        """
+        from claude_agent_sdk import (  # deferred — see the module docstring
+            TaskProgressMessage,
+            TaskStartedMessage,
+            TaskUpdatedMessage,
+        )
+
+        if isinstance(message, (TaskProgressMessage, TaskStartedMessage, TaskUpdatedMessage)):
+            task_id: str | None = message.task_id
+        else:
+            parent = getattr(message, "parent_tool_use_id", None)
+            task_id = self._by_tool_use.get(parent) if isinstance(parent, str) else None
+        return task_id in self._live
 
     def _settle(self, task_id: str, status: str | None) -> None:
         from claude_agent_sdk import TERMINAL_TASK_STATUSES  # deferred
@@ -214,6 +240,14 @@ async def drain_until_settled(
     shepherd charges to the proposal, reintroducing mctl-agents#366 by another
     route.
 
+    While waiting for a child it is an INACTIVITY deadline: every message that
+    shows a live task still working (`LiveTaskLedger.shows_progress`) pushes it
+    out by another ``timeout_s``. As an absolute deadline it killed children
+    that were streaming progress mid `go test` at exactly 300s, and charged the
+    run as an orphan for work that was still going (mctl-agents#645). A wedged
+    child goes silent, and silence is still caught within ``timeout_s``; a busy
+    one is capped by the caller's own bound instead.
+
     Returns at the first ``ResultMessage`` that arrives with nothing in flight
     -- the SDK's own "the run is over" condition -- not at the moment the last
     child settles, because a settling child wakes the parent for another turn.
@@ -224,7 +258,7 @@ async def drain_until_settled(
     if not ledger.live:
         # Nothing to wait for. Guarded here as well as at the call site so the
         # helper states its own precondition -- otherwise it falls through and
-        # raises the self-contradicting "never reported a terminal status ...
+        # raises the self-contradicting "reported neither progress nor a terminal status ...
         # no outstanding tasks".
         return
     if timeout_s <= 0:
@@ -241,22 +275,26 @@ async def drain_until_settled(
     # on the second delegation instead of the first.
     while True:
         if ledger.live:
-            # WAIT FOR QUIESCENCE, bounded. A child that never reports is the
-            # orphan this whole module exists to catch.
-            with anyio.move_on_after(timeout_s):
+            # WAIT FOR QUIESCENCE, bounded by SILENCE rather than by elapsed
+            # time (mctl-agents#645). A child that stops reporting is the orphan
+            # this whole module exists to catch; one still reporting progress is
+            # not, and the caller's outer bound caps how long it may take.
+            with anyio.CancelScope(deadline=anyio.current_time() + timeout_s) as quiet:
                 async for message in stream:
                     on_message(message)
                     ledger.observe(message)
                     if not ledger.live:
                         break
+                    if ledger.shows_progress(message):
+                        quiet.deadline = anyio.current_time() + timeout_s
             # Covers both ways out: the deadline, and the stream ending. There
             # is no third case -- the ONLY way the ledger empties in that loop
             # is the break above, so reaching here with it non-empty means we
             # stopped waiting on a child that never reported.
             if ledger.live:
                 raise OrphanedSubagentError(
-                    f"sub-agent task(s) never reported a terminal status within "
-                    f"{timeout_s:g}s: {ledger.describe()}"
+                    f"sub-agent task(s) reported neither progress nor a terminal "
+                    f"status within {timeout_s:g}s: {ledger.describe()}"
                 )
 
         # WAIT FOR THE CLOSING FRAME, on a RESTARTED clock -- a slow child must
