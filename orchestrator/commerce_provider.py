@@ -470,16 +470,21 @@ PRE_DISPATCH_REFUSAL_HINTS: tuple[str, ...] = (
     "unknown tool: ",
     "arguments cannot be digested",
     "provider operation key is bound to another invocation",
-    # 2. Domain non-visibility refusals (Fastify projects-mcp & Coolify status)
-    '" is available to you',
-    "' is available to you",
-    '" is not configured for tenant',
-    "' is not configured for tenant",
-    'no live status is configured for "',
-    "no live status is configured for '",
-    'no live status is available to you for "',
-    "no live status is available to you for '",
 )
+
+DOMAIN_REFUSAL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r'no project\s+["\'][^"\']+["\']\s+is available to you', re.IGNORECASE),
+    re.compile(r'project\s+["\'][^"\']+["\']\s+is not configured for tenant', re.IGNORECASE),
+    re.compile(r'no live status is configured for\b', re.IGNORECASE),
+)
+
+
+def is_pre_dispatch_refusal(text: str) -> bool:
+    """True if text indicates a pre-acceptance refusal where execution never ran."""
+    text_low = text.lower()
+    if any(hint in text_low for hint in PRE_DISPATCH_REFUSAL_HINTS):
+        return True
+    return any(pat.search(text) for pat in DOMAIN_REFUSAL_PATTERNS)
 
 
 @dataclass
@@ -665,7 +670,7 @@ class HttpProjectsMcpPaidSession:
                     raise OutcomeUnavailable(f"provider operation state: {err_msg}")
                 if any(hint in err_msg.lower() for hint in POST_ACCEPTANCE_HINTS):
                     raise OutcomeUnavailable(f"provider operation state: {err_msg}")
-                if any(hint in err_msg.lower() for hint in PRE_DISPATCH_REFUSAL_HINTS):
+                if is_pre_dispatch_refusal(err_msg):
                     raise DispatchRefused(err_msg)
                 raise OutcomeUnavailable(f"tools/call JSON-RPC error: {err_msg}")
 
@@ -698,7 +703,7 @@ class HttpProjectsMcpPaidSession:
             if is_error:
                 if any(hint in text.lower() for hint in POST_ACCEPTANCE_HINTS):
                     raise OutcomeUnavailable(f"provider operation state: {text}")
-                if any(hint in text.lower() for hint in PRE_DISPATCH_REFUSAL_HINTS):
+                if is_pre_dispatch_refusal(text):
                     raise DispatchRefused(text)
                 raise OutcomeUnavailable(f"provider operation state: {text}")
 

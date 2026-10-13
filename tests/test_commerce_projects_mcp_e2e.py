@@ -1108,7 +1108,9 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         "timestamp validation failed: event must be timezone-aware",
         "webhook signature invalid for payload",
         'no passages matching "is available to you" in project acme',
+        'no passage matching "acme-auth" is available to you',
         'query failed for "is not configured for tenant" in database',
+        'index "acme" is not configured for tenant',
     ]
     s_app_errors = [
         cp.HttpProjectsMcpPaidSession(
@@ -2138,7 +2140,7 @@ def test_unit_paid_invocation_domain_refusal_releases_hold(monkeypatch):
 
 
 def test_unit_refusal_hints_table_integrity():
-    """PRE_DISPATCH_REFUSAL_HINTS and POST_ACCEPTANCE_HINTS don't false-positive on application errors."""
+    """PRE_DISPATCH_REFUSAL_HINTS and DOMAIN_REFUSAL_PATTERNS are bidirectional and hermetic."""
     sample_key = cm.provider_operation_key("inv_01j8m4k_abcdef")
     assert cp.PROVIDER_OPERATION_KEY_PATTERN.fullmatch(sample_key)
     uuid_key = cm.provider_operation_key("0192e428-1234-7abc-def0-000000000001")
@@ -2159,14 +2161,65 @@ def test_unit_refusal_hints_table_integrity():
         "timestamp validation failed: event must be timezone-aware",
         "webhook signature invalid for payload",
         'no passages matching "is available to you" in project acme',
+        'no passage matching "acme-auth" is available to you',
         'query failed for "is not configured for tenant" in database',
+        'index "acme" is not configured for tenant',
+        'found 0 items: is available to you',
     ]
     for msg in app_errors:
+        assert not cp.is_pre_dispatch_refusal(msg), f"falsely classified app error as refusal: {msg!r}"
         low = msg.lower()
         for hint in cp.PRE_DISPATCH_REFUSAL_HINTS:
             assert hint not in low, f"PRE_DISPATCH_REFUSAL_HINTS hint {hint!r} falsely matched {msg!r}"
         for hint in cp.POST_ACCEPTANCE_HINTS:
             assert hint not in low, f"POST_ACCEPTANCE_HINTS hint {hint!r} falsely matched {msg!r}"
+
+    observed_refusals = [
+        'no project "nonexistent" is available to you',
+        'no project "secret-proj" is available to you',
+        'project "test" is not configured for tenant',
+        'no live status is configured for "test"',
+        'no live status is configured for service-beta',
+    ]
+    for msg in observed_refusals:
+        assert cp.is_pre_dispatch_refusal(msg), f"expected pre-dispatch refusal for observed {msg!r}"
+
+    # Verify zero orphan hints across all defined reference messages
+    ref_messages = [
+        *(f"authorization.{name} is missing" for name in ("signature", *cm.DISPATCH_SIGNED_FIELDS)),
+        "authorization must be an object",
+        "authorization.schema_version must be an integer",
+        "unknown authorization schema_version",
+        "unknown authorization version",
+        "authorization carries unknown fields",
+        "names another provider",
+        "names another capability",
+        "names another input schema",
+        "signed for other arguments",
+        "names another tenant",
+        "requires a dispatch authorization",
+        "requires a valid dispatch authorization",
+        "invalid authorization structure",
+        "invalid authorization json",
+        "signature does not verify",
+        "signature is not base64url",
+        "unknown signing key",
+        "provider_operation_key does not derive",
+        "invalid dispatch_deadline",
+        "invalid signature length",
+        "public key must be 32 bytes",
+        "dispatch deadline has passed",
+        "is not a yyyy-mm-ddthh:mm:ssz time",
+        "a hashed time must be timezone-aware",
+        "unknown tool 'test'",
+        'unknown tool "test"',
+        "unknown tool: test",
+        "arguments cannot be digested",
+        "provider operation key is bound to another invocation",
+        "authorization rejected: signature does not verify",
+    ]
+    for hint in cp.PRE_DISPATCH_REFUSAL_HINTS:
+        assert any(hint in m.lower() for m in ref_messages), f"orphan refusal hint: {hint!r}"
 
 
 
