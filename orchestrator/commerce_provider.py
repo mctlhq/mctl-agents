@@ -333,8 +333,7 @@ def pilot_lookup_status_ingress(
 
 PROJECTS_MCP_PROVIDER_ID = "projects-mcp"
 PROJECTS_SEARCH_TOOL = "projects_search"
-PROJECTS_SEARCH_CAPABILITY_ID = "mctl://projects/projects_search"
-PROJECTS_SEARCH_SCHEMA_HASH = "sha256:dcb46609c306694f18c69fd4d2a1f3e39741066ee845f882c4605fefd846fafe"
+PROJECTS_SEARCH_CAPABILITY_ID = "mctl://mcp-remote/projects-mcp/projects_search"
 PROJECTS_SEARCH_INPUT_SCHEMA: Mapping[str, Any] = {
     "type": "object",
     "properties": {
@@ -350,12 +349,13 @@ PROJECTS_SEARCH_INPUT_SCHEMA: Mapping[str, Any] = {
     },
     "required": ["project", "query"],
 }
+PROJECTS_SEARCH_SCHEMA_HASH: str = hash_bytes(canonical_json(dict(PROJECTS_SEARCH_INPUT_SCHEMA)))
 
 
 def _parse_mcp_response(raw_text: str) -> dict[str, Any]:
     import json
 
-    text = raw_text.strip()
+    text = raw_text.strip().replace("\r\n", "\n").replace("\r", "\n")
     if "data:" in text:
         # Split into SSE frames by double newline to handle multiline events and pings
         frames = [f.strip() for f in text.split("\n\n") if f.strip()]
@@ -370,7 +370,7 @@ def _parse_mcp_response(raw_text: str) -> dict[str, Any]:
                 combined_payload = "\n".join(frame_data_lines).strip()
                 try:
                     obj = json.loads(combined_payload)
-                    if isinstance(obj, dict) and ("result" in obj or "error" in obj or "jsonrpc" in obj):
+                    if isinstance(obj, dict) and ("result" in obj or "error" in obj) and "method" not in obj:
                         return obj
                 except json.JSONDecodeError:
                     continue
@@ -384,13 +384,17 @@ def _parse_mcp_response(raw_text: str) -> dict[str, Any]:
         if all_data_lines:
             try:
                 obj = json.loads("\n".join(all_data_lines).strip())
-                if isinstance(obj, dict):
+                if isinstance(obj, dict) and ("result" in obj or "error" in obj) and "method" not in obj:
                     return obj
             except json.JSONDecodeError as exc:
                 raise OutcomeUnavailable(f"malformed SSE data payload: {exc}") from exc
+        raise OutcomeUnavailable("no JSON-RPC response found in SSE stream")
 
     try:
-        return json.loads(text)
+        obj = json.loads(text)
+        if isinstance(obj, dict) and ("result" in obj or "error" in obj) and "method" not in obj:
+            return obj
+        raise OutcomeUnavailable("malformed JSON-RPC response: neither 'result' nor 'error' present")
     except json.JSONDecodeError as exc:
         raise OutcomeUnavailable(f"malformed JSON response: {exc}") from exc
 
@@ -425,16 +429,19 @@ class HttpProjectsMcpPaidSession:
                 data = _parse_mcp_response(resp.text)
                 if "error" in data:
                     raise OutcomeUnavailable(f"tools/list JSON-RPC error: {data['error']}")
+                if "result" not in data:
+                    raise OutcomeUnavailable(f"tools/list response missing 'result': {data}")
                 result = data.get("result", {})
                 raw_tools = result.get("tools", [])
                 tools = []
                 for t in raw_tools:
-                    tools.append(ProviderTool(
-                        name=t.get("name", ""),
-                        description=t.get("description", ""),
-                        input_schema=t.get("inputSchema", {}),
-                        annotations=t.get("annotations", {}),
-                    ))
+                    if isinstance(t, dict):
+                        tools.append(ProviderTool(
+                            name=t.get("name", ""),
+                            description=t.get("description", ""),
+                            input_schema=t.get("inputSchema", {}),
+                            annotations=t.get("annotations", {}),
+                        ))
                 return tools
         except httpx.RequestError as exc:
             raise OutcomeUnavailable(f"tools/list network error: {exc}") from exc
@@ -472,29 +479,41 @@ class HttpProjectsMcpPaidSession:
                 if resp.status_code != 200:
                     raise OutcomeUnavailable(f"tools/call failed: HTTP {resp.status_code}")
                 data = _parse_mcp_response(resp.text)
-                refusal_hints = (
+                post_acceptance_hints = (
+                    "in progress", "already accepted", "concurrent dispatch", "previous attempt",
+                )
+                pre_dispatch_refusal_hints = (
                     "authorization", "signature", "deadline", "signing key",
-                    "operation key", "already accepted", "concurrent dispatch",
-                    "in progress", "previous attempt", "dispatch", "mismatch",
+                    "operation key", "bound to", "schema hash mismatch",
+                    "arguments digest mismatch", "tenant mismatch", "provider mismatch",
+                    "capability mismatch", "dispatch", "mismatch",
                 )
                 if "error" in data:
                     err = data["error"]
                     err_msg = str(err.get("message", err) if isinstance(err, dict) else err)
-                    if any(hint in err_msg.lower() for hint in refusal_hints):
+                    if any(hint in err_msg.lower() for hint in post_acceptance_hints):
+                        raise OutcomeUnavailable(f"provider operation state: {err_msg}")
+                    if any(hint in err_msg.lower() for hint in pre_dispatch_refusal_hints):
                         raise DispatchRefused(err_msg)
                     raise OutcomeUnavailable(f"tools/call JSON-RPC error: {err_msg}")
-                result = data.get("result", {})
+                if "result" not in data:
+                    raise OutcomeUnavailable(f"tools/call response missing 'result': {data}")
+                result = data["result"]
                 is_error = bool(result.get("isError", False))
                 content = result.get("content", [])
-                text = "\n".join(str(c.get("text", "")) for c in content)
+                text = "\n".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
                 if is_error:
-                    if any(hint in text.lower() for hint in refusal_hints):
+                    if any(hint in text.lower() for hint in post_acceptance_hints):
+                        raise OutcomeUnavailable(f"provider operation state: {text}")
+                    if any(hint in text.lower() for hint in pre_dispatch_refusal_hints):
                         raise DispatchRefused(text)
                 return ToolCallResult(is_error=is_error, text=text)
         except httpx.RequestError as exc:
             raise OutcomeUnavailable(f"tools/call network error: {exc}") from exc
 
     async def outcome(self, provider_operation_key: str) -> ProviderOutcome:
+        import json
+
         import httpx
 
         url = f"{self.base_url.rstrip('/')}/commerce/outcome/{provider_operation_key}"
@@ -509,7 +528,10 @@ class HttpProjectsMcpPaidSession:
                     return ProviderOutcome(NOT_FOUND)
                 if resp.status_code != 200:
                     raise OutcomeUnavailable(f"outcome lookup failed: HTTP {resp.status_code}")
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except (json.JSONDecodeError, ValueError) as exc:
+                    raise OutcomeUnavailable(f"malformed outcome JSON response: {exc}") from exc
                 status = data.get("status", "")
                 if status not in (SUCCEEDED, FAILED, IN_PROGRESS, NOT_FOUND):
                     raise OutcomeUnavailable(f"unknown outcome status {status!r}")

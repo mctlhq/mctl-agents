@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import select
 import shutil
 import subprocess
 import time
@@ -60,7 +61,7 @@ def _find_projects_mcp_dir() -> Path:
 
 PROJECTS_MCP_DIR = _find_projects_mcp_dir()
 HAVE_PROJECTS_MCP = (
-    bool(str(PROJECTS_MCP_DIR))
+    PROJECTS_MCP_DIR != Path("")
     and PROJECTS_MCP_DIR.exists()
     and (PROJECTS_MCP_DIR / "tools/serve-test.ts").exists()
     and shutil.which("npx") is not None
@@ -96,15 +97,17 @@ def projects_mcp_server(tmp_path_factory):
 
     server_url = ""
     try:
-        # Wait up to 10 seconds for READY line
+        # Wait up to 10 seconds for READY line non-blockingly
         start_wait = time.time()
         while time.time() - start_wait < 10.0:
+            if proc.poll() is not None:
+                err = proc.stderr.read()
+                raise RuntimeError(f"projects-mcp server exited prematurely: {err}")
+            rlist, _, _ = select.select([proc.stdout], [], [], 0.1)
+            if not rlist:
+                continue
             line = proc.stdout.readline()
             if not line:
-                if proc.poll() is not None:
-                    err = proc.stderr.read()
-                    raise RuntimeError(f"projects-mcp server exited prematurely: {err}")
-                time.sleep(0.05)
                 continue
             if line.startswith("READY "):
                 server_url = line.strip().split(" ")[1]
@@ -242,7 +245,7 @@ def test_successful_paid_call_e2e(e2e_harness):
         assert res.phase == "finalized"
         assert res.text is not None and "project" in res.text
 
-        # 12 units committed, 0 reserved, budget available = 100 - 12 = 88
+        # 12 units committed, 0 reserved, budget available remains 100
         assert e2e_harness.ledger.budget == {"available": 100, "reserved": 0, "committed": 12}
 
         # Verify outcome lookup on Fastify endpoint
@@ -548,13 +551,20 @@ def _make_dummy_auth(args: dict[str, Any]) -> cm.DispatchAuthorization:
         invocation_id="inv_unit_test",
         provider_operation_key="mctl-op/v1:inv_unit_test",
         provider_id="projects-mcp",
-        capability_id="mctl://projects/projects_search",
+        capability_id=cp.PROJECTS_SEARCH_CAPABILITY_ID,
         input_schema_hash=cp.PROJECTS_SEARCH_SCHEMA_HASH,
         args_digest=cm.args_digest(args),
         tenant_id="acme",
         dispatch_deadline=deadline,
     )
     return cm.sign_dispatch_authorization(SEED, raw_auth)
+
+
+def test_schema_hash_and_capability_id_derivation():
+    """PROJECTS_SEARCH_SCHEMA_HASH is derived from canonical JSON of schema and capability ID matches ADR 017."""
+    expected_hash = cp.hash_bytes(cp.canonical_json(dict(cp.PROJECTS_SEARCH_INPUT_SCHEMA)))
+    assert cp.PROJECTS_SEARCH_SCHEMA_HASH == expected_hash
+    assert cp.PROJECTS_SEARCH_CAPABILITY_ID == "mctl://mcp-remote/projects-mcp/projects_search"
 
 
 def test_unit_session_list_tools_success():
@@ -593,7 +603,7 @@ def test_unit_session_list_tools_success():
 
 
 def test_unit_session_list_tools_error_cases():
-    """list_tools handles HTTP errors, JSON-RPC errors, and network disconnects."""
+    """list_tools handles HTTP errors, JSON-RPC errors, missing result, and network disconnects."""
     s500 = cp.HttpProjectsMcpPaidSession(
         "http://mock-provider",
         transport=httpx.MockTransport(lambda req: httpx.Response(500, text="Internal Error")),
@@ -602,6 +612,12 @@ def test_unit_session_list_tools_error_cases():
         "http://mock-provider",
         transport=httpx.MockTransport(
             lambda req: httpx.Response(200, json={"jsonrpc": "2.0", "error": {"message": "method not found"}})
+        ),
+    )
+    s_missing_result = cp.HttpProjectsMcpPaidSession(
+        "http://mock-provider",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"jsonrpc": "2.0", "id": 1})
         ),
     )
 
@@ -619,6 +635,9 @@ def test_unit_session_list_tools_error_cases():
 
         with pytest.raises(cm.OutcomeUnavailable, match="tools/list JSON-RPC error:"):
             await s_rpc_err.list_tools()
+
+        with pytest.raises(cm.OutcomeUnavailable, match="neither 'result' nor 'error' present"):
+            await s_missing_result.list_tools()
 
         with pytest.raises(cm.OutcomeUnavailable, match="tools/list network error:"):
             await s_net_err.list_tools()
@@ -650,11 +669,12 @@ def test_unit_session_call_paid_tool_http_refusal():
     asyncio.run(run())
 
 
-def test_unit_session_call_paid_tool_jsonrpc_refusals():
-    """call_paid_tool transforms JSON-RPC errors with refusal hints into DispatchRefused."""
+def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
+    """call_paid_tool differentiates pre-dispatch refusals from post-acceptance conditions."""
     args = {"project": "acme", "query": "auth", "limit": 5}
     auth = _make_dummy_auth(args)
 
+    # Pre-dispatch refusal -> DispatchRefused (hold should be released)
     s_sig_err = cp.HttpProjectsMcpPaidSession(
         "http://mock-provider",
         transport=httpx.MockTransport(
@@ -663,16 +683,6 @@ def test_unit_session_call_paid_tool_jsonrpc_refusals():
             )
         ),
     )
-
-    s_gen_err = cp.HttpProjectsMcpPaidSession(
-        "http://mock-provider",
-        transport=httpx.MockTransport(
-            lambda req: httpx.Response(
-                200, json={"jsonrpc": "2.0", "error": {"message": "backend query failed unexpectedly"}}
-            )
-        ),
-    )
-
     s_deadline_err = cp.HttpProjectsMcpPaidSession(
         "http://mock-provider",
         transport=httpx.MockTransport(
@@ -689,6 +699,40 @@ def test_unit_session_call_paid_tool_jsonrpc_refusals():
         ),
     )
 
+    # Post-acceptance conditions -> OutcomeUnavailable (operation was already accepted, do not drop hold)
+    s_in_progress = cp.HttpProjectsMcpPaidSession(
+        "http://mock-provider",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(
+                200, json={"jsonrpc": "2.0", "error": {"message": "the capability execution is still in progress"}}
+            )
+        ),
+    )
+    s_prev_attempt = cp.HttpProjectsMcpPaidSession(
+        "http://mock-provider",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "isError": True,
+                        "content": [{"type": "text", "text": "the capability failed on previous attempt"}],
+                    },
+                },
+            )
+        ),
+    )
+
+    # Response missing 'result' and 'error' -> OutcomeUnavailable
+    s_missing_result = cp.HttpProjectsMcpPaidSession(
+        "http://mock-provider",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"jsonrpc": "2.0", "id": 1})
+        ),
+    )
+
+    # Tool error that is NOT an ingress refusal -> returns ToolCallResult(is_error=True)
     s_tool_fail = cp.HttpProjectsMcpPaidSession(
         "http://mock-provider",
         transport=httpx.MockTransport(
@@ -706,15 +750,25 @@ def test_unit_session_call_paid_tool_jsonrpc_refusals():
     )
 
     async def run():
+        # Pre-dispatch refusals
         with pytest.raises(cm.DispatchRefused, match="signature invalid"):
             await s_sig_err.call_paid_tool("projects_search", args, auth)
-
-        with pytest.raises(cm.OutcomeUnavailable, match="tools/call JSON-RPC error:"):
-            await s_gen_err.call_paid_tool("projects_search", args, auth)
 
         with pytest.raises(cm.DispatchRefused, match="dispatch deadline has passed"):
             await s_deadline_err.call_paid_tool("projects_search", args, auth)
 
+        # Post-acceptance states
+        with pytest.raises(cm.OutcomeUnavailable, match="provider operation state:"):
+            await s_in_progress.call_paid_tool("projects_search", args, auth)
+
+        with pytest.raises(cm.OutcomeUnavailable, match="provider operation state:"):
+            await s_prev_attempt.call_paid_tool("projects_search", args, auth)
+
+        # Missing result
+        with pytest.raises(cm.OutcomeUnavailable, match="neither 'result' nor 'error' present"):
+            await s_missing_result.call_paid_tool("projects_search", args, auth)
+
+        # Non-refusal tool execution error
         res = await s_tool_fail.call_paid_tool("projects_search", args, auth)
         assert res.is_error is True
         assert "syntax error in lucene query" in res.text
@@ -750,7 +804,7 @@ def test_unit_session_call_paid_tool_network_and_http_errors():
 
 
 def test_unit_session_outcome_cases():
-    """outcome handles 404 not found, succeeded, network error, and unknown status."""
+    """outcome handles 404 not found, succeeded, network error, malformed JSON, and unknown status."""
     s404 = cp.HttpProjectsMcpPaidSession(
         "http://mock-provider",
         transport=httpx.MockTransport(lambda req: httpx.Response(404, text="Not Found")),
@@ -764,6 +818,12 @@ def test_unit_session_outcome_cases():
     s500 = cp.HttpProjectsMcpPaidSession(
         "http://mock-provider",
         transport=httpx.MockTransport(lambda req: httpx.Response(500, text="Internal Error")),
+    )
+    s_malformed_json = cp.HttpProjectsMcpPaidSession(
+        "http://mock-provider",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, text="<html>502 Bad Gateway</html>")
+        ),
     )
     s_unknown_status = cp.HttpProjectsMcpPaidSession(
         "http://mock-provider",
@@ -784,6 +844,9 @@ def test_unit_session_outcome_cases():
         with pytest.raises(cm.OutcomeUnavailable, match="outcome lookup failed: HTTP 500"):
             await s500.outcome("mctl-op/v1:test_key")
 
+        with pytest.raises(cm.OutcomeUnavailable, match="malformed outcome JSON response:"):
+            await s_malformed_json.outcome("mctl-op/v1:test_key")
+
         with pytest.raises(cm.OutcomeUnavailable, match="unknown outcome status 'invalid_status'"):
             await s_unknown_status.outcome("mctl-op/v1:test_key")
 
@@ -791,7 +854,8 @@ def test_unit_session_outcome_cases():
 
 
 def test_unit_session_robust_sse_multiline_parsing():
-    """_parse_mcp_response and session parse multiline SSE frames and ignore ping events."""
+    """_parse_mcp_response parses multiline SSE, handles CRLF, and ignores pings/notifications."""
+    # 1. Standard multiline with ping preceding
     multiline_sse = (
         "event: ping\n"
         "data: {}\n\n"
@@ -817,6 +881,32 @@ def test_unit_session_robust_sse_multiline_parsing():
 
     asyncio.run(run())
 
+    # 2. CRLF-delimited SSE stream
+    crlf_sse = (
+        "event: ping\r\n"
+        "data: {}\r\n\r\n"
+        "event: message\r\n"
+        "data: {\"jsonrpc\": \"2.0\", \"id\": 1, \"result\": {\"tools\": []}}\r\n\r\n"
+    )
+    parsed_crlf = cp._parse_mcp_response(crlf_sse)
+    assert parsed_crlf == {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}
+
+    # 3. Notification frame preceding response frame
+    notification_and_result = (
+        "event: message\n"
+        "data: {\"jsonrpc\": \"2.0\", \"method\": \"notifications/progress\", \"params\": {}}\n\n"
+        "event: message\n"
+        "data: {\"jsonrpc\": \"2.0\", \"id\": 1, \"result\": {\"tools\": []}}\n\n"
+    )
+    parsed_notif = cp._parse_mcp_response(notification_and_result)
+    assert parsed_notif == {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}
+
+    # 4. Stream containing only pings raises OutcomeUnavailable
+    ping_only = "event: ping\ndata: {}\n\n"
+    with pytest.raises(cm.OutcomeUnavailable, match="no JSON-RPC response found"):
+        cp._parse_mcp_response(ping_only)
+
+    # 5. Malformed SSE data line
     bad_sse = "event: message\ndata: {unclosed json\n\n"
     with pytest.raises(cm.OutcomeUnavailable, match="malformed SSE data payload:"):
         cp._parse_mcp_response(bad_sse)
