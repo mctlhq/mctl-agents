@@ -29,13 +29,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import threading
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -427,6 +428,54 @@ def _parse_mcp_response(raw_text: str) -> dict[str, Any]:
         raise OutcomeUnavailable(f"malformed JSON response: {exc}") from exc
 
 
+PROVIDER_OPERATION_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
+
+POST_ACCEPTANCE_HINTS: tuple[str, ...] = (
+    "still in progress",
+    "failed on previous attempt",
+    "already accepted",
+    "concurrent dispatch",
+)
+
+PRE_DISPATCH_REFUSAL_HINTS: tuple[str, ...] = (
+    # 1. Authorization & ingress verification phrases (commerce.py & ProviderIngress)
+    "authorization rejected:",
+    *(f"authorization.{name} is missing" for name in ("signature", *DISPATCH_SIGNED_FIELDS)),
+    "authorization must be an object",
+    "authorization.schema_version must be an integer",
+    "unknown authorization schema_version",
+    "unknown authorization version",
+    "authorization carries unknown fields",
+    "names another provider",
+    "names another capability",
+    "names another input schema",
+    "signed for other arguments",
+    "names another tenant",
+    "requires a dispatch authorization",
+    "requires a valid dispatch authorization",
+    "invalid authorization structure",
+    "invalid authorization json",
+    "signature does not verify",
+    "signature invalid",
+    "signature is not base64url",
+    "unknown signing key",
+    "provider_operation_key does not derive",
+    "invalid dispatch_deadline",
+    "invalid signature length",
+    "public key must be 32 bytes",
+    "dispatch deadline has passed",
+    "is not a yyyy-mm-ddthh:mm:ssz time",
+    "must be timezone-aware",
+    "unknown tool",
+    "arguments cannot be digested",
+    "provider operation key is bound to another invocation",
+    # 2. Domain non-visibility refusals (Fastify projects-mcp & Coolify status)
+    "is available to you",
+    "is not configured for tenant",
+    "no live status is configured for",
+)
+
+
 @dataclass
 class HttpProjectsMcpPaidSession:
     """A paid provider session connecting to `projects-mcp` over HTTP/MCP.
@@ -594,50 +643,6 @@ class HttpProjectsMcpPaidSession:
             if raw_id is True or raw_id not in (1, "1"):
                 raise OutcomeUnavailable(f"tools/call response id mismatch: expected 1, got {raw_id}")
 
-            post_acceptance_hints = (
-                "still in progress",
-                "failed on previous attempt",
-                "already accepted",
-                "concurrent dispatch",
-            )
-            pre_dispatch_refusal_hints = (
-                # 1. Authorization & ingress verification phrases (commerce.py & ProviderIngress)
-                "authorization rejected:",
-                *(f"authorization.{name} is missing" for name in ("signature", *DISPATCH_SIGNED_FIELDS)),
-                "authorization must be an object",
-                "authorization.schema_version must be an integer",
-                "unknown authorization schema_version",
-                "unknown authorization version",
-                "authorization carries unknown fields",
-                "names another provider",
-                "names another capability",
-                "names another input schema",
-                "signed for other arguments",
-                "names another tenant",
-                "requires a dispatch authorization",
-                "requires a valid dispatch authorization",
-                "invalid authorization structure",
-                "invalid authorization json",
-                "signature does not verify",
-                "signature invalid",
-                "signature is not base64url",
-                "unknown signing key",
-                "provider_operation_key does not derive",
-                "invalid dispatch_deadline",
-                "invalid signature length",
-                "public key must be 32 bytes",
-                "dispatch deadline has passed",
-                "is not a yyyy-mm-ddthh:mm:ssz time",
-                "must be timezone-aware",
-                "unknown tool",
-                "arguments cannot be digested",
-                "provider operation key is bound to another invocation",
-                # 2. Domain non-visibility refusals (Fastify projects-mcp & Coolify status)
-                "is available to you",
-                "is not configured for tenant",
-                "no live status is configured for",
-            )
-
             # 1. JSON-RPC protocol error branch
             if "error" in data:
                 err = data["error"]
@@ -652,9 +657,9 @@ class HttpProjectsMcpPaidSession:
                     raise DispatchRefused(err_msg)
                 if refusal_marker == "post_acceptance":
                     raise OutcomeUnavailable(f"provider operation state: {err_msg}")
-                if any(hint in err_msg.lower() for hint in post_acceptance_hints):
+                if any(hint in err_msg.lower() for hint in POST_ACCEPTANCE_HINTS):
                     raise OutcomeUnavailable(f"provider operation state: {err_msg}")
-                if any(hint in err_msg.lower() for hint in pre_dispatch_refusal_hints):
+                if any(hint in err_msg.lower() for hint in PRE_DISPATCH_REFUSAL_HINTS):
                     raise DispatchRefused(err_msg)
                 raise OutcomeUnavailable(f"tools/call JSON-RPC error: {err_msg}")
 
@@ -685,9 +690,9 @@ class HttpProjectsMcpPaidSession:
 
             is_error = bool(result.get("isError", False))
             if is_error:
-                if any(hint in text.lower() for hint in post_acceptance_hints):
+                if any(hint in text.lower() for hint in POST_ACCEPTANCE_HINTS):
                     raise OutcomeUnavailable(f"provider operation state: {text}")
-                if any(hint in text.lower() for hint in pre_dispatch_refusal_hints):
+                if any(hint in text.lower() for hint in PRE_DISPATCH_REFUSAL_HINTS):
                     raise DispatchRefused(text)
                 raise OutcomeUnavailable(f"provider operation state: {text}")
 
@@ -700,7 +705,13 @@ class HttpProjectsMcpPaidSession:
             raise OutcomeUnavailable(f"tools/call network error: {exc}") from exc
 
     async def outcome(self, provider_operation_key: str) -> ProviderOutcome:
-        url = f"{self.base_url.rstrip('/')}/commerce/outcome/{provider_operation_key}"
+        if (
+            not PROVIDER_OPERATION_KEY_PATTERN.fullmatch(provider_operation_key)
+            or ".." in provider_operation_key
+        ):
+            raise OutcomeUnavailable(f"invalid provider_operation_key: {provider_operation_key!r}")
+        safe_key = quote(provider_operation_key, safe="/:")
+        url = f"{self.base_url.rstrip('/')}/commerce/outcome/{safe_key}"
         headers = {"accept": "application/json"}
         if self.access_token:
             headers["cf-access-jwt-assertion"] = self.access_token
@@ -708,14 +719,21 @@ class HttpProjectsMcpPaidSession:
         try:
             client = self._get_client()
             resp = await client.get(url, headers=headers)
-            if resp.status_code == 404:
-                return ProviderOutcome(NOT_FOUND)
-            if resp.status_code != 200:
+            if resp.status_code not in (200, 404):
                 raise OutcomeUnavailable(f"outcome lookup failed: HTTP {resp.status_code}")
             try:
                 data = resp.json()
             except (json.JSONDecodeError, ValueError) as exc:
-                raise OutcomeUnavailable(f"malformed outcome JSON response: {exc}") from exc
+                raise OutcomeUnavailable(
+                    f"malformed outcome JSON response (HTTP {resp.status_code}): {exc}"
+                ) from exc
+            if not isinstance(data, dict):
+                raise OutcomeUnavailable(f"outcome response is not a mapping: {data!r}")
+            if resp.status_code == 404:
+                status = data.get("status", "")
+                if status == NOT_FOUND:
+                    return ProviderOutcome(NOT_FOUND)
+                raise OutcomeUnavailable(f"HTTP 404 returned unexpected status: {status!r}")
             status = data.get("status", "")
             if status not in (SUCCEEDED, FAILED, IN_PROGRESS, NOT_FOUND):
                 raise OutcomeUnavailable(f"unknown outcome status {status!r}")

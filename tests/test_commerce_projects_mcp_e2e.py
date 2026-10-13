@@ -1252,16 +1252,34 @@ def test_unit_session_call_paid_tool_network_and_http_errors():
 
 
 def test_unit_session_outcome_cases():
-    """outcome handles 404 not found, succeeded, network error, malformed JSON, and unknown status."""
-    s404 = cp.HttpProjectsMcpPaidSession(
+    """outcome handles structured 404 not found, edge 404, succeeded, malformed JSON, and unknown status."""
+    s404_provider = cp.HttpProjectsMcpPaidSession(
+        "https://mock-provider",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(404, json={"status": "not_found"})
+        ),
+    )
+    s404_edge_text = cp.HttpProjectsMcpPaidSession(
         "https://mock-provider",
         transport=httpx.MockTransport(lambda req: httpx.Response(404, text="Not Found")),
+    )
+    s404_non_mapping = cp.HttpProjectsMcpPaidSession(
+        "https://mock-provider",
+        transport=httpx.MockTransport(lambda req: httpx.Response(404, json=["not_found"])),
+    )
+    s404_wrong_status = cp.HttpProjectsMcpPaidSession(
+        "https://mock-provider",
+        transport=httpx.MockTransport(lambda req: httpx.Response(404, json={"status": "succeeded"})),
     )
     s200_ok = cp.HttpProjectsMcpPaidSession(
         "https://mock-provider",
         transport=httpx.MockTransport(
             lambda req: httpx.Response(200, json={"status": "succeeded", "is_error": False, "text": "done"})
         ),
+    )
+    s200_non_mapping = cp.HttpProjectsMcpPaidSession(
+        "https://mock-provider",
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=["succeeded"])),
     )
     s500 = cp.HttpProjectsMcpPaidSession(
         "https://mock-provider",
@@ -1289,18 +1307,30 @@ def test_unit_session_outcome_cases():
     )
 
     async def run():
-        out404 = await s404.outcome("mctl-op/v1:test_key")
+        out404 = await s404_provider.outcome("mctl-op/v1:test_key")
         assert out404.status == "not_found"
+
+        with pytest.raises(cm.OutcomeUnavailable, match="HTTP 404"):
+            await s404_edge_text.outcome("mctl-op/v1:test_key")
+
+        with pytest.raises(cm.OutcomeUnavailable, match="outcome response is not a mapping"):
+            await s404_non_mapping.outcome("mctl-op/v1:test_key")
+
+        with pytest.raises(cm.OutcomeUnavailable, match="HTTP 404 returned unexpected status: 'succeeded'"):
+            await s404_wrong_status.outcome("mctl-op/v1:test_key")
 
         out_ok = await s200_ok.outcome("mctl-op/v1:test_key")
         assert out_ok.status == "succeeded"
         assert not out_ok.is_error
         assert out_ok.text == "done"
 
+        with pytest.raises(cm.OutcomeUnavailable, match="outcome response is not a mapping"):
+            await s200_non_mapping.outcome("mctl-op/v1:test_key")
+
         with pytest.raises(cm.OutcomeUnavailable, match="outcome lookup failed: HTTP 500"):
             await s500.outcome("mctl-op/v1:test_key")
 
-        with pytest.raises(cm.OutcomeUnavailable, match="malformed outcome JSON response:"):
+        with pytest.raises(cm.OutcomeUnavailable, match="malformed outcome JSON response"):
             await s_malformed_json.outcome("mctl-op/v1:test_key")
 
         with pytest.raises(cm.OutcomeUnavailable, match="unknown outcome status 'invalid_status'"):
@@ -1308,6 +1338,12 @@ def test_unit_session_outcome_cases():
 
         with pytest.raises(cm.OutcomeUnavailable, match="outcome lookup network error:"):
             await s_net_err.outcome("mctl-op/v1:test_key")
+
+        with pytest.raises(cm.OutcomeUnavailable, match="invalid provider_operation_key"):
+            await s200_ok.outcome("../traversal/key")
+
+        with pytest.raises(cm.OutcomeUnavailable, match="invalid provider_operation_key"):
+            await s200_ok.outcome("key?with=query")
 
     asyncio.run(run())
 
@@ -1699,8 +1735,8 @@ def test_unit_paid_invocation_raise_then_lookup_failure_route(monkeypatch):
 
 
 def test_unit_paid_invocation_executed_tool_failure_finalizes(monkeypatch):
-    """When call_paid_tool returns ToolCallResult(is_error=True) on tool execution failure,
-    PaidInvocation._dispatch records cm.FAILED directly and finalizes without outcome lookup.
+    """When an executed tool failure returns isError without a refusal hint, call_paid_tool raises
+    OutcomeUnavailable, prompting PaidInvocation to consult session.outcome() and finalize FAILED.
     """
     clock = Clock()
     clock.t = datetime.now(UTC)
