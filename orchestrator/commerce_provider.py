@@ -325,3 +325,152 @@ def pilot_lookup_status_ingress(
         tenant_id=tenant_id,
         now=now,
     )
+
+
+# ---------------------------------------------------------------------------
+# projects-mcp: Paid Capability Alpha (ADR 020 sec. 9, projects_search)
+# ---------------------------------------------------------------------------
+
+PROJECTS_MCP_PROVIDER_ID = "projects-mcp"
+PROJECTS_SEARCH_TOOL = "projects_search"
+PROJECTS_SEARCH_CAPABILITY_ID = "mctl://projects/projects_search"
+PROJECTS_SEARCH_SCHEMA_HASH = "sha256:dcb46609c306694f18c69fd4d2a1f3e39741066ee845f882c4605fefd846fafe"
+PROJECTS_SEARCH_INPUT_SCHEMA: Mapping[str, Any] = {
+    "type": "object",
+    "properties": {
+        "project": {"type": "string", "description": "The project slug, as returned by projects_list", "minLength": 1},
+        "query": {"type": "string", "description": "Words to look for", "minLength": 1},
+        "limit": {
+            "type": "integer",
+            "default": 8,
+            "description": "How many passages to return",
+            "minimum": 1,
+            "maximum": 25,
+        },
+    },
+    "required": ["project", "query"],
+}
+
+
+def _parse_mcp_response(raw_text: str) -> dict[str, Any]:
+    import json
+    import re
+
+    text = raw_text.strip()
+    match = re.search(r"data:\s*({.*})", text)
+    if match:
+        return json.loads(match.group(1))
+    return json.loads(text)
+
+
+@dataclass
+class HttpProjectsMcpPaidSession:
+    """A paid provider session connecting to `projects-mcp` over HTTP/MCP.
+    Implements PaidProviderSession protocol (ADR 020 sec. 9)."""
+
+    base_url: str
+    access_token: str = ""
+    timeout_s: float = 30.0
+
+    async def list_tools(self) -> list[ProviderTool]:
+        import httpx
+
+        url = f"{self.base_url.rstrip('/')}/mcp"
+        headers = {
+            "accept": "application/json, text/event-stream",
+            "content-type": "application/json",
+        }
+        if self.access_token:
+            headers["cf-access-jwt-assertion"] = self.access_token
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+
+        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code != 200:
+                raise OutcomeUnavailable(f"tools/list failed: HTTP {resp.status_code}")
+            data = _parse_mcp_response(resp.text)
+            result = data.get("result", {})
+            raw_tools = result.get("tools", [])
+            tools = []
+            for t in raw_tools:
+                tools.append(ProviderTool(
+                    name=t.get("name", ""),
+                    description=t.get("description", ""),
+                    input_schema=t.get("inputSchema", {}),
+                    annotations=t.get("annotations", {}),
+                ))
+            return tools
+
+    async def call_tool(self, tool: str, arguments: Mapping[str, Any]) -> ToolCallResult:
+        raise DispatchRefused("a paid capability requires a dispatch authorization")
+
+    async def call_paid_tool(
+        self, tool: str, arguments: Mapping[str, Any], authorization: DispatchAuthorization,
+    ) -> ToolCallResult:
+        import httpx
+
+        url = f"{self.base_url.rstrip('/')}/mcp"
+        headers = {
+            "accept": "application/json, text/event-stream",
+            "content-type": "application/json",
+        }
+        if self.access_token:
+            headers["cf-access-jwt-assertion"] = self.access_token
+
+        args = dict(arguments)
+        args["_mctl_dispatch_authorization"] = authorization.to_dict()
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": args},
+        }
+
+        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code in (401, 403):
+                raise DispatchRefused(f"HTTP {resp.status_code}: {resp.text}")
+            if resp.status_code != 200:
+                raise OutcomeUnavailable(f"tools/call failed: HTTP {resp.status_code}")
+            data = _parse_mcp_response(resp.text)
+            result = data.get("result", {})
+            is_error = bool(result.get("isError", False))
+            content = result.get("content", [])
+            text = "\n".join(str(c.get("text", "")) for c in content)
+            if is_error:
+                refusal_hints = (
+                    "authorization", "signature", "deadline", "signing key",
+                    "operation key", "already accepted", "concurrent dispatch",
+                    "in progress", "previous attempt", "dispatch", "mismatch",
+                )
+                if any(hint in text.lower() for hint in refusal_hints):
+                    raise DispatchRefused(text)
+            return ToolCallResult(is_error=is_error, text=text)
+
+    async def outcome(self, provider_operation_key: str) -> ProviderOutcome:
+        import httpx
+
+        url = f"{self.base_url.rstrip('/')}/commerce/outcome/{provider_operation_key}"
+        headers = {"accept": "application/json"}
+        if self.access_token:
+            headers["cf-access-jwt-assertion"] = self.access_token
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 404:
+                    return ProviderOutcome(NOT_FOUND)
+                if resp.status_code != 200:
+                    raise OutcomeUnavailable(f"outcome lookup failed: HTTP {resp.status_code}")
+                data = resp.json()
+                status = data.get("status", "")
+                if status not in (SUCCEEDED, FAILED, IN_PROGRESS, NOT_FOUND):
+                    raise OutcomeUnavailable(f"unknown outcome status {status!r}")
+                return ProviderOutcome(
+                    status=status,
+                    is_error=bool(data.get("is_error", False)),
+                    text=str(data.get("text", "")),
+                )
+        except httpx.RequestError as exc:
+            raise OutcomeUnavailable(f"outcome lookup network error: {exc}") from exc
+
