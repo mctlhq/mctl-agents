@@ -441,6 +441,7 @@ class HttpProjectsMcpPaidSession:
     timeout_s: float = 30.0
     transport: httpx.AsyncBaseTransport | None = None
     _client: httpx.AsyncClient | None = field(default=None, init=False, repr=False, compare=False)
+    _client_loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.base_url)
@@ -451,7 +452,6 @@ class HttpProjectsMcpPaidSession:
             )
 
     def _get_client(self) -> httpx.AsyncClient:
-        client_loop = getattr(self._client, "_loop", None) if self._client else None
         current_loop = None
         try:
             current_loop = asyncio.get_running_loop()
@@ -460,9 +460,10 @@ class HttpProjectsMcpPaidSession:
         if (
             self._client is None
             or self._client.is_closed
-            or (client_loop is not None and client_loop is not current_loop)
+            or (self._client_loop is not None and self._client_loop is not current_loop)
         ):
             self._client = httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport)
+            self._client_loop = current_loop
         return self._client
 
     async def close(self) -> None:
@@ -473,6 +474,7 @@ class HttpProjectsMcpPaidSession:
                 pass
             finally:
                 self._client = None
+                self._client_loop = None
 
     async def __aenter__(self) -> HttpProjectsMcpPaidSession:
         return self
@@ -496,19 +498,17 @@ class HttpProjectsMcpPaidSession:
             if resp.status_code != 200:
                 raise OutcomeUnavailable(f"tools/list failed: HTTP {resp.status_code}")
             data = _parse_mcp_response(resp.text)
-            if "error" in data:
-                raise OutcomeUnavailable(f"tools/list JSON-RPC error: {data['error']}")
             if data.get("id") != 1:
                 raise OutcomeUnavailable(f"tools/list response id mismatch: expected 1, got {data.get('id')}")
+            if "error" in data:
+                raise OutcomeUnavailable(f"tools/list JSON-RPC error: {data['error']}")
             if "result" not in data:
                 raise OutcomeUnavailable(f"tools/list response missing 'result': {data}")
             result = data.get("result")
             if not isinstance(result, dict):
                 raise OutcomeUnavailable(f"tools/list result is not a mapping: {result}")
             raw_tools = result.get("tools")
-            if raw_tools is None:
-                raw_tools = []
-            elif not isinstance(raw_tools, list):
+            if not isinstance(raw_tools, list):
                 raise OutcomeUnavailable(f"tools/list result 'tools' is not a list: {raw_tools}")
             tools = []
             for t in raw_tools:
@@ -557,6 +557,8 @@ class HttpProjectsMcpPaidSession:
             if resp.status_code != 200:
                 raise OutcomeUnavailable(f"tools/call failed: HTTP {resp.status_code}")
             data = _parse_mcp_response(resp.text)
+            if data.get("id") != 1:
+                raise OutcomeUnavailable(f"tools/call response id mismatch: expected 1, got {data.get('id')}")
 
             post_acceptance_hints = (
                 "still in progress",
@@ -609,9 +611,7 @@ class HttpProjectsMcpPaidSession:
                     raise DispatchRefused(err_msg)
                 raise OutcomeUnavailable(f"tools/call JSON-RPC error: {err_msg}")
 
-            # 2. Result id validation and structure check
-            if data.get("id") != 1:
-                raise OutcomeUnavailable(f"tools/call response id mismatch: expected 1, got {data.get('id')}")
+            # 2. Result structure check
             if "result" not in data:
                 raise OutcomeUnavailable(f"tools/call response missing 'result': {data}")
             result = data["result"]

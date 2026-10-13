@@ -216,16 +216,17 @@ def test_tools_list_over_mcp_http(e2e_harness):
         search_tool = next(t for t in tools if t.name == cp.PROJECTS_SEARCH_TOOL)
         assert search_tool.input_schema.get("type") == "object"
         assert search_tool.input_schema.get("required") == ["project", "query"]
-        assert set(search_tool.input_schema.get("properties", {}).keys()) >= {"project", "query", "limit"}
+        clean_remote_props = {
+            k: v for k, v in search_tool.input_schema["properties"].items()
+            if k != "_mctl_dispatch_authorization"
+        }
+        assert set(clean_remote_props.keys()) == {"project", "query", "limit"}
 
         # Assert remote inputSchema canonical hash matches cp.PROJECTS_SEARCH_SCHEMA_HASH
         canonical_remote_schema = {
             "type": "object",
-            "properties": {
-                k: v for k, v in search_tool.input_schema["properties"].items()
-                if k in ("project", "query", "limit")
-            },
-            "required": search_tool.input_schema.get("required", []),
+            "properties": clean_remote_props,
+            "required": search_tool.input_schema["required"],
         }
         derived_remote_hash = cp.hash_bytes(cp.canonical_json(canonical_remote_schema))
         assert derived_remote_hash == cp.PROJECTS_SEARCH_SCHEMA_HASH
@@ -633,7 +634,9 @@ def test_unit_session_list_tools_error_cases():
     s_rpc_err = cp.HttpProjectsMcpPaidSession(
         "https://mock-provider",
         transport=httpx.MockTransport(
-            lambda req: httpx.Response(200, json={"jsonrpc": "2.0", "error": {"message": "method not found"}})
+            lambda req: httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": 1, "error": {"message": "method not found"}}
+            )
         ),
     )
     s_missing_result = cp.HttpProjectsMcpPaidSession(
@@ -677,8 +680,9 @@ def test_unit_session_list_tools_error_cases():
         with pytest.raises(cm.OutcomeUnavailable, match="tools/list network error:"):
             await s_net_err.list_tools()
 
-        # result.tools == None safely returns empty list
-        assert await s_null_tools.list_tools() == []
+        # result.tools == None raises OutcomeUnavailable per strict schema
+        with pytest.raises(cm.OutcomeUnavailable, match="tools/list result 'tools' is not a list"):
+            await s_null_tools.list_tools()
 
         # result.tools not a list raises OutcomeUnavailable
         with pytest.raises(cm.OutcomeUnavailable, match="tools/list result 'tools' is not a list"):
@@ -1242,6 +1246,163 @@ def test_unit_session_client_lifecycle():
         assert session._client is None
 
     asyncio.run(run())
+
+
+def test_unit_session_cross_loop_recreation():
+    """HttpProjectsMcpPaidSession recreates its client when called across different event loops."""
+    payload = {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}
+    session = cp.HttpProjectsMcpPaidSession(
+        "https://mock-provider",
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=payload)),
+    )
+
+    loop1 = asyncio.new_event_loop()
+    try:
+        tools1 = loop1.run_until_complete(session.list_tools())
+        assert tools1 == []
+        assert session._client is not None
+        assert session._client_loop is loop1
+    finally:
+        loop1.close()
+
+    loop2 = asyncio.new_event_loop()
+    try:
+        tools2 = loop2.run_until_complete(session.list_tools())
+        assert tools2 == []
+        assert session._client is not None
+        assert session._client_loop is loop2
+    finally:
+        loop2.run_until_complete(session.close())
+        loop2.close()
+
+
+def test_unit_session_unattributable_error_frame_not_refused():
+    """Error frame with id: null or mismatched id raises OutcomeUnavailable, never DispatchRefused."""
+    args = {"project": "acme", "query": "auth", "limit": 5}
+    auth = _make_dummy_auth(args)
+    # A payload that would otherwise match refusal keywords (unauthorized message)
+    # but lacks valid request id (id: null)
+    unattributable_err = {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32600, "message": "unauthorized dispatch signature"},
+    }
+    session = cp.HttpProjectsMcpPaidSession(
+        "https://mock-provider",
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=unattributable_err)),
+    )
+    async def run():
+        with pytest.raises(cm.OutcomeUnavailable, match="response id mismatch"):
+            await session.call_paid_tool("projects_search", args, auth)
+
+    asyncio.run(run())
+
+
+def test_unit_paid_invocation_raise_then_lookup_failure_route(monkeypatch):
+    """PaidInvocation handles tool error (isError=True) raising OutcomeUnavailable during dispatch,
+    then looks up durable outcome from provider. Under per_successful_call, budget hold is released.
+    """
+    clock = Clock()
+    clock.t = datetime.now(UTC)
+    ledger = FakeLedger(clock, budget=100)
+    approvals = FakeApprovals(clock)
+    ledger.publish(
+        cp.PROJECTS_SEARCH_CAPABILITY_ID,
+        cp.PROJECTS_SEARCH_SCHEMA_HASH,
+        provider_id=cp.PROJECTS_MCP_PROVIDER_ID,
+    )
+    monkeypatch.setattr(
+        pc,
+        "current_identity",
+        lambda: pc.ExecutionIdentity(execution_id=EXECUTION, trace_id="tr-unit-fail", actor="agent:test"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            # Tools/call returns isError without pre-acceptance refusal marker
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "isError": True,
+                        "content": [{"type": "text", "text": "bad query syntax"}],
+                    },
+                },
+            )
+        if request.method == "GET" and "/commerce/outcome/" in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "status": "failed",
+                    "is_error": True,
+                    "text": "bad query syntax",
+                },
+            )
+        return httpx.Response(404)
+
+    session = cp.HttpProjectsMcpPaidSession(
+        "https://mock-provider",
+        access_token="unit-jwt",  # noqa: S106
+        transport=httpx.MockTransport(handler),
+    )
+    runtime = cg.CommerceRuntime(
+        client=ledger,
+        tenant_id="acme",
+        admitted_providers=frozenset({cp.PROJECTS_MCP_PROVIDER_ID}),
+        approvals=approvals,
+        now=clock,
+        call_timeout_s=5.0,
+    )
+    provider_ref = cap.ProviderRef(type="mcp-remote", id=cp.PROJECTS_MCP_PROVIDER_ID, alias="projects")
+    descriptor = cap.CapabilityDescriptor(
+        capability_id=cp.PROJECTS_SEARCH_CAPABILITY_ID,
+        tool_name="mcp__projects__projects_search",
+        provider=provider_ref,
+        title="projects_search",
+        summary="Search project docs",
+        keywords=("projects", "search"),
+        input_schema_hash=cp.PROJECTS_SEARCH_SCHEMA_HASH,
+        input_schema_bytes=100,
+        consequence="safe",
+        matched_tool_pattern="mcp__projects__*",
+        commerce=cap.CommerceSummary(
+            terms_id="ctm_01JZ8PZ0000000000000000000",
+            terms_version=1,
+            price_mode="per_successful_call",
+            currency="EUR",
+            amount_minor=12,
+            funds_mode="simulated",
+        ),
+    )
+
+    args = {"project": "acme", "query": "auth", "limit": 8}
+    paid = cg.PaidInvocation(
+        runtime=runtime,
+        descriptor=descriptor,
+        session=session,
+        tool=cp.PROJECTS_SEARCH_TOOL,
+        arguments=args,
+        grants=("mcp__projects__*",),
+        policy=ALLOW_PAID,
+        client_key="k_unit_fail_lookup",
+        emit=lambda p, event: None,
+    )
+
+    async def run():
+        res = await paid.run()
+        assert res.reason_code == "provider-error"
+        assert res.phase == "finalized"
+        assert res.text == "bad query syntax"
+        # Under per_successful_call, a failed execution releases hold without charging
+        assert ledger.budget["reserved"] == 0
+        assert ledger.budget["committed"] == 0
+        assert ledger.free() == 100
+        await session.close()
+
+    asyncio.run(run())
+
 
 
 
