@@ -439,26 +439,40 @@ class HttpProjectsMcpPaidSession:
     base_url: str
     access_token: str = ""
     timeout_s: float = 30.0
-    transport: httpx.BaseTransport | None = None
-    _client: httpx.AsyncClient | None = field(default=None, repr=False, compare=False)
+    transport: httpx.AsyncBaseTransport | None = None
+    _client: httpx.AsyncClient | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.base_url)
-        loopback_hosts = ("localhost", "127.0.0.1", "::1", "mock-provider", "testserver")
+        loopback_hosts = ("localhost", "127.0.0.1", "::1")
         if parsed.scheme != "https" and parsed.hostname not in loopback_hosts:
             raise ValueError(
                 f"base_url must use https scheme for remote providers to protect access tokens, got: {self.base_url}"
             )
 
     def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
+        client_loop = getattr(self._client, "_loop", None) if self._client else None
+        current_loop = None
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        if (
+            self._client is None
+            or self._client.is_closed
+            or (client_loop is not None and client_loop is not current_loop)
+        ):
             self._client = httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport)
         return self._client
 
     async def close(self) -> None:
         if self._client is not None and not self._client.is_closed:
-            await self._client.aclose()
-            self._client = None
+            try:
+                await self._client.aclose()
+            except (RuntimeError, httpx.RequestError):
+                pass
+            finally:
+                self._client = None
 
     async def __aenter__(self) -> HttpProjectsMcpPaidSession:
         return self
@@ -482,16 +496,20 @@ class HttpProjectsMcpPaidSession:
             if resp.status_code != 200:
                 raise OutcomeUnavailable(f"tools/list failed: HTTP {resp.status_code}")
             data = _parse_mcp_response(resp.text)
-            if data.get("id") not in (None, 1):
-                raise OutcomeUnavailable(f"tools/list response id mismatch: expected 1, got {data.get('id')}")
             if "error" in data:
                 raise OutcomeUnavailable(f"tools/list JSON-RPC error: {data['error']}")
+            if data.get("id") != 1:
+                raise OutcomeUnavailable(f"tools/list response id mismatch: expected 1, got {data.get('id')}")
             if "result" not in data:
                 raise OutcomeUnavailable(f"tools/list response missing 'result': {data}")
             result = data.get("result")
             if not isinstance(result, dict):
                 raise OutcomeUnavailable(f"tools/list result is not a mapping: {result}")
-            raw_tools = result.get("tools", [])
+            raw_tools = result.get("tools")
+            if raw_tools is None:
+                raw_tools = []
+            elif not isinstance(raw_tools, list):
+                raise OutcomeUnavailable(f"tools/list result 'tools' is not a list: {raw_tools}")
             tools = []
             for t in raw_tools:
                 if isinstance(t, dict):
@@ -539,8 +557,6 @@ class HttpProjectsMcpPaidSession:
             if resp.status_code != 200:
                 raise OutcomeUnavailable(f"tools/call failed: HTTP {resp.status_code}")
             data = _parse_mcp_response(resp.text)
-            if data.get("id") not in (None, 1):
-                raise OutcomeUnavailable(f"tools/call response id mismatch: expected 1, got {data.get('id')}")
 
             post_acceptance_hints = (
                 "still in progress",
@@ -577,7 +593,11 @@ class HttpProjectsMcpPaidSession:
             if "error" in data:
                 err = data["error"]
                 err_data = err.get("data") if isinstance(err, dict) else None
-                refusal_marker = err_data.get("mctl_refusal") if isinstance(err_data, dict) else None
+                refusal_marker = (
+                    (err_data.get("_mctl_refusal") or err_data.get("mctl_refusal"))
+                    if isinstance(err_data, dict)
+                    else None
+                )
                 err_msg = str(err.get("message", err) if isinstance(err, dict) else err)
                 if refusal_marker == "pre_acceptance":
                     raise DispatchRefused(err_msg)
@@ -589,7 +609,9 @@ class HttpProjectsMcpPaidSession:
                     raise DispatchRefused(err_msg)
                 raise OutcomeUnavailable(f"tools/call JSON-RPC error: {err_msg}")
 
-            # 2. Result structure check
+            # 2. Result id validation and structure check
+            if data.get("id") != 1:
+                raise OutcomeUnavailable(f"tools/call response id mismatch: expected 1, got {data.get('id')}")
             if "result" not in data:
                 raise OutcomeUnavailable(f"tools/call response missing 'result': {data}")
             result = data["result"]
@@ -616,16 +638,13 @@ class HttpProjectsMcpPaidSession:
 
             is_error = bool(result.get("isError", False))
             if is_error:
-                # Handle legacy servers that omit _mctl_refusal on post-acceptance states
-                if any(hint in text.lower() for hint in post_acceptance_hints):
-                    raise OutcomeUnavailable(f"provider operation state: {text}")
-                # Note: Pre-dispatch refusal hints are deliberately NOT matched against
-                # tool output text in the isError branch, because search tools like
-                # projects_search echo query strings (e.g. query='invalid authorization').
-                # Any tool failure without an explicit refusal marker is treated as an
-                # executed tool error result, preserving ledger liability and returning text.
+                # Without an explicit refusal marker indicating pre-acceptance refusal,
+                # any tool error (isError=True) defaults to OutcomeUnavailable (ADR 020 sec. 11).
+                # This ensures the commerce gateway verifies the durable outcome table rather than
+                # committing a charge for an unmarked pre-dispatch refusal.
+                raise OutcomeUnavailable(f"provider operation state: {text}")
 
-            return ToolCallResult(is_error=is_error, text=text)
+            return ToolCallResult(is_error=False, text=text)
         except httpx.RequestError as exc:
             raise OutcomeUnavailable(f"tools/call network error: {exc}") from exc
 
