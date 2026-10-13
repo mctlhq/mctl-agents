@@ -19,6 +19,7 @@ import base64
 import os
 import select
 import shutil
+import sqlite3
 import subprocess
 import time
 from datetime import UTC, datetime, timedelta
@@ -221,10 +222,10 @@ def test_tools_list_over_mcp_http(e2e_harness):
             if k != "_mctl_dispatch_authorization"
         }
         assert set(clean_remote_props.keys()) == {"project", "query", "limit"}
-
-        # Assert remote inputSchema canonical hash matches cp.PROJECTS_SEARCH_SCHEMA_HASH
+        assert search_tool.input_schema.get("required") == ["project", "query"]
+        assert search_tool.input_schema.get("type") == "object"
         canonical_remote_schema = {
-            "type": "object",
+            "type": search_tool.input_schema["type"],
             "properties": clean_remote_props,
             "required": search_tool.input_schema["required"],
         }
@@ -468,6 +469,74 @@ def test_provider_refusal_releases_hold(e2e_harness):
         # Hold must be released: committed unchanged, reserved 0, available restored!
         assert e2e_harness.ledger.budget["reserved"] == 0
         assert e2e_harness.ledger.free() == initial_available
+        await bad_session.close()
+
+    asyncio.run(run())
+
+
+def test_live_tool_failure_outcome_settlement(e2e_harness, projects_mcp_server):
+    """When a tool execution has previously failed or failed post-acceptance on the provider,
+    Fastify returns post_acceptance marker, session looks up outcome table, verifies 'failed'
+    status, and PaidInvocation settles as finalized provider-error, releasing the hold.
+    """
+    async def run():
+        initial_available = e2e_harness.ledger.free()
+        args = {"project": "acme", "query": "auth", "limit": 8}
+
+        # Pre-seed the SQLite dedupe table with a failed outcome for a distinct invocation
+        # Advance ledger._n to 100 so it does not collide with other test invocations in the shared DB
+        e2e_harness.ledger._n = 100
+        # mint_quote increments _n by 1, accept increments _n by 1, so the invocation is _n + 2
+        next_seq = e2e_harness.ledger._n + 2
+        target_inv_id = f"inv_{next_seq:026d}"
+        target_op_key = cm.provider_operation_key(target_inv_id)
+
+        conn = sqlite3.connect(projects_mcp_server.dedupe_db)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO commerce_provider_dedupe "
+                "(operation_key, invocation_id, status, caller_email, caller_tier, result_json, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    target_op_key,
+                    target_inv_id,
+                    "failed",
+                    "customer@example.com",
+                    "public",
+                    None,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        paid = cg.PaidInvocation(
+            runtime=e2e_harness.runtime,
+            descriptor=e2e_harness.descriptor,
+            session=e2e_harness.session,
+            tool=cp.PROJECTS_SEARCH_TOOL,
+            arguments=args,
+            grants=("mcp__projects__*",),
+            policy=ALLOW_PAID,
+            client_key="k_live_tool_failure_1",
+            emit=lambda p, event: None,
+        )
+
+        res = await paid.run()
+        assert res.reason_code == "provider-error"
+        assert res.phase == "finalized"
+        assert res.invocation_id == target_inv_id
+
+        # Hold must be released under per_successful_call pricing without committing charges
+        assert e2e_harness.ledger.budget["reserved"] == 0
+        assert e2e_harness.ledger.budget["committed"] == 0
+        assert e2e_harness.ledger.free() == initial_available
+
+        # Verify outcome lookup on Fastify endpoint answers status: failed
+        outcome = await e2e_harness.session.outcome(target_op_key)
+        assert outcome.status == "failed"
+        assert outcome.is_error
 
     asyncio.run(run())
 
@@ -1227,6 +1296,9 @@ def test_unit_session_response_id_validation():
         with pytest.raises(cm.OutcomeUnavailable, match="response id mismatch"):
             await s_null_id.list_tools()
 
+        await session.close()
+        await s_null_id.close()
+
     asyncio.run(run())
 
 
@@ -1294,6 +1366,7 @@ def test_unit_session_unattributable_error_frame_not_refused():
     async def run():
         with pytest.raises(cm.OutcomeUnavailable, match="response id mismatch"):
             await session.call_paid_tool("projects_search", args, auth)
+        await session.close()
 
     asyncio.run(run())
 

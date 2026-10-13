@@ -437,11 +437,14 @@ class HttpProjectsMcpPaidSession:
     """
 
     base_url: str
-    access_token: str = ""
+    access_token: str = field(default="", repr=False)
     timeout_s: float = 30.0
     transport: httpx.AsyncBaseTransport | None = None
     _client: httpx.AsyncClient | None = field(default=None, init=False, repr=False, compare=False)
     _client_loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False, compare=False)
+    _discarded_tasks: set[asyncio.Task[Any]] = field(
+        default_factory=set, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.base_url)
@@ -462,19 +465,37 @@ class HttpProjectsMcpPaidSession:
             or self._client.is_closed
             or (self._client_loop is not None and self._client_loop is not current_loop)
         ):
+            if (
+                self._client is not None
+                and not self._client.is_closed
+                and self._client_loop is current_loop
+                and current_loop is not None
+            ):
+                try:
+                    task = current_loop.create_task(self._client.aclose())
+                    self._discarded_tasks.add(task)
+                    task.add_done_callback(self._discarded_tasks.discard)
+                except RuntimeError:
+                    pass
             self._client = httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport)
             self._client_loop = current_loop
         return self._client
 
     async def close(self) -> None:
-        if self._client is not None and not self._client.is_closed:
-            try:
-                await self._client.aclose()
-            except (RuntimeError, httpx.RequestError):
-                pass
-            finally:
-                self._client = None
-                self._client_loop = None
+        try:
+            if self._client is not None and not self._client.is_closed:
+                current_loop = None
+                try:
+                    current_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+                if self._client_loop is None or self._client_loop is current_loop:
+                    await self._client.aclose()
+        except (RuntimeError, httpx.RequestError):
+            pass
+        finally:
+            self._client = None
+            self._client_loop = None
 
     async def __aenter__(self) -> HttpProjectsMcpPaidSession:
         return self
@@ -498,10 +519,10 @@ class HttpProjectsMcpPaidSession:
             if resp.status_code != 200:
                 raise OutcomeUnavailable(f"tools/list failed: HTTP {resp.status_code}")
             data = _parse_mcp_response(resp.text)
-            if data.get("id") != 1:
-                raise OutcomeUnavailable(f"tools/list response id mismatch: expected 1, got {data.get('id')}")
             if "error" in data:
                 raise OutcomeUnavailable(f"tools/list JSON-RPC error: {data['error']}")
+            if data.get("id") != 1:
+                raise OutcomeUnavailable(f"tools/list response id mismatch: expected 1, got {data.get('id')}")
             if "result" not in data:
                 raise OutcomeUnavailable(f"tools/list response missing 'result': {data}")
             result = data.get("result")
@@ -513,11 +534,18 @@ class HttpProjectsMcpPaidSession:
             tools = []
             for t in raw_tools:
                 if isinstance(t, dict):
+                    execution = t.get("execution")
+                    task_support = ""
+                    if isinstance(execution, dict):
+                        raw_ts = execution.get("taskSupport")
+                        if isinstance(raw_ts, str):
+                            task_support = raw_ts
                     tools.append(ProviderTool(
                         name=t.get("name", ""),
                         description=t.get("description", ""),
                         input_schema=t.get("inputSchema", {}),
                         annotations=t.get("annotations", {}),
+                        task_support=task_support,
                     ))
             return tools
         except httpx.RequestError as exc:
