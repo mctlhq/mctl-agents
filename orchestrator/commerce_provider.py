@@ -442,9 +442,6 @@ class HttpProjectsMcpPaidSession:
     transport: httpx.AsyncBaseTransport | None = None
     _client: httpx.AsyncClient | None = field(default=None, init=False, repr=False, compare=False)
     _client_loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False, compare=False)
-    _discarded_tasks: set[asyncio.Task[Any]] = field(
-        default_factory=set, init=False, repr=False, compare=False
-    )
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.base_url)
@@ -465,23 +462,15 @@ class HttpProjectsMcpPaidSession:
             or self._client.is_closed
             or (self._client_loop is not None and self._client_loop is not current_loop)
         ):
-            if (
-                self._client is not None
-                and not self._client.is_closed
-                and self._client_loop is current_loop
-                and current_loop is not None
-            ):
-                try:
-                    task = current_loop.create_task(self._client.aclose())
-                    self._discarded_tasks.add(task)
-                    task.add_done_callback(self._discarded_tasks.discard)
-                except RuntimeError:
-                    pass
             self._client = httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport)
             self._client_loop = current_loop
         return self._client
 
     async def close(self) -> None:
+        """Close the underlying HTTP client if open on the active event loop.
+        An AsyncClient cannot be cleanly closed from an event loop different from the one
+        that created its transport; in that cross-loop case, drop the reference directly.
+        """
         try:
             if self._client is not None and not self._client.is_closed:
                 current_loop = None
@@ -519,10 +508,10 @@ class HttpProjectsMcpPaidSession:
             if resp.status_code != 200:
                 raise OutcomeUnavailable(f"tools/list failed: HTTP {resp.status_code}")
             data = _parse_mcp_response(resp.text)
+            if data.get("id") not in (1, "1"):
+                raise OutcomeUnavailable(f"tools/list response id mismatch: expected 1, got {data.get('id')}")
             if "error" in data:
                 raise OutcomeUnavailable(f"tools/list JSON-RPC error: {data['error']}")
-            if data.get("id") != 1:
-                raise OutcomeUnavailable(f"tools/list response id mismatch: expected 1, got {data.get('id')}")
             if "result" not in data:
                 raise OutcomeUnavailable(f"tools/list response missing 'result': {data}")
             result = data.get("result")
@@ -585,7 +574,7 @@ class HttpProjectsMcpPaidSession:
             if resp.status_code != 200:
                 raise OutcomeUnavailable(f"tools/call failed: HTTP {resp.status_code}")
             data = _parse_mcp_response(resp.text)
-            if data.get("id") != 1:
+            if data.get("id") not in (1, "1"):
                 raise OutcomeUnavailable(f"tools/call response id mismatch: expected 1, got {data.get('id')}")
 
             post_acceptance_hints = (
