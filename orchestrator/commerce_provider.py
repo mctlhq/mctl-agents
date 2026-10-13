@@ -41,6 +41,7 @@ import httpx
 
 from orchestrator.capability_gateway import ProviderTool, ToolCallResult
 from orchestrator.commerce import (
+    DISPATCH_SIGNED_FIELDS,
     FAILED,
     IN_PROGRESS,
     NOT_FOUND,
@@ -600,7 +601,14 @@ class HttpProjectsMcpPaidSession:
                 "concurrent dispatch",
             )
             pre_dispatch_refusal_hints = (
+                # 1. Authorization & ingress verification phrases (commerce.py & ProviderIngress)
                 "authorization rejected:",
+                *(f"authorization.{name} is missing" for name in ("signature", *DISPATCH_SIGNED_FIELDS)),
+                "authorization must be an object",
+                "authorization.schema_version must be an integer",
+                "unknown authorization schema_version",
+                "unknown authorization version",
+                "authorization carries unknown fields",
                 "names another provider",
                 "names another capability",
                 "names another input schema",
@@ -614,12 +622,6 @@ class HttpProjectsMcpPaidSession:
                 "signature invalid",
                 "signature is not base64url",
                 "unknown signing key",
-                "authorization carries unknown fields",
-                "authorization.",
-                "authorization must be an object",
-                "authorization.schema_version must be an integer",
-                "unknown authorization schema_version",
-                "unknown authorization version",
                 "provider_operation_key does not derive",
                 "invalid dispatch_deadline",
                 "invalid signature length",
@@ -630,6 +632,7 @@ class HttpProjectsMcpPaidSession:
                 "unknown tool",
                 "arguments cannot be digested",
                 "provider operation key is bound to another invocation",
+                # 2. Domain non-visibility refusals (Fastify projects-mcp & Coolify status)
                 "is available to you",
                 "is not configured for tenant",
                 "no live status is configured for",
@@ -688,6 +691,10 @@ class HttpProjectsMcpPaidSession:
                     raise DispatchRefused(text)
                 raise OutcomeUnavailable(f"provider operation state: {text}")
 
+            # Note: An executed error (is_error=True) that did not match pre-acceptance
+            # refusal hints raises OutcomeUnavailable above to be definitively resolved
+            # through the provider's /commerce/outcome/{key} endpoint. Reaching here
+            # guarantees a successful, executed tool result (is_error=False).
             return ToolCallResult(is_error=False, text=text)
         except httpx.RequestError as exc:
             raise OutcomeUnavailable(f"tools/call network error: {exc}") from exc

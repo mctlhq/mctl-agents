@@ -1094,6 +1094,10 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         "metadata is missing from passage",
         "cluster is configured for v2",
         "syntax error in lucene query",
+        "failed to read docs/authorization.md",
+        "syntax error in src/authorization.ts",
+        "Query execution failed: backend service requires database authorization.",
+        "Syntax error near token authorization.",
     ]
     s_app_errors = [
         cp.HttpProjectsMcpPaidSession(
