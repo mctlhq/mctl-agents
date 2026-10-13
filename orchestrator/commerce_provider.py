@@ -354,13 +354,45 @@ PROJECTS_SEARCH_INPUT_SCHEMA: Mapping[str, Any] = {
 
 def _parse_mcp_response(raw_text: str) -> dict[str, Any]:
     import json
-    import re
 
     text = raw_text.strip()
-    match = re.search(r"data:\s*({.*})", text)
-    if match:
-        return json.loads(match.group(1))
-    return json.loads(text)
+    if "data:" in text:
+        # Split into SSE frames by double newline to handle multiline events and pings
+        frames = [f.strip() for f in text.split("\n\n") if f.strip()]
+        for frame in reversed(frames):
+            frame_data_lines = []
+            for line in frame.splitlines():
+                line_str = line.strip()
+                if line_str.startswith("data:"):
+                    payload = line_str[len("data:"):].lstrip()
+                    frame_data_lines.append(payload)
+            if frame_data_lines:
+                combined_payload = "\n".join(frame_data_lines).strip()
+                try:
+                    obj = json.loads(combined_payload)
+                    if isinstance(obj, dict) and ("result" in obj or "error" in obj or "jsonrpc" in obj):
+                        return obj
+                except json.JSONDecodeError:
+                    continue
+
+        # If no frame matched with double newline, try all data: lines together
+        all_data_lines = []
+        for line in text.splitlines():
+            line_str = line.strip()
+            if line_str.startswith("data:"):
+                all_data_lines.append(line_str[len("data:"):].lstrip())
+        if all_data_lines:
+            try:
+                obj = json.loads("\n".join(all_data_lines).strip())
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError as exc:
+                raise OutcomeUnavailable(f"malformed SSE data payload: {exc}") from exc
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise OutcomeUnavailable(f"malformed JSON response: {exc}") from exc
 
 
 @dataclass
@@ -371,6 +403,7 @@ class HttpProjectsMcpPaidSession:
     base_url: str
     access_token: str = ""
     timeout_s: float = 30.0
+    transport: Any = None
 
     async def list_tools(self) -> list[ProviderTool]:
         import httpx
@@ -384,22 +417,27 @@ class HttpProjectsMcpPaidSession:
             headers["cf-access-jwt-assertion"] = self.access_token
         payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
 
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            if resp.status_code != 200:
-                raise OutcomeUnavailable(f"tools/list failed: HTTP {resp.status_code}")
-            data = _parse_mcp_response(resp.text)
-            result = data.get("result", {})
-            raw_tools = result.get("tools", [])
-            tools = []
-            for t in raw_tools:
-                tools.append(ProviderTool(
-                    name=t.get("name", ""),
-                    description=t.get("description", ""),
-                    input_schema=t.get("inputSchema", {}),
-                    annotations=t.get("annotations", {}),
-                ))
-            return tools
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code != 200:
+                    raise OutcomeUnavailable(f"tools/list failed: HTTP {resp.status_code}")
+                data = _parse_mcp_response(resp.text)
+                if "error" in data:
+                    raise OutcomeUnavailable(f"tools/list JSON-RPC error: {data['error']}")
+                result = data.get("result", {})
+                raw_tools = result.get("tools", [])
+                tools = []
+                for t in raw_tools:
+                    tools.append(ProviderTool(
+                        name=t.get("name", ""),
+                        description=t.get("description", ""),
+                        input_schema=t.get("inputSchema", {}),
+                        annotations=t.get("annotations", {}),
+                    ))
+                return tools
+        except httpx.RequestError as exc:
+            raise OutcomeUnavailable(f"tools/list network error: {exc}") from exc
 
     async def call_tool(self, tool: str, arguments: Mapping[str, Any]) -> ToolCallResult:
         raise DispatchRefused("a paid capability requires a dispatch authorization")
@@ -426,26 +464,35 @@ class HttpProjectsMcpPaidSession:
             "params": {"name": tool, "arguments": args},
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            if resp.status_code in (401, 403):
-                raise DispatchRefused(f"HTTP {resp.status_code}: {resp.text}")
-            if resp.status_code != 200:
-                raise OutcomeUnavailable(f"tools/call failed: HTTP {resp.status_code}")
-            data = _parse_mcp_response(resp.text)
-            result = data.get("result", {})
-            is_error = bool(result.get("isError", False))
-            content = result.get("content", [])
-            text = "\n".join(str(c.get("text", "")) for c in content)
-            if is_error:
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code in (401, 403):
+                    raise DispatchRefused(f"HTTP {resp.status_code}: {resp.text}")
+                if resp.status_code != 200:
+                    raise OutcomeUnavailable(f"tools/call failed: HTTP {resp.status_code}")
+                data = _parse_mcp_response(resp.text)
                 refusal_hints = (
                     "authorization", "signature", "deadline", "signing key",
                     "operation key", "already accepted", "concurrent dispatch",
                     "in progress", "previous attempt", "dispatch", "mismatch",
                 )
-                if any(hint in text.lower() for hint in refusal_hints):
-                    raise DispatchRefused(text)
-            return ToolCallResult(is_error=is_error, text=text)
+                if "error" in data:
+                    err = data["error"]
+                    err_msg = str(err.get("message", err) if isinstance(err, dict) else err)
+                    if any(hint in err_msg.lower() for hint in refusal_hints):
+                        raise DispatchRefused(err_msg)
+                    raise OutcomeUnavailable(f"tools/call JSON-RPC error: {err_msg}")
+                result = data.get("result", {})
+                is_error = bool(result.get("isError", False))
+                content = result.get("content", [])
+                text = "\n".join(str(c.get("text", "")) for c in content)
+                if is_error:
+                    if any(hint in text.lower() for hint in refusal_hints):
+                        raise DispatchRefused(text)
+                return ToolCallResult(is_error=is_error, text=text)
+        except httpx.RequestError as exc:
+            raise OutcomeUnavailable(f"tools/call network error: {exc}") from exc
 
     async def outcome(self, provider_operation_key: str) -> ProviderOutcome:
         import httpx
@@ -456,7 +503,7 @@ class HttpProjectsMcpPaidSession:
             headers["cf-access-jwt-assertion"] = self.access_token
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+            async with httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport) as client:
                 resp = await client.get(url, headers=headers)
                 if resp.status_code == 404:
                     return ProviderOutcome(NOT_FOUND)
