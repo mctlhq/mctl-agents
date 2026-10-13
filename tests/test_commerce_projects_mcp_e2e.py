@@ -1107,6 +1107,8 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         "invalid syntax in query: unknown tool",
         "timestamp validation failed: event must be timezone-aware",
         "webhook signature invalid for payload",
+        'no passages matching "is available to you" in project acme',
+        'query failed for "is not configured for tenant" in database',
     ]
     s_app_errors = [
         cp.HttpProjectsMcpPaidSession(
@@ -2156,6 +2158,8 @@ def test_unit_refusal_hints_table_integrity():
         "invalid syntax in query: unknown tool",
         "timestamp validation failed: event must be timezone-aware",
         "webhook signature invalid for payload",
+        'no passages matching "is available to you" in project acme',
+        'query failed for "is not configured for tenant" in database',
     ]
     for msg in app_errors:
         low = msg.lower()

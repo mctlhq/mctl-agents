@@ -471,9 +471,14 @@ PRE_DISPATCH_REFUSAL_HINTS: tuple[str, ...] = (
     "arguments cannot be digested",
     "provider operation key is bound to another invocation",
     # 2. Domain non-visibility refusals (Fastify projects-mcp & Coolify status)
-    "is available to you",
-    "is not configured for tenant",
-    "no live status is configured for",
+    '" is available to you',
+    "' is available to you",
+    '" is not configured for tenant',
+    "' is not configured for tenant",
+    'no live status is configured for "',
+    "no live status is configured for '",
+    'no live status is available to you for "',
+    "no live status is available to you for '",
 )
 
 
