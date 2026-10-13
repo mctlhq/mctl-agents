@@ -122,7 +122,7 @@ def projects_mcp_server(tmp_path_factory):
             diag = "".join(captured_lines[-20:])
             raise TimeoutError(f"Timed out waiting for projects-mcp server to emit READY. Recent output:\n{diag}")
 
-        yield SimpleNamespace(url=server_url, dedupe_db=dedupe_db)
+        yield SimpleNamespace(url=server_url)
     finally:
         proc.terminate()
         try:
@@ -132,13 +132,20 @@ def projects_mcp_server(tmp_path_factory):
             proc.wait()
 
 
+_HARNESS_SEQ = 0
+
+
 @pytest.fixture
 def e2e_harness(projects_mcp_server, monkeypatch):
     """Sets up an end-to-end commerce test harness with live wall-clock time."""
+    global _HARNESS_SEQ
+    _HARNESS_SEQ += 100
+
     clock = Clock()
     clock.t = datetime.now(UTC)
 
     ledger = FakeLedger(clock, budget=100)
+    ledger._n = _HARNESS_SEQ
     approvals = FakeApprovals(clock)
     ledger.publish(
         cp.PROJECTS_SEARCH_CAPABILITY_ID,
@@ -222,9 +229,9 @@ def test_tools_list_over_mcp_http(e2e_harness):
         }
         assert set(clean_remote_props.keys()) == {"project", "query", "limit"}
         canonical_remote_schema = {
-            "type": search_tool.input_schema["type"],
-            "properties": clean_remote_props,
-            "required": search_tool.input_schema["required"],
+            k: (clean_remote_props if k == "properties" else v)
+            for k, v in search_tool.input_schema.items()
+            if k != "$schema"
         }
         derived_remote_hash = cp.hash_bytes(cp.canonical_json(canonical_remote_schema))
         assert derived_remote_hash == cp.PROJECTS_SEARCH_SCHEMA_HASH
@@ -471,6 +478,41 @@ def test_provider_refusal_releases_hold(e2e_harness):
     asyncio.run(run())
 
 
+def test_live_domain_refusal_releases_hold(e2e_harness):
+    """When a caller requests a project they lack access to (e.g. nonexistent or orbit),
+    Fastify returns pre-acceptance domain refusal 'no project ... is available to you',
+    releases the accepted operation key from dedupe store, and PaidInvocation releases
+    the budget hold without committing charges.
+    """
+    async def run():
+        initial_available = e2e_harness.ledger.free()
+        args = {"project": "nonexistent", "query": "auth", "limit": 8}
+        paid = cg.PaidInvocation(
+            runtime=e2e_harness.runtime,
+            descriptor=e2e_harness.descriptor,
+            session=e2e_harness.session,
+            tool=cp.PROJECTS_SEARCH_TOOL,
+            arguments=args,
+            grants=("mcp__projects__*",),
+            policy=ALLOW_PAID,
+            client_key="k_live_domain_refusal",
+            emit=lambda p, event: None,
+        )
+        res = await paid.run()
+        assert res.reason_code == "provider-error"
+        assert res.phase == "released"
+        assert e2e_harness.ledger.budget["reserved"] == 0
+        assert e2e_harness.ledger.budget["committed"] == 0
+        assert e2e_harness.ledger.free() == initial_available
+
+        # Verify outcome lookup confirms acceptance was released (status is not_found)
+        op_key = cm.provider_operation_key(res.invocation_id)
+        outcome = await e2e_harness.session.outcome(op_key)
+        assert outcome.status == "not_found"
+
+    asyncio.run(run())
+
+
 def test_budget_exhaustion_before_dispatch(e2e_harness):
     """When budget is insufficient to cover amount_minor, call is refused before dispatch."""
     async def run():
@@ -694,7 +736,9 @@ def test_unit_session_list_tools_error_cases():
 
 
 def test_unit_session_task_support_parsing():
-    """list_tools parses MCP execution taskSupport metadata into ProviderTool.task_support."""
+    """list_tools parses MCP execution taskSupport metadata into ProviderTool.task_support,
+    safely handling non-mapping execution, non-string taskSupport, and filtering nameless tools.
+    """
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -711,6 +755,29 @@ def test_unit_session_task_support_parsing():
                     "description": "Tool without task support",
                     "inputSchema": {"type": "object"},
                 },
+                {
+                    "name": "non_mapping_exec",
+                    "description": "Execution is string",
+                    "inputSchema": {"type": "object"},
+                    "execution": "invalid_structure",
+                },
+                {
+                    "name": "non_string_task_support",
+                    "description": "taskSupport is integer",
+                    "inputSchema": {"type": "object"},
+                    "execution": {"taskSupport": 42},
+                },
+                {
+                    "name": "",
+                    "description": "Nameless tool with empty string",
+                },
+                {
+                    "name": "   ",
+                    "description": "Nameless tool with whitespace",
+                },
+                {
+                    "description": "Nameless tool missing name field",
+                },
             ]
         },
     }
@@ -721,11 +788,16 @@ def test_unit_session_task_support_parsing():
 
     async def run():
         tools = await session.list_tools()
-        assert len(tools) == 2
+        # Nameless tools must be filtered out
+        assert len(tools) == 4
         assert tools[0].name == "task_aware_tool"
         assert tools[0].task_support == "required"
         assert tools[1].name == "basic_tool"
         assert tools[1].task_support == ""
+        assert tools[2].name == "non_mapping_exec"
+        assert tools[2].task_support == ""
+        assert tools[3].name == "non_string_task_support"
+        assert tools[3].task_support == ""
         await session.close()
 
     asyncio.run(run())
@@ -809,17 +881,96 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
     )
 
     # 4. Ingress refusals raised before acceptance across all ProviderIngress validation checks
-    ingress_refusal_messages = [
-        "authorization carries unknown fields",
-        "authorization is missing required parameter",
-        "signature is not base64url encoded",
-        "unknown tool requested by client",
-        "arguments cannot be digested",
-        "provider operation key is bound to another invocation",
+    real_rejection_messages: list[str] = []
+
+    try:
+        cm.DispatchAuthorization.from_dict("not an object")  # type: ignore[arg-type]
+    except cm.AuthorizationRejected as exc:
+        real_rejection_messages.append(str(exc))
+
+    try:
+        cm.DispatchAuthorization.from_dict({"schema_version": 1, "extra_unknown_field": True})
+    except cm.AuthorizationRejected as exc:
+        real_rejection_messages.append(str(exc))
+
+    try:
+        cm.DispatchAuthorization.from_dict({"schema_version": True})
+    except cm.AuthorizationRejected as exc:
+        real_rejection_messages.append(str(exc))
+
+    try:
+        cm.DispatchAuthorization.from_dict({"schema_version": 99})
+    except cm.AuthorizationRejected as exc:
+        real_rejection_messages.append(str(exc))
+
+    try:
+        cm.DispatchAuthorization.from_dict({"schema_version": 1})
+    except cm.AuthorizationRejected as exc:
+        real_rejection_messages.append(str(exc))
+
+    bad_deadline_auth = cm.DispatchAuthorization(
+        key_id=KID,
+        invocation_id="inv_test",
+        provider_operation_key="mctl-op/v1:inv_test",
+        provider_id="projects-mcp",
+        capability_id=cp.PROJECTS_SEARCH_CAPABILITY_ID,
+        input_schema_hash=cp.PROJECTS_SEARCH_SCHEMA_HASH,
+        args_digest=cm.args_digest(args),
+        tenant_id="acme",
+        dispatch_deadline="malformed-deadline-string",
+        signature="dGVzdA",
+    )
+    try:
+        cm.verify_dispatch_authorization({KID: cm.public_key_for(SEED)}, bad_deadline_auth)
+    except cm.AuthorizationRejected as exc:
+        real_rejection_messages.append(str(exc))
+
+    bad_op_auth = cm.DispatchAuthorization(
+        key_id=KID,
+        invocation_id="inv_test",
+        provider_operation_key="mctl-op/v1:foreign_inv",
+        provider_id="projects-mcp",
+        capability_id=cp.PROJECTS_SEARCH_CAPABILITY_ID,
+        input_schema_hash=cp.PROJECTS_SEARCH_SCHEMA_HASH,
+        args_digest=cm.args_digest(args),
+        tenant_id="acme",
+        dispatch_deadline=cm.hashed_time(datetime.now(UTC) + timedelta(seconds=60)),
+        signature="dGVzdA",
+    )
+    try:
+        cm.verify_dispatch_authorization({KID: cm.public_key_for(SEED)}, bad_op_auth)
+    except cm.AuthorizationRejected as exc:
+        real_rejection_messages.append(str(exc))
+
+    good_auth = _make_dummy_auth(args)
+    try:
+        cm.verify_dispatch_authorization({"foreign_kid": cm.public_key_for(SEED)}, good_auth)
+    except cm.AuthorizationRejected as exc:
+        real_rejection_messages.append(str(exc))
+
+    tampered_auth = cm.DispatchAuthorization(**{**good_auth.to_dict(), "signature": "dGFtcGVyZWQ"})
+    try:
+        cm.verify_dispatch_authorization({KID: cm.public_key_for(SEED)}, tampered_auth)
+    except cm.AuthorizationRejected as exc:
+        real_rejection_messages.append(str(exc))
+
+    real_rejection_messages.extend([
+        "a paid capability requires a dispatch authorization",
+        "invalid authorization json",
+        "invalid authorization structure",
+        "unknown authorization version 2",
+        "invalid dispatch_deadline timestamp",
+        "public key must be 32 bytes, got 16",
         "invalid signature length",
-        "public key must be 32 bytes",
-        "unknown authorization version",
-    ]
+        "authorization names another provider",
+        "authorization names another capability",
+        "authorization names another input schema",
+        "authorization was signed for other arguments",
+        "authorization names another tenant",
+        "dispatch deadline has passed",
+        "a paid capability requires a valid dispatch authorization",
+        'no project "nonexistent" is available to you',
+    ])
     s_ingress_errors = [
         cp.HttpProjectsMcpPaidSession(
             "https://mock-provider",
@@ -827,7 +978,23 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
                 lambda req, msg=msg: httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {"message": msg}})
             ),
         )
-        for msg in ingress_refusal_messages
+        for msg in real_rejection_messages
+    ]
+    s_tool_errors = [
+        cp.HttpProjectsMcpPaidSession(
+            "https://mock-provider",
+            transport=httpx.MockTransport(
+                lambda req, msg=msg: httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {"isError": True, "content": [{"type": "text", "text": msg}]},
+                    },
+                )
+            ),
+        )
+        for msg in real_rejection_messages
     ]
 
     # 5. Post-acceptance conditions via hints in JSON-RPC error
@@ -887,7 +1054,7 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         ),
     )
 
-    # 9. Tool error without refusal marker -> defaults to OutcomeUnavailable
+    # 9. Tool error without refusal marker -> returns ToolCallResult(is_error=True)
     s_tool_fail = cp.HttpProjectsMcpPaidSession(
         "https://mock-provider",
         transport=httpx.MockTransport(
@@ -965,9 +1132,15 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         with pytest.raises(cm.DispatchRefused, match="custom authorization refusal"):
             await s_error_data_pre_underscore.call_paid_tool("projects_search", args, auth)
 
-        for s_ing, _expected_msg in zip(s_ingress_errors, ingress_refusal_messages, strict=True):
+        for s_ing in s_ingress_errors:
             with pytest.raises(cm.DispatchRefused):
                 await s_ing.call_paid_tool("projects_search", args, auth)
+            await s_ing.close()
+
+        for s_tool in s_tool_errors:
+            with pytest.raises(cm.DispatchRefused):
+                await s_tool.call_paid_tool("projects_search", args, auth)
+            await s_tool.close()
 
         # Post-acceptance states
         with pytest.raises(cm.OutcomeUnavailable, match="provider operation state:"):
@@ -983,9 +1156,21 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         with pytest.raises(cm.OutcomeUnavailable, match="neither 'result' nor 'error' present"):
             await s_missing_result.call_paid_tool("projects_search", args, auth)
 
-        # Tool execution error without refusal marker safely defaults to OutcomeUnavailable
-        with pytest.raises(cm.OutcomeUnavailable, match="provider operation state: syntax error in lucene query"):
-            await s_tool_fail.call_paid_tool("projects_search", args, auth)
+        # Tool execution error without refusal marker returns ToolCallResult(is_error=True)
+        fail_res = await s_tool_fail.call_paid_tool("projects_search", args, auth)
+        assert fail_res.is_error
+        assert "syntax error in lucene query" in fail_res.text
+
+        await s_sig_err.close()
+        await s_marker_pre.close()
+        await s_error_data_pre.close()
+        await s_real_ingress_refusal.close()
+        await s_error_data_pre_underscore.close()
+        await s_in_progress.close()
+        await s_marker_post.close()
+        await s_error_data_post.close()
+        await s_missing_result.close()
+        await s_tool_fail.close()
 
     asyncio.run(run())
 
@@ -1162,10 +1347,12 @@ def test_unit_session_tool_output_containing_authorization_keyword_not_refused()
     )
 
     async def run():
-        # Unmarked error containing 'authorization' in tool text defaults to OutcomeUnavailable,
+        # Application-level tool error containing 'authorization' returns ToolCallResult(is_error=True),
         # never falsely classifying as DispatchRefused
-        with pytest.raises(cm.OutcomeUnavailable, match="no passages matching 'authorization'"):
-            await session.call_paid_tool("projects_search", args, auth)
+        res = await session.call_paid_tool("projects_search", args, auth)
+        assert res.is_error
+        assert "no passages matching 'authorization'" in res.text
+        await session.close()
 
     asyncio.run(run())
 
@@ -1236,39 +1423,53 @@ def test_unit_session_image_content_not_stringified():
 
 
 def test_unit_session_response_id_validation():
-    """call_paid_tool and list_tools reject responses with mismatched response id."""
+    """call_paid_tool and list_tools accept integer 1 and string '1', but reject True, wrong id, or None."""
     args = {"project": "acme", "query": "auth", "limit": 5}
     auth = _make_dummy_auth(args)
-    wrong_id_resp = {
-        "jsonrpc": "2.0",
-        "id": 999,  # Expected 1
-        "result": {"tools": []},
-    }
-    session = cp.HttpProjectsMcpPaidSession(
-        "https://mock-provider",
-        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=wrong_id_resp)),
-    )
-    null_id_resp = {
-        "jsonrpc": "2.0",
-        "id": None,
-        "result": {"tools": []},
-    }
-    s_null_id = cp.HttpProjectsMcpPaidSession(
-        "https://mock-provider",
-        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=null_id_resp)),
-    )
+
     async def run():
-        with pytest.raises(cm.OutcomeUnavailable, match="response id mismatch"):
-            await session.list_tools()
+        # Valid string id "1" succeeds
+        str_id_resp = {"jsonrpc": "2.0", "id": "1", "result": {"tools": []}}
+        s_str = cp.HttpProjectsMcpPaidSession(
+            "https://mock-provider",
+            transport=httpx.MockTransport(lambda req: httpx.Response(200, json=str_id_resp)),
+        )
+        assert await s_str.list_tools() == []
+        await s_str.close()
 
+        # Boolean True (which evaluates to True == 1 in Python) must be rejected
+        bool_id_resp = {"jsonrpc": "2.0", "id": True, "result": {"tools": []}}
+        s_bool = cp.HttpProjectsMcpPaidSession(
+            "https://mock-provider",
+            transport=httpx.MockTransport(lambda req: httpx.Response(200, json=bool_id_resp)),
+        )
         with pytest.raises(cm.OutcomeUnavailable, match="response id mismatch"):
-            await session.call_paid_tool("projects_search", args, auth)
-
+            await s_bool.list_tools()
         with pytest.raises(cm.OutcomeUnavailable, match="response id mismatch"):
-            await s_null_id.list_tools()
+            await s_bool.call_paid_tool("projects_search", args, auth)
+        await s_bool.close()
 
-        await session.close()
-        await s_null_id.close()
+        # Integer 999 rejected
+        wrong_id_resp = {"jsonrpc": "2.0", "id": 999, "result": {"tools": []}}
+        s_wrong = cp.HttpProjectsMcpPaidSession(
+            "https://mock-provider",
+            transport=httpx.MockTransport(lambda req: httpx.Response(200, json=wrong_id_resp)),
+        )
+        with pytest.raises(cm.OutcomeUnavailable, match="response id mismatch"):
+            await s_wrong.list_tools()
+        with pytest.raises(cm.OutcomeUnavailable, match="response id mismatch"):
+            await s_wrong.call_paid_tool("projects_search", args, auth)
+        await s_wrong.close()
+
+        # None / null id rejected
+        null_id_resp = {"jsonrpc": "2.0", "id": None, "result": {"tools": []}}
+        s_null = cp.HttpProjectsMcpPaidSession(
+            "https://mock-provider",
+            transport=httpx.MockTransport(lambda req: httpx.Response(200, json=null_id_resp)),
+        )
+        with pytest.raises(cm.OutcomeUnavailable, match="response id mismatch"):
+            await s_null.list_tools()
+        await s_null.close()
 
     asyncio.run(run())
 
@@ -1343,7 +1544,7 @@ def test_unit_session_unattributable_error_frame_not_refused():
 
 
 def test_unit_paid_invocation_raise_then_lookup_failure_route(monkeypatch):
-    """PaidInvocation handles tool error (isError=True) raising OutcomeUnavailable during dispatch,
+    """PaidInvocation handles tool error raising OutcomeUnavailable during dispatch,
     then looks up durable outcome from provider. Under per_successful_call, budget hold is released.
     """
     clock = Clock()
@@ -1363,7 +1564,7 @@ def test_unit_paid_invocation_raise_then_lookup_failure_route(monkeypatch):
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
-            # Tools/call returns isError without pre-acceptance refusal marker
+            # Post-acceptance condition causes call_paid_tool to raise OutcomeUnavailable
             return httpx.Response(
                 200,
                 json={
@@ -1371,7 +1572,8 @@ def test_unit_paid_invocation_raise_then_lookup_failure_route(monkeypatch):
                     "id": 1,
                     "result": {
                         "isError": True,
-                        "content": [{"type": "text", "text": "bad query syntax"}],
+                        "_mctl_refusal": "post_acceptance",
+                        "content": [{"type": "text", "text": "the capability execution is still in progress"}],
                     },
                 },
             )
@@ -1381,7 +1583,7 @@ def test_unit_paid_invocation_raise_then_lookup_failure_route(monkeypatch):
                 json={
                     "status": "failed",
                     "is_error": True,
-                    "text": "bad query syntax",
+                    "text": "execution failed on worker node",
                 },
             )
         return httpx.Response(404)
@@ -1438,7 +1640,101 @@ def test_unit_paid_invocation_raise_then_lookup_failure_route(monkeypatch):
         res = await paid.run()
         assert res.reason_code == "provider-error"
         assert res.phase == "finalized"
-        assert res.text == "bad query syntax"
+        assert res.text == "execution failed on worker node"
+        # Under per_successful_call, a failed execution releases hold without charging
+        assert ledger.budget["reserved"] == 0
+        assert ledger.budget["committed"] == 0
+        assert ledger.free() == 100
+        await session.close()
+
+    asyncio.run(run())
+
+
+def test_unit_paid_invocation_executed_tool_failure_finalizes(monkeypatch):
+    """When call_paid_tool returns ToolCallResult(is_error=True) on tool execution failure,
+    PaidInvocation._dispatch records cm.FAILED directly and finalizes without outcome lookup.
+    """
+    clock = Clock()
+    clock.t = datetime.now(UTC)
+    ledger = FakeLedger(clock, budget=100)
+    approvals = FakeApprovals(clock)
+    ledger.publish(
+        cp.PROJECTS_SEARCH_CAPABILITY_ID,
+        cp.PROJECTS_SEARCH_SCHEMA_HASH,
+        provider_id=cp.PROJECTS_MCP_PROVIDER_ID,
+    )
+    monkeypatch.setattr(
+        pc,
+        "current_identity",
+        lambda: pc.ExecutionIdentity(execution_id=EXECUTION, trace_id="tr-unit-exec-fail", actor="agent:test"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "isError": True,
+                    "content": [{"type": "text", "text": "bad query syntax in lucene parser"}],
+                },
+            },
+        )
+
+    session = cp.HttpProjectsMcpPaidSession(
+        "https://mock-provider",
+        access_token="unit-jwt",  # noqa: S106
+        transport=httpx.MockTransport(handler),
+    )
+    runtime = cg.CommerceRuntime(
+        client=ledger,
+        tenant_id="acme",
+        admitted_providers=frozenset({cp.PROJECTS_MCP_PROVIDER_ID}),
+        approvals=approvals,
+        now=clock,
+        call_timeout_s=5.0,
+    )
+    provider_ref = cap.ProviderRef(type="mcp-remote", id=cp.PROJECTS_MCP_PROVIDER_ID, alias="projects")
+    descriptor = cap.CapabilityDescriptor(
+        capability_id=cp.PROJECTS_SEARCH_CAPABILITY_ID,
+        tool_name="mcp__projects__projects_search",
+        provider=provider_ref,
+        title="projects_search",
+        summary="Search project docs",
+        keywords=("projects", "search"),
+        input_schema_hash=cp.PROJECTS_SEARCH_SCHEMA_HASH,
+        input_schema_bytes=100,
+        consequence="safe",
+        matched_tool_pattern="mcp__projects__*",
+        commerce=cap.CommerceSummary(
+            terms_id="ctm_01JZ8PZ0000000000000000000",
+            terms_version=1,
+            price_mode="per_successful_call",
+            currency="EUR",
+            amount_minor=12,
+            funds_mode="simulated",
+        ),
+    )
+
+    args = {"project": "acme", "query": "auth", "limit": 8}
+    paid = cg.PaidInvocation(
+        runtime=runtime,
+        descriptor=descriptor,
+        session=session,
+        tool=cp.PROJECTS_SEARCH_TOOL,
+        arguments=args,
+        grants=("mcp__projects__*",),
+        policy=ALLOW_PAID,
+        client_key="k_unit_exec_fail",
+        emit=lambda p, event: None,
+    )
+
+    async def run():
+        res = await paid.run()
+        assert res.reason_code == "provider-error"
+        assert res.phase == "finalized"
+        assert res.text == "bad query syntax in lucene parser"
         # Under per_successful_call, a failed execution releases hold without charging
         assert ledger.budget["reserved"] == 0
         assert ledger.budget["committed"] == 0

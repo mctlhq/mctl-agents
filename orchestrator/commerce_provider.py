@@ -462,12 +462,17 @@ class HttpProjectsMcpPaidSession:
             or self._client.is_closed
             or (self._client_loop is not None and self._client_loop is not current_loop)
         ):
+            # A session is bound to a single event loop. An AsyncClient cannot be safely
+            # awaited or closed from a foreign event loop (its transport pool belongs to the
+            # loop that created it). If this session is invoked across different event loops,
+            # we discard the stale client handle and instantiate a fresh client on the active loop.
             self._client = httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport)
             self._client_loop = current_loop
         return self._client
 
     async def close(self) -> None:
         """Close the underlying HTTP client if open on the active event loop.
+
         An AsyncClient cannot be cleanly closed from an event loop different from the one
         that created its transport; in that cross-loop case, drop the reference directly.
         """
@@ -480,8 +485,6 @@ class HttpProjectsMcpPaidSession:
                     pass
                 if self._client_loop is None or self._client_loop is current_loop:
                     await self._client.aclose()
-        except (RuntimeError, httpx.RequestError):
-            pass
         finally:
             self._client = None
             self._client_loop = None
@@ -508,10 +511,13 @@ class HttpProjectsMcpPaidSession:
             if resp.status_code != 200:
                 raise OutcomeUnavailable(f"tools/list failed: HTTP {resp.status_code}")
             data = _parse_mcp_response(resp.text)
-            if data.get("id") not in (1, "1"):
-                raise OutcomeUnavailable(f"tools/list response id mismatch: expected 1, got {data.get('id')}")
+            # Discovery does not carry money liability, so inspect JSON-RPC error first
+            # to preserve upstream/middleware diagnostics even if response id is null.
             if "error" in data:
                 raise OutcomeUnavailable(f"tools/list JSON-RPC error: {data['error']}")
+            raw_id = data.get("id")
+            if raw_id is True or raw_id not in (1, "1"):
+                raise OutcomeUnavailable(f"tools/list response id mismatch: expected 1, got {raw_id}")
             if "result" not in data:
                 raise OutcomeUnavailable(f"tools/list response missing 'result': {data}")
             result = data.get("result")
@@ -523,17 +529,23 @@ class HttpProjectsMcpPaidSession:
             tools = []
             for t in raw_tools:
                 if isinstance(t, dict):
+                    name = t.get("name")
+                    if not isinstance(name, str) or not name.strip():
+                        continue
                     execution = t.get("execution")
                     task_support = ""
                     if isinstance(execution, dict):
                         raw_ts = execution.get("taskSupport")
                         if isinstance(raw_ts, str):
                             task_support = raw_ts
+                    desc = t.get("description", "")
+                    inp = t.get("inputSchema", {})
+                    ann = t.get("annotations", {})
                     tools.append(ProviderTool(
-                        name=t.get("name", ""),
-                        description=t.get("description", ""),
-                        input_schema=t.get("inputSchema", {}),
-                        annotations=t.get("annotations", {}),
+                        name=name,
+                        description=desc if isinstance(desc, str) else "",
+                        input_schema=inp if isinstance(inp, dict) else {},
+                        annotations=ann if isinstance(ann, dict) else {},
                         task_support=task_support,
                     ))
             return tools
@@ -574,8 +586,12 @@ class HttpProjectsMcpPaidSession:
             if resp.status_code != 200:
                 raise OutcomeUnavailable(f"tools/call failed: HTTP {resp.status_code}")
             data = _parse_mcp_response(resp.text)
-            if data.get("id") not in (1, "1"):
-                raise OutcomeUnavailable(f"tools/call response id mismatch: expected 1, got {data.get('id')}")
+            # Paid capability execution binds an authorization and ledger liability:
+            # validate response id first to ensure unattributable error frames (e.g. id: null)
+            # cannot trigger an unverified pre-acceptance refusal release.
+            raw_id = data.get("id")
+            if raw_id is True or raw_id not in (1, "1"):
+                raise OutcomeUnavailable(f"tools/call response id mismatch: expected 1, got {raw_id}")
 
             post_acceptance_hints = (
                 "still in progress",
@@ -584,28 +600,33 @@ class HttpProjectsMcpPaidSession:
                 "concurrent dispatch",
             )
             pre_dispatch_refusal_hints = (
-                "requires a valid dispatch authorization",
+                "names another provider",
+                "names another capability",
+                "names another input schema",
+                "signed for other arguments",
+                "names another tenant",
                 "requires a dispatch authorization",
+                "requires a valid dispatch authorization",
+                "invalid authorization structure",
+                "invalid authorization json",
                 "signature does not verify",
                 "signature invalid",
-                "signature is not base64url",
-                "dispatch deadline has passed",
-                "authorization names another",
-                "authorization was signed for other",
                 "unknown signing key",
-                "invalid authorization",
                 "authorization carries unknown fields",
-                "authorization is missing",
-                "unknown tool",
-                "arguments cannot be digested",
-                "provider operation key is bound to another invocation",
+                "is missing",
                 "provider_operation_key does not derive",
                 "invalid dispatch_deadline",
-                "schema hash mismatch",
-                "arguments digest mismatch",
                 "invalid signature length",
                 "public key must be 32 bytes",
+                "unknown authorization schema_version",
                 "unknown authorization version",
+                "authorization must be an object",
+                "must be an integer",
+                "is not a yyyy-mm-ddthh:mm:ssz time",
+                "timezone-aware",
+                "dispatch deadline has passed",
+                "is available to you",
+                "is configured for",
             )
 
             # 1. JSON-RPC protocol error branch
@@ -655,13 +676,12 @@ class HttpProjectsMcpPaidSession:
 
             is_error = bool(result.get("isError", False))
             if is_error:
-                # Without an explicit refusal marker indicating pre-acceptance refusal,
-                # any tool error (isError=True) defaults to OutcomeUnavailable (ADR 020 sec. 11).
-                # This ensures the commerce gateway verifies the durable outcome table rather than
-                # committing a charge for an unmarked pre-dispatch refusal.
-                raise OutcomeUnavailable(f"provider operation state: {text}")
+                if any(hint in text.lower() for hint in post_acceptance_hints):
+                    raise OutcomeUnavailable(f"provider operation state: {text}")
+                if any(hint in text.lower() for hint in pre_dispatch_refusal_hints):
+                    raise DispatchRefused(text)
 
-            return ToolCallResult(is_error=False, text=text)
+            return ToolCallResult(is_error=is_error, text=text)
         except httpx.RequestError as exc:
             raise OutcomeUnavailable(f"tools/call network error: {exc}") from exc
 
