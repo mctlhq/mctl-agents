@@ -220,6 +220,11 @@ IMPLEMENTER_TIMEOUT_SECONDS = float(
 # operation timeout, which the shepherd charges to the proposal's review-attempt
 # budget, which is the very bug #366 is about.
 #
+# While a child is live this is an INACTIVITY bound, not an elapsed one: each
+# progress message from the child restarts it (mctl-agents#645), so a child
+# busy in `go test` past 300s is capped by IMPLEMENTER_TIMEOUT_SECONDS, and
+# only a child silent for this long is classified as orphaned.
+#
 # NOT a single spend. drain_until_settled loops: it allows this much for the
 # child to go quiescent, then this much AGAIN for the parent's closing frame,
 # and a second delegation observed while waiting for that frame sends it back

@@ -3779,8 +3779,8 @@ def test_investigator_orphan_surfaces_as_a_named_harness_failure(tmp_path, monke
     """
     def orphaning_agent(repo_dir, prompt, proposal_dir):
         raise run_issue_investigator.InvestigatorOrphanedSubagent(
-            "orphaned sub-agent: sub-agent task(s) never reported a terminal "
-            "status within 300s: 1 task(s) still live: t1"
+            "orphaned sub-agent: sub-agent task(s) reported neither progress "
+            "nor a terminal status within 300s: 1 task(s) still live: t1"
         )
 
     issue = _investigate_harness(tmp_path, monkeypatch, agent=orphaning_agent)
