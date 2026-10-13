@@ -988,7 +988,6 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         "dispatch deadline has passed",
         "a paid capability requires a valid dispatch authorization",
         'no project "nonexistent" is available to you',
-        'no live status is configured for "test"',
         'project "test" is not configured for tenant',
     ])
     s_ingress_errors = [
@@ -2165,6 +2164,7 @@ def test_unit_refusal_hints_table_integrity():
         'query failed for "is not configured for tenant" in database',
         'index "acme" is not configured for tenant',
         'found 0 items: is available to you',
+        'no project "test\' is available to you',
     ]
     for msg in app_errors:
         assert not cp.is_pre_dispatch_refusal(msg), f"falsely classified app error as refusal: {msg!r}"
@@ -2177,9 +2177,9 @@ def test_unit_refusal_hints_table_integrity():
     observed_refusals = [
         'no project "nonexistent" is available to you',
         'no project "secret-proj" is available to you',
+        "no project 'quoted-proj' is available to you",
         'project "test" is not configured for tenant',
-        'no live status is configured for "test"',
-        'no live status is configured for service-beta',
+        "project 'test' is not configured for tenant",
     ]
     for msg in observed_refusals:
         assert cp.is_pre_dispatch_refusal(msg), f"expected pre-dispatch refusal for observed {msg!r}"

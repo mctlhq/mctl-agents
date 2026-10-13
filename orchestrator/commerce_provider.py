@@ -465,6 +465,7 @@ PRE_DISPATCH_REFUSAL_HINTS: tuple[str, ...] = (
     "dispatch deadline has passed",
     "is not a yyyy-mm-ddthh:mm:ssz time",
     "a hashed time must be timezone-aware",
+    # 2. JSON-RPC tool dispatch errors (pre-execution protocol rejections)
     "unknown tool '",
     'unknown tool "',
     "unknown tool: ",
@@ -472,10 +473,12 @@ PRE_DISPATCH_REFUSAL_HINTS: tuple[str, ...] = (
     "provider operation key is bound to another invocation",
 )
 
+# Provenance: Fastify projects-mcp domain non-visibility refusals (pre-acceptance 404).
+# Only observed, live-verified patterns are included. Matching opening and closing
+# delimiters are strictly required.
 DOMAIN_REFUSAL_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r'no project\s+["\'][^"\']+["\']\s+is available to you', re.IGNORECASE),
-    re.compile(r'project\s+["\'][^"\']+["\']\s+is not configured for tenant', re.IGNORECASE),
-    re.compile(r'no live status is configured for\b', re.IGNORECASE),
+    re.compile(r'no project\s+(["\'])[^"\']+\1\s+is available to you', re.IGNORECASE),
+    re.compile(r'project\s+(["\'])[^"\']+\1\s+is not configured for tenant', re.IGNORECASE),
 )
 
 
@@ -701,6 +704,8 @@ class HttpProjectsMcpPaidSession:
 
             is_error = bool(result.get("isError", False))
             if is_error:
+                # Precedence rule: post-acceptance markers take priority over refusal hints
+                # so that any post-acceptance errors raise OutcomeUnavailable.
                 if any(hint in text.lower() for hint in POST_ACCEPTANCE_HINTS):
                     raise OutcomeUnavailable(f"provider operation state: {text}")
                 if is_pre_dispatch_refusal(text):
