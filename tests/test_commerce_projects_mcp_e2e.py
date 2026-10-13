@@ -320,7 +320,7 @@ def test_tampered_arguments_rejected(e2e_harness):
             invocation_id=inv_id,
             provider_operation_key="mctl-op/v1:" + inv_id,
             provider_id="projects-mcp",
-            capability_id="mctl://projects/projects_search",
+            capability_id=cp.PROJECTS_SEARCH_CAPABILITY_ID,
             input_schema_hash=cp.PROJECTS_SEARCH_SCHEMA_HASH,
             args_digest=cm.args_digest(valid_args),
             tenant_id="acme",
@@ -348,7 +348,7 @@ def test_expired_deadline_rejected(e2e_harness):
             invocation_id=inv_id,
             provider_operation_key="mctl-op/v1:" + inv_id,
             provider_id="projects-mcp",
-            capability_id="mctl://projects/projects_search",
+            capability_id=cp.PROJECTS_SEARCH_CAPABILITY_ID,
             input_schema_hash=cp.PROJECTS_SEARCH_SCHEMA_HASH,
             args_digest=cm.args_digest(args),
             tenant_id="acme",
@@ -373,7 +373,7 @@ def test_bad_signature_rejected(e2e_harness):
             invocation_id=inv_id,
             provider_operation_key="mctl-op/v1:" + inv_id,
             provider_id="projects-mcp",
-            capability_id="mctl://projects/projects_search",
+            capability_id=cp.PROJECTS_SEARCH_CAPABILITY_ID,
             input_schema_hash=cp.PROJECTS_SEARCH_SCHEMA_HASH,
             args_digest=cm.args_digest(args),
             tenant_id="acme",
@@ -399,7 +399,7 @@ def test_wrong_tenant_rejected(e2e_harness):
             invocation_id=inv_id,
             provider_operation_key="mctl-op/v1:" + inv_id,
             provider_id="projects-mcp",
-            capability_id="mctl://projects/projects_search",
+            capability_id=cp.PROJECTS_SEARCH_CAPABILITY_ID,
             input_schema_hash=cp.PROJECTS_SEARCH_SCHEMA_HASH,
             args_digest=cm.args_digest(args),
             tenant_id="evil-corp",
@@ -832,6 +832,14 @@ def test_unit_session_outcome_cases():
         ),
     )
 
+    def raise_connect_err(req: httpx.Request):
+        raise httpx.ConnectError("connection failed")
+
+    s_net_err = cp.HttpProjectsMcpPaidSession(
+        "http://mock-provider",
+        transport=httpx.MockTransport(raise_connect_err),
+    )
+
     async def run():
         out404 = await s404.outcome("mctl-op/v1:test_key")
         assert out404.status == "not_found"
@@ -849,6 +857,9 @@ def test_unit_session_outcome_cases():
 
         with pytest.raises(cm.OutcomeUnavailable, match="unknown outcome status 'invalid_status'"):
             await s_unknown_status.outcome("mctl-op/v1:test_key")
+
+        with pytest.raises(cm.OutcomeUnavailable, match="outcome lookup network error:"):
+            await s_net_err.outcome("mctl-op/v1:test_key")
 
     asyncio.run(run())
 
@@ -910,5 +921,49 @@ def test_unit_session_robust_sse_multiline_parsing():
     bad_sse = "event: message\ndata: {unclosed json\n\n"
     with pytest.raises(cm.OutcomeUnavailable, match="malformed SSE data payload:"):
         cp._parse_mcp_response(bad_sse)
+
+
+def test_unit_session_tool_output_containing_authorization_keyword_not_refused():
+    """Application-level tool error containing 'authorization' or 'mismatch' is not classified as DispatchRefused."""
+    args = {"project": "acme", "query": "authorization", "limit": 5}
+    auth = _make_dummy_auth(args)
+
+    error_payload = {
+        "jsonrpc": "2.0",
+        "result": {
+            "isError": True,
+            "content": [
+                {
+                    "type": "text",
+                    "text": "query failed: no passages matching 'authorization' due to type mismatch in filter",
+                }
+            ],
+        },
+    }
+
+    session = cp.HttpProjectsMcpPaidSession(
+        "http://mock-provider",
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=error_payload)),
+    )
+
+    async def run():
+        res = await session.call_paid_tool("projects_search", args, auth)
+        # Must return ToolCallResult with is_error=True, NOT raise DispatchRefused
+        assert res.is_error is True
+        assert "no passages matching 'authorization'" in res.text
+
+    asyncio.run(run())
+
+
+def test_unit_session_direct_json_with_data_substring_parsed():
+    """_parse_mcp_response correctly parses direct JSON payloads that contain 'data:' in string content."""
+    json_with_data_prefix = (
+        '{"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", '
+        '"text": "Example snippet:\\ndata: { foo: 123 }\\nand data:image/png;base64,abc"}]}}'
+    )
+    res = cp._parse_mcp_response(json_with_data_prefix)
+    assert res["id"] == 1
+    assert "data: { foo: 123 }" in res["result"]["content"][0]["text"]
+
 
 

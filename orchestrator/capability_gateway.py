@@ -963,7 +963,7 @@ class CapabilityGateway:
         if dispatch is None:
             return "provider-error", f"{capability_id!r} has no dispatch target"
         provider, _ = dispatch
-        session = self.local_sessions.get(provider.id)
+        session = None if provider.type == "mcp-remote" else self.local_sessions.get(provider.id)
         if (provider.id not in self.commerce.admitted_providers or session is None
                 or not isinstance(session, cg.PaidProviderSession)):
             return "unsupported-execution", "this provider is not admitted for paid execution"

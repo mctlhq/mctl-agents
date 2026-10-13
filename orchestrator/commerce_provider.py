@@ -355,10 +355,20 @@ PROJECTS_SEARCH_SCHEMA_HASH: str = hash_bytes(canonical_json(dict(PROJECTS_SEARC
 def _parse_mcp_response(raw_text: str) -> dict[str, Any]:
     import json
 
-    text = raw_text.strip().replace("\r\n", "\n").replace("\r", "\n")
-    if "data:" in text:
+    text = raw_text.strip()
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict) and ("result" in obj or "error" in obj) and "method" not in obj:
+                return obj
+            raise OutcomeUnavailable("malformed JSON-RPC response: neither 'result' nor 'error' present")
+        except json.JSONDecodeError as exc:
+            raise OutcomeUnavailable(f"malformed JSON response: {exc}") from exc
+
+    text_norm = text.replace("\r\n", "\n").replace("\r", "\n")
+    if "data:" in text_norm:
         # Split into SSE frames by double newline to handle multiline events and pings
-        frames = [f.strip() for f in text.split("\n\n") if f.strip()]
+        frames = [f.strip() for f in text_norm.split("\n\n") if f.strip()]
         for frame in reversed(frames):
             frame_data_lines = []
             for line in frame.splitlines():
@@ -377,7 +387,7 @@ def _parse_mcp_response(raw_text: str) -> dict[str, Any]:
 
         # If no frame matched with double newline, try all data: lines together
         all_data_lines = []
-        for line in text.splitlines():
+        for line in text_norm.splitlines():
             line_str = line.strip()
             if line_str.startswith("data:"):
                 all_data_lines.append(line_str[len("data:"):].lstrip())
@@ -480,13 +490,25 @@ class HttpProjectsMcpPaidSession:
                     raise OutcomeUnavailable(f"tools/call failed: HTTP {resp.status_code}")
                 data = _parse_mcp_response(resp.text)
                 post_acceptance_hints = (
-                    "in progress", "already accepted", "concurrent dispatch", "previous attempt",
+                    "still in progress",
+                    "failed on previous attempt",
+                    "already accepted",
+                    "concurrent dispatch",
                 )
                 pre_dispatch_refusal_hints = (
-                    "authorization", "signature", "deadline", "signing key",
-                    "operation key", "bound to", "schema hash mismatch",
-                    "arguments digest mismatch", "tenant mismatch", "provider mismatch",
-                    "capability mismatch", "dispatch", "mismatch",
+                    "requires a valid dispatch authorization",
+                    "requires a dispatch authorization",
+                    "signature does not verify",
+                    "signature invalid",
+                    "dispatch deadline has passed",
+                    "authorization names another",
+                    "authorization was signed for other",
+                    "unknown signing key",
+                    "invalid authorization",
+                    "provider_operation_key does not derive",
+                    "invalid dispatch_deadline",
+                    "schema hash mismatch",
+                    "arguments digest mismatch",
                 )
                 if "error" in data:
                     err = data["error"]
@@ -499,9 +521,13 @@ class HttpProjectsMcpPaidSession:
                 if "result" not in data:
                     raise OutcomeUnavailable(f"tools/call response missing 'result': {data}")
                 result = data["result"]
+                if not isinstance(result, dict):
+                    raise OutcomeUnavailable(f"tools/call result is not a mapping: {result}")
                 is_error = bool(result.get("isError", False))
                 content = result.get("content", [])
-                text = "\n".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
+                if not isinstance(content, list):
+                    content = [content]
+                text = "\n".join(str(c.get("text", c) if isinstance(c, dict) else c) for c in content)
                 if is_error:
                     if any(hint in text.lower() for hint in post_acceptance_hints):
                         raise OutcomeUnavailable(f"provider operation state: {text}")
