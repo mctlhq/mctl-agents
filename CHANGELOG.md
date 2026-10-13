@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.75.2](https://github.com/mctlhq/mctl-agents/compare/1.75.1...1.75.2) (2026-10-13)
+
+
+### Bug Fixes
+
+* **drain:** annotate shows_progress task id for mypy; rewrap docstring ([94acec5](https://github.com/mctlhq/mctl-agents/commit/94acec5d67f71c4d08667fe0e27e023228fb90fd))
+* **drain:** restart the sub-agent wait on child progress ([96e2623](https://github.com/mctlhq/mctl-agents/commit/96e262317e859227016809892ec959d9d77e1c9a))
+* **drain:** restart the sub-agent wait on child progress ([20d406e](https://github.com/mctlhq/mctl-agents/commit/20d406e395949d04302a794648350f8dccfc6baa)), closes [#645](https://github.com/mctlhq/mctl-agents/issues/645)
+
 ## [1.75.1](https://github.com/mctlhq/mctl-agents/compare/1.75.0...1.75.1) (2026-10-12)
 
 
