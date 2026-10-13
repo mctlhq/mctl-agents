@@ -82,9 +82,10 @@ class OrphanedSubagentError(RuntimeError):
     """A run ended while a delegated sub-agent was still live.
 
     Raised when the child went silent -- neither progress nor a terminal
-    status -- for the whole drain timeout, or the stream ended under it. Callers map this to a
-    harness-failure exit code: the agent never got its attempt, so the work is
-    lost through no fault of the proposal being implemented.
+    status -- for the whole drain timeout, or the stream ended under it.
+    Callers map this to a harness-failure exit code: the agent never got its
+    attempt, so the work is lost through no fault of the proposal being
+    implemented.
     """
 
 
@@ -194,7 +195,7 @@ class LiveTaskLedger:
         )
 
         if isinstance(message, (TaskProgressMessage, TaskStartedMessage, TaskUpdatedMessage)):
-            task_id = message.task_id
+            task_id: str | None = message.task_id
         else:
             parent = getattr(message, "parent_tool_use_id", None)
             task_id = self._by_tool_use.get(parent) if isinstance(parent, str) else None
