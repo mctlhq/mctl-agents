@@ -600,6 +600,7 @@ class HttpProjectsMcpPaidSession:
                 "concurrent dispatch",
             )
             pre_dispatch_refusal_hints = (
+                "authorization rejected:",
                 "names another provider",
                 "names another capability",
                 "names another input schema",
@@ -611,22 +612,27 @@ class HttpProjectsMcpPaidSession:
                 "invalid authorization json",
                 "signature does not verify",
                 "signature invalid",
+                "signature is not base64url",
                 "unknown signing key",
                 "authorization carries unknown fields",
-                "is missing",
+                "authorization.",
+                "authorization must be an object",
+                "authorization.schema_version must be an integer",
+                "unknown authorization schema_version",
+                "unknown authorization version",
                 "provider_operation_key does not derive",
                 "invalid dispatch_deadline",
                 "invalid signature length",
                 "public key must be 32 bytes",
-                "unknown authorization schema_version",
-                "unknown authorization version",
-                "authorization must be an object",
-                "must be an integer",
-                "is not a yyyy-mm-ddthh:mm:ssz time",
-                "timezone-aware",
                 "dispatch deadline has passed",
+                "is not a yyyy-mm-ddthh:mm:ssz time",
+                "must be timezone-aware",
+                "unknown tool",
+                "arguments cannot be digested",
+                "provider operation key is bound to another invocation",
                 "is available to you",
-                "is configured for",
+                "is not configured for tenant",
+                "no live status is configured for",
             )
 
             # 1. JSON-RPC protocol error branch
@@ -680,8 +686,9 @@ class HttpProjectsMcpPaidSession:
                     raise OutcomeUnavailable(f"provider operation state: {text}")
                 if any(hint in text.lower() for hint in pre_dispatch_refusal_hints):
                     raise DispatchRefused(text)
+                raise OutcomeUnavailable(f"provider operation state: {text}")
 
-            return ToolCallResult(is_error=is_error, text=text)
+            return ToolCallResult(is_error=False, text=text)
         except httpx.RequestError as exc:
             raise OutcomeUnavailable(f"tools/call network error: {exc}") from exc
 

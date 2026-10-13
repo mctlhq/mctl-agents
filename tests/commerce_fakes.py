@@ -88,7 +88,7 @@ _GENERIC_EDGES = {("accepted", "refused"), ("dispatching", "dispatched"), ("disp
 
 class FakeLedger:
     def __init__(self, clock: Clock, *, price_mode: str = "per_successful_call", amount: int = 12,
-                 budget: int | None = 100) -> None:
+                 budget: int | None = 100, id_seed: int = 0) -> None:
         self.clock = clock
         self.lock = threading.Lock()
         self.terms: dict[tuple[str, str], dict] = {}
@@ -111,7 +111,7 @@ class FakeLedger:
         self.settlement_unknown = 0
         self.tenant = TENANT
         self.dispatch_unavailable = False
-        self._n = 0
+        self._n = id_seed
         self.default_price_mode, self.default_amount = price_mode, amount
 
     # -- set-up ----------------------------------------------------------------

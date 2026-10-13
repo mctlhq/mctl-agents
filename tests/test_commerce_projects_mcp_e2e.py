@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import os
 import select
 import shutil
@@ -132,20 +133,16 @@ def projects_mcp_server(tmp_path_factory):
             proc.wait()
 
 
-_HARNESS_SEQ = 0
-
-
 @pytest.fixture
-def e2e_harness(projects_mcp_server, monkeypatch):
+def e2e_harness(projects_mcp_server, monkeypatch, request):
     """Sets up an end-to-end commerce test harness with live wall-clock time."""
-    global _HARNESS_SEQ
-    _HARNESS_SEQ += 100
-
     clock = Clock()
     clock.t = datetime.now(UTC)
 
-    ledger = FakeLedger(clock, budget=100)
-    ledger._n = _HARNESS_SEQ
+    # Derive deterministic id seed per test from pytest nodeid to ensure disjoint
+    # invocation ID spaces without global mutable state and safe under pytest-xdist.
+    id_seed = int(hashlib.sha256(request.node.nodeid.encode()).hexdigest()[:6], 16) * 1000
+    ledger = FakeLedger(clock, budget=100, id_seed=id_seed)
     approvals = FakeApprovals(clock)
     ledger.publish(
         cp.PROJECTS_SEARCH_CAPABILITY_ID,
@@ -223,6 +220,9 @@ def test_tools_list_over_mcp_http(e2e_harness):
         search_tool = next(t for t in tools if t.name == cp.PROJECTS_SEARCH_TOOL)
         assert search_tool.input_schema.get("type") == "object"
         assert search_tool.input_schema.get("required") == ["project", "query"]
+        # Fastify / MCP SDK injects _mctl_dispatch_authorization in-band for transport
+        # and adds "$schema": "http://json-schema.org/draft-07/schema#" upon tools/list;
+        # both are stripped to reconstruct the canonical input schema for digest verification.
         clean_remote_props = {
             k: v for k, v in search_tool.input_schema["properties"].items()
             if k != "_mctl_dispatch_authorization"
@@ -947,12 +947,22 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         cm.verify_dispatch_authorization({"foreign_kid": cm.public_key_for(SEED)}, good_auth)
     except cm.AuthorizationRejected as exc:
         real_rejection_messages.append(str(exc))
+        real_rejection_messages.append(f"authorization rejected: {exc}")
 
     tampered_auth = cm.DispatchAuthorization(**{**good_auth.to_dict(), "signature": "dGFtcGVyZWQ"})
     try:
         cm.verify_dispatch_authorization({KID: cm.public_key_for(SEED)}, tampered_auth)
     except cm.AuthorizationRejected as exc:
         real_rejection_messages.append(str(exc))
+        real_rejection_messages.append(f"authorization rejected: {exc}")
+
+    # Drive non-base64url signature rejection from _unb64url (commerce.py:264)
+    bad_b64_auth = cm.DispatchAuthorization(**{**good_auth.to_dict(), "signature": "???not_b64url???"})
+    try:
+        cm.verify_dispatch_authorization({KID: cm.public_key_for(SEED)}, bad_b64_auth)
+    except cm.AuthorizationRejected as exc:
+        real_rejection_messages.append(str(exc))
+        real_rejection_messages.append(f"authorization rejected: {exc}")
 
     real_rejection_messages.extend([
         "a paid capability requires a dispatch authorization",
@@ -962,6 +972,9 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         "invalid dispatch_deadline timestamp",
         "public key must be 32 bytes, got 16",
         "invalid signature length",
+        "unknown tool 'projects_nonexistent'",
+        "arguments cannot be digested",
+        "provider operation key is bound to another invocation",
         "authorization names another provider",
         "authorization names another capability",
         "authorization names another input schema",
@@ -970,6 +983,8 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         "dispatch deadline has passed",
         "a paid capability requires a valid dispatch authorization",
         'no project "nonexistent" is available to you',
+        'no live status is configured for "test"',
+        'project "test" is not configured for tenant',
     ])
     s_ingress_errors = [
         cp.HttpProjectsMcpPaidSession(
@@ -1054,7 +1069,7 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         ),
     )
 
-    # 9. Tool error without refusal marker -> returns ToolCallResult(is_error=True)
+    # 9. Tool error without refusal marker -> raises OutcomeUnavailable (consults outcome)
     s_tool_fail = cp.HttpProjectsMcpPaidSession(
         "https://mock-provider",
         transport=httpx.MockTransport(
@@ -1071,6 +1086,31 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
             )
         ),
     )
+
+    # Application-level errors that must NOT be misclassified as pre-dispatch refusals
+    app_error_messages = [
+        "document index is missing",
+        "parameter 'limit' must be an integer",
+        "metadata is missing from passage",
+        "cluster is configured for v2",
+        "syntax error in lucene query",
+    ]
+    s_app_errors = [
+        cp.HttpProjectsMcpPaidSession(
+            "https://mock-provider",
+            transport=httpx.MockTransport(
+                lambda req, msg=msg: httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {"isError": True, "content": [{"type": "text", "text": msg}]},
+                    },
+                )
+            ),
+        )
+        for msg in app_error_messages
+    ]
 
     # 10. Captured real projects-mcp refusal fixture (with _mctl_refusal: "pre_acceptance")
     s_real_ingress_refusal = cp.HttpProjectsMcpPaidSession(
@@ -1142,6 +1182,12 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
                 await s_tool.call_paid_tool("projects_search", args, auth)
             await s_tool.close()
 
+        # Application-level errors raise OutcomeUnavailable (to consult outcome store), never DispatchRefused
+        for s_app in s_app_errors:
+            with pytest.raises(cm.OutcomeUnavailable, match="provider operation state:"):
+                await s_app.call_paid_tool("projects_search", args, auth)
+            await s_app.close()
+
         # Post-acceptance states
         with pytest.raises(cm.OutcomeUnavailable, match="provider operation state:"):
             await s_in_progress.call_paid_tool("projects_search", args, auth)
@@ -1156,10 +1202,9 @@ def test_unit_session_call_paid_tool_refusals_and_post_acceptance():
         with pytest.raises(cm.OutcomeUnavailable, match="neither 'result' nor 'error' present"):
             await s_missing_result.call_paid_tool("projects_search", args, auth)
 
-        # Tool execution error without refusal marker returns ToolCallResult(is_error=True)
-        fail_res = await s_tool_fail.call_paid_tool("projects_search", args, auth)
-        assert fail_res.is_error
-        assert "syntax error in lucene query" in fail_res.text
+        # Tool execution error without refusal marker raises OutcomeUnavailable
+        with pytest.raises(cm.OutcomeUnavailable, match="provider operation state:"):
+            await s_tool_fail.call_paid_tool("projects_search", args, auth)
 
         await s_sig_err.close()
         await s_marker_pre.close()
@@ -1347,11 +1392,10 @@ def test_unit_session_tool_output_containing_authorization_keyword_not_refused()
     )
 
     async def run():
-        # Application-level tool error containing 'authorization' returns ToolCallResult(is_error=True),
-        # never falsely classifying as DispatchRefused
-        res = await session.call_paid_tool("projects_search", args, auth)
-        assert res.is_error
-        assert "no passages matching 'authorization'" in res.text
+        # Application-level tool error containing 'authorization' raises OutcomeUnavailable
+        # (deferring to outcome lookup) and is never falsely classified as DispatchRefused
+        with pytest.raises(cm.OutcomeUnavailable, match="provider operation state:"):
+            await session.call_paid_tool("projects_search", args, auth)
         await session.close()
 
     asyncio.run(run())
@@ -1670,6 +1714,16 @@ def test_unit_paid_invocation_executed_tool_failure_finalizes(monkeypatch):
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/commerce/outcome/"):
+            return httpx.Response(
+                200,
+                json={
+                    "provider_operation_key": request.url.path.split("/")[-1],
+                    "status": "failed",
+                    "is_error": True,
+                    "text": "bad query syntax in lucene parser",
+                },
+            )
         return httpx.Response(
             200,
             json={
@@ -1736,6 +1790,294 @@ def test_unit_paid_invocation_executed_tool_failure_finalizes(monkeypatch):
         assert res.phase == "finalized"
         assert res.text == "bad query syntax in lucene parser"
         # Under per_successful_call, a failed execution releases hold without charging
+        assert ledger.budget["reserved"] == 0
+        assert ledger.budget["committed"] == 0
+        assert ledger.free() == 100
+        await session.close()
+
+    asyncio.run(run())
+
+
+def test_unit_paid_invocation_per_call_executed_failure(monkeypatch):
+    """Under per_call (billable_on = accepted_dispatch), an executed tool failure on the provider
+    is settled via outcome lookup and captured to committed budget.
+    """
+    clock = Clock()
+    clock.t = datetime.now(UTC)
+    ledger = FakeLedger(clock, budget=100, price_mode="per_call")
+    approvals = FakeApprovals(clock)
+    ledger.publish(
+        cp.PROJECTS_SEARCH_CAPABILITY_ID,
+        cp.PROJECTS_SEARCH_SCHEMA_HASH,
+        provider_id=cp.PROJECTS_MCP_PROVIDER_ID,
+        price_mode="per_call",
+    )
+    monkeypatch.setattr(
+        pc,
+        "current_identity",
+        lambda: pc.ExecutionIdentity(execution_id=EXECUTION, trace_id="tr-unit-per-call-fail", actor="agent:test"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/commerce/outcome/"):
+            return httpx.Response(
+                200,
+                json={
+                    "provider_operation_key": request.url.path.split("/")[-1],
+                    "status": "failed",
+                    "is_error": True,
+                    "text": "bad query syntax in lucene parser",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "isError": True,
+                    "content": [{"type": "text", "text": "bad query syntax in lucene parser"}],
+                },
+            },
+        )
+
+    session = cp.HttpProjectsMcpPaidSession(
+        "https://mock-provider",
+        access_token="unit-jwt",  # noqa: S106
+        transport=httpx.MockTransport(handler),
+    )
+    runtime = cg.CommerceRuntime(
+        client=ledger,
+        tenant_id="acme",
+        admitted_providers=frozenset({cp.PROJECTS_MCP_PROVIDER_ID}),
+        approvals=approvals,
+        now=clock,
+        call_timeout_s=5.0,
+    )
+    provider_ref = cap.ProviderRef(type="mcp-remote", id=cp.PROJECTS_MCP_PROVIDER_ID, alias="projects")
+    descriptor = cap.CapabilityDescriptor(
+        capability_id=cp.PROJECTS_SEARCH_CAPABILITY_ID,
+        tool_name="mcp__projects__projects_search",
+        provider=provider_ref,
+        title="projects_search",
+        summary="Search project docs",
+        keywords=("projects", "search"),
+        input_schema_hash=cp.PROJECTS_SEARCH_SCHEMA_HASH,
+        input_schema_bytes=100,
+        consequence="safe",
+        matched_tool_pattern="mcp__projects__*",
+        commerce=cap.CommerceSummary(
+            terms_id="ctm_01JZ8PZ0000000000000000000",
+            terms_version=1,
+            price_mode="per_call",
+            currency="EUR",
+            amount_minor=12,
+            funds_mode="simulated",
+        ),
+    )
+
+    args = {"project": "acme", "query": "auth", "limit": 8}
+    paid = cg.PaidInvocation(
+        runtime=runtime,
+        descriptor=descriptor,
+        session=session,
+        tool=cp.PROJECTS_SEARCH_TOOL,
+        arguments=args,
+        grants=("mcp__projects__*",),
+        policy=ALLOW_PAID,
+        client_key="k_unit_per_call_fail",
+        emit=lambda p, event: None,
+    )
+
+    async def run():
+        res = await paid.run()
+        assert res.phase == "finalized"
+        assert res.text == "bad query syntax in lucene parser"
+        assert res.reason_code == "provider-error"
+        # Under per_call, the executed failure captures the committed price
+        assert ledger.budget["reserved"] == 0
+        assert ledger.budget["committed"] == 12
+        assert ledger.free() == 88
+        await session.close()
+
+    asyncio.run(run())
+
+
+def test_unit_paid_invocation_per_call_unmarked_refusal(monkeypatch):
+    """Under per_call, an unclassified pre-dispatch refusal (outcome not found on provider)
+    must NOT capture liability into committed budget.
+    """
+    clock = Clock()
+    clock.t = datetime.now(UTC)
+    ledger = FakeLedger(clock, budget=100, price_mode="per_call")
+    approvals = FakeApprovals(clock)
+    ledger.publish(
+        cp.PROJECTS_SEARCH_CAPABILITY_ID,
+        cp.PROJECTS_SEARCH_SCHEMA_HASH,
+        provider_id=cp.PROJECTS_MCP_PROVIDER_ID,
+        price_mode="per_call",
+    )
+    monkeypatch.setattr(
+        pc,
+        "current_identity",
+        lambda: pc.ExecutionIdentity(execution_id=EXECUTION, trace_id="tr-unit-unmarked-refuse", actor="agent:test"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/commerce/outcome/"):
+            return httpx.Response(404, json={"error": "not found"})
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -32000, "message": "unmarked custom provider rejection"},
+            },
+        )
+
+    session = cp.HttpProjectsMcpPaidSession(
+        "https://mock-provider",
+        access_token="unit-jwt",  # noqa: S106
+        transport=httpx.MockTransport(handler),
+    )
+    runtime = cg.CommerceRuntime(
+        client=ledger,
+        tenant_id="acme",
+        admitted_providers=frozenset({cp.PROJECTS_MCP_PROVIDER_ID}),
+        approvals=approvals,
+        now=clock,
+        call_timeout_s=5.0,
+    )
+    provider_ref = cap.ProviderRef(type="mcp-remote", id=cp.PROJECTS_MCP_PROVIDER_ID, alias="projects")
+    descriptor = cap.CapabilityDescriptor(
+        capability_id=cp.PROJECTS_SEARCH_CAPABILITY_ID,
+        tool_name="mcp__projects__projects_search",
+        provider=provider_ref,
+        title="projects_search",
+        summary="Search project docs",
+        keywords=("projects", "search"),
+        input_schema_hash=cp.PROJECTS_SEARCH_SCHEMA_HASH,
+        input_schema_bytes=100,
+        consequence="safe",
+        matched_tool_pattern="mcp__projects__*",
+        commerce=cap.CommerceSummary(
+            terms_id="ctm_01JZ8PZ0000000000000000000",
+            terms_version=1,
+            price_mode="per_call",
+            currency="EUR",
+            amount_minor=12,
+            funds_mode="simulated",
+        ),
+    )
+
+    args = {"project": "acme", "query": "auth", "limit": 8}
+    paid = cg.PaidInvocation(
+        runtime=runtime,
+        descriptor=descriptor,
+        session=session,
+        tool=cp.PROJECTS_SEARCH_TOOL,
+        arguments=args,
+        grants=("mcp__projects__*",),
+        policy=ALLOW_PAID,
+        client_key="k_unit_unmarked_refusal",
+        emit=lambda p, event: None,
+    )
+
+    async def run():
+        res = await paid.run()
+        # Because outcome is not_found, the refusal is never committed to revenue
+        assert res.reason_code == "outcome-unknown"
+        assert ledger.budget["committed"] == 0
+        assert ledger.budget["reserved"] == 12
+        await session.close()
+
+    asyncio.run(run())
+
+
+def test_unit_paid_invocation_domain_refusal_releases_hold(monkeypatch):
+    """In unit tests (runs in CI), pre-acceptance domain refusal ('no project ... is available to you')
+    raises DispatchRefused and PaidInvocation releases the budget hold without charging.
+    """
+    clock = Clock()
+    clock.t = datetime.now(UTC)
+    ledger = FakeLedger(clock, budget=100)
+    approvals = FakeApprovals(clock)
+    ledger.publish(
+        cp.PROJECTS_SEARCH_CAPABILITY_ID,
+        cp.PROJECTS_SEARCH_SCHEMA_HASH,
+        provider_id=cp.PROJECTS_MCP_PROVIDER_ID,
+    )
+    monkeypatch.setattr(
+        pc,
+        "current_identity",
+        lambda: pc.ExecutionIdentity(execution_id=EXECUTION, trace_id="tr-unit-domain-refusal", actor="agent:test"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "isError": True,
+                    "content": [{"type": "text", "text": 'no project "secret-proj" is available to you'}],
+                },
+            },
+        )
+
+    session = cp.HttpProjectsMcpPaidSession(
+        "https://mock-provider",
+        access_token="unit-jwt",  # noqa: S106
+        transport=httpx.MockTransport(handler),
+    )
+    runtime = cg.CommerceRuntime(
+        client=ledger,
+        tenant_id="acme",
+        admitted_providers=frozenset({cp.PROJECTS_MCP_PROVIDER_ID}),
+        approvals=approvals,
+        now=clock,
+        call_timeout_s=5.0,
+    )
+    provider_ref = cap.ProviderRef(type="mcp-remote", id=cp.PROJECTS_MCP_PROVIDER_ID, alias="projects")
+    descriptor = cap.CapabilityDescriptor(
+        capability_id=cp.PROJECTS_SEARCH_CAPABILITY_ID,
+        tool_name="mcp__projects__projects_search",
+        provider=provider_ref,
+        title="projects_search",
+        summary="Search project docs",
+        keywords=("projects", "search"),
+        input_schema_hash=cp.PROJECTS_SEARCH_SCHEMA_HASH,
+        input_schema_bytes=100,
+        consequence="safe",
+        matched_tool_pattern="mcp__projects__*",
+        commerce=cap.CommerceSummary(
+            terms_id="ctm_01JZ8PZ0000000000000000000",
+            terms_version=1,
+            price_mode="per_successful_call",
+            currency="EUR",
+            amount_minor=12,
+            funds_mode="simulated",
+        ),
+    )
+
+    args = {"project": "secret-proj", "query": "auth", "limit": 8}
+    paid = cg.PaidInvocation(
+        runtime=runtime,
+        descriptor=descriptor,
+        session=session,
+        tool=cp.PROJECTS_SEARCH_TOOL,
+        arguments=args,
+        grants=("mcp__projects__*",),
+        policy=ALLOW_PAID,
+        client_key="k_unit_domain_refusal",
+        emit=lambda p, event: None,
+    )
+
+    async def run():
+        res = await paid.run()
+        assert res.reason_code == "provider-error"
+        assert res.phase == "released"
         assert ledger.budget["reserved"] == 0
         assert ledger.budget["committed"] == 0
         assert ledger.free() == 100
