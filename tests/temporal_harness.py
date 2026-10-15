@@ -41,6 +41,9 @@ from orchestrator.temporal.constants import (
 # worker.py's execution_plan registers, and a shared import would let both
 # sides move together without anything noticing.
 EXECUTION_ACTIVITY = "submit_and_wait"
+# #636: the delegated approve flip runs beside it on the execution queue only
+# (it mints a credential, so it is not offered to the admission pool).
+EXECUTION_ONLY_ACTIVITIES = frozenset({"submit_delegated_approve"})
 
 
 def _activity_name(fn: Any) -> str | None:
@@ -70,13 +73,14 @@ class Worker:
             **kwargs,
         )
         routed = [fn for fn in activities if _activity_name(fn) == EXECUTION_ACTIVITY]
+        execution_routed = routed + [fn for fn in activities if _activity_name(fn) in EXECUTION_ONLY_ACTIVITIES]
         # No submit_and_wait fake means this test never routes anything, so
         # a second worker would only slow it down.
         self._execution = (
             _TemporalWorker(
                 client,
                 task_queue=EXECUTION_TASK_QUEUE,
-                activities=routed,
+                activities=execution_routed,
                 **kwargs,
             )
             if routed

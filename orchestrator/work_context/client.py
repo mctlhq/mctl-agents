@@ -23,6 +23,7 @@ import urllib.request
 from typing import Any
 from urllib.parse import quote
 
+from orchestrator.work_context import creation
 from orchestrator.work_context import execution_requests as xr
 from orchestrator.work_context import intents as wi
 from orchestrator.work_context.contract import (
@@ -56,6 +57,9 @@ DEFAULT_TIMEOUT_S = 10
 
 # mctl-api's `workitem/v1` read routes (internal/api/router.go there).
 ROUTES = {
+    # POST creates the item, or answers the open one with the same
+    # (tenant, external_key): the DevLoop's issue resolver (#636).
+    "create_work_item": "/api/v1/work-items",
     "get_work_item": "/api/v1/work-items/{id}",
     # GET lists the ledger; POST attaches an execution or advances its
     # phase, idempotent on (engine, engine_ref) (mctlhq/mctl-agents#455).
@@ -377,6 +381,32 @@ class WorkItemClient:
         except WorkItemUnavailable as exc:
             return ExecutionAnswer(EXECUTION_UNKNOWN, reason=str(exc))
         return answer_from_attach(res.status, res.payload, work_item_id=work_item_id, run=run, phase=phase)
+
+    def create_work_item(self, tenant: str, issue_url: str) -> creation.CreateAnswer:
+        """Resolve or create the open work item of `issue_url` in `tenant`
+        (mctlhq/mctl-agents#636). mctl-api's create route is the idempotency
+        boundary: the same issue lands on the same open item. A refusal is
+        REFUSED and nothing else is ever tried; no caller may answer
+        `external_key_in_use` by creating another item.
+
+        The policy checkpoint (#197) sits immediately before the POST."""
+        try:
+            body = creation.create_body(tenant, issue_url)
+        except ValueError as exc:
+            return creation.CreateAnswer(creation.REFUSED, reason=str(exc))
+        refused = self._governed(
+            creation.CREATE_OPERATION, body["external_key"], body,
+            {"tenant": tenant, "external_key": body["external_key"]},
+        )
+        if refused:
+            return creation.CreateAnswer(creation.REFUSED, reason=refused)
+        try:
+            res = self._request("POST", ROUTES["create_work_item"], body)
+        except WorkItemUnavailable as exc:
+            return creation.CreateAnswer(creation.UNKNOWN, reason=str(exc))
+        return creation.answer_from_create(
+            res.status, res.payload, tenant=tenant, external_key=body["external_key"],
+        )
 
     # -- execution requests (mctl-api#368, mctlhq/mctl-agents#461) --------
     #

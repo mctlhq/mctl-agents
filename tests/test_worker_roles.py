@@ -334,7 +334,10 @@ def test_the_execution_worker_polls_only_the_new_queue(visibility):
     plans = worker_plans("execution", visibility)
 
     assert [p.task_queue for p in plans] == [EXECUTION_TASK_QUEUE]
-    assert plans[0].activity_names == {"submit_and_wait"}
+    # submit_delegated_approve (#636) mints a credential and polls the CWFT it
+    # submits, so it lives with the Argo activity it wraps, and not on the
+    # admission queue (which serves only the implement submit).
+    assert plans[0].activity_names == {"submit_and_wait", "submit_delegated_approve"}
 
 
 def test_the_control_worker_still_serves_submit_and_wait(visibility):

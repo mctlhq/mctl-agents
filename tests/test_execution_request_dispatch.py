@@ -42,12 +42,16 @@ from temporalio.testing import WorkflowEnvironment
 from orchestrator.temporal import dispatcher as dx
 from orchestrator.temporal import worker as worker_module
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
+from orchestrator.temporal.activities.canonical_execution import EnsuredExecution
 from orchestrator.temporal.activities.execution_requests import (
+    AdvanceInput,
     advance_dispatched_execution,
     bind_dispatched_execution,
 )
+from orchestrator.temporal.activities.pr_state import PRState
+from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.constants import TASK_QUEUE
-from orchestrator.temporal.issue_ref import request_engine_ref, workflow_id_for
+from orchestrator.temporal.issue_ref import is_request_engine_ref, request_engine_ref, workflow_id_for
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
 from orchestrator.work_context import execution_requests as xr
 from orchestrator.work_context.client import WorkItemClient, WorkItemUnavailable, _HTTPResult
@@ -57,6 +61,10 @@ from tests.test_work_context_resume_acceptance import SV, TERMINAL_PHASES, URL, 
 pytestmark = pytest.mark.anyio
 
 OTHER_WID = "wi_461b0000-0000-4000-8000-000000000461"
+#: Keeps a loop that passed its approval gates alive in its merge watch.
+_OPEN_PR = PRState(
+    found=True, pr_url="https://github.com/mctlhq/mctl-telegram/pull/9", repo="mctl-telegram", number=9, state="OPEN"
+)
 
 
 class DispatchFakeApi(FakeMctlApi):
@@ -321,15 +329,37 @@ def _investigate_log() -> tuple[Any, list[dict]]:
 def _loop_activities(submit: Any, **fakes: Any) -> list[Any]:
     from tests.test_dev_loop_workflow import _fake_activities
 
-    activities, *_ = _fake_activities(released=True, **fakes)
-    activities = [a for a in activities if a.__temporal_activity_definition.name != "submit_and_wait"]
-    return [*activities, submit, bind_dispatched_execution, advance_dispatched_execution]
-
-
-def _worker(env: WorkflowEnvironment, submit: Any, **fakes: Any) -> Worker:
-    return Worker(
-        env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=_loop_activities(submit, **fakes)
+    # An ordinary start opens its own `we_` on the issue's work item (#636).
+    fakes.setdefault(
+        "ensure_result", EnsuredExecution(ok=True, work_item_id=WID, execution_id="we_test_own", sequence=1)
     )
+    activities, *_ = _fake_activities(released=True, **fakes)
+    # The factory's fake advance is replaced by the real one: these tests
+    # drive the loop against the fake mctl-api.
+    replaced = {"submit_and_wait", "advance_dispatched_execution"}
+    activities = [a for a in activities if a.__temporal_activity_definition.name not in replaced]
+
+    @activity.defn(name="advance_dispatched_execution")
+    async def advance(inp: AdvanceInput) -> str:
+        # The fake `ensure_issue_execution` registers nothing in the fake
+        # store, so a loop's OWN `we_` (engine ref = its workflow id) has no
+        # row there: advancing it would mint a stray one. Only a dispatched
+        # execution (`<loop>#<request>`) lives in the store, and that advance
+        # is the real one.
+        if not is_request_engine_ref(inp.engine_ref):
+            return f"own-execution {inp.phase}"
+        return await advance_dispatched_execution(inp)
+
+    return [*activities, submit, bind_dispatched_execution, advance]
+
+
+def _worker(env: WorkflowEnvironment, submit: Any, *, gate: Any = None, **fakes: Any) -> Worker:
+    if gate is not None:
+        fakes["approval_requests"] = gate.requests
+    activities = _loop_activities(submit, **fakes)
+    if gate is not None:
+        activities = _replace(activities, gate.activity)
+    return Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities)
 
 
 def _dispatcher(env: WorkflowEnvironment, client: Any = None) -> dx.Dispatcher:
@@ -351,6 +381,57 @@ async def _end(env: WorkflowEnvironment, workflow_id: str) -> None:
     handle = env.client.get_workflow_handle(workflow_id)
     await handle.signal(DevLoopWorkflow.abandon, {"reason": "test over"})
     await handle.result()
+
+
+_RELEASES = {
+    agent: ResolvedRelease(agent=agent, environment="production", version=version, image_ref=f"ghcr.io/x@sha256:{sha}")
+    for agent, version, sha in (
+        ("issue-investigator", "1.0.0", "aaa"),
+        ("implementer", "2.0.0", "bbb"),
+        ("shepherd", "3.0.0", "ccc"),
+    )
+}
+
+
+class _Gate:
+    """Holds the loop in the window right after its approve flip.
+
+    The loop's own `we_` is open until the flip (#636), so a resume cannot be
+    fulfilled before it: mctl-api answers `execution_active`. The first await
+    after the flip has ended that `we_` is the implementer's release resolve,
+    so holding that activity keeps the loop alive with its first execution
+    terminal and its re-approval gate still ahead: exactly the state a resume
+    delivered "onto a live parked loop" needs. `release()` lets it on."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.open = asyncio.Event()
+        self.passed = asyncio.Event()
+        #: Every grant the loop requested (the loop must have requested its
+        #: grant before a signal can decide it).
+        self.requests: list[Any] = []
+
+    @property
+    def activity(self) -> Any:
+        @activity.defn(name="resolve_agent_release")
+        async def resolve(agent: str, environment: str) -> ResolvedRelease | None:
+            if agent == "implementer":
+                self.entered.set()
+                await self.open.wait()
+                self.passed.set()
+            return _RELEASES.get(agent)
+
+        return resolve
+
+    async def release(self) -> None:
+        self.open.set()
+        if self.entered.is_set():
+            await _wait_for(self.passed.is_set)
+
+
+def _replace(activities: list[Any], *replacements: Any) -> list[Any]:
+    names = {r.__temporal_activity_definition.name for r in replacements}
+    return [a for a in activities if a.__temporal_activity_definition.name not in names] + list(replacements)
 
 
 def _delivery(rid: str, kind: str, work_item_id: str = WID) -> Any:
@@ -608,7 +689,7 @@ async def test_intake_first_a_start_request_joins_its_loop_and_is_refused_loop_a
         assert (await env.client.get_workflow_handle(wid).describe()).run_id == run_id
         await _end(env, wid)
 
-    assert len(seen) == 1 and "execution_id" not in seen[0]
+    assert len(seen) == 1 and seen[0]["execution_id"] == "we_test_own"
     assert api.fulfils() == [] and api.executions == []
     assert api.request_state(rid)["reason"] == xr.LOOP_ACTIVE
 
@@ -1015,18 +1096,28 @@ async def test_a_rejected_request_ends_its_loop_without_running_anything(api, en
 
 async def test_resume_onto_a_live_loop_is_delivered_and_onto_a_finished_loop_continues(api, env):
     submit, seen = _investigate_log()
+    gate = _Gate()
     first = api.create_request("start")
     first_loop = workflow_id_for(URL)
-    async with _worker(env, submit):
+    async with _worker(env, submit, gate=gate, pr_states=[_OPEN_PR]):
         started = await _dispatcher(env).dispatch_once()
         assert started.action == dx.FULFILLED
         first_run = (await env.client.get_workflow_handle(first_loop).describe()).run_id
         await _wait_for(lambda: len(seen) == 1)
-        # The dispatched execution ended with its investigator run...
-        await _wait_for(lambda: api.executions[0]["phase"] == "Succeeded")
-        # ...but the loop lives on, parked at approval.
+        # The loop is parked at approval, and since #636 its dispatched
+        # execution is held open there (mctl-api refuses a resume while any
+        # execution is open, so none is delivered yet)...
+        await _wait_for(lambda: bool(gate.requests))
+        assert api.executions[0]["phase"] == "Running"
         desc = await env.client.get_workflow_handle(first_loop).describe()
         assert desc.status == WorkflowExecutionStatus.RUNNING
+        # ...until the approve flip ends it; the loop then lives on, held
+        # before its re-approval gate.
+        await env.client.get_workflow_handle(first_loop).signal(
+            DevLoopWorkflow.approve, {"approver": "bob", "approval_ref": "aar_test"}
+        )
+        await _wait_for(lambda: api.executions[0]["phase"] == "Succeeded")
+        await _wait_for(gate.entered.is_set)
 
         live = api.create_request("resume")
         delivered = await _dispatcher(env).dispatch_once()
@@ -1037,7 +1128,10 @@ async def test_resume_onto_a_live_loop_is_delivered_and_onto_a_finished_loop_con
         assert len(seen) == 1
 
         # The loop ends before its re-approval: the resumed execution fails.
-        await _end(env, first_loop)
+        handle = env.client.get_workflow_handle(first_loop)
+        await handle.signal(DevLoopWorkflow.abandon, {"reason": "test over"})
+        await gate.release()
+        await handle.result()
         assert api.executions[1]["phase"] == "Failed"
 
         finished = api.create_request("resume")
@@ -1047,8 +1141,11 @@ async def test_resume_onto_a_live_loop_is_delivered_and_onto_a_finished_loop_con
         assert continued.workflow_id == first_loop
         assert (await env.client.get_workflow_handle(first_loop).describe()).run_id != first_run
         await _wait_for(lambda: len(seen) == 2)
-        await _wait_for(lambda: api.executions[2]["phase"] == "Succeeded")
+        # The continuation's `we_` is held open like any other loop's, until
+        # its loop exits: abandoned here, never approved, so it ends Failed.
+        await _wait_for(lambda: api.executions[2]["phase"] == "Running")
         await _end(env, continued.workflow_id)
+        assert api.executions[2]["phase"] == "Failed"
 
     first_we, _resumed_we, continued_we = (e["id"] for e in api.executions)
     assert [p["execution_id"] for p in seen] == [first_we, continued_we]
@@ -1154,7 +1251,8 @@ async def test_offline_end_to_end_request_to_a_snapshot_sealed_for_the_dispatche
         outcome = await _dispatcher(env).dispatch_once()
         assert outcome.action == dx.FULFILLED
         await _wait_for(lambda: len(runs) == 1, limit=60)
-        await _wait_for(lambda: api.executions[0]["phase"] == "Succeeded")
+        # Held open through the approval park (#636); ended by the loop's exit.
+        await _wait_for(lambda: api.executions[0]["phase"] == "Running")
         handle = env.client.get_workflow_handle(loop_id)
         state = await handle.query(DevLoopWorkflow.work_context)
         run_id = (await handle.describe()).run_id
@@ -1168,9 +1266,10 @@ async def test_offline_end_to_end_request_to_a_snapshot_sealed_for_the_dispatche
     assert params["execution_request_id"] == rid
     assert result.error is None and result.skipped_reason is None, result
     # Exactly one execution: the dispatcher's, attached at fulfilment and
-    # ended by the loop; the investigator attached none of its own.
+    # ended by the loop (Failed: abandoned before any approval); the
+    # investigator attached none of its own.
     assert [(e["id"], e["engine"], e["engine_ref"], e["phase"]) for e in api.executions] == [
-        (we, "temporal", request_engine_ref(loop_id, rid), "Succeeded"),
+        (we, "temporal", request_engine_ref(loop_id, rid), "Failed"),
     ]
     # A snapshot sealed for exactly that execution, naming it.
     assert list(api.snapshots) == [we]
@@ -1273,7 +1372,9 @@ async def test_an_issue_keyed_loop_passes_its_own_ids_and_no_request_id(api, env
         await _end(env, wid)
     assert seen[0]["temporal_workflow_id"] == wid
     assert seen[0]["temporal_run_id"] == handle.result_run_id
-    assert "execution_request_id" not in seen[0] and "execution_id" not in seen[0]
+    # #636: the loop opened its own `we_` and names it; it has no request.
+    assert "execution_request_id" not in seen[0]
+    assert seen[0]["execution_id"] == "we_test_own" and seen[0]["work_item_id"] == WID
 
 
 async def test_the_investigator_refuses_a_dispatched_execution_of_another_item(api, monkeypatch, tmp_path):
@@ -1666,40 +1767,56 @@ def _scheduled_advances(history: Any) -> int:
     )
 
 
-async def _run_to_the_park(api, env, unavailable: int) -> tuple[str, Any]:
+async def _run_to_the_flip(api, env, unavailable: int) -> tuple[str, Any]:
+    """A dispatched loop approved with the grant it requested, while mctl-api
+    answers 503 to the first `unavailable` advances to Succeeded. Since #636
+    that advance is the one that ends the loop's `we_` right after the flip
+    (it is held open until then); the loop then goes on to implement and
+    watch the PR. Returns the request's engine ref and the loop's history."""
     submit, seen = _investigate_log()
+    requests: list[Any] = []
     api.unavailable_advances["Succeeded"] = unavailable
     rid = api.create_request("start")
     wid = workflow_id_for(URL)
-    async with _worker(env, submit):
+    async with _worker(env, submit, approval_requests=requests, pr_states=[_OPEN_PR]):
         assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
-        # Skip past every retry backoff; the loop then sits at approval.
-        await env.sleep(timedelta(hours=3))
+        await _wait_for(lambda: bool(requests))
+        # Held open at the park: nothing has tried to end it yet.
+        assert api.executions[0]["phase"] == "Running" and _advance_attempts(api, "Succeeded") == 0
         handle = env.client.get_workflow_handle(wid)
+        await handle.signal(DevLoopWorkflow.approve, {"approver": "bob", "approval_ref": "aar_test"})
+        # Skip past every retry backoff; the loop then sits in its merge watch.
+        await env.sleep(timedelta(hours=1))
         assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING
         history = await handle.fetch_history()
-        await _end(env, wid)
+        await handle.terminate("test over")
     assert len(seen) == 1
     return request_engine_ref(wid, rid), history
 
 
-async def test_a_transient_advance_failure_on_the_success_path_ends_succeeded_before_the_park(api, env):
+async def test_a_transient_advance_failure_on_the_success_path_ends_succeeded_right_after_the_flip(api, env):
     """mctl-api unavailable for longer than FAST's five attempts: the patient
-    policy still lands the advance, in ONE activity, before the park."""
-    ref, history = await _run_to_the_park(api, env, unavailable=7)
+    policy still lands the end-of-execution advance, in ONE activity, right
+    after the approve flip (the execution is held Running until then)."""
+    ref, history = await _run_to_the_flip(api, env, unavailable=7)
 
     assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Succeeded")]
     assert _advance_attempts(api, "Succeeded") == 8
     assert _scheduled_advances(history) == 1
 
 
-async def test_an_advance_that_outlasts_its_retries_is_re_attempted_before_the_park(api, env):
+async def test_an_advance_that_outlasts_its_retries_is_not_re_attempted_by_a_canonical_loop(api, env):
     """Unavailable past the whole patient policy: the loop goes on (best
-    effort), re-attempts once before the approval park, and that lands."""
-    ref, history = await _run_to_the_park(api, env, unavailable=12)
+    effort). Under #636 the end-of-execution advance is a single patient
+    activity (`_end_canonical_execution` clears its flag first), and the
+    pre-park re-attempt of the legacy branch (`_land_pending_advance`) is not
+    reached any more, so the `we_` is left Running behind a live loop. This
+    pins that behaviour as it is, not as it was: see the report on #636."""
+    ref, history = await _run_to_the_flip(api, env, unavailable=12)
 
-    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Succeeded")]
-    assert _scheduled_advances(history) == 2
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Running")]
+    assert _advance_attempts(api, "Succeeded") == 10  # DISPATCHED_ADVANCE_RETRY_POLICY, once
+    assert _scheduled_advances(history) == 1
     from temporalio.worker import Replayer
 
     await Replayer(workflows=[DevLoopWorkflow]).replay_workflow(history)
@@ -1739,20 +1856,22 @@ async def test_a_reject_that_finds_the_request_closed_reports_closed(api):
 
 # -- review round 3 (PR #468) ------------------------------------------------
 #
-# P2: a pending advance is re-attempted before EVERY park, including the
-# human-input one.
+# P2 (legacy): a pending advance is re-attempted before EVERY park, including
+# the human-input one. Under #636 the dispatched execution is not advanced at
+# a park at all: it is held open through every park.
 
 
-async def test_an_advance_that_outlasts_its_retries_lands_before_a_human_input_park(api, env):
+async def test_a_human_input_park_holds_the_dispatched_execution_open_and_advances_nothing(api, env):
     from datetime import UTC, datetime
 
     from tests.test_dev_loop_workflow import _request_json, _sealed_request
 
     submit, seen = _investigate_log()
-    # More than the whole patient policy (10), fewer than it plus the brief
-    # pre-park attempt (4): only that attempt can land it.
+    # mctl-api would refuse every advance to Succeeded for longer than the
+    # whole patient policy: if the park tried to end the execution, it would
+    # consume them.
     api.unavailable_advances["Succeeded"] = 12
-    rid = api.create_request("start")
+    api.create_request("start")
     wid = workflow_id_for(URL)
     # The clarification this run's investigator sealed, for THIS loop.
     request = _sealed_request(workflow_id=wid, created=datetime.now(UTC), ttl_seconds=7 * 24 * 3600)
@@ -1762,12 +1881,17 @@ async def test_an_advance_that_outlasts_its_retries_lands_before_a_human_input_p
         handle = env.client.get_workflow_handle(wid)
         state = await handle.query(DevLoopWorkflow.human_input_state)
         history = await handle.fetch_history()
+        attempts_at_the_park = _advance_attempts(api, "Succeeded")
+        phase_at_the_park = api.executions[0]["phase"]
+        untouched = api.unavailable_advances["Succeeded"]
+        api.unavailable_advances["Succeeded"] = 0  # the exit's own advance may now land
         await _end(env, wid)
 
-    # Parked on the clarification, and the execution already ended.
+    # Parked on the clarification with the execution still Running: no
+    # advance was attempted before the park (the legacy branch made two).
     assert state.state == "WAITING_FOR_INPUT" and state.request_id == request.request_id
-    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(request_engine_ref(wid, rid), "Succeeded")]
-    assert len(seen) == 1 and _scheduled_advances(history) == 2
+    assert (attempts_at_the_park, phase_at_the_park, untouched) == (0, "Running", 12)
+    assert len(seen) == 1 and _scheduled_advances(history) == 0
     from temporalio.worker import Replayer
 
     await Replayer(workflows=[DevLoopWorkflow]).replay_workflow(history)

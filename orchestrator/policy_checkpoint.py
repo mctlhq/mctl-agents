@@ -380,6 +380,11 @@ BUILTIN_POLICY = Policy(
         # by (engine, engine_ref), so the run can only name its own; it
         # never creates a work item, resumes one or changes its state.
         Rule("mctl-attach-own-execution", MCTL_WORK_ITEM_WRITE, "attach:work-item-execution", ALLOW),
+        # Resolving or creating the DevLoop's own issue work item
+        # (mctlhq/mctl-agents#636). mctl-api's create route dedupes open work
+        # on (tenant, external_key), so this can only open the one item of the
+        # issue the loop was started for; it carries no identity field.
+        Rule("mctl-create-issue-work-item", MCTL_WORK_ITEM_WRITE, "create:work-item", ALLOW),
         # The execution-request dispatcher (mctlhq/mctl-agents#461, mctl-api#368):
         # claim a surface's request under a lease, fulfil it with the engine
         # run the dispatcher started, or reject it with a typed reason.
