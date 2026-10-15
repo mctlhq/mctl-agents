@@ -351,6 +351,17 @@ async def test_another_execution_or_target_is_another_grant(env, aar_api):
     assert len({one.approval_ref, other_we.approval_ref, other_slug.approval_ref}) == 3
 
 
+async def test_a_new_attempt_asks_for_a_new_decision(env, aar_api):
+    """agy P2 on #651: after a surface/actor transition the loop asks again
+    under the next attempt; that must be a fresh grant, not the old one."""
+    first = await env.run(da.request_devloop_approval, REQUEST)
+    aar_api.records[first.approval_ref]["state"] = "denied"
+
+    again = await env.run(da.request_devloop_approval, dataclasses.replace(REQUEST, attempt=1))
+
+    assert again.ok and again.approval_ref != first.approval_ref and len(aar_api.records) == 2
+
+
 @pytest.mark.parametrize("state", ["denied", "expired", "consumed"])
 async def test_a_request_already_in_a_final_state_is_not_asked_again(env, aar_api, state):
     first = await env.run(da.request_devloop_approval, REQUEST)

@@ -532,8 +532,11 @@ class Dispatcher:
         counts because the `#xr_` suffix proves this dispatcher fulfilled it
         for a loop that took it, and Temporal forgets a workflow only after it
         closed and its namespace retention expired, while a RUNNING workflow
-        is always found. An execution of another engine, one the loop seeded
-        itself, or one of a RUNNING loop is never touched (a running loop may
+        is always found. Also (#636) the own `we_` a canonical loop attached
+        under the bare issue-keyed id of THIS request's loop, once that loop
+        is CLOSED or ABSENT: a terminated loop never ends it, and it would
+        block the item for good. An execution of another engine, one the loop
+        seeded itself, or one of a RUNNING loop is never touched (a running loop may
         still bind and end it). The write is the same attach-or-advance the
         loop itself uses, through the policy checkpoint; its answer is logged
         and never stops the dispatch (mctl-api's fulfil re-decides
@@ -544,7 +547,12 @@ class Dispatcher:
             ref = execution.temporal_workflow_id
             if not ref or ref == engine_ref:
                 continue
-            if not is_request_engine_ref(ref) and not ref.startswith(PRE_ISSUE_KEYED_DISPATCH_PREFIX):
+            # #636: a canonical loop attaches its own `we_` under the bare
+            # issue-keyed id and holds it open until its approve flip; a
+            # TERMINATED one never ends it. Only this request's own loop id.
+            own_canonical = ref == loop_id_of_engine_ref(engine_ref)
+            dispatched = is_request_engine_ref(ref) or ref.startswith(PRE_ISSUE_KEYED_DISPATCH_PREFIX)
+            if not dispatched and not own_canonical:
                 continue
             if not execution.phase or execution.phase in TERMINAL_PHASES:
                 continue
@@ -552,7 +560,9 @@ class Dispatcher:
             if await self._temporal.loop_state(owner) == LOOP_RUNNING:
                 if not is_request_engine_ref(ref):
                     # A pre-option-A `dev-loop-xr_<id>` loop is its own
-                    # request: running means it still holds it.
+                    # request, and a running canonical loop may still end its
+                    # own `we_` (a later run re-adopts it: the attach is
+                    # idempotent on the engine ref): running means it holds it.
                     continue
                 # The id is the issue's, shared by every run: only the run
                 # that took the request will end its execution. A later run

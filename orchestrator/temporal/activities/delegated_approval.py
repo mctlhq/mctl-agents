@@ -87,6 +87,9 @@ class ApprovalRequestInput:
     slug: str
     #: How long the request stays decidable (clamped to mctl-api's cap).
     ttl_seconds: int = aa.DEFAULT_TTL_S
+    #: Bumped by the workflow on every surface/actor transition: a new key,
+    #: so a fresh human decision is asked rather than an earlier one found.
+    attempt: int = 0
 
 
 @dataclass(frozen=True)
@@ -128,7 +131,7 @@ async def request_devloop_approval(input: ApprovalRequestInput) -> ApprovalReque
     answer = await asyncio.to_thread(
         aa.ActionApprovalClient().create,
         intent,
-        key=aa.idempotency_key(intent),
+        key=aa.idempotency_key(intent, input.attempt),
         expires_at=datetime.now(UTC) + timedelta(seconds=ttl),
     )
     if answer.status == aa.UNKNOWN or answer.record is None:

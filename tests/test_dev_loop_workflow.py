@@ -1614,7 +1614,18 @@ class TestDevLoopWorkflow:
         ]
         assert [d.execution_id for d in delegated] == ["we_test_own"]
 
-    @pytest.mark.parametrize("payload", [None, {"approver": "mashkovd"}, {"approval_ref": "not-a-grant"}])
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            None,
+            {"approver": "mashkovd"},
+            {"approval_ref": "not-a-grant"},
+            # claude P3 on #651: the ref becomes an HTTP header value.
+            {"approval_ref": "aar_x\r\nX-Evil: 1"},
+            {"approval_ref": "aar_"},
+            {"approval_ref": "aar_" + "a" * 200},
+        ],
+    )
     async def test_a_signal_without_a_grant_never_approves_a_canonical_loop(self, env, payload):
         """#636: a bare signal, an `approver` string and a malformed ref are
         none of them authority. The loop keeps waiting for the grant, so an
@@ -1644,6 +1655,89 @@ class TestDevLoopWorkflow:
         assert result.approve is None and result.implement is None
         assert result.ended.startswith("abandoned")
         assert "mctl-agents-approve" not in calls and "mctl-agents-implement" not in calls
+
+    async def test_a_grant_found_already_approved_is_adopted_without_a_signal(self, env):
+        """claude P2 on #651: signals are per run, so a run that re-finds the
+        grant a human approved for an earlier run must act on it, not park
+        until it expires. Only `approved` is adopted."""
+        delegated: list[DelegatedApproveInput] = []
+        activities, calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True,
+            delegated_log=delegated,
+            approval_result=ApprovalRequestResult(ok=True, approval_ref="aar_decided_earlier", state="approved"),
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/8"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                result = await handle.result()
+
+        assert [d.approval_ref for d in delegated] == ["aar_decided_earlier"]
+        assert result.implement is not None and "mctl-agents-approve" not in calls
+
+    async def test_a_pending_grant_found_again_still_waits_for_the_decision(self, env):
+        delegated: list[DelegatedApproveInput] = []
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True, delegated_log=delegated)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/8"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await env.sleep(timedelta(days=1))
+            await handle.signal(DevLoopWorkflow.abandon, "nobody decided")
+            result = await handle.result()
+
+        assert delegated == [] and result.ended.startswith("abandoned")
+
+    async def test_an_end_that_did_not_land_is_retried_on_exit_with_its_own_phase(self, env):
+        """agy P2 on #651: the flip's end of the own `we_` (Succeeded) did not
+        land; the exit retry must land Succeeded, never Failed."""
+        attempts: list[str] = []
+        landed: list[str] = []
+
+        @activity.defn(name="advance_dispatched_execution")
+        async def flaky_advance(inp: AdvanceInput) -> str:
+            attempts.append(inp.phase)
+            if len(attempts) <= 10:  # the whole first activity's retry policy
+                raise ApplicationError("mctl-api down")
+            landed.append(inp.phase)
+            return "execution-existing we_test_own"
+
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in activities if getattr(a, "__temporal_activity_definition").name != "advance_dispatched_execution"
+        ]
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=[*activities, flaky_advance],
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/8"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await env.sleep(timedelta(days=30))
+            await handle.result()
+
+        assert set(attempts) == {"Succeeded"} and landed == ["Succeeded"]
 
     async def test_failed_approve_flip_never_implements(self, env):
         """If the approve CWFT fails (missing proposal dir, unexpected
@@ -5358,13 +5452,20 @@ class TestWorkContextResume:
         async def fake_record_execution(record: ExecutionRecord) -> None:
             return None
 
+        slug_lookups: list[str] = []
+
         @activity.defn(name="find_proposal_slug")
         async def gated_find_proposal_slug(service: str, issue_number: str) -> str | None:
-            slug_lookup_entered.set()
-            await slug_release.wait()
+            # #636: the lookups before the grant name its target; the gap
+            # under test is the first one after it, right before the flip.
+            if requests and not slug_lookups:
+                slug_lookups.append(issue_number)
+                slug_lookup_entered.set()
+                await slug_release.wait()
             return f"issue-{issue_number}-fake-title"
 
         delegated: list[DelegatedApproveInput] = []
+        requests: list[ApprovalRequestInput] = []
         async with Worker(
             env.client,
             task_queue=TASK_QUEUE,
@@ -5372,6 +5473,7 @@ class TestWorkContextResume:
             activities=[
                 *_canonical_activities(
                     delegated_log=delegated,
+                    approval_requests=requests,
                     # The loop's own canonical WorkItem (#636) is the one the
                     # resume names; a production start carries none of its own.
                     ensure_result=EnsuredExecution(
@@ -5427,6 +5529,13 @@ class TestWorkContextResume:
                 result = await handle.result()
 
         assert [d.approval_ref for d in delegated] == ["aar_bob"]
+        # claude P2 on #651: the resume recorded `e2` after the grant was
+        # requested, but the grant, the run token and the flip all name the
+        # loop's own `we_`, the one the grant is bound to.
+        assert [d.execution_id for d in delegated] == ["we_own"]
+        # agy P2 on #651: the transition cleared the grant, so a fresh one was
+        # asked for (a new attempt: a new key), on the same `we_`.
+        assert [(r.execution_id, r.attempt) for r in requests] == [("we_own", 0), ("we_own", 1)]
         assert result.implement is not None
         assert result.implement.phase == "Succeeded"
 

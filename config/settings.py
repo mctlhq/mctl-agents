@@ -103,7 +103,8 @@ SERVICES = [
 # the issue's work item must land in the tenant that owns the target.
 # `mctl` is the platform scope for platform work items; `labs` owns the
 # products developed through the DevLoop. A new SERVICES entry must be added
-# here (tests/test_settings_service_tenants.py fails otherwise).
+# here (tests/test_settings.py::test_every_service_has_a_work_item_tenant fails
+# otherwise).
 PLATFORM_TENANT = "mctl"
 SERVICE_TENANTS = {
     "mctl-web": PLATFORM_TENANT,

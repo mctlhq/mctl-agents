@@ -39,6 +39,9 @@ EXISTING = "work-item-existing"
 REFUSED = "work-item-refused"
 #: No usable answer (transport, 5xx, 401/403/408/429, a malformed body).
 UNKNOWN = "work-item-unknown"
+#: Our own `code` (not mctl-api's) for an answer naming this issue's item in
+#: a terminal state.
+TERMINAL_CODE = "work_item_terminal"
 
 #: 4xx statuses that say nothing about the request itself.
 _UNCERTAIN_4XX = frozenset({401, 403, 408, 425, 429})
@@ -101,8 +104,14 @@ def answer_from_create(status: int, payload: dict[str, Any], *, tenant: str, ext
             and item.get("external_key") == external_key
             and isinstance(state, str)
             and state in WORK_ITEM_STATES
-            and state not in TERMINAL_WORK_ITEM_STATES
         )
+        if describes_ours and state in TERMINAL_WORK_ITEM_STATES:
+            # This issue's item, definitely closed (an idempotent replay
+            # answers the stored item whatever its state): a retry would get
+            # the same answer, so it is a refusal that names it, not unknown.
+            return CreateAnswer(
+                REFUSED, work_item_id=str(item_id), reason=f"work item {item_id} is {state}", code=TERMINAL_CODE
+            )
         if not describes_ours:
             return CreateAnswer(UNKNOWN, reason=f"HTTP {status} does not describe an open work item for {external_key}")
         return CreateAnswer(CREATED if status == 201 else EXISTING, work_item_id=str(item_id))

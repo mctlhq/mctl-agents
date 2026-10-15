@@ -59,7 +59,6 @@ def test_a_2xx_that_describes_our_open_item_is_usable(status, verdict):
     [
         _item(tenant="labs"),  # another tenant
         _item(external_key=KEY + "0"),  # another issue
-        _item(state="completed"),  # a terminal item
         _item(id="oops"),  # not a wi_
         _item(id="wi_"),
         {"schema_version": "workitem/v0", "work_item": _item()["work_item"]},
@@ -70,6 +69,16 @@ def test_a_2xx_that_does_not_describe_our_open_item_is_unknown_never_adopted(pay
     answer = creation.answer_from_create(200, payload, tenant="mctl", external_key=KEY)
 
     assert answer.verdict == creation.UNKNOWN and not answer.usable
+
+
+@pytest.mark.parametrize("state", ["completed", "superseded", "archived"])
+def test_our_item_in_a_terminal_state_is_a_refusal_that_names_it(state):
+    """claude P3 on #651: definite, so a refusal (no retries), with a reason
+    that says what it is."""
+    answer = creation.answer_from_create(200, _item(state=state), tenant="mctl", external_key=KEY)
+
+    assert answer.verdict == creation.REFUSED and answer.code == creation.TERMINAL_CODE
+    assert answer.work_item_id == WI and state in answer.reason and not answer.usable
 
 
 @pytest.mark.parametrize(

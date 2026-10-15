@@ -1600,6 +1600,26 @@ async def test_a_pre_option_a_dispatched_loop_s_execution_is_still_reconciled(ap
     assert [a["engine_ref"] for a in reconcile] == ([old] if reconciled else [])
 
 
+@pytest.mark.parametrize(
+    ("state", "reconciled"), [(dx.LOOP_RUNNING, False), (dx.LOOP_CLOSED, True), (dx.LOOP_ABSENT, True)]
+)
+async def test_a_closed_canonical_loop_s_own_execution_is_reconciled(api, capsys, state, reconciled):
+    """claude P2 on #651: a canonical loop holds its own issue-keyed `we_`
+    open until the approve flip. Terminated before it could end it, nothing
+    else would, and mctl-api answers `execution_active` for the item from
+    then on. A loop still running ends its own."""
+    own = workflow_id_for(URL)
+    _ledger_entry(api, "temporal", own, "Running")
+    api.create_request("resume")
+    temporal = FakeTemporal({own: state}, held=False)
+
+    await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert (api.executions[0]["phase"] == "Failed") is reconciled
+    reconcile = [a for a in _audit(capsys.readouterr().out) if a["event"] == "reconcile"]
+    assert [a["engine_ref"] for a in reconcile] == ([own] if reconciled else [])
+
+
 def _ledger_entry(api: DispatchFakeApi, engine: str, ref: str, phase: str) -> None:
     api._next += 1
     api.executions.append(
@@ -1616,14 +1636,17 @@ def _ledger_entry(api: DispatchFakeApi, engine: str, ref: str, phase: str) -> No
 
 
 async def test_the_reconciliation_never_touches_another_engine_or_a_non_dispatched_loop(api, capsys):
-    """Non-terminal executions of an Argo run and of an issue-keyed loop that
-    Temporal says is closed are left alone; the fulfil then meets
-    `execution_active` and defers (the request stays claimed)."""
+    """Non-terminal executions of an Argo run and of another issue's
+    issue-keyed loop that Temporal says is closed are left alone; the fulfil
+    then meets `execution_active` and defers (the request stays claimed).
+    Only this request's own loop id is reconciled (#636, test above)."""
+    other = workflow_id_for(URL.replace("/issues/", "/issues/9"))
+    assert other != workflow_id_for(URL)
     _ledger_entry(api, "argo", "mctl-agents-investigate-abcde", "Succeeded")
-    _ledger_entry(api, "temporal", workflow_id_for(URL), "Running")
+    _ledger_entry(api, "temporal", other, "Running")
     _ledger_entry(api, "argo", "mctl-agents-investigate-fghij", "Running")
     rid = api.create_request("resume")
-    temporal = FakeTemporal({workflow_id_for(URL): dx.LOOP_CLOSED})
+    temporal = FakeTemporal({other: dx.LOOP_CLOSED, workflow_id_for(URL): dx.LOOP_CLOSED})
 
     outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
 
