@@ -183,12 +183,18 @@ async def test_a_given_work_item_skips_creation(fake):
     assert out.ok and fake.creates == [] and fake.attaches[0][0] == WI
 
 
-async def test_a_labs_service_opens_its_item_in_the_labs_tenant(fake):
+@pytest.mark.parametrize("service", ["mctl-api", "portfolio", "newton-mcp-gateway", "mctl-telegram"])
+async def test_an_issue_opens_its_item_where_the_telegram_surface_does(fake, service):
+    """mctl-api dedupes open work per (tenant, external_key), and the
+    Telegram surface opens every issue's item in `mctl`: a DevLoop item in
+    any other tenant (`labs` was the first guess for labs-deployed products)
+    would split one issue into two WorkItems."""
     await ActivityEnvironment().run(
-        ce.ensure_issue_execution, ce.EnsureExecutionInput("https://github.com/mctlhq/portfolio/issues/2", "wf-2")
+        ce.ensure_issue_execution,
+        ce.EnsureExecutionInput(f"https://github.com/mctlhq/{service}/issues/2", "wf-2"),
     )
 
-    assert fake.creates[0][0] == "labs"
+    assert fake.creates[0][0] == "mctl"
 
 
 async def test_an_unmapped_service_is_a_refusal_with_no_request(fake):

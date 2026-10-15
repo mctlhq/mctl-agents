@@ -100,9 +100,12 @@ SERVICES = [
 # The mctl-api tenant that owns each service's DevLoop WorkItems
 # (mctlhq/mctl-agents#636). `POST /api/v1/work-items` takes an explicit
 # tenant, and an unmapped service is a hard start failure, never a default:
-# the issue's work item must land in the tenant that owns the target.
-# `mctl` is the platform scope for platform work items; `labs` owns the
-# products developed through the DevLoop. A new SERVICES entry must be added
+# the issue's work item must land in the tenant where every other surface
+# opens it. mctl-api dedupes open work per (tenant, external_key), and the
+# Telegram surface opens an issue's item in `mctl` (MCTL_WORK_ITEM_TENANT in
+# mctl-gitops services/labs/mctl-telegram/values.yaml) whatever namespace the
+# target deploys to, so a DevLoop item in another tenant would split one
+# issue into two WorkItems. A new SERVICES entry must be added
 # here (tests/test_settings.py::test_every_service_has_a_work_item_tenant fails
 # otherwise).
 PLATFORM_TENANT = "mctl"
@@ -119,9 +122,9 @@ SERVICE_TENANTS = {
     "mctl-pairdesk": PLATFORM_TENANT,
     "mctl-academy": PLATFORM_TENANT,
     "seerrsense": PLATFORM_TENANT,
-    "portfolio": "labs",
+    "portfolio": PLATFORM_TENANT,
     ".github": PLATFORM_TENANT,
-    "newton-mcp-gateway": "labs",
+    "newton-mcp-gateway": PLATFORM_TENANT,
     "mctl-claude-remote": PLATFORM_TENANT,
 }
 
