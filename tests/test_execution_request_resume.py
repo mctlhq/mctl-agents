@@ -107,10 +107,13 @@ async def env():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         yield env
 
+
 APPROVE_OPERATION = "mctl-agents-approve"
 OPEN_PR = PRState(
     found=True, pr_url="https://github.com/mctlhq/mctl-telegram/pull/9", repo="mctl-telegram", number=9, state="OPEN"
 )
+
+
 def _submit_log() -> tuple[Any, list[tuple[str, dict]]]:
     """A fake Argo submit that records every operation. The approve flip is
     no longer one of them (#636): see `_delegated`."""
@@ -241,6 +244,13 @@ async def _end_through_the_grace(env: Any, workflow_id: str) -> Any:
     return await handle.result()
 
 
+async def _approve_fresh(handle: Any, gate: _Gate) -> None:
+    """alice decides the grant the loop asked for after the flip (#636: the
+    flip's grant is spent, so the re-approval is a new `aar_`)."""
+    await _wait_for(lambda: len(gate.requests) == 2)
+    await handle.signal(DevLoopWorkflow.approve, {"approval_ref": f"aar_test_a{gate.requests[-1].attempt}"})
+
+
 def _row(api: DispatchFakeApi, engine_ref: str) -> dict:
     return next(e for e in api.executions if e["engine_ref"] == engine_ref)
 
@@ -259,8 +269,10 @@ async def test_a_resume_onto_a_live_loop_is_delivered_and_the_loop_continues_und
     Telegram right after it (the loop's own `we_` ended with the flip, #636:
     while it was open mctl-api would refuse the resume). The loop binds
     alice's `we_`, and the gate before the implement step waits for a FRESH
-    approval: the resume never inherits bob's. alice approves, her execution
-    succeeds, implement runs."""
+    approval: the resume never inherits bob's. The loop asks for a new grant
+    on alice's `we_` (bob's was spent, and his `we_` ended), and neither
+    bob's spent `aar_` nor alice's login releases it; her decision on that
+    new grant does. Her execution succeeds, implement runs."""
     gate = _Gate()
     delegated, flips = _delegated()
     submit, ops = _submit_log()
@@ -291,7 +303,16 @@ async def test_a_resume_onto_a_live_loop_is_delivered_and_the_loop_continues_und
         assert _ops(ops, IMPLEMENTATION_OPERATION) == []
         assert api.executions[1]["phase"] == "Running"
 
+        # A fresh grant, asked for alice's `we_`, not bob's spent one.
+        await _wait_for(lambda: len(gate.requests) == 2)
+        fresh = gate.requests[-1]
+        assert fresh.execution_id == resumed["id"] and fresh.attempt > gate.requests[0].attempt
         await handle.signal(DevLoopWorkflow.approve, {"approver": "alice", "approval_ref": "aar_test"})
+        await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+        await anyio.sleep(1.0)
+        assert _ops(ops, IMPLEMENTATION_OPERATION) == [] and api.executions[1]["phase"] == "Running"
+
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": f"aar_test_a{fresh.attempt}"})
         await _wait_for(lambda: api.executions[1]["phase"] == "Succeeded")
         await _wait_for(lambda: bool(_ops(ops, IMPLEMENTATION_OPERATION)))
         assert len(flips) == 1  # alice's approval re-opens the gate, it does not flip again
@@ -391,9 +412,7 @@ async def test_a_crash_after_the_fulfil_loses_nothing(api, env):
         # `we_` from the store itself.
         await _wait_for(lambda: len(api.executions) == 2 and api.executions[1]["phase"] == "Running")
         await gate.release()
-        await env.client.get_workflow_handle(loop).signal(
-            DevLoopWorkflow.approve, {"approver": "alice", "approval_ref": "aar_test"}
-        )
+        await _approve_fresh(env.client.get_workflow_handle(loop), gate)
         await _wait_for(lambda: api.executions[1]["phase"] == "Succeeded")
         await _stop(env, loop)
 
@@ -843,7 +862,7 @@ async def test_a_terminal_advance_that_outlasts_its_retries_is_kept_open_and_lan
         # One more than DISPATCHED_ADVANCE_RETRY_POLICY's 10 attempts, and then some.
         api.unavailable_advances["Succeeded"] = 13
         handle = env.client.get_workflow_handle(loop)
-        await handle.signal(DevLoopWorkflow.approve, {"approver": "alice", "approval_ref": "aar_test"})
+        await _approve_fresh(handle, gate)
         for _ in range(12):
             if _row(api, ref)["phase"] == "Succeeded":
                 break

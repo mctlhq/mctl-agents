@@ -29,6 +29,7 @@ from config.settings import tenant_for_service
 from orchestrator.temporal.issue_ref import parse_issue_url
 from orchestrator.work_context import creation
 from orchestrator.work_context.client import WorkItemClient
+from orchestrator.work_context.contract import WORK_ITEM_ABSENT, WORK_ITEM_FOUND
 from orchestrator.work_context.executions import EXECUTION_ACTIVE, EXECUTION_REFUSED, EngineRun
 
 ENGINE_TEMPORAL = "temporal"
@@ -41,7 +42,8 @@ UNAVAILABLE_TYPE = "CanonicalExecutionUnavailable"
 @dataclass(frozen=True)
 class EnsureExecutionInput:
     issue_url: str
-    #: This workflow's own id: the engine ref of the execution.
+    #: This run's own engine ref (`issue_ref.run_engine_ref`), which also
+    #: scopes the create's idempotency key to the run.
     engine_ref: str
     #: A work item the caller already holds for this issue (`IssueRef`
     #: carries one when a surface started the loop). Empty: resolve by issue.
@@ -69,17 +71,39 @@ async def ensure_issue_execution(input: EnsureExecutionInput) -> EnsuredExecutio
     engine run to it as `Running`."""
     client = _client()
     work_item_id = input.work_item_id
-    if not work_item_id:
-        try:
-            service = parse_issue_url(input.issue_url).repo
-        except ValueError as exc:
-            return EnsuredExecution(ok=False, reason=str(exc))
-        tenant = tenant_for_service(service)
-        if tenant is None:
-            # An unmapped service is a hard failure, never a default tenant:
-            # the item must land in the tenant that owns the target.
-            return EnsuredExecution(ok=False, reason=f"no tenant is configured for service {service!r}")
-        created = await asyncio.to_thread(client.create_work_item, tenant, input.issue_url)
+    try:
+        service = parse_issue_url(input.issue_url).repo
+    except ValueError as exc:
+        return EnsuredExecution(ok=False, reason=str(exc))
+    tenant = tenant_for_service(service)
+    if tenant is None:
+        # An unmapped service is a hard failure, never a default tenant:
+        # the item must land in the tenant that owns the target.
+        return EnsuredExecution(ok=False, reason=f"no tenant is configured for service {service!r}")
+    if work_item_id:
+        # A supplied item is held to what a created one would be: this
+        # issue's, in this service's tenant. Otherwise the grant would be
+        # decided under another issue's or another tenant's item while the
+        # flip targets this issue's proposal.
+        answer = await asyncio.to_thread(client.get, work_item_id)
+        if answer.verdict == WORK_ITEM_ABSENT:
+            return EnsuredExecution(ok=False, reason=f"work item {work_item_id} does not exist")
+        if answer.verdict != WORK_ITEM_FOUND or answer.item is None:
+            raise ApplicationError(
+                f"work item {work_item_id}: {answer.verdict} {answer.reason}".strip(), type=UNAVAILABLE_TYPE
+            )
+        item = answer.item
+        if item.external_key != creation.canonical_issue_url(input.issue_url) or item.tenant != tenant:
+            return EnsuredExecution(
+                ok=False,
+                work_item_id=work_item_id,
+                reason=(
+                    f"work item {work_item_id} is {item.external_key!r} in tenant {item.tenant!r}, "
+                    f"not {creation.canonical_issue_url(input.issue_url)!r} in {tenant!r}"
+                ),
+            )
+    else:
+        created = await asyncio.to_thread(client.create_work_item, tenant, input.issue_url, input.engine_ref)
         if created.verdict == creation.UNKNOWN:
             raise ApplicationError(f"work item for {input.issue_url}: {created.reason}", type=UNAVAILABLE_TYPE)
         if not created.usable:

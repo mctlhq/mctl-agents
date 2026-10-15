@@ -287,6 +287,8 @@ class WorkItem:
     state_version: int = 0
     schema_version: str = ""
     external_key: str = ""
+    #: mctl-api's `tenant`; empty when the record carries none.
+    tenant: str = ""
 
     @staticmethod
     def from_payload(data: Any) -> WorkItem | None:
@@ -323,6 +325,7 @@ class WorkItem:
             state_version=state_version,
             schema_version=_str(data.get("schema_version")),
             external_key=external_key,
+            tenant=_str(data.get("tenant")),
         )
 
 

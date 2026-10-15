@@ -382,7 +382,7 @@ class WorkItemClient:
             return ExecutionAnswer(EXECUTION_UNKNOWN, reason=str(exc))
         return answer_from_attach(res.status, res.payload, work_item_id=work_item_id, run=run, phase=phase)
 
-    def create_work_item(self, tenant: str, issue_url: str) -> creation.CreateAnswer:
+    def create_work_item(self, tenant: str, issue_url: str, run: str) -> creation.CreateAnswer:
         """Resolve or create the open work item of `issue_url` in `tenant`
         (mctlhq/mctl-agents#636). mctl-api's create route is the idempotency
         boundary: the same issue lands on the same open item. A refusal is
@@ -391,7 +391,7 @@ class WorkItemClient:
 
         The policy checkpoint (#197) sits immediately before the POST."""
         try:
-            body = creation.create_body(tenant, issue_url)
+            body = creation.create_body(tenant, issue_url, run)
         except ValueError as exc:
             return creation.CreateAnswer(creation.REFUSED, reason=str(exc))
         refused = self._governed(

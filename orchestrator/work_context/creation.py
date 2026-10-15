@@ -69,19 +69,26 @@ def canonical_issue_url(issue_url: str) -> str:
     return f"https://github.com/{parts.owner.lower()}/{parts.repo.lower()}/issues/{int(parts.number)}"
 
 
-def idempotency_key_for(issue_url: str) -> str:
-    """`devloop:github:<owner>/<repo>#<number>`, normalised like the URL."""
+def idempotency_key_for(issue_url: str, run: str) -> str:
+    """`devloop:github:<owner>/<repo>#<number>@<run>`, normalised like the
+    URL. Scoped to the run: a retry of one run replays its own create, while
+    mctl-api keeps keys forever, so an issue-wide key would answer every
+    later run with the first run's item even after that item ended (a run
+    after it must open the issue's next item; the open-work dedupe on
+    `(tenant, external_key)` still joins an item that is open)."""
+    if not run:
+        raise ValueError("a work item create needs the run it is for")
     parts = parse_issue_url(issue_url)
-    return f"devloop:github:{parts.owner.lower()}/{parts.repo.lower()}#{int(parts.number)}"
+    return f"devloop:github:{parts.owner.lower()}/{parts.repo.lower()}#{int(parts.number)}@{run}"
 
 
-def create_body(tenant: str, issue_url: str) -> dict[str, Any]:
+def create_body(tenant: str, issue_url: str, run: str) -> dict[str, Any]:
     parts = parse_issue_url(issue_url)
     return {
         "tenant": tenant,
         "title": f"DevLoop {parts.owner.lower()}/{parts.repo.lower()}#{int(parts.number)}",
         "external_key": canonical_issue_url(issue_url),
-        "idempotency_key": idempotency_key_for(issue_url),
+        "idempotency_key": idempotency_key_for(issue_url, run),
         "visibility": "tenant",
         "origin_surface": "api",
     }

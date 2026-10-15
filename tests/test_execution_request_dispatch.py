@@ -51,7 +51,12 @@ from orchestrator.temporal.activities.execution_requests import (
 from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.constants import TASK_QUEUE
-from orchestrator.temporal.issue_ref import is_request_engine_ref, request_engine_ref, workflow_id_for
+from orchestrator.temporal.issue_ref import (
+    is_request_engine_ref,
+    request_engine_ref,
+    run_engine_ref,
+    workflow_id_for,
+)
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
 from orchestrator.work_context import execution_requests as xr
 from orchestrator.work_context.client import WorkItemClient, WorkItemUnavailable, _HTTPResult
@@ -1142,10 +1147,11 @@ async def test_resume_onto_a_live_loop_is_delivered_and_onto_a_finished_loop_con
         assert (await env.client.get_workflow_handle(first_loop).describe()).run_id != first_run
         await _wait_for(lambda: len(seen) == 2)
         # The continuation's `we_` is held open like any other loop's, until
-        # its loop exits: abandoned here, never approved, so it ends Failed.
+        # its loop exits: abandoned before any approval, it ends with its
+        # investigator's phase (claude P2 on #651), as a dispatched one did.
         await _wait_for(lambda: api.executions[2]["phase"] == "Running")
         await _end(env, continued.workflow_id)
-        assert api.executions[2]["phase"] == "Failed"
+        assert api.executions[2]["phase"] == "Succeeded"
 
     first_we, _resumed_we, continued_we = (e["id"] for e in api.executions)
     assert [p["execution_id"] for p in seen] == [first_we, continued_we]
@@ -1266,10 +1272,10 @@ async def test_offline_end_to_end_request_to_a_snapshot_sealed_for_the_dispatche
     assert params["execution_request_id"] == rid
     assert result.error is None and result.skipped_reason is None, result
     # Exactly one execution: the dispatcher's, attached at fulfilment and
-    # ended by the loop (Failed: abandoned before any approval); the
-    # investigator attached none of its own.
+    # ended by the loop with its investigator's phase (abandoned before any
+    # approval, claude P2 on #651); the investigator attached none of its own.
     assert [(e["id"], e["engine"], e["engine_ref"], e["phase"]) for e in api.executions] == [
-        (we, "temporal", request_engine_ref(loop_id, rid), "Failed"),
+        (we, "temporal", request_engine_ref(loop_id, rid), "Succeeded"),
     ]
     # A snapshot sealed for exactly that execution, naming it.
     assert list(api.snapshots) == [we]
@@ -1609,7 +1615,10 @@ async def test_a_closed_canonical_loop_s_own_execution_is_reconciled(api, capsys
     else would, and mctl-api answers `execution_active` for the item from
     then on. A loop still running ends its own."""
     own = workflow_id_for(URL)
-    _ledger_entry(api, "temporal", own, "Running")
+    # The loop's `we_` is keyed by its run (P1 on #651: a restart is a new
+    # execution), and the bare loop id is a dispatched hop's ref, not this.
+    own_ref = run_engine_ref(own, "r1")
+    _ledger_entry(api, "temporal", own_ref, "Running")
     api.create_request("resume")
     temporal = FakeTemporal({own: state}, held=False)
 
@@ -1617,7 +1626,7 @@ async def test_a_closed_canonical_loop_s_own_execution_is_reconciled(api, capsys
 
     assert (api.executions[0]["phase"] == "Failed") is reconciled
     reconcile = [a for a in _audit(capsys.readouterr().out) if a["event"] == "reconcile"]
-    assert [a["engine_ref"] for a in reconcile] == ([own] if reconciled else [])
+    assert [a["engine_ref"] for a in reconcile] == ([own_ref] if reconciled else [])
 
 
 def _ledger_entry(api: DispatchFakeApi, engine: str, ref: str, phase: str) -> None:

@@ -74,6 +74,29 @@ def request_engine_ref(loop_workflow_id: str, execution_request_id: str) -> str:
     return f"{loop_workflow_id}{REQUEST_ENGINE_REF_SEPARATOR}{execution_request_id}"
 
 
+#: Marks the engine ref of a canonical loop's own execution (#636).
+RUN_ENGINE_REF_MARK = "run_"
+
+
+def run_engine_ref(loop_workflow_id: str, run_id: str) -> str:
+    """The `engine_ref` of a canonical DevLoop run's own execution (#636):
+    `<loop id>#run_<run id>`.
+
+    Per RUN, not per loop: mctl-api never re-opens an ended execution
+    (`(work item, engine, engine_ref)` is its identity, and attaching an
+    ended one as Running is `invalid_transition`), and a failed loop may be
+    started again under the same workflow id. A bare workflow id would make
+    that second run's start fail for good. mctl-api reads the loop half
+    (`strings.Cut(engine_ref, "#")`) to bind a grant and to find a loop's
+    open executions, so the suffix changes nothing there."""
+    return f"{loop_workflow_id}{REQUEST_ENGINE_REF_SEPARATOR}{RUN_ENGINE_REF_MARK}{run_id}"
+
+
+def is_run_engine_ref(engine_ref: str) -> bool:
+    """Is `engine_ref` a canonical loop run's own (`#run_`)?"""
+    return f"{REQUEST_ENGINE_REF_SEPARATOR}{RUN_ENGINE_REF_MARK}" in engine_ref
+
+
 def is_request_engine_ref(engine_ref: str) -> bool:
     """Was `engine_ref` written by the dispatcher for an execution request?
     The `#xr_` suffix is the proof: no workflow id has it."""

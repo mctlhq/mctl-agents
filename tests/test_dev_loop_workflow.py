@@ -27,8 +27,8 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner
 
 import orchestrator.human_input as hi
+from orchestrator import action_approvals, tracing
 from orchestrator import policy_checkpoint as pc
-from orchestrator import tracing
 from orchestrator.context_snapshot import ExecutionCorrelation as _ExecutionCorrelation
 from orchestrator.lifecycle.contract import Owner, answer_from
 from orchestrator.temporal.activities.action_approval import ApprovalPoll, GatedActionInput, GatedActionResult
@@ -55,6 +55,7 @@ from orchestrator.temporal.constants import (
     argo_admission_width,
     implementation_max_concurrent_activities,
 )
+from orchestrator.temporal.issue_ref import is_run_engine_ref, loop_id_of_engine_ref
 from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.action_approval import ActionApprovalWaitWorkflow, ApprovalWaitResult
 from orchestrator.temporal.workflows.dev_loop import (
@@ -248,7 +249,10 @@ def _canonical_activities(
     async def fake_request_devloop_approval(inp: ApprovalRequestInput) -> ApprovalRequestResult:
         if approval_requests is not None:
             approval_requests.append(inp)
-        return approval_result or ApprovalRequestResult(ok=True, approval_ref="aar_test", state="pending")
+        # Like mctl-api, a new attempt is a new idempotency key and so a new
+        # `aar_`; asking again for the same attempt finds the same one.
+        ref = "aar_test" if inp.attempt == 0 else f"aar_test_a{inp.attempt}"
+        return approval_result or ApprovalRequestResult(ok=True, approval_ref=ref, state="pending")
 
     @activity.defn(name="submit_delegated_approve")
     async def fake_submit_delegated_approve(inp: DelegatedApproveInput) -> DelegatedApproveResult:
@@ -1579,11 +1583,72 @@ class TestDevLoopWorkflow:
 
         assert "refusing to request an approval for it" in str(excinfo.value.cause)
 
+    async def test_a_restarted_loop_attaches_a_new_execution_of_its_own(self, env):
+        """P1 on #651: a failed loop is restarted under the same workflow id
+        (ALLOW_DUPLICATE_FAILED_ONLY). Its first run's `we_` has ended, and
+        mctl-api never re-opens an ended execution, so a run keyed only by
+        the loop id could never start again. Each run asks for its own."""
+        ensure_calls: list[EnsureExecutionInput] = []
+        activities, _calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, ensure_calls=ensure_calls
+        )
+        wf_id = f"dev-loop-test-{uuid.uuid4()}"
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            for n in (1, 2):
+                handle = await env.client.start_workflow(
+                    DevLoopWorkflow.run,
+                    IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/12"),
+                    id=wf_id,
+                    task_queue=TASK_QUEUE,
+                )
+                with anyio.fail_after(10):
+                    while len(ensure_calls) < n:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                        await anyio.sleep(0.05)
+                await handle.signal(DevLoopWorkflow.abandon, {"reason": "restart"})
+                await handle.result()
+
+        refs = [c.engine_ref for c in ensure_calls]
+        assert len(refs) == 2 and refs[0] != refs[1]
+        assert all(is_run_engine_ref(r) and loop_id_of_engine_ref(r) == wf_id for r in refs)
+
+    @pytest.mark.parametrize("ref", ["", "aar_x\r\nX-Evil: 1", "not-a-grant"])
+    async def test_a_malformed_requested_ref_ends_the_loop_before_any_flip(self, env, ref):
+        """claude P3 on #651: the ref mctl-api answers the request with is a
+        header value at the flip, like a signalled one, so it gets the same
+        shape check; a malformed one is a refusal, never exercised."""
+        delegated: list[DelegatedApproveInput] = []
+        activities, calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True,
+            delegated_log=delegated,
+            approval_result=ApprovalRequestResult(ok=True, approval_ref=ref, state="approved"),
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await env.client.execute_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/13"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+
+        assert result.ended.startswith("approval request refused")
+        assert delegated == [] and "mctl-agents-implement" not in calls
+
+    def test_the_canonical_park_is_as_long_as_the_grant_it_waits_for(self):
+        """P3 on #651: the park is a literal (replay-stable), the grant's TTL
+        cap is mctl-api's. A grant that expires before the park, or a park
+        that ends while its grant is still decidable, are both wrong."""
+        assert dev_loop.CANONICAL_APPROVAL_WAIT.total_seconds() == action_approvals.MAX_TTL_S
+
     async def test_the_signalled_approval_ref_is_the_one_exercised_and_no_approver_travels(self, env):
         """#636, mutation pins 4 and 6: the flip exercises exactly the `aar_`
-        the signal carried (not the one this loop requested), and no human
-        identity reaches the delegated operation: the legacy `approver` the
-        same signal also carries is dropped on the floor."""
+        this loop requested and the signal carried, and no human identity
+        reaches the delegated operation: the legacy `approver` the same signal
+        also carries is dropped on the floor. A signal carrying any other
+        `aar_` (a stale grant of an earlier attempt, say) releases nothing."""
         delegated: list[DelegatedApproveInput] = []
         requests: list[ApprovalRequestInput] = []
         activities, calls, investigate_ran, _ownership_ops = _fake_activities(
@@ -1600,12 +1665,16 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(
-                DevLoopWorkflow.approve, {"approver": "mashkovd", "approval_ref": "aar_the_decided_one"}
-            )
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_a_stale_one"})
+            with anyio.fail_after(10):
+                while not requests:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await anyio.sleep(0.05)
+            await anyio.sleep(0.5)
+            assert delegated == []
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "mashkovd", "approval_ref": "aar_test"})
             await handle.result()
 
-        assert [d.approval_ref for d in delegated] == ["aar_the_decided_one"]
+        assert [d.approval_ref for d in delegated] == ["aar_test"]
         assert not [f for f in dataclasses.fields(DelegatedApproveInput) if "approver" in f.name]
         assert "mctl-agents-approve" not in calls
         # The grant was asked for this loop's own `we_` and the flip's target.
@@ -5228,7 +5297,8 @@ class TestWorkContextResume:
             assert after.execution_id == "e2"
             assert after.execution_sequence == 2
 
-            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            # carol's transition asked for a fresh grant (a new attempt).
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test_a1"})
             result = await handle.result()
 
         assert result.implement is not None
@@ -5334,6 +5404,48 @@ class TestWorkContextResume:
             await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.result()
 
+    async def test_a_transition_while_parked_asks_for_a_fresh_grant(self, env):
+        """claude P2 on #651: a transition that lands while the loop is
+        already parked on its grant must not strand it. The park wakes, asks
+        for the new attempt's grant, and a decision on that one releases it."""
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        activities, calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, approval_requests=requests, delegated_log=delegated
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/268", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                while not requests:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await anyio.sleep(0.05)
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            with anyio.fail_after(10):
+                while len(requests) < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await anyio.sleep(0.05)
+            # The grant asked before the transition releases nothing now.
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await handle.query(DevLoopWorkflow.work_context)
+            assert delegated == []
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test_a1"})
+            result = await handle.result()
+
+        assert [r.attempt for r in requests] == [0, 1]
+        assert [d.approval_ref for d in delegated] == ["aar_test_a1"]
+        assert result.implement is not None and calls.count("mctl-agents-implement") == 1
+
     async def test_a_surface_transition_clears_approval_until_a_fresh_approve(self, env):
         activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
         async with Worker(
@@ -5368,7 +5480,12 @@ class TestWorkContextResume:
             assert state.executions[-1].surface_transition is True
             assert "mctl-agents-implement" not in calls  # approval cleared, not inherited
 
+            # alice's grant does not carry over either: bob decides the
+            # fresh one the transition asked for.
             await handle.signal(DevLoopWorkflow.approve, {"approver": "bob", "approval_ref": "aar_test"})
+            await handle.query(DevLoopWorkflow.work_context)
+            assert "mctl-agents-implement" not in calls
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "bob", "approval_ref": "aar_test_a1"})
             result = await handle.result()
 
         assert calls.count("mctl-agents-implement") == 1
@@ -5398,7 +5515,7 @@ class TestWorkContextResume:
                     "actor_kind": "human", "actor_id": "alice",
                 },
             )
-            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice", "approval_ref": "aar_test"})
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice", "approval_ref": "aar_test_a1"})
 
             # A second resume from the SAME surface and actor must not
             # re-litigate a decision nobody changed.
@@ -5418,7 +5535,8 @@ class TestWorkContextResume:
         assert result.implement is not None
         assert result.implement.phase == "Succeeded"
 
-    async def test_prod_shaped_start_resume_transition_fires_and_flip_waits(self, env):
+    @pytest.mark.parametrize("again_while_parked", [False, True])
+    async def test_prod_shaped_start_resume_transition_fires_and_flip_waits(self, env, again_while_parked):
         """The two production-shaped guarantees, on a loop started WITHOUT a
         work_item_id (exactly what orchestrator/temporal/start.py submits):
 
@@ -5429,6 +5547,10 @@ class TestWorkContextResume:
            was consumed by the first gate) re-arms approval BEFORE the
            approve CWFT, so the durable flip is attributed to the actor who
            re-approved, never to "unknown".
+
+        `again_while_parked` (claude P2 on #651): a second transition that
+        lands while the loop is parked at that pre-flip gate wakes it, and
+        it asks for that attempt's grant in turn.
         """
         seen_params: dict[str, dict[str, str]] = {}
         investigate_ran = anyio.Event()
@@ -5524,18 +5646,43 @@ class TestWorkContextResume:
             assert delegated == []
             assert "mctl-agents-implement" not in seen_params
 
-            await handle.signal(DevLoopWorkflow.approve, {"approver": "bob", "approval_ref": "aar_bob"})
+            decided = "aar_test_a1"
+            if again_while_parked:
+                with anyio.fail_after(10):
+                    while len(requests) < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                        await anyio.sleep(0.05)
+                # A stale decision (alice's spent grant) releases nothing, but
+                # closes bob's pending window, so carol's resume is accepted.
+                await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+                await handle.signal(
+                    DevLoopWorkflow.resume,
+                    {
+                        "work_item_id": "wi-1", "execution_id": "e3", "surface": "github",
+                        "actor_kind": "human", "actor_id": "carol",
+                    },
+                )
+                with anyio.fail_after(10):
+                    while len(requests) < 3:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                        await anyio.sleep(0.05)
+                await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test_a1"})
+                await handle.query(DevLoopWorkflow.work_context)
+                assert delegated == []
+                decided = "aar_test_a2"
+            # The fresh grant the (last) transition asked for is decided.
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "bob", "approval_ref": decided})
             with anyio.fail_after(10):
                 result = await handle.result()
 
-        assert [d.approval_ref for d in delegated] == ["aar_bob"]
+        assert [d.approval_ref for d in delegated] == [decided]
         # claude P2 on #651: the resume recorded `e2` after the grant was
         # requested, but the grant, the run token and the flip all name the
         # loop's own `we_`, the one the grant is bound to.
         assert [d.execution_id for d in delegated] == ["we_own"]
         # agy P2 on #651: the transition cleared the grant, so a fresh one was
         # asked for (a new attempt: a new key), on the same `we_`.
-        assert [(r.execution_id, r.attempt) for r in requests] == [("we_own", 0), ("we_own", 1)]
+        assert [(r.execution_id, r.attempt) for r in requests] == [
+            ("we_own", n) for n in range(3 if again_while_parked else 2)
+        ]
         assert result.implement is not None
         assert result.implement.phase == "Succeeded"
 

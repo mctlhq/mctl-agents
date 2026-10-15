@@ -181,7 +181,10 @@ async def record_resumed(env: WorkflowEnvironment) -> dict[str, Any]:
         assert resumed.action == "fulfilled" and resumed.engine_ref.endswith(f"#{rid}"), resumed
         await _wait_for(lambda: len(api.executions) == 2 and api.executions[1]["phase"] == "Running")
         await gate.release()
-        await handle.signal(DevLoopWorkflow.approve, {"approver": "alice", "approval_ref": "aar_test"})
+        # The flip spent bob's grant: alice decides the fresh one the loop
+        # asks for on her `we_` (#636).
+        await _wait_for(lambda: len(gate.requests) == 2)
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": f"aar_test_a{gate.requests[-1].attempt}"})
         await _wait_for(lambda: api.executions[1]["phase"] == "Succeeded")
         # The rest of the loop (merge watch, deploy observation, incident
         # watch) waits on timers and retry backoffs, which the test server
@@ -246,7 +249,10 @@ async def record_issue_keyed(env: WorkflowEnvironment) -> dict[str, Any]:
         assert again.verdict == dx.DELIVERED
         handle = env.client.get_workflow_handle(loop)
         await gate.release()
-        await handle.signal(DevLoopWorkflow.approve, {"approver": "alice", "approval_ref": "aar_test"})
+        # The flip spent bob's grant: alice decides the fresh one the loop
+        # asks for on her `we_` (#636).
+        await _wait_for(lambda: len(gate.requests) == 2)
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": f"aar_test_a{gate.requests[-1].attempt}"})
         await _wait_for(lambda: api.executions[1]["phase"] == "Succeeded")
         await env.sleep(timedelta(days=30))
         await handle.result()

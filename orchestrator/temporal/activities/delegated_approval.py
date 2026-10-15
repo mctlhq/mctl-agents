@@ -188,13 +188,13 @@ def _code_of(response: httpx.Response) -> str:
 
 def _refusal_of(what: str, response: httpx.Response) -> DelegatedApproveResult | None:
     """Classify a non-2xx answer: a definite refusal (returned), or None when
-    it is uncertainty the caller raises for a bounded retry. Only the status
-    and the typed code are ever kept."""
+    it is uncertainty the caller raises for a bounded retry. Any 5xx is
+    uncertainty, typed or not (claude P3 / agy P2 on #651): every refusal
+    mctl-api means as definite is a 4xx. Only the status and the typed code
+    are ever kept."""
     code = _code_of(response)
     status = response.status_code
-    if status >= 500 and not code:
-        return None
-    if code in _RETRYABLE_CODES or status in (408, 425, 429):
+    if status >= 500 or code in _RETRYABLE_CODES or status in (408, 425, 429):
         return None
     return DelegatedApproveResult(refusal=f"{what}: HTTP {status} {code}".strip(), code=code)
 

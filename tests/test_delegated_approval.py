@@ -219,6 +219,9 @@ RETRYABLE = [
     (503, "agent_run_tokens_unavailable"),
     (502, ""),
     (500, ""),
+    # A typed 5xx is uncertainty too, whatever its code says.
+    (500, "internal_error"),
+    (504, "gateway_timeout"),
     (429, ""),
 ]
 

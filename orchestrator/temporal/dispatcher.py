@@ -76,6 +76,7 @@ from orchestrator.temporal.issue_ref import (
     MAX_ENGINE_REF_BYTES,
     REQUEST_ENGINE_REF_SEPARATOR,
     is_request_engine_ref,
+    is_run_engine_ref,
     loop_id_of_engine_ref,
     parse_issue_url,
     request_engine_ref,
@@ -533,9 +534,9 @@ class Dispatcher:
         for a loop that took it, and Temporal forgets a workflow only after it
         closed and its namespace retention expired, while a RUNNING workflow
         is always found. Also (#636) the own `we_` a canonical loop attached
-        under the bare issue-keyed id of THIS request's loop, once that loop
-        is CLOSED or ABSENT: a terminated loop never ends it, and it would
-        block the item for good. An execution of another engine, one the loop
+        as `<THIS request's loop id>#run_<run id>`, once that loop is CLOSED
+        or ABSENT: a terminated loop never ends it, and it would block the
+        item for good. An execution of another engine, one the loop
         seeded itself, or one of a RUNNING loop is never touched (a running loop may
         still bind and end it). The write is the same attach-or-advance the
         loop itself uses, through the policy checkpoint; its answer is logged
@@ -547,10 +548,10 @@ class Dispatcher:
             ref = execution.temporal_workflow_id
             if not ref or ref == engine_ref:
                 continue
-            # #636: a canonical loop attaches its own `we_` under the bare
-            # issue-keyed id and holds it open until its approve flip; a
-            # TERMINATED one never ends it. Only this request's own loop id.
-            own_canonical = ref == loop_id_of_engine_ref(engine_ref)
+            # #636: a canonical loop attaches its own `we_` (`<loop id>#run_<run
+            # id>`) and holds it open until its approve flip; a TERMINATED one
+            # never ends it. Only runs of this request's own loop id.
+            own_canonical = is_run_engine_ref(ref) and loop_id_of_engine_ref(ref) == loop_id_of_engine_ref(engine_ref)
             dispatched = is_request_engine_ref(ref) or ref.startswith(PRE_ISSUE_KEYED_DISPATCH_PREFIX)
             if not dispatched and not own_canonical:
                 continue
