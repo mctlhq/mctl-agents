@@ -2005,6 +2005,9 @@ class DevLoopWorkflow:
         # one: the grant is created only now.
         if not self._approval_ref:
             self._approved = False
+        # A transition can land while the request is in flight (claude P2 on
+        # #651): its answer is then the ended attempt's, and is not adopted.
+        attempt = self._approval_attempt
         try:
             requested: ApprovalRequestResult = await workflow.execute_activity(
                 request_devloop_approval,
@@ -2013,7 +2016,7 @@ class DevLoopWorkflow:
                     service=target_repo,
                     slug=slug,
                     ttl_seconds=int(CANONICAL_APPROVAL_WAIT.total_seconds()),
-                    attempt=self._approval_attempt,
+                    attempt=attempt,
                 ),
                 start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
                 retry_policy=FAST_ACTIVITY_RETRY_POLICY,
@@ -2025,6 +2028,10 @@ class DevLoopWorkflow:
                 human_input=human_input,
                 ended=f"approval request unavailable: {type(exc.cause).__name__ if exc.cause else 'unknown'}",
             )
+        if attempt != self._approval_attempt:
+            # `_grant_refresh` is still set, so the park asks again under
+            # the new attempt.
+            return None
         if not requested.ok:
             return DevLoopResult(
                 investigate=investigate_result,
@@ -3424,13 +3431,11 @@ class DevLoopWorkflow:
                     continuation_params.pop("work_item_id", None)
                     continuation_params.pop("execution_id", None)
                 continuation_params["human_input_responses"] = json.dumps(accepted_answers)
-                if self._canonical_open:
-                    # The own `we_` is still open (#636): it ends with the
-                    # latest investigate's phase, and Failed if this one
-                    # never finishes (agy P2 on #651).
-                    self._canonical_end_phase = "Failed"
                 investigate_result = await _run_cwft("mctl-agents-investigate", continuation_params)
                 if self._canonical_open:
+                    # The own `we_` is still open (#636): it ends with the
+                    # latest investigate's phase (agy P2 on #651). A raise
+                    # ends it Failed through `run`'s own exit handling.
                     self._canonical_end_phase = "Succeeded" if investigate_result.succeeded else "Failed"
                 await _record("issue-investigator", investigator_release, investigate_result, target_repo)
                 if not investigate_result.succeeded:

@@ -78,6 +78,11 @@ def _client() -> WorkItemClient:
 async def ensure_issue_execution(input: EnsureExecutionInput) -> EnsuredExecution:
     """Resolve (or create) the issue's WorkItem and attach this workflow's
     engine run to it as `Running`."""
+    if not is_run_engine_ref(input.engine_ref):
+        # Both the create key and the attach ref are per run: without a run
+        # suffix they would be issue-wide again, and an ended item or `we_`
+        # would answer every later run (claude P3 on #651).
+        return EnsuredExecution(ok=False, reason=f"engine ref {input.engine_ref!r} names no run")
     client = _client()
     work_item_id = input.work_item_id
     try:
@@ -116,10 +121,6 @@ async def ensure_issue_execution(input: EnsureExecutionInput) -> EnsuredExecutio
     else:
         # The run suffix alone scopes the key to this run; the issue is
         # already in it (claude P3 on #651: the whole ref repeated it).
-        if not is_run_engine_ref(input.engine_ref):
-            # Without a run suffix the key would be issue-wide again, and an
-            # ended item would answer every later run (claude P3 on #651).
-            return EnsuredExecution(ok=False, reason=f"engine ref {input.engine_ref!r} names no run")
         run_scope = input.engine_ref.rpartition("#")[2]
         created = await asyncio.to_thread(client.create_work_item, tenant, input.issue_url, run_scope)
         if created.verdict == creation.UNKNOWN:

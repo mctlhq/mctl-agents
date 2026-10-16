@@ -445,12 +445,14 @@ async def test_a_dead_run_whose_end_is_refused_answers_the_refusal_without_retry
     assert not out.ok and "execution_active" in out.reason and len(fake.attaches) == 2
 
 
-async def test_a_create_for_a_ref_that_names_no_run_is_refused(fake):
-    """claude P3 on #651: without a `#run_` suffix the create key would be
-    issue-wide, so an ended item would answer every later run."""
+@pytest.mark.parametrize("supplied", ["", WI])
+async def test_a_ref_that_names_no_run_is_refused_before_any_request(fake, supplied):
+    """claude P3 on #651: without a `#run_` suffix the create key and the
+    attach ref would be issue-wide, so an ended item or `we_` would answer
+    every later run; a supplied item is no exception."""
     out = await ActivityEnvironment().run(
-        ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "dev-loop-mctlhq-mctl-telegram-7")
+        ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "dev-loop-mctlhq-mctl-telegram-7", supplied)
     )
 
     assert not out.ok and "names no run" in out.reason
-    assert fake.runs == [] and fake.attaches == []
+    assert fake.creates == fake.gets == fake.runs == fake.attaches == []

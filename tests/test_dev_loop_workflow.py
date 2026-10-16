@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC as _UTC
 from datetime import datetime as _datetime
 from datetime import timedelta
+from typing import Any
 
 import anyio
 import pytest
@@ -226,6 +227,7 @@ def _canonical_activities(
     ensure_raises: bool = False,
     approval_requests: list[ApprovalRequestInput] | None = None,
     approval_result: ApprovalRequestResult | None = None,
+    approval_hook: Any = None,
     delegated_log: list[DelegatedApproveInput] | None = None,
     delegated_result: DelegatedApproveResult | None = None,
     advance_log: list[AdvanceInput] | None = None,
@@ -249,6 +251,8 @@ def _canonical_activities(
     async def fake_request_devloop_approval(inp: ApprovalRequestInput) -> ApprovalRequestResult:
         if approval_requests is not None:
             approval_requests.append(inp)
+        if approval_hook is not None and (hooked := await approval_hook(inp)) is not None:
+            return hooked
         # Like mctl-api, a new attempt is a new idempotency key and so a new
         # `aar_`; asking again for the same attempt finds the same one.
         ref = "aar_test" if inp.attempt == 0 else f"aar_test_a{inp.attempt}"
@@ -362,6 +366,7 @@ def _fake_activities(
     ensure_raises: bool = False,
     approval_requests: list[ApprovalRequestInput] | None = None,
     approval_result: ApprovalRequestResult | None = None,
+    approval_hook: Any = None,
     delegated_log: list[DelegatedApproveInput] | None = None,
     delegated_result: DelegatedApproveResult | None = None,
     advance_log: list[AdvanceInput] | None = None,
@@ -756,6 +761,7 @@ def _fake_activities(
             ensure_raises=ensure_raises,
             approval_requests=approval_requests,
             approval_result=approval_result,
+            approval_hook=approval_hook,
             delegated_log=delegated_log,
             delegated_result=delegated_result,
             advance_log=advance_log,
@@ -5443,6 +5449,55 @@ class TestWorkContextResume:
             # The grant asked before the transition releases nothing now.
             await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.query(DevLoopWorkflow.work_context)
+            assert delegated == []
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test_a1"})
+            result = await handle.result()
+
+        assert [r.attempt for r in requests] == [0, 1]
+        assert [d.approval_ref for d in delegated] == ["aar_test_a1"]
+        assert result.implement is not None and calls.count("mctl-agents-implement") == 1
+
+    async def test_a_transition_during_the_grant_request_never_adopts_the_old_attempt(self, env):
+        """claude P2 on #651: the transition lands while the grant request is
+        in flight. Its answer is the ended attempt's, so it is not adopted:
+        a decision on it releases nothing, and the loop asks again."""
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        handles: list[Any] = []
+
+        async def transition_once(inp: ApprovalRequestInput) -> ApprovalRequestResult | None:
+            if inp.attempt != 0:
+                return None
+            await handles[0].signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            # alice had already approved attempt 0's grant: adopting that
+            # answer now would hand bob her decision.
+            return ApprovalRequestResult(ok=True, approval_ref="aar_test", state="approved")
+
+        activities, calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, approval_requests=requests, approval_hook=transition_once, delegated_log=delegated
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/268", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            handles.append(handle)
+            with anyio.fail_after(10):
+                while len(requests) < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await anyio.sleep(0.05)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await handle.query(DevLoopWorkflow.work_context)
+            await anyio.sleep(0.5)
             assert delegated == []
             await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test_a1"})
             result = await handle.result()
