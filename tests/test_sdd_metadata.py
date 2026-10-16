@@ -58,16 +58,13 @@ def test_t6_skip_specs(tmp_path):
     assert load_change_metadata(tmp_path / "c") is not None
 
 
+@pytest.mark.parametrize("case", [str, str.title, str.upper], ids=["lower", "title", "upper"])
 @pytest.mark.parametrize("key", sorted(FORBIDDEN_EXECUTION_KEYS))
-def test_t7_forbidden_keys_rejected_non_strict(key, tmp_path):
-    data = {"schema": "mctl-devloop", key: "x"}
-    with pytest.raises(MetadataError, match=key):
-        dump_change_metadata(data, tmp_path, strict=False)
-    assert not (tmp_path / ".openspec.yaml").exists()
-    data = {"schema": "mctl-devloop", f"x-mctl-{key}": "x"}
-    with pytest.raises(MetadataError, match=key):
-        dump_change_metadata(data, tmp_path, strict=False)
-    assert not (tmp_path / ".openspec.yaml").exists()
+def test_t7_forbidden_keys_rejected_non_strict(key, case, tmp_path):
+    for name in (case(key), f"x-mctl-{case(key)}"):
+        with pytest.raises(MetadataError):
+            dump_change_metadata({"schema": "mctl-devloop", name: "x"}, tmp_path, strict=False)
+        assert not (tmp_path / ".openspec.yaml").exists()
 
 
 def test_t7_forbidden_key_in_file_rejected():

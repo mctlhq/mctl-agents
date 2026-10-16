@@ -83,13 +83,19 @@ def test_abort_does_not_archive_or_touch_specs(tmp_path):
 
 def test_review_fixes(tmp_path):
     import pytest
+
     from orchestrator.sdd.apply import ApplyAbort, archive_change
     from orchestrator.sdd.spec_model import GrammarError, parse_delta
 
     d = parse_delta("## ADDED Requirements\n\n### Requirement: A\n- **THEN** x\n\n~~~md\n## Other\n~~~\n")
     assert len(d.added) == 1
     with pytest.raises(GrammarError):
-        parse_delta("## RENAMED Requirements\n- FROM: `### Requirement: A`\n- FROM: `### Requirement: B`\n- TO: `### Requirement: C`\n")
+        parse_delta(
+            "## RENAMED Requirements\n"
+            "- FROM: `### Requirement: A`\n"
+            "- FROM: `### Requirement: B`\n"
+            "- TO: `### Requirement: C`\n"
+        )
     with pytest.raises(ApplyAbort):
         archive_change(tmp_path, "missing")
     assert not (tmp_path / "changes" / "archive").exists()

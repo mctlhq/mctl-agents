@@ -52,3 +52,22 @@ def test_sizes_recorded():
     cur, cand = measure(t), measure(pkg.files)
     assert cur.bytes > 0 and cand.bytes > cur.bytes * 0.5
     assert cur.approx_tokens > 0 and "len(text) / 4" in ESTIMATE_METHOD
+
+
+def test_ac_section_without_bullets_is_not_dropped():
+    import pytest
+
+    from orchestrator.sdd.convert import ConversionError
+
+    t, info = _load()
+    t["requirements.md"] = "# T\n\n## Acceptance Criteria (EARS)\n\n1. WHEN a THEN THE SYSTEM SHALL b\n"
+    with pytest.raises(ConversionError, match="bullet"):
+        triplet_to_change(t, info, capability="c", created="2026-10-16")
+
+
+def test_null_source_block_is_tolerated():
+    t, info = _load()
+    info["source"] = None
+    pkg = triplet_to_change(t, info, capability="c", created="2026-10-16")
+    assert "x-mctl-issue" not in yaml.safe_load(pkg.files[".openspec.yaml"])
+    assert [e for e in loss_report(t, info, pkg) if e.kind == "source"]

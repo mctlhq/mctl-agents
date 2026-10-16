@@ -75,6 +75,10 @@ def _requirement_block(n: int, group: str | None, lines: list[str]) -> str:
     return "\n".join(out) + "\n\n" + "\n".join(scen)
 
 
+class ConversionError(ValueError):
+    """Malformed input that conversion refuses to drop silently."""
+
+
 @dataclass
 class ChangePackage:
     capability: str
@@ -104,7 +108,7 @@ def triplet_to_change(
             prev = heading
     items = _parse_ac(ac_chunk)
     if ac_chunk.strip() and not items:
-        raise ValueError("acceptance criteria section has no '- ' bullet items; refusing to drop it silently")
+        raise ConversionError("acceptance criteria section has no '- ' bullet items; refusing to drop it silently")
     blocks = [_requirement_block(i, g, ls) for i, (g, ls) in enumerate(items, 1)]
     spec = "## ADDED Requirements\n\n" + "\n\n".join(blocks) + "\n" if blocks else ""
     src = (source_info.get("source") or {})
