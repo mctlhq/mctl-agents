@@ -71,3 +71,34 @@ def test_null_source_block_is_tolerated():
     pkg = triplet_to_change(t, info, capability="c", created="2026-10-16")
     assert "x-mctl-issue" not in yaml.safe_load(pkg.files[".openspec.yaml"])
     assert [e for e in loss_report(t, info, pkg) if e.kind == "source"]
+
+
+_GROUPED = (
+    "# T\n\n## Context\n\nc\n\n## Acceptance criteria (EARS)\n\n"
+    "Contract\n\n"
+    "- WHEN a THE SYSTEM SHALL b\n"
+    "- WHEN c THE SYSTEM SHALL d\n\n"
+    "Invariants\n\n"
+    "- THE SYSTEM SHALL e\n"
+    "- THE SYSTEM SHALL f\n\n"
+    "## Out of scope\n\n- x\n"
+)
+
+
+def test_group_label_covers_every_bullet_and_roundtrips():
+    t, info = _load()
+    t["requirements.md"] = _GROUPED
+    pkg = triplet_to_change(t, info, capability="c", created="2026-10-16")
+    spec = pkg.files["specs/c/spec.md"]
+    assert spec.count("_Group: Contract_") == 2
+    assert spec.count("_Group: Invariants_") == 2
+    t2, _ = change_to_triplet(pkg)
+    assert t2["requirements.md"] == _GROUPED
+
+
+def test_trivial_package_without_design_converts_back():
+    t, _, pkg = _pkg()
+    del pkg.files["design.md"]
+    t2, _ = change_to_triplet(pkg)
+    assert t2["design.md"] == ""
+    assert t2["tasks.md"] == t["tasks.md"]
