@@ -5,7 +5,11 @@ The dispatcher hands the live loop L the request through the
 `accept_execution_request` Update (update id = the request id) BEFORE it
 fulfils, then fulfils with `engine_ref = "<L>#<request id>"`; L binds the
 `we_` that fulfil mints and ends it at its next approval decision, or on any
-exit. Everything runs against `DispatchFakeApi` (mctl-api#368's rules) and
+exit. Since #636 the loop's own first `we_` is held non-terminal from the
+start through the approve flip (mctl-api refuses a resume while any execution
+is open, `execution_active`), so every delivery below is made in the window
+between that `we_` ending after the flip and the loop's re-approval gate; the
+`_Gate` holds the loop there. Everything runs against `DispatchFakeApi` (mctl-api#368's rules) and
 the real `DevLoopWorkflow` in the time-skipping test server; only the Argo
 submit is faked. What each test pins:
 
@@ -43,6 +47,7 @@ from temporalio.testing import WorkflowEnvironment
 
 from orchestrator.temporal import dispatcher as dx
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
+from orchestrator.temporal.activities.delegated_approval import DelegatedApproveInput, DelegatedApproveResult
 from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.constants import IMPLEMENTATION_OPERATION, TASK_QUEUE
 from orchestrator.temporal.issue_ref import (
@@ -76,9 +81,10 @@ from tests.test_execution_request_dispatch import (
     FakeTemporal,
     _audit,
     _dispatcher,
-    _end,
+    _Gate,
     _ledger_entry,
     _loop_activities,
+    _replace,
     _wait_for,
 )
 from tests.test_work_context_resume_acceptance import URL, WID
@@ -101,49 +107,85 @@ async def env():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         yield env
 
+
 APPROVE_OPERATION = "mctl-agents-approve"
 OPEN_PR = PRState(
     found=True, pr_url="https://github.com/mctlhq/mctl-telegram/pull/9", repo="mctl-telegram", number=9, state="OPEN"
 )
 
 
-def _submit_log(*, hold_approve: asyncio.Event | None = None) -> tuple[Any, list[tuple[str, dict]]]:
-    """A fake Argo submit that records every operation; with `hold_approve`
-    the approve flip does not return until the event is set."""
+def _submit_log() -> tuple[Any, list[tuple[str, dict]]]:
+    """A fake Argo submit that records every operation. The approve flip is
+    no longer one of them (#636): see `_delegated`."""
     ops: list[tuple[str, dict]] = []
 
     @activity.defn(name="submit_and_wait")
     async def submit(input: SubmitAndWaitInput) -> WorkflowResult:
         ops.append((input.operation, dict(input.params)))
-        if input.operation == APPROVE_OPERATION and hold_approve is not None:
-            await hold_approve.wait()
         return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
 
     return submit, ops
 
 
-def _worker(env: Any, submit: Any) -> Worker:
-    # An open PR keeps a loop that reaches its merge watch alive until `_end`.
-    return Worker(
-        env.client,
-        task_queue=TASK_QUEUE,
-        workflows=[DevLoopWorkflow],
-        activities=_loop_activities(submit, pr_states=[OPEN_PR]),
-    )
+def _delegated(*, hold: asyncio.Event | None = None) -> tuple[Any, list[DelegatedApproveInput]]:
+    """A fake `submit_delegated_approve` (the approve flip since #636) that
+    records its input; with `hold` it does not return until the event is set."""
+    flips: list[DelegatedApproveInput] = []
+
+    @activity.defn(name="submit_delegated_approve")
+    async def delegated(inp: DelegatedApproveInput) -> DelegatedApproveResult:
+        flips.append(inp)
+        if hold is not None:
+            await hold.wait()
+        return DelegatedApproveResult(
+            result=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Succeeded")
+        )
+
+    return delegated, flips
+
+
+def _worker(env: Any, submit: Any, *, gate: _Gate | None = None, delegated: Any = None) -> Worker:
+    # An open PR keeps a loop that reaches its merge watch alive until `_finish`.
+    activities = _loop_activities(submit, pr_states=[OPEN_PR], **({"approval_requests": gate.requests} if gate else {}))
+    if gate is not None:
+        activities = _replace(activities, gate.activity)
+    if delegated is not None:
+        activities = _replace(activities, delegated)
+    return Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities)
 
 
 def _ops(ops: list[tuple[str, dict]], operation: str) -> list[dict]:
     return [params for op, params in ops if op == operation]
 
 
-async def _park(api: DispatchFakeApi, env: Any) -> str:
-    """A dispatched loop, its first execution ended, parked at approval."""
+async def _park(api: DispatchFakeApi, env: Any, gate: _Gate) -> str:
+    """A dispatched loop whose approval was flipped: bob approved with the
+    grant the loop requested, its own first `we_` ended Succeeded right after
+    the flip, and `gate` holds it before its re-approval gate."""
     api.create_request("start")
     outcome = await _dispatcher(env).dispatch_once()
     assert outcome.action == dx.FULFILLED
-    await _wait_for(lambda: bool(api.executions) and api.executions[0]["phase"] == "Succeeded")
     assert outcome.workflow_id == workflow_id_for(URL)
+    await _wait_for(lambda: bool(api.executions) and api.executions[0]["phase"] == "Running")
+    # The first `we_` is held open through the approval (#636)...
+    await _wait_for(lambda: bool(gate.requests))
+    assert api.executions[0]["phase"] == "Running"
+    await env.client.get_workflow_handle(outcome.workflow_id).signal(
+        DevLoopWorkflow.approve, {"approver": "bob", "approval_ref": "aar_test"}
+    )
+    # ...and ends right after the flip.
+    await _wait_for(lambda: api.executions[0]["phase"] == "Succeeded")
+    await _wait_for(gate.entered.is_set)
     return outcome.workflow_id
+
+
+async def _finish(env: Any, workflow_id: str, gate: _Gate) -> Any:
+    """`_end` for a loop held by `gate`: abandon first, then let it on, so it
+    leaves at its re-approval gate."""
+    handle = env.client.get_workflow_handle(workflow_id)
+    await handle.signal(DevLoopWorkflow.abandon, {"reason": "test over"})
+    await gate.release()
+    return await handle.result()
 
 
 def _first(api: DispatchFakeApi) -> str:
@@ -202,6 +244,13 @@ async def _end_through_the_grace(env: Any, workflow_id: str) -> Any:
     return await handle.result()
 
 
+async def _approve_fresh(handle: Any, gate: _Gate) -> None:
+    """alice decides the grant the loop asked for after the flip (#636: the
+    flip's grant is spent, so the re-approval is a new `aar_`)."""
+    await _wait_for(lambda: len(gate.requests) == 2)
+    await handle.signal(DevLoopWorkflow.approve, {"approval_ref": f"aar_test_a{gate.requests[-1].attempt}"})
+
+
 def _row(api: DispatchFakeApi, engine_ref: str) -> dict:
     return next(e for e in api.executions if e["engine_ref"] == engine_ref)
 
@@ -217,16 +266,19 @@ def _delivery(rid: str, *, surface: str = "telegram") -> ResumeDelivery:
 
 async def test_a_resume_onto_a_live_loop_is_delivered_and_the_loop_continues_under_it(api, env, capsys):
     """bob's approval is spent on the approve flip; alice resumes from
-    Telegram while that flip runs. The loop binds alice's `we_`, and the gate
-    before the implement step waits for a FRESH approval: the resume never
-    inherits bob's. alice approves, her execution succeeds, implement runs."""
-    held = asyncio.Event()
-    submit, ops = _submit_log(hold_approve=held)
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    Telegram right after it (the loop's own `we_` ended with the flip, #636:
+    while it was open mctl-api would refuse the resume). The loop binds
+    alice's `we_`, and the gate before the implement step waits for a FRESH
+    approval: the resume never inherits bob's. The loop asks for a new grant
+    on alice's `we_` (bob's was spent, and his `we_` ended), and neither
+    bob's spent `aar_` nor alice's login releases it; her decision on that
+    new grant does. Her execution succeeds, implement runs."""
+    gate = _Gate()
+    delegated, flips = _delegated()
+    submit, ops = _submit_log()
+    async with _worker(env, submit, gate=gate, delegated=delegated):
+        loop = await _park(api, env, gate)
         handle = env.client.get_workflow_handle(loop)
-        await handle.signal(DevLoopWorkflow.approve, {"approver": "bob"})
-        await _wait_for(lambda: bool(_ops(ops, APPROVE_OPERATION)))
 
         rid = api.create_request("resume")
         outcome = await _dispatcher(env).dispatch_once()
@@ -241,26 +293,86 @@ async def test_a_resume_onto_a_live_loop_is_delivered_and_the_loop_continues_und
         assert ctx.last_actor == ActorRef(kind="human", actor_id="user:alice")
         assert ctx.executions[-1].surface_transition and ctx.executions[-1].temporal_workflow_id == f"{loop}#{rid}"
 
-        held.set()
+        await gate.release()
         await anyio.sleep(1.5)
-        # The flip ran on bob's approval, as it was already under way; the
-        # implement step did not, and alice's execution is still open.
-        assert [p["approver"] for p in _ops(ops, APPROVE_OPERATION)] == ["bob"]
+        # The flip ran once, on the grant bob's approval carried, through the
+        # delegated operation and never through the legacy relay; the
+        # implement step did not run, and alice's execution is still open.
+        assert [d.approval_ref for d in flips] == ["aar_test"]
+        assert _ops(ops, APPROVE_OPERATION) == []
         assert _ops(ops, IMPLEMENTATION_OPERATION) == []
         assert api.executions[1]["phase"] == "Running"
 
+        # A fresh grant, asked for alice's `we_`, not bob's spent one.
+        await _wait_for(lambda: len(gate.requests) == 2)
+        fresh = gate.requests[-1]
+        assert fresh.execution_id == resumed["id"] and fresh.attempt > gate.requests[0].attempt
+        await handle.signal(DevLoopWorkflow.approve, {"approver": "alice", "approval_ref": "aar_test"})
         await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+        await anyio.sleep(1.0)
+        assert _ops(ops, IMPLEMENTATION_OPERATION) == [] and api.executions[1]["phase"] == "Running"
+
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": f"aar_test_a{fresh.attempt}"})
         await _wait_for(lambda: api.executions[1]["phase"] == "Succeeded")
         await _wait_for(lambda: bool(_ops(ops, IMPLEMENTATION_OPERATION)))
+        assert len(flips) == 1  # alice's approval re-opens the gate, it does not flip again
         await _stop(env, loop)
 
     # One loop, one investigation, no continuation started for the resume.
     assert len(_ops(ops, "mctl-agents-investigate")) == 1
-    assert [e["engine_ref"] for e in api.executions] == [_first_ref(api, loop), f"{loop}#{rid}"]
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [
+        (_first_ref(api, loop), "Succeeded"),
+        (f"{loop}#{rid}", "Succeeded"),
+    ]
     assert api.request_state(rid)["state"] == "fulfilled"
     audit = [a for a in _audit(capsys.readouterr().out) if a["execution_request_id"] == rid]
     assert [a["event"] for a in audit] == ["claim", "deliver", "fulfil"]
     assert audit[1]["workflow_id"] == loop and audit[1]["verdict"] == dx.DELIVERED
+
+
+async def test_the_re_approval_is_asked_on_the_latest_transitions_execution_not_an_earlier_one(api, env):
+    """claude P2 on #651: carol resumed by signal before the flip, so the
+    loop records her execution; alice's delivery after the flip is a second
+    transition whose `we_` is bound only at the fulfil, after the Update
+    answered. The fresh grant must wait for alice's `we_`: "any execution
+    but the loop's own" is already carol's, and a grant asked there is
+    bound to the wrong execution (or refused, once it ended)."""
+    gate = _Gate()
+    submit, _ = _submit_log()
+    carol = "we_carol_signalled"
+
+    class FulfilsLate(_Port):
+        async def deliver(self, issue: Any, delivery: Any) -> dx.DeliveryAnswer:
+            answer = await super().deliver(issue, delivery)
+            await gate.release()  # on to the re-approval gate, before the bind
+            await anyio.sleep(1.0)
+            return answer
+
+    async with _worker(env, submit, gate=gate):
+        api.create_request("start")
+        outcome = await _dispatcher(env).dispatch_once()
+        loop = outcome.workflow_id
+        handle = env.client.get_workflow_handle(loop)
+        await _wait_for(lambda: bool(gate.requests))
+        await handle.signal(
+            DevLoopWorkflow.resume,
+            {
+                "work_item_id": WID, "execution_id": carol,
+                "surface": "github", "actor_kind": "human", "actor_id": "user:carol",
+            },
+        )
+        await _wait_for(lambda: len(gate.requests) == 2)
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": f"aar_test_a{gate.requests[-1].attempt}"})
+        await _wait_for(lambda: api.executions[0]["phase"] == "Succeeded")
+        await _wait_for(gate.entered.is_set)
+
+        rid = api.create_request("resume")
+        fulfilled = await dx.Dispatcher(WorkItemClient(), FulfilsLate(env.client), lease=60).dispatch_once()
+        assert fulfilled.action == dx.FULFILLED and fulfilled.engine_ref == f"{loop}#{rid}"
+        await _wait_for(lambda: len(gate.requests) == 3)
+        await anyio.sleep(0.5)
+        assert [r.execution_id for r in gate.requests[2:]] == [fulfilled.execution_id]
+        await _finish(env, loop, gate)
 
 
 # -- crash windows -------------------------------------------------------------
@@ -268,8 +380,9 @@ async def test_a_resume_onto_a_live_loop_is_delivered_and_the_loop_continues_und
 
 async def test_a_crash_between_the_update_and_the_fulfil_converges_with_one_delivery(api, env):
     submit, _ = _submit_log()
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    gate = _Gate()
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         rid = api.create_request("resume")
         with pytest.raises(Crash):
             await _dispatcher(env, CrashBeforeFulfil(WorkItemClient())).dispatch_once()
@@ -284,7 +397,7 @@ async def test_a_crash_between_the_update_and_the_fulfil_converges_with_one_deli
         assert outcome.action == dx.FULFILLED and outcome.engine_ref == f"{loop}#{rid}"
         await _wait_for(lambda: len(api.executions) == 2 and api.executions[1]["phase"] == "Running")
         events = await _events(env, loop)
-        await _end(env, loop)
+        await _finish(env, loop, gate)
 
     # The re-sent Update (same update id) was answered from the registry: no
     # second acceptance, one bind, one execution.
@@ -299,11 +412,15 @@ async def test_an_accepted_delivery_outwaits_a_whole_fulfilment_wait(api, env):
     re-sent Update is answered from Temporal's registry, not by the loop, so
     a loop that had given up would leave the fulfil it triggers unbound."""
     submit, _ = _submit_log()
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    gate = _Gate()
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         rid = api.create_request("resume")
         with pytest.raises(Crash):
             await _dispatcher(env, CrashBeforeFulfil(WorkItemClient())).dispatch_once()
+        # The gate goes first: the test server skips time while the test
+        # sleeps, and the held resolve would time out and burn its retries.
+        await gate.release()
         await env.sleep(FULFILMENT_WAIT + timedelta(minutes=15))
         assert _binds_for(await _events(env, loop), rid) >= 2  # a second wait began
 
@@ -311,7 +428,7 @@ async def test_an_accepted_delivery_outwaits_a_whole_fulfilment_wait(api, env):
         outcome = await _dispatcher(env).dispatch_once()
         assert outcome.action == dx.FULFILLED and outcome.engine_ref == f"{loop}#{rid}"
         await _wait_for(lambda: len(api.executions) == 2 and api.executions[1]["phase"] == "Running")
-        await _end(env, loop)
+        await _finish(env, loop, gate)
 
     assert api.executions[1]["phase"] == "Failed"
 
@@ -327,8 +444,9 @@ class CrashAfterFulfil(CrashBeforeFulfil):
 
 async def test_a_crash_after_the_fulfil_loses_nothing(api, env):
     submit, _ = _submit_log()
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    gate = _Gate()
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         rid = api.create_request("resume")
         with pytest.raises(Crash):
             await _dispatcher(env, CrashAfterFulfil(WorkItemClient())).dispatch_once()
@@ -338,7 +456,8 @@ async def test_a_crash_after_the_fulfil_loses_nothing(api, env):
         # ...and none is needed: the loop accepted it first, and reads the
         # `we_` from the store itself.
         await _wait_for(lambda: len(api.executions) == 2 and api.executions[1]["phase"] == "Running")
-        await env.client.get_workflow_handle(loop).signal(DevLoopWorkflow.approve, {"approver": "alice"})
+        await gate.release()
+        await _approve_fresh(env.client.get_workflow_handle(loop), gate)
         await _wait_for(lambda: api.executions[1]["phase"] == "Succeeded")
         await _stop(env, loop)
 
@@ -348,8 +467,9 @@ async def test_a_crash_after_the_fulfil_loses_nothing(api, env):
 
 async def test_a_repeated_delivery_is_a_no_op_under_either_update_id(api, env):
     submit, _ = _submit_log()
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    gate = _Gate()
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         rid = api.create_request("resume")
         assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
         await _wait_for(lambda: len(api.executions) == 2 and api.executions[1]["phase"] == "Running")
@@ -368,7 +488,7 @@ async def test_a_repeated_delivery_is_a_no_op_under_either_update_id(api, env):
         await anyio.sleep(1.0)
         ctx = await handle.query(DevLoopWorkflow.work_context)
         events = await _events(env, loop)
-        await _end(env, loop)
+        await _finish(env, loop, gate)
 
     assert [e.execution_id for e in ctx.executions].count(api.executions[1]["id"]) == 1
     assert _accepted_updates(events) == [_first(api), rid, f"{rid}-again"]
@@ -508,17 +628,18 @@ async def test_a_resume_onto_a_closed_loop_starts_a_new_run_of_the_same_loop(api
     takes the request as its own start: one loop id, two runs, the resumed
     execution under `<loop>#<request>`."""
     submit, ops = _submit_log()
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    gate = _Gate()
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         first_run = (await env.client.get_workflow_handle(loop).describe()).run_id
-        await _end(env, loop)
+        await _finish(env, loop, gate)
         rid = api.create_request("resume")
         outcome = await _dispatcher(env).dispatch_once()
         assert outcome.action == dx.FULFILLED and outcome.workflow_id == loop
         assert outcome.engine_ref == f"{loop}#{rid}"
         await _wait_for(lambda: len(_ops(ops, "mctl-agents-investigate")) == 2)
         second_run = (await env.client.get_workflow_handle(loop).describe()).run_id
-        await _end(env, loop)
+        await _finish(env, loop, gate)
 
     assert second_run != first_run
     assert [e["engine_ref"] for e in api.executions] == [_first_ref(api, loop), f"{loop}#{rid}"]
@@ -531,15 +652,17 @@ async def test_a_loop_that_accepted_and_then_ended_before_the_fulfil_gets_nothin
     no execution is ever minted for the run that is gone. The next claim
     re-sends it, and Update-with-Start starts a new run that takes it."""
     submit, ops = _submit_log()
+    gate = _Gate()
 
     class EndsAfterAccepting(_Port):
         async def deliver(self, issue: Any, delivery: Any) -> dx.DeliveryAnswer:
             answer = await super().deliver(issue, delivery)
+            await gate.release()
             await _end_through_the_grace(env, workflow_id_for(issue.issue_url))
             return answer
 
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         rid = api.create_request("resume")
         stale = await dx.Dispatcher(WorkItemClient(), EndsAfterAccepting(env.client), lease=60).dispatch_once()
         assert stale.action == dx.DEFERRED and api.request_state(rid)["state"] == "claimed"
@@ -550,7 +673,7 @@ async def test_a_loop_that_accepted_and_then_ended_before_the_fulfil_gets_nothin
         outcome = await _dispatcher(env).dispatch_once()
         assert outcome.action == dx.FULFILLED and outcome.workflow_id == loop
         await _wait_for(lambda: len(_ops(ops, "mctl-agents-investigate")) == 2)
-        await _end(env, loop)
+        await _finish(env, loop, gate)
 
     assert [e["engine_ref"] for e in api.executions] == [_first_ref(api, loop), f"{loop}#{rid}"]
     assert [(r.execution_request_id, r.reason) for r in ctx.resume_rejections] == [
@@ -565,17 +688,19 @@ async def test_a_fulfil_landing_while_the_loop_is_ending_is_bound_and_ended_by_t
     ending. The exit grace lets the loop bind that execution and end it
     itself, `Failed` — nothing is left for the dispatcher to clean up."""
     submit, _ = _submit_log()
+    gate = _Gate()
 
     class AbandonsAfterAccepting(_Port):
         async def deliver(self, issue: Any, delivery: Any) -> dx.DeliveryAnswer:
             answer = await super().deliver(issue, delivery)
             handle = env.client.get_workflow_handle(workflow_id_for(issue.issue_url))
             await handle.signal(DevLoopWorkflow.abandon, {"reason": "test over"})
+            await gate.release()  # the abandon is observed once the loop is past the gate
             await anyio.sleep(0.5)  # the loop is now in its exit, still running
             return answer
 
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         rid = api.create_request("resume")
         outcome = await dx.Dispatcher(WorkItemClient(), AbandonsAfterAccepting(env.client), lease=60).dispatch_once()
         assert outcome.action == dx.FULFILLED and outcome.engine_ref == f"{loop}#{rid}"
@@ -594,16 +719,18 @@ async def test_a_fulfil_that_lands_after_the_loop_closed_is_ended_by_the_dispatc
     while it is, so no reconciliation could ever run — so the dispatcher
     checks once more after the fulfil and ends it itself."""
     submit, _ = _submit_log()
+    gate = _Gate()
 
     class ClosesBeforeTheFulfil(_Port):
         async def loop_state(self, workflow_id: str) -> str:
             answer = await super().loop_state(workflow_id)
             if workflow_id == loop and len(self.state_calls) == 1:
+                await gate.release()
                 await _end_through_the_grace(env, loop)  # closes right after answering "running"
             return answer
 
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         rid = api.create_request("resume")
         outcome = await dx.Dispatcher(WorkItemClient(), ClosesBeforeTheFulfil(env.client), lease=60).dispatch_once()
 
@@ -619,25 +746,30 @@ async def test_a_fulfil_that_lands_after_the_loop_closed_is_ended_by_the_dispatc
 
 async def test_the_resumed_execution_fails_when_the_re_approval_wait_expires(api, env):
     submit, _ = _submit_log()
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    gate = _Gate()
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         api.create_request("resume")
         assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
         await _wait_for(lambda: len(api.executions) == 2 and api.executions[1]["phase"] == "Running")
+        await gate.release()  # the loop is now parked at its re-approval gate
         await env.sleep(timedelta(days=15))
         result = await env.client.get_workflow_handle_for(DevLoopWorkflow.run, loop).result()
 
-    assert result.ended == "approval wait expired"
+    # The re-approval gate, not the original park: the grant was spent on the flip.
+    assert result.ended == "re-approval wait expired"
     assert api.executions[1]["phase"] == "Failed"
 
 
 async def test_the_resumed_execution_fails_when_the_loop_is_cancelled(api, env):
     submit, _ = _submit_log()
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    gate = _Gate()
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         api.create_request("resume")
         assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
         await _wait_for(lambda: len(api.executions) == 2 and api.executions[1]["phase"] == "Running")
+        await gate.release()
         handle = env.client.get_workflow_handle(loop)
         await handle.cancel()
         with pytest.raises(WorkflowFailureError):
@@ -652,8 +784,9 @@ async def test_a_delivery_whose_request_is_rejected_at_fulfil_binds_nothing_and_
     a later resume is accepted again (the pending window closed with it).
     The approval the accepted resume cleared stays cleared: fail closed."""
     submit, _ = _submit_log()
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    gate = _Gate()
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         stale = api.create_request("resume")
         api.state_version += 1  # the item moved after the surface asked
         refused = await _dispatcher(env).dispatch_once()
@@ -676,7 +809,7 @@ async def test_a_delivery_whose_request_is_rejected_at_fulfil_binds_nothing_and_
         accepted = await _dispatcher(env).dispatch_once()
         assert accepted.action == dx.FULFILLED and accepted.engine_ref == f"{loop}#{fresh}"
         await _wait_for(lambda: len(api.executions) == 2 and api.executions[1]["phase"] == "Running")
-        await _end(env, loop)
+        await _finish(env, loop, gate)
 
     assert api.executions[1]["phase"] == "Failed"
 
@@ -704,6 +837,7 @@ async def test_a_delivery_whose_item_is_about_another_issue_ends_its_minted_exec
     and the bind: re-pointed before the claim, the request would simply go
     to the other issue's loop."""
     submit, ops = _submit_log()
+    gate = _Gate()
 
     class RePointsAfterTheDelivery(_Port):
         async def deliver(self, issue: Any, delivery: Any) -> dx.DeliveryAnswer:
@@ -711,8 +845,8 @@ async def test_a_delivery_whose_item_is_about_another_issue_ends_its_minted_exec
             api.external_key = "https://github.com/mctlhq/mctl-telegram/issues/9999"
             return answer
 
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         rid = api.create_request("resume")
         outcome = await dx.Dispatcher(WorkItemClient(), RePointsAfterTheDelivery(env.client), lease=60).dispatch_once()
         assert outcome.action == dx.FULFILLED and outcome.engine_ref == f"{loop}#{rid}"
@@ -721,7 +855,7 @@ async def test_a_delivery_whose_item_is_about_another_issue_ends_its_minted_exec
         await _wait_for(lambda: _row(api, f"{loop}#{rid}")["phase"] == "Failed")
         ctx = await env.client.get_workflow_handle(loop).query(DevLoopWorkflow.work_context)
         assert outcome.execution_id not in [e.execution_id for e in ctx.executions]  # never adopted
-        await _end(env, loop)
+        await _finish(env, loop, gate)
 
     assert _ops(ops, IMPLEMENTATION_OPERATION) == []
 
@@ -731,8 +865,9 @@ async def test_a_delivery_whose_advance_to_running_is_refused_ends_its_minted_ex
     policy checkpoint) refuses its advance to Running: a definite no, so it
     must not run, and it is ended `Failed` rather than left `Pending`."""
     submit, _ = _submit_log()
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    gate = _Gate()
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         rid = api.create_request("resume")
         ref = f"{loop}#{rid}"
         serve = api.request
@@ -752,7 +887,7 @@ async def test_a_delivery_whose_advance_to_running_is_refused_ends_its_minted_ex
 
         assert await _rejected_delivery(env, loop, rid) == [(rid, "delivery-execution-refused")]
         await _wait_for(lambda: _row(api, ref)["phase"] == "Failed")
-        await _end(env, loop)
+        await _finish(env, loop, gate)
 
 
 async def test_a_terminal_advance_that_outlasts_its_retries_is_kept_open_and_lands_later(api, env):
@@ -761,16 +896,18 @@ async def test_a_terminal_advance_that_outlasts_its_retries_is_kept_open_and_lan
     policy. The delivery stays open with the phase pending and lands it once
     the store answers again: never popped with its `we_` still Running."""
     submit, _ = _submit_log()
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    gate = _Gate()
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         rid = api.create_request("resume")
         assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
         ref = f"{loop}#{rid}"
         await _wait_for(lambda: _row(api, ref)["phase"] == "Running")
+        await gate.release()
         # One more than DISPATCHED_ADVANCE_RETRY_POLICY's 10 attempts, and then some.
         api.unavailable_advances["Succeeded"] = 13
         handle = env.client.get_workflow_handle(loop)
-        await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+        await _approve_fresh(handle, gate)
         for _ in range(12):
             if _row(api, ref)["phase"] == "Succeeded":
                 break
@@ -791,13 +928,14 @@ async def test_a_resume_the_loop_refuses_is_rejected_typed_and_never_fulfilled(a
     rejected before any `we_`. (mctl-api's own default surface `api` is in
     the vocabulary since #481: see the validator test below.)"""
     submit, _ = _submit_log()
-    async with _worker(env, submit):
-        loop = await _park(api, env)
+    gate = _Gate()
+    async with _worker(env, submit, gate=gate):
+        loop = await _park(api, env, gate)
         rid = api.create_request("resume")
         api.xrs[rid]["surface"] = "slack"
         outcome = await _dispatcher(env).dispatch_once()
         events = await _events(env, loop)
-        await _end(env, loop)
+        await _finish(env, loop, gate)
 
     assert outcome.action == dx.REJECTED
     assert api.request_state(rid)["reason"] == f"{xr.RESUME_REFUSED}:surface-or-actor-unrecognised"

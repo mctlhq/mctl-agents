@@ -70,6 +70,7 @@ from temporalio.client import WorkflowHistory
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer
 
+from orchestrator.temporal.constants import TASK_QUEUE
 from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.dev_loop import (
     DISPATCHED_NOT_RUN_FAILS_PATCH,
@@ -80,11 +81,17 @@ from orchestrator.temporal.workflows.dev_loop import (
     DevLoopWorkflow,
     IssueRef,
 )
+from tests.temporal_harness import Worker
 
 HISTORY_DIR = Path(__file__).resolve().parent / "fixtures" / "histories"
 DISPATCHED_HISTORY = HISTORY_DIR / "dev_loop_dispatched.json"
 RESUMED_HISTORY = HISTORY_DIR / "dev_loop_resumed.json"
 ISSUE_KEYED_HISTORY = HISTORY_DIR / "dev_loop_issue_keyed.json"
+# #636: a dispatched loop and an ordinary (issue-started) one, each through
+# the canonical approval: own `we_`, `aar_`, the delegated flip.
+DELEGATED_HISTORY = HISTORY_DIR / "dev_loop_delegated.json"
+ISSUE_STARTED_HISTORY = HISTORY_DIR / "dev_loop_issue_started_delegated.json"
+CANONICAL_HISTORIES = (DELEGATED_HISTORY, ISSUE_STARTED_HISTORY)
 #: Recorded before #461 option A; today's code cannot record them again.
 PRE_ISSUE_KEYED_HISTORIES = (DISPATCHED_HISTORY, RESUMED_HISTORY)
 
@@ -136,7 +143,8 @@ async def record(env: WorkflowEnvironment) -> dict[str, Any]:
     async with _worker(env, submit):
         outcome = await _dispatcher(env).dispatch_once()
         assert outcome.action == "fulfilled", outcome
-        await _wait_for(lambda: len(seen) == 1 and api.executions[0]["phase"] == "Succeeded")
+        # The dispatched `we_` is held open through the approval (#636).
+        await _wait_for(lambda: len(seen) == 1 and api.executions[0]["phase"] == "Running")
         await _end(env, outcome.workflow_id)
         history = await env.client.get_workflow_handle(outcome.workflow_id).fetch_history()
     assert outcome.workflow_id == workflow_id_for(URL) and outcome.engine_ref == f"{outcome.workflow_id}#{rid}"
@@ -144,24 +152,39 @@ async def record(env: WorkflowEnvironment) -> dict[str, Any]:
 
 
 async def record_resumed(env: WorkflowEnvironment) -> dict[str, Any]:
-    """A dispatched loop parked at approval takes a resume delivered onto
-    it, binds the resumed execution, is re-approved by the resuming actor
-    and runs to its end, as a history dict."""
-    from tests.test_execution_request_dispatch import _dispatcher, _investigate_log, _wait_for, _worker
+    """A dispatched loop whose approval was flipped takes a resume delivered
+    onto it, binds the resumed execution, is re-approved by the resuming
+    actor and runs to its end, as a history dict."""
+    from tests.test_execution_request_dispatch import (
+        _dispatcher,
+        _Gate,
+        _investigate_log,
+        _loop_activities,
+        _replace,
+        _wait_for,
+    )
 
     api = _CURRENT_API[0]
     submit, _ = _investigate_log()
+    gate = _Gate()
+    activities = _replace(_loop_activities(submit, approval_requests=gate.requests), gate.activity)
     api.create_request("start")
-    async with _worker(env, submit):
+    async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
         started = await _dispatcher(env).dispatch_once()
         assert started.action == "fulfilled", started
-        await _wait_for(lambda: bool(api.executions) and api.executions[0]["phase"] == "Succeeded")
+        handle = env.client.get_workflow_handle(started.workflow_id)
+        await _wait_for(lambda: bool(gate.requests))
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+        await _wait_for(lambda: api.executions[0]["phase"] == "Succeeded" and gate.entered.is_set())
         rid = api.create_request("resume")
         resumed = await _dispatcher(env).dispatch_once()
         assert resumed.action == "fulfilled" and resumed.engine_ref.endswith(f"#{rid}"), resumed
         await _wait_for(lambda: len(api.executions) == 2 and api.executions[1]["phase"] == "Running")
-        handle = env.client.get_workflow_handle(started.workflow_id)
-        await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+        await gate.release()
+        # The flip spent bob's grant: alice decides the fresh one the loop
+        # asks for on her `we_` (#636).
+        await _wait_for(lambda: len(gate.requests) == 2)
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": f"aar_test_a{gate.requests[-1].attempt}"})
         await _wait_for(lambda: api.executions[1]["phase"] == "Succeeded")
         # The rest of the loop (merge watch, deploy observation, incident
         # watch) waits on timers and retry backoffs, which the test server
@@ -183,20 +206,31 @@ async def record_issue_keyed(env: WorkflowEnvironment) -> dict[str, Any]:
     from orchestrator.temporal.issue_ref import workflow_id_for
     from orchestrator.temporal.start import start_dev_loop_workflow
     from orchestrator.temporal.workflows.dev_loop import ResumeDelivery
-    from tests.test_execution_request_dispatch import _dispatcher, _investigate_log, _wait_for, _worker
+    from tests.test_execution_request_dispatch import (
+        _dispatcher,
+        _Gate,
+        _investigate_log,
+        _loop_activities,
+        _replace,
+        _wait_for,
+    )
     from tests.test_work_context_resume_acceptance import URL, WID
 
     api = _CURRENT_API[0]
     submit, _ = _investigate_log()
     loop = workflow_id_for(URL)
     first = api.create_request("start")
-    async with _worker(env, submit):
+    gate = _Gate()
+    activities = _replace(_loop_activities(submit, approval_requests=gate.requests), gate.activity)
+    async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
         started = await _dispatcher(env).dispatch_once()
         assert started.action == "fulfilled" and started.workflow_id == loop, started
         run_id = (await env.client.get_workflow_handle(loop).describe()).run_id
         joined = await start_dev_loop_workflow(URL, client=env.client)
         assert joined.id == loop and (await joined.describe()).run_id == run_id
-        await _wait_for(lambda: bool(api.executions) and api.executions[0]["phase"] == "Succeeded")
+        await _wait_for(lambda: bool(gate.requests))
+        await env.client.get_workflow_handle(loop).signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+        await _wait_for(lambda: api.executions[0]["phase"] == "Succeeded" and gate.entered.is_set())
 
         second = api.create_request("start")
         refused = await _dispatcher(env).dispatch_once()
@@ -214,13 +248,80 @@ async def record_issue_keyed(env: WorkflowEnvironment) -> dict[str, Any]:
         )
         assert again.verdict == dx.DELIVERED
         handle = env.client.get_workflow_handle(loop)
-        await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+        await gate.release()
+        # The flip spent bob's grant: alice decides the fresh one the loop
+        # asks for on her `we_` (#636).
+        await _wait_for(lambda: len(gate.requests) == 2)
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": f"aar_test_a{gate.requests[-1].attempt}"})
         await _wait_for(lambda: api.executions[1]["phase"] == "Succeeded")
         await env.sleep(timedelta(days=30))
         await handle.result()
         assert (await handle.describe()).run_id == run_id
         history = await handle.fetch_history()
     assert [e["engine_ref"] for e in api.executions] == [f"{loop}#{first}", f"{loop}#{rid}"]
+    return history.to_json_dict()
+
+
+async def record_delegated(env: WorkflowEnvironment) -> dict[str, Any]:
+    """A dispatched loop through the canonical approval: it requests its
+    `aar_`, the signalled grant is exercised by the delegated flip, and the
+    loop runs to its end, as a history dict."""
+    from tests.test_execution_request_dispatch import (
+        _dispatcher,
+        _Gate,
+        _investigate_log,
+        _loop_activities,
+        _replace,
+        _wait_for,
+    )
+
+    api = _CURRENT_API[0]
+    submit, _ = _investigate_log()
+    gate = _Gate()
+    activities = _replace(_loop_activities(submit, approval_requests=gate.requests), gate.activity)
+    api.create_request("start")
+    async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+        started = await _dispatcher(env).dispatch_once()
+        assert started.action == "fulfilled", started
+        handle = env.client.get_workflow_handle(started.workflow_id)
+        await _wait_for(lambda: bool(gate.requests))
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+        await _wait_for(lambda: api.executions[0]["phase"] == "Succeeded" and gate.entered.is_set())
+        await gate.release()
+        await env.sleep(timedelta(days=30))
+        await handle.result()
+        history = await handle.fetch_history()
+    return history.to_json_dict()
+
+
+async def record_issue_started(env: WorkflowEnvironment) -> dict[str, Any]:
+    """An ordinary start (no request): the loop opens its own WorkItem
+    execution, requests its `aar_`, and is approved through the delegated
+    flip, as a history dict."""
+    from orchestrator.temporal.issue_ref import workflow_id_for
+    from orchestrator.temporal.start import start_dev_loop_workflow
+    from tests.test_execution_request_dispatch import (
+        _Gate,
+        _investigate_log,
+        _loop_activities,
+        _replace,
+        _wait_for,
+    )
+    from tests.test_work_context_resume_acceptance import URL
+
+    submit, _ = _investigate_log()
+    gate = _Gate()
+    activities = _replace(_loop_activities(submit, approval_requests=gate.requests), gate.activity)
+    async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+        handle = await start_dev_loop_workflow(URL, client=env.client)
+        assert handle.id == workflow_id_for(URL)
+        await _wait_for(lambda: bool(gate.requests))
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+        await _wait_for(gate.entered.is_set)
+        await gate.release()
+        await env.sleep(timedelta(days=30))
+        await handle.result()
+        history = await handle.fetch_history()
     return history.to_json_dict()
 
 
@@ -268,7 +369,7 @@ def test_no_older_dev_loop_history_records_the_dispatch_marker():
     it must carry neither the marker nor either new activity — otherwise it
     was re-recorded and no longer proves that old histories replay."""
     for path in sorted(HISTORY_DIR.glob("dev_loop_*.json")):
-        if path in (DISPATCHED_HISTORY, RESUMED_HISTORY, ISSUE_KEYED_HISTORY):
+        if path in (DISPATCHED_HISTORY, RESUMED_HISTORY, ISSUE_KEYED_HISTORY, *CANONICAL_HISTORIES):
             continue
         events = _events(json.loads(path.read_text(encoding="utf-8")))
         assert EXECUTION_REQUEST_PATCH not in _patch_ids(events), path.name
@@ -324,7 +425,7 @@ def test_no_history_without_a_delivery_records_the_resume_marker():
     """The resume marker is recorded where a delivery starts, so no other
     history — the dispatched one included — may carry it."""
     for path in sorted(HISTORY_DIR.glob("*.json")):
-        if path in (RESUMED_HISTORY, ISSUE_KEYED_HISTORY):
+        if path in (RESUMED_HISTORY, ISSUE_KEYED_HISTORY, DELEGATED_HISTORY):
             continue
         events = _events(json.loads(path.read_text(encoding="utf-8")))
         assert EXECUTION_REQUEST_RESUME_PATCH not in _patch_ids(events), path.name
@@ -367,7 +468,7 @@ def test_no_pre_option_a_history_records_the_issue_keyed_marker():
     """The pre-option-A fixtures prove that loops already in flight at the
     upgrade replay; carrying the marker would mean they were re-recorded."""
     for path in sorted(HISTORY_DIR.glob("*.json")):
-        if path == ISSUE_KEYED_HISTORY:
+        if path in (ISSUE_KEYED_HISTORY, DELEGATED_HISTORY):
             continue
         events = _events(json.loads(path.read_text(encoding="utf-8")))
         assert ISSUE_KEYED_DISPATCH_PATCH not in _patch_ids(events), path.name
@@ -401,7 +502,11 @@ def _regenerate(names: list[str]) -> None:  # pragma: no cover — a maintenance
     from orchestrator.work_context.client import WorkItemClient
     from tests.test_execution_request_dispatch import DispatchFakeApi
 
-    recorders = {"issue_keyed": (ISSUE_KEYED_HISTORY, record_issue_keyed)}
+    recorders = {
+        "issue_keyed": (ISSUE_KEYED_HISTORY, record_issue_keyed),
+        "delegated": (DELEGATED_HISTORY, record_delegated),
+        "issue_started": (ISSUE_STARTED_HISTORY, record_issue_started),
+    }
 
     async def main() -> None:
         for name in names or list(recorders):
@@ -528,3 +633,59 @@ def test_no_committed_history_records_the_stranded_marker():
         # Every committed history ran something; the not-run end is guarded
         # by the fresh stranded recordings above.
         assert DISPATCHED_NOT_RUN_FAILS_PATCH not in _patch_ids(events), path.name
+
+
+# -- the canonical approval (#636) ---------------------------------------------
+
+
+@pytest.mark.parametrize("path", CANONICAL_HISTORIES, ids=lambda p: p.name)
+async def test_the_canonical_histories_replay_against_current_definitions(path):
+    """Do not re-record to make this pass: guard the change with a patch."""
+    history = WorkflowHistory.from_json(f"replay-{path.stem}", path.read_text(encoding="utf-8"))
+    await Replayer(workflows=[DevLoopWorkflow]).replay_workflow(history)
+
+
+@pytest.mark.parametrize("path", CANONICAL_HISTORIES, ids=lambda p: p.name)
+def test_the_canonical_histories_use_the_delegated_flip_and_never_the_legacy_one(path):
+    """What each fixture must contain to be worth replaying: the marker, the
+    grant request before the flip, the delegated flip, and no
+    `mctl-agents-approve` submit carrying an `approver`."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    events = _events(raw)
+    assert dev_loop.CANONICAL_APPROVAL_PATCH in _patch_ids(events)
+    scheduled = _scheduled(events)
+    assert scheduled.count("request_devloop_approval") == 1
+    assert scheduled.count("submit_delegated_approve") == 1
+    assert scheduled.index("request_devloop_approval") < scheduled.index("submit_delegated_approve")
+    wire = json.dumps(raw)
+    assert "mctl-agents-approve" not in wire
+    assert "approver" not in wire.lower().replace("approver_", "")
+
+
+def test_the_issue_started_history_opens_its_own_execution_first():
+    events = _events(json.loads(ISSUE_STARTED_HISTORY.read_text(encoding="utf-8")))
+    assert _scheduled(events)[0] == "ensure_issue_execution"
+
+
+def test_no_older_history_records_the_canonical_approval_marker():
+    """Every other recorded DevLoop history predates #636: it must carry
+    neither the marker nor a canonical activity, or it was re-recorded and no
+    longer proves that in-flight loops keep their legacy approval."""
+    canonical = {"ensure_issue_execution", "request_devloop_approval", "submit_delegated_approve"}
+    for path in sorted(HISTORY_DIR.glob("*.json")):
+        if path in CANONICAL_HISTORIES:
+            continue
+        events = _events(json.loads(path.read_text(encoding="utf-8")))
+        assert dev_loop.CANONICAL_APPROVAL_PATCH not in _patch_ids(events), path.name
+        assert not canonical & set(_scheduled(events)), path.name
+
+
+@pytest.mark.parametrize(
+    ("recorder", "name"), [(record_delegated, "delegated"), (record_issue_started, "issue_started")]
+)
+async def test_todays_canonical_loop_replays_its_own_history(routed_api, recorder, name):
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        history = await recorder(env)
+    await Replayer(workflows=[DevLoopWorkflow]).replay_workflow(
+        WorkflowHistory.from_json(f"today-{name}", json.dumps(history))
+    )

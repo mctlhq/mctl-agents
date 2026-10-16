@@ -195,10 +195,10 @@ async def test_investigator_asks_human_answers_loop_continues_then_approval_gate
         assert calls.count("mctl-agents-investigate") == 2
 
         # (g) approve, and only then the implementer runs.
-        await handle.signal(DevLoopWorkflow.approve)
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
         result = await handle.result()
 
-    assert calls.index("mctl-agents-implement") > calls.index("mctl-agents-approve")
+    assert calls.index("mctl-agents-implement") > calls.index("delegated-approve")
     assert result.human_input is not None and result.human_input.outcome == "answered"
     assert result.human_input.request_id == sealed.request_id
     assert result.implement is not None and result.implement.phase == "Succeeded"
@@ -257,7 +257,7 @@ async def test_round_two_parks_again_and_the_third_answer_hits_the_round_bound(
         assert "mctl-agents-implement" not in calls
         assert calls.count("mctl-agents-investigate") == rounds + 1
 
-        await handle.signal(DevLoopWorkflow.approve)
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
         result = await handle.result()
 
     assert result.human_input is not None and result.human_input.outcome == "answered"

@@ -79,3 +79,18 @@ def test_no_service_name_is_shell_glob_hostile_beyond_a_leading_dot():
     for name in SERVICES:
         assert "/" not in name, name
         assert name not in {".", ".."}, name
+
+
+def test_every_service_has_a_work_item_tenant():
+    """#636: an unmapped service cannot open its issue's WorkItem. A new
+    SERVICES entry must be mapped in SERVICE_TENANTS."""
+    from config.settings import SERVICE_TENANTS, tenant_for_service
+
+    assert [s for s in SERVICES if tenant_for_service(s) is None] == []
+    assert set(SERVICE_TENANTS) <= set(SERVICES)
+
+
+def test_an_unmapped_service_has_no_tenant_and_no_default():
+    from config.settings import tenant_for_service
+
+    assert tenant_for_service("not-a-service") is None

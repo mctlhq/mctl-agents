@@ -417,16 +417,15 @@ async def test_todays_dev_loop_full_carries_the_launch_correlation_marker() -> N
         assert params.get("temporal_workflow_id") == handle.id
         assert params.get("temporal_run_id") == handle.first_execution_run_id
         # This scenario starts with no work item (`_dev_loop_start` passes
-        # only `issue_url`), so `work_item_id` must be omitted entirely
-        # rather than sent empty (requirements.md's EARS clause).
-        assert "work_item_id" not in params
+        # only `issue_url`); since #636 the loop resolves its own, so the
+        # implementer is told which, and still no execution id.
+        assert params.get("work_item_id") == "wi_test"
         assert "execution_id" not in params
-    # The approve submit keeps its own shape: the helper touches only the
-    # implement and shepherd sites.
-    approve_submits = _submit_params(events, "mctl-agents-approve")
-    assert approve_submits and all(
-        set(p) == {"service", "slug", "approver"} for p in approve_submits
-    ), approve_submits
+    # The flip is the delegated operation now (#636): the workflow submits no
+    # approve CWFT itself, so no `approver` is left to travel.
+    assert not _submit_params(events, "mctl-agents-approve")
+    assert "canonical-approval" in _patch_ids(events)
+    assert "submit_delegated_approve" in [name for name, _ in _scheduled_activities(events)]
 
 
 async def test_todays_code_still_routes_and_still_guards() -> None:
@@ -500,6 +499,10 @@ async def test_todays_dev_loop_admits_the_implement_submit_on_its_own_queue() ->
     ids = _patch_ids(events)
     assert "implement-queue" in ids
     assert "exec-queue" in ids
+    # The delegated approve flip (#636) is on the execution queue, never the
+    # admission queue: it would take an implementer's slot.
+    delegated_queues = [q for name, q in _scheduled_activities(events) if name == "submit_delegated_approve"]
+    assert delegated_queues == [EXECUTION_TASK_QUEUE]
 
     submits = [(a, a["taskQueue"]["name"]) for a in _activity_scheduled_attrs(events, "submit_and_wait")]
     queues = [queue for _, queue in submits]
@@ -580,6 +583,9 @@ _STANDALONE_FIXTURES = {
     "dev_loop_issue_keyed.json",
     # mctlhq/mctl-agents#198, replayed by tests/test_action_approval_wait.py.
     "action_approval_wait.json",
+    # #636: recorded by tests/test_execution_request_replay.py
+    "dev_loop_delegated.json",
+    "dev_loop_issue_started_delegated.json",
 }
 
 

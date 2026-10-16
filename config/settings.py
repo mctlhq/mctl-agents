@@ -97,6 +97,43 @@ SERVICES = [
     # "upwork-mcp",
 ]
 
+# The mctl-api tenant that owns each service's DevLoop WorkItems
+# (mctlhq/mctl-agents#636). `POST /api/v1/work-items` takes an explicit
+# tenant, and an unmapped service is a hard start failure, never a default:
+# the issue's work item must land in the tenant where every other surface
+# opens it. mctl-api dedupes open work per (tenant, external_key), and the
+# Telegram surface opens an issue's item in `mctl` (MCTL_WORK_ITEM_TENANT in
+# mctl-gitops services/labs/mctl-telegram/values.yaml) whatever namespace the
+# target deploys to, so a DevLoop item in another tenant would split one
+# issue into two WorkItems. A new SERVICES entry must be added
+# here (tests/test_settings.py::test_every_service_has_a_work_item_tenant fails
+# otherwise).
+PLATFORM_TENANT = "mctl"
+SERVICE_TENANTS = {
+    "mctl-web": PLATFORM_TENANT,
+    "mctl-docs": PLATFORM_TENANT,
+    "mctl-api": PLATFORM_TENANT,
+    "mctl-portal": PLATFORM_TENANT,
+    "mctl-agent": PLATFORM_TENANT,
+    "mctl-gitops": PLATFORM_TENANT,
+    "mctl-agents": PLATFORM_TENANT,
+    "mctl-telegram": PLATFORM_TENANT,
+    "mctl-design": PLATFORM_TENANT,
+    "mctl-pairdesk": PLATFORM_TENANT,
+    "mctl-academy": PLATFORM_TENANT,
+    "seerrsense": PLATFORM_TENANT,
+    "portfolio": PLATFORM_TENANT,
+    ".github": PLATFORM_TENANT,
+    "newton-mcp-gateway": PLATFORM_TENANT,
+    "mctl-claude-remote": PLATFORM_TENANT,
+}
+
+
+def tenant_for_service(service: str) -> str | None:
+    """The tenant that owns `service`'s WorkItems, or None when unmapped."""
+    return SERVICE_TENANTS.get(service)
+
+
 # Services that are valid implementer/investigator targets but are NOT
 # analyzed by the proactive researcher/analyst/spec-writer rotation.
 NON_ROTATING_SERVICES = {

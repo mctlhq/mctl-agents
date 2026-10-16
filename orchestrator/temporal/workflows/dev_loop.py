@@ -53,6 +53,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -77,6 +78,19 @@ with workflow.unsafe.imports_passed_through():
     )
     from orchestrator.temporal.activities.action_approval import GatedActionInput
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
+    from orchestrator.temporal.activities.canonical_execution import (
+        EnsuredExecution,
+        EnsureExecutionInput,
+        ensure_issue_execution,
+    )
+    from orchestrator.temporal.activities.delegated_approval import (
+        ApprovalRequestInput,
+        ApprovalRequestResult,
+        DelegatedApproveInput,
+        DelegatedApproveResult,
+        request_devloop_approval,
+        submit_delegated_approve,
+    )
     from orchestrator.temporal.activities.deploy_state import (
         DeployStatus,
         DeployTarget,
@@ -122,7 +136,7 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.implement_outcome import (
         pre_start_reason as render_pre_start_reason,
     )
-    from orchestrator.temporal.issue_ref import parse_issue_url, request_engine_ref
+    from orchestrator.temporal.issue_ref import parse_issue_url, request_engine_ref, run_engine_ref
     from orchestrator.temporal.workflows.action_approval import (
         DEFAULT_MAX_WAIT_SECONDS,
         OUTCOME_BLOCKED,
@@ -257,6 +271,39 @@ APPROVE_STEP_TIMEOUT = timedelta(minutes=15)
 # budgets for its own 14-day watch.
 APPROVAL_POLL_INTERVAL = timedelta(hours=6)
 APPROVAL_WAIT_DEADLINE = timedelta(days=14)
+
+#: mctlhq/mctl-agents#636 (mctl-api#571, #376 Slice C). Guards the canonical
+#: identity path of a NEW loop: its own WorkItem and `we_` from the start, an
+#: `aar_` bound to that `we_` before the human is asked, and the approve
+#: operation exercised through a run token on that grant instead of a direct
+#: `mctl-agents-approve` CWFT carrying a free-text approver. Evaluated once,
+#: at the start of a loop that is not a continued merge watch. A history
+#: recorded before it never records the marker and replays the legacy path
+#: verbatim; a history that does record it has no legacy branch to fall back
+#: to, whatever the outcome (fail closed).
+CANONICAL_APPROVAL_PATCH = "canonical-approval"
+#: The `ApplicationError.type` of a start that could not obtain its canonical
+#: WorkItem/`we_`: the loop fails here, it never runs without an identity.
+CANONICAL_EXECUTION_ERROR_TYPE = "CanonicalExecutionRefused"
+#: Bounded: a grant is spent by the first request mctl-api accepts, so a
+#: blind retry of an ambiguous one meets `approval_consumed` and stops there.
+DELEGATED_APPROVE_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
+#: How long the loop's `aar_` stays decidable, and so how long it parks for:
+#: mctl-api caps a request at 7 days, so the 14-day park of the legacy path
+#: would outlive any grant it could still be approved with. A literal, not
+#: derived from `action_approvals.MAX_TTL_S`: it times parks already in
+#: flight, so a later change to that constant must not move their deadline
+#: on replay (tests/test_dev_loop_workflow.py pins the two together).
+CANONICAL_APPROVAL_WAIT = timedelta(seconds=7 * 24 * 3600 - 300)
+#: The shape of an `approval_ref` this loop accepts from a signal: mctl-api's
+#: `aar_` ids. Anything else is ignored, so a malformed value never reaches an
+#: HTTP header as a transport error instead of a typed refusal.
+_APPROVAL_REF = re.compile(r"aar_[A-Za-z0-9_-]{1,124}")
+#: How many signalled refs a run remembers: enough for every attempt a loop
+#: plausibly makes, bounded so a signal flood cannot grow workflow state.
+_MAX_SIGNALLED_REFS = 16
+#: `request_devloop_approval`'s state for a grant a human already approved.
+APPROVAL_APPROVED = "approved"
 
 # A dispatched loop (mctlhq/mctl-agents#461) waits for its execution request
 # to be fulfilled before it runs anything: the dispatcher starts the loop
@@ -1592,6 +1639,38 @@ class DevLoopWorkflow:
         # (`_bind_dispatched_execution`); "" until then, and for every loop
         # that was not dispatched.
         self._own_engine_ref = ""
+        # The canonical identity path (#636), all empty/false on a history
+        # that did not record `CANONICAL_APPROVAL_PATCH`. `_canonical_open`
+        # is true while this loop holds a non-terminal `we_` that it must end.
+        self._canonical = False
+        self._canonical_open = False
+        self._canonical_end_phase = ""
+        # The phase an end of the own `we_` still has to reach when its
+        # advance did not land; `run`'s exit retries it with this phase.
+        self._canonical_pending_phase = ""
+        # This loop's own `we_`, pinned when it is opened or bound: the one
+        # every grant is requested for, minted against and flipped under.
+        # Never `_executions[-1]`, which a resume or a delivery appends to.
+        self._canonical_execution = ""
+        # The grant this loop will exercise: set only when it is the one this
+        # loop requested (`_requested_ref`) AND a human decided it, i.e. a
+        # signal named it or the request found it already approved.
+        self._approval_ref = ""
+        # The `aar_` the current attempt asked for; cleared by a transition.
+        self._requested_ref = ""
+        # Refs signalled to this run, in order, bounded. A signal is only a
+        # claim; it counts once it matches the requested grant, whichever of
+        # the two arrives first.
+        self._signalled_refs: list[str] = []
+        #: Set by a transition, cleared when the fresh grant is asked for.
+        self._grant_refresh = False
+        #: `len(self._executions)` at the latest transition.
+        self._transition_mark = 0
+        self._approval_slug = ""
+        # Bumped by every surface/actor transition: the re-asked grant gets a
+        # new idempotency key, so a decision made before the transition is
+        # never found again as the fresh one the transition requires.
+        self._approval_attempt = 0
         self._implement_state = ImplementExecutionState()
         # Which cadence this execution runs at. Bound for real in _watch_pr,
         # once, off the `fast-shepherd-cadence` marker; CADENCE here so every
@@ -1789,6 +1868,17 @@ class DevLoopWorkflow:
                 approver = arg.get("approver")
                 if isinstance(approver, str) and approver:
                     self._approver = approver
+                # mctl-api signals `{"approval_ref": "aar_..."}` once a human
+                # decided this loop's grant (#636). It is the only authority
+                # a canonical loop acts on; an `approver` string never is,
+                # and neither is a ref this loop did not request for its
+                # current attempt (a stale or replayed decision).
+                approval_ref = arg.get("approval_ref")
+                if isinstance(approval_ref, str) and _APPROVAL_REF.fullmatch(approval_ref):
+                    if approval_ref not in self._signalled_refs:
+                        self._signalled_refs = [*self._signalled_refs, approval_ref][-_MAX_SIGNALLED_REFS:]
+                    if self._requested_ref and approval_ref == self._requested_ref:
+                        self._approval_ref = approval_ref
             elif isinstance(arg, str) and arg:
                 self._approver = arg
         self._approved = True
@@ -1868,8 +1958,154 @@ class DevLoopWorkflow:
         if transition:
             self._approved = False
             self._approver = None
+            self._approval_ref = ""
+            self._requested_ref = ""
+            # A decision signalled before the transition belongs to the
+            # attempt it ended; only one asked for afterwards can release.
+            self._signalled_refs = []
+            # Wakes a canonical park, whose grant is now the wrong attempt's,
+            # so it asks for a fresh one (claude P2 on #651).
+            self._grant_refresh = True
+            # The execution this transition opens is the first one recorded
+            # after it (bound at its fulfil, or appended by the signal).
+            self._transition_mark = len(self._executions)
+            self._approval_attempt += 1
             self._resume_pending = True
         return transition
+
+    async def _request_canonical_approval(
+        self,
+        issue: IssueRef,
+        target_repo: str,
+        investigate_result: WorkflowResult,
+        human_input: HumanInputOutcome | None,
+        *,
+        execution_id: str = "",
+    ) -> DevLoopResult | None:
+        """Create (or find) the `aar_` for exactly the flip that will follow:
+        this loop's `we_`, `mctl-agents-approve`, `<service>/<slug>`. Returns
+        the result that ends the loop, or None to park for the decision.
+
+        The slug is looked up here and again after the park; the flip refuses
+        to run if the two differ, so a human never approves one proposal and
+        has another flipped."""
+        slug = await workflow.execute_activity(
+            find_proposal_slug,
+            args=[target_repo, parse_issue_url(issue.issue_url).number],
+            start_to_close_timeout=SLUG_LOOKUP_TIMEOUT,
+            retry_policy=SLUG_LOOKUP_RETRY_POLICY,
+        )
+        if not slug:
+            raise ApplicationError(
+                f"no proposal dir issue-{parse_issue_url(issue.issue_url).number}-* found under "
+                f"agents-state/{target_repo}/proposals on gitops main; refusing to request an approval for it",
+                non_retryable=True,
+            )
+        # A signal that arrived before there was a grant to decide cannot be
+        # one: the grant is created only now.
+        if not self._approval_ref:
+            self._approved = False
+        # A transition can land while the request is in flight (claude P2 on
+        # #651): its answer is then the ended attempt's, and is not adopted.
+        attempt = self._approval_attempt
+        try:
+            requested: ApprovalRequestResult = await workflow.execute_activity(
+                request_devloop_approval,
+                ApprovalRequestInput(
+                    execution_id=execution_id or self._canonical_execution_id(),
+                    service=target_repo,
+                    slug=slug,
+                    ttl_seconds=int(CANONICAL_APPROVAL_WAIT.total_seconds()),
+                    attempt=attempt,
+                ),
+                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+            )
+        except ActivityError as exc:
+            return DevLoopResult(
+                investigate=investigate_result,
+                implement=None,
+                human_input=human_input,
+                ended=f"approval request unavailable: {type(exc.cause).__name__ if exc.cause else 'unknown'}",
+            )
+        if attempt != self._approval_attempt:
+            # `_grant_refresh` is still set, so the park asks again under
+            # the new attempt.
+            return None
+        if not requested.ok:
+            return DevLoopResult(
+                investigate=investigate_result,
+                implement=None,
+                human_input=human_input,
+                ended=f"approval request refused: {requested.reason}",
+            )
+        if not _APPROVAL_REF.fullmatch(requested.approval_ref):
+            # It becomes a header value, like a signalled one (claude P3).
+            return DevLoopResult(
+                investigate=investigate_result,
+                implement=None,
+                human_input=human_input,
+                ended="approval request refused: mctl-api answered no well-formed approval ref",
+            )
+        self._approval_slug = slug
+        self._requested_ref = requested.approval_ref
+        if requested.state == APPROVAL_APPROVED and requested.approval_ref:
+            # Found already decided (a new run of this loop re-finding the
+            # grant a human approved for an earlier run): signals are per
+            # run, so this run would otherwise never learn it. `approved`
+            # means exactly that a human decided; nothing else is adopted.
+            self._approval_ref = requested.approval_ref
+            self._approved = True
+        elif requested.approval_ref and requested.approval_ref in self._signalled_refs:
+            # The decision's signal overtook the request's answer.
+            self._approval_ref = requested.approval_ref
+            self._approved = True
+        return None
+
+    async def _delegated_approve(self, target_repo: str, slug: str) -> tuple[WorkflowResult | None, str]:
+        """Flip the proposal through mctl-api's delegated operation, under the
+        signalled grant. Returns (result, "") or (None, why the loop ends)."""
+        if slug != self._approval_slug:
+            return None, "approve flip refused: the proposal changed since the approval was requested"
+        if not self._approval_ref:
+            return None, "approve flip refused: no approval grant was signalled"
+        try:
+            delegated: DelegatedApproveResult = await workflow.execute_activity(
+                submit_delegated_approve,
+                DelegatedApproveInput(
+                    execution_id=self._canonical_execution_id(),
+                    approval_ref=self._approval_ref,
+                    service=target_repo,
+                    slug=slug,
+                ),
+                task_queue=EXECUTION_TASK_QUEUE,
+                start_to_close_timeout=APPROVE_STEP_TIMEOUT,
+                heartbeat_timeout=SDK_STEP_HEARTBEAT_TIMEOUT,
+                retry_policy=DELEGATED_APPROVE_RETRY_POLICY,
+            )
+        except ActivityError as exc:
+            return None, f"approve flip unavailable: {type(exc.cause).__name__ if exc.cause else 'unknown'}"
+        if delegated.refusal or delegated.result is None:
+            return None, f"approve flip refused: {delegated.refusal or 'no result'}" + (
+                f" ({delegated.code})" if delegated.code else ""
+            )
+        return delegated.result, ""
+
+    def _canonical_execution_id(self) -> str:
+        """This canonical loop's own `we_`, pinned when it was opened or
+        bound. A resume or a delivery records other executions after it; the
+        grant, the run token and the flip must all name this one."""
+        return self._canonical_execution
+
+    def _is_approved(self, *, needs_grant: bool = True) -> bool:
+        """Has this loop been approved? A canonical loop's approval is the
+        signalled `aar_` and nothing else: a legacy `{"approver"}` signal, or a
+        bare one, never counts, so the park keeps waiting for the grant.
+        `needs_grant=False` is the gate AFTER the flip, where the grant is
+        already spent and only a resume's re-approval is being re-asked."""
+        if not self._approved:
+            return False
+        return not (self._canonical and needs_grant) or bool(self._approval_ref)
 
     async def _await_reapproval(
         self,
@@ -1877,6 +2113,8 @@ class DevLoopWorkflow:
         *,
         approve: WorkflowResult | None = None,
         human_input: HumanInputOutcome | None = None,
+        needs_grant: bool = False,
+        wait: timedelta | None = None,
     ) -> DevLoopResult | None:
         """Park until a resume-cleared approval is re-granted — releasable
         and bounded, per #420's rule for every approval park in this
@@ -1890,13 +2128,23 @@ class DevLoopWorkflow:
         guarded by their own checks."""
         try:
             await workflow.wait_condition(
-                lambda: self._approved or self._abandoned,
-                timeout=APPROVAL_WAIT_DEADLINE,
+                lambda: (
+                    self._is_approved(needs_grant=needs_grant)
+                    or self._abandoned
+                    or (self._canonical and needs_grant and self._grant_refresh)
+                ),
+                # A canonical grant is decidable for at most its TTL.
+                timeout=wait
+                or (CANONICAL_APPROVAL_WAIT if (self._canonical and needs_grant) else APPROVAL_WAIT_DEADLINE),
             )
         except TimeoutError:
             # A signal landing while the timeout fired must not be
             # discarded — same late-signal rule as the original park.
-            if not (self._approved or self._abandoned):
+            if not (
+                self._is_approved(needs_grant=needs_grant)
+                or self._abandoned
+                or (self._canonical and needs_grant and self._grant_refresh)
+            ):
                 return DevLoopResult(
                     investigate=investigate_result,
                     implement=None,
@@ -1913,6 +2161,75 @@ class DevLoopWorkflow:
                 ended=f"abandoned: {self._abandon_reason}",
             )
         return None
+
+    async def _await_canonical_reapproval(
+        self,
+        issue: IssueRef,
+        target_repo: str,
+        investigate_result: WorkflowResult,
+        *,
+        approve: WorkflowResult | None = None,
+        human_input: HumanInputOutcome | None = None,
+        after_flip: bool = False,
+    ) -> DevLoopResult | None:
+        """The canonical re-approval park (#636): ask for a fresh grant
+        whenever a transition cleared the decision, and wait for a decision
+        on exactly that grant. A transition can land while parked (claude P2
+        on #651), so the ask is repeated after every wake it caused, not
+        only before the first. The whole park is bounded by one
+        CANONICAL_APPROVAL_WAIT from its start, however many transitions
+        land in it (#420).
+
+        Before the flip the grant is asked on this loop's own `we_`; after it
+        that `we_` has ended and its grant is spent, so it is asked on the
+        execution the LATEST transition opened (claude P2 on #651: not any
+        execution but the own one, which an earlier resume's also is)."""
+        deadline = workflow.now() + CANONICAL_APPROVAL_WAIT
+
+        def ended(reason: str) -> DevLoopResult:
+            return DevLoopResult(
+                investigate=investigate_result,
+                implement=None,
+                approve=approve,
+                human_input=human_input,
+                ended=reason,
+            )
+
+        def opened() -> bool:
+            return len(self._executions) > self._transition_mark
+
+        while True:
+            if self._abandoned:
+                return ended(f"abandoned: {self._abandon_reason}")
+            remaining = deadline - workflow.now()
+            if remaining <= timedelta(0) and not self._is_approved(needs_grant=True):
+                return ended("re-approval wait expired")
+            if not self._is_approved(needs_grant=True):
+                if after_flip:
+                    # The resume's `we_` is bound at its fulfil, after the
+                    # transition; a grant asked before that would be asked
+                    # on an ended one, and refused.
+                    try:
+                        await workflow.wait_condition(lambda: self._abandoned or opened(), timeout=remaining)
+                    except TimeoutError:
+                        pass
+                    if self._abandoned:
+                        return ended(f"abandoned: {self._abandon_reason}")
+                    if not opened():
+                        return ended("re-approval wait expired")
+                self._grant_refresh = False
+                refused = await self._request_canonical_approval(
+                    issue, target_repo, investigate_result, human_input,
+                    execution_id=self._executions[-1].execution_id if after_flip else "",
+                )
+                if refused is not None:
+                    return dataclasses.replace(refused, approve=approve)
+            result = await self._await_reapproval(
+                investigate_result, approve=approve, human_input=human_input, needs_grant=True,
+                wait=max(deadline - workflow.now(), timedelta(seconds=1)),
+            )
+            if result is not None or self._is_approved(needs_grant=True):
+                return result
 
     @workflow.signal
     def resume(self, *args: object) -> None:
@@ -2183,10 +2500,12 @@ class DevLoopWorkflow:
                     surface_transition=opened.surface_transition,
                 )
             )
+        # A canonical loop's decision is a grant (#636): a bare or legacy
+        # `approver` signal decides no delivery either.
         await workflow.wait_condition(
-            lambda: self._abandoned or self._approved or self._gates_passed or self._exiting or self._hopping
+            lambda: self._abandoned or self._is_approved() or self._gates_passed or self._exiting or self._hopping
         )
-        decided = (self._approved or self._gates_passed) and not self._abandoned
+        decided = (self._is_approved() or self._gates_passed) and not self._abandoned
         if self._hopping and not decided and not self._abandoned:
             return  # still open, undecided: carried across the hop, re-bound by the next run
         await self._land_delivery(opened, "Succeeded" if decided else "Failed", "", engine_ref)
@@ -2648,6 +2967,47 @@ class DevLoopWorkflow:
         )
         return bound, ""
 
+    async def _ensure_canonical_execution(self, issue: IssueRef) -> None:
+        """Resolve this loop's WorkItem and attach its own engine run, or fail
+        the start (#636). Both mctl-api routes are idempotent, so a retry of
+        the activity lands on the same `wi_` and `we_`; a new run under the
+        same id attaches its own `we_` (and creates the next `wi_` if the
+        previous one ended). A refusal, `external_key_in_use` included, and an
+        unreadable store alike stop the loop before it runs anything: it never
+        creates another WorkItem and never runs without one."""
+        # Per run (`run_engine_ref`): an ended `we_` is never re-opened, and a
+        # failed loop may be started again under the same workflow id.
+        engine_ref = run_engine_ref(workflow.info().workflow_id, workflow.info().run_id)
+        try:
+            ensured: EnsuredExecution = await workflow.execute_activity(
+                ensure_issue_execution,
+                EnsureExecutionInput(
+                    issue_url=issue.issue_url, engine_ref=engine_ref, work_item_id=issue.work_item_id or "",
+                ),
+                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+            )
+        except ActivityError as exc:
+            raise ApplicationError(
+                f"no canonical work item/execution for {issue.issue_url}: the work-item store gave no usable answer",
+                type=CANONICAL_EXECUTION_ERROR_TYPE,
+                non_retryable=True,
+            ) from exc
+        if not ensured.ok:
+            raise ApplicationError(ensured.reason, type=CANONICAL_EXECUTION_ERROR_TYPE, non_retryable=True)
+        self._work_item_id = ensured.work_item_id
+        self._own_engine_ref = engine_ref
+        self._seen_execution_ids.add(ensured.execution_id)
+        self._executions.append(
+            ExecutionRef(
+                execution_id=ensured.execution_id,
+                sequence=ensured.sequence,
+                temporal_workflow_id=engine_ref,
+            )
+        )
+        self._canonical_execution = ensured.execution_id
+        self._canonical_open = True
+
     async def _fail_dispatched_execution(self) -> None:
         """Advance the dispatched execution to `Failed` while the loop is
         unwinding, including on a workflow cancellation.
@@ -2769,10 +3129,46 @@ class DevLoopWorkflow:
         try:
             result = await self._run_loop(issue)
         except (Exception, asyncio.CancelledError):
+            # A canonical loop's own `we_` ends on every exit too (#636): it
+            # is held non-terminal through the approval, and a loop that no
+            # longer runs must not leave it blocking the work item.
+            # The unwind keeps FAST_ACTIVITY_RETRY_POLICY (see
+            # DISPATCHED_ADVANCE_RETRY_POLICY): this loop closes next, and the
+            # dispatcher reconciles the own `we_` of a closed loop.
+            await self._end_canonical_execution(
+                self._canonical_pending_phase or "Failed", retry_policy=FAST_ACTIVITY_RETRY_POLICY
+            )
             await self._settle_deliveries(hopping=False)
             raise
+        # Still open here: either the flip's own end did not land (retry it
+        # with that phase), or the loop exited before any flip: the `we_`
+        # then ends with the investigator's phase, as a dispatched one always
+        # did (claude P2 on #651), and Failed if it never got that far.
+        await self._end_canonical_execution(
+            self._canonical_pending_phase or self._canonical_end_phase or "Failed"
+        )
         await self._settle_deliveries(hopping=False)
         return result
+
+    async def _end_canonical_execution(
+        self, phase: str, *, retry_policy: RetryPolicy = DISPATCHED_ADVANCE_RETRY_POLICY
+    ) -> None:
+        """End this loop's own canonical `we_` in `phase`, once.
+
+        A no-op, and no command, unless the loop opened one (a history that
+        recorded `CANONICAL_APPROVAL_PATCH`). Held non-terminal from the start
+        through the approval because mctl-api only binds an `aar_` to, mints a
+        run token for, and resolves an approve to a NON-TERMINAL execution; it
+        ends right after the approve flip, or on whichever exit comes first."""
+        if not self._canonical_open:
+            return
+        # Stay open when the store gave no answer, so the exit path in `run`
+        # tries once more rather than leaving the `we_` blocking the item.
+        if await self._advance_dispatched_execution(phase, retry_policy=retry_policy):
+            self._canonical_open = False
+            self._canonical_pending_phase = ""
+        else:
+            self._canonical_pending_phase = phase
 
     async def _run_loop(self, issue: IssueRef) -> DevLoopResult:
         # mctl-agents#404 v2: a continued run of a hopped merge watch. Every
@@ -2797,6 +3193,13 @@ class DevLoopWorkflow:
         # work item and one execution request, and its execution #1 is the
         # store's canonical `we_`, never a locally derived id: it runs nothing
         # until the request is fulfilled with this workflow's own engine run.
+        #
+        # #636: a loop new enough to record `CANONICAL_APPROVAL_PATCH` always
+        # has a canonical WorkItem and `we_` — the dispatched one below, or
+        # its own, resolved through `POST /work-items` and attached as
+        # `(temporal, <workflow id>#run_<run id>)` — and holds that `we_` non-terminal
+        # until the approve flip, because the approval chain is bound to it.
+        self._canonical = workflow.patched(CANONICAL_APPROVAL_PATCH)
         dispatched: BoundExecution | None = None
         if issue.execution_request_id and workflow.patched(EXECUTION_REQUEST_PATCH):
             dispatched, refused = await self._bind_dispatched_execution(issue)
@@ -2808,6 +3211,13 @@ class DevLoopWorkflow:
                     implement=None,
                     ended=refused,
                 )
+            # Reuses the fulfilled request's WorkItem and `we_`; creates and
+            # attaches nothing. The advance to a terminal phase is deferred.
+            self._canonical_open = self._canonical
+            if self._canonical:
+                self._canonical_execution = dispatched.execution_id
+        elif self._canonical:
+            await self._ensure_canonical_execution(issue)
         elif issue.work_item_id:
             self._work_item_id = issue.work_item_id
             seed_execution_id = execution_id_for(issue.work_item_id, 1, str(workflow.info().attempt))
@@ -2857,14 +3267,20 @@ class DevLoopWorkflow:
             loop_info = workflow.info()
             investigate_params["temporal_workflow_id"] = loop_info.workflow_id
             investigate_params["temporal_run_id"] = loop_info.run_id
-            if dispatched is not None:
+            if dispatched is not None or self._canonical_open:
                 # The investigate CWFT's declared `work_item_id`/`execution_id`
                 # parameters (gitops#1279) become `--work-item-id`/`--execution-id`:
                 # the investigator uses this `we_` as its execution identity and
                 # refuses it unless it is in that item's ledger, and refuses an
-                # item about another issue (`work-item mismatch`).
+                # item about another issue (`work-item mismatch`). A canonical
+                # loop's own `we_` is handed over the same way: it is Running,
+                # so an investigator attaching its own Argo run would meet
+                # `execution_active`.
                 investigate_params["work_item_id"] = self._work_item_id
-                investigate_params["execution_id"] = dispatched.execution_id
+                investigate_params["execution_id"] = (
+                    dispatched.execution_id if dispatched is not None else self._canonical_execution_id()
+                )
+            if dispatched is not None:
                 # Correlation only (gitops#1345's `execution_request_id`):
                 # the execution identity is still `execution_id`.
                 investigate_params["execution_request_id"] = str(issue.execution_request_id)
@@ -2873,14 +3289,20 @@ class DevLoopWorkflow:
             await _record("issue-investigator", investigator_release, investigate_result, target_repo)
         except (Exception, asyncio.CancelledError):
             # Not BaseException: GeneratorExit and the SDK eviction teardown
-            # must unwind untouched (see `_fail_dispatched_execution`).
-            if dispatched is not None:
+            # must unwind untouched (see `_fail_dispatched_execution`). A
+            # canonical loop's `we_` is ended by `run`'s own exit handling.
+            if dispatched is not None and not self._canonical:
                 await self._fail_dispatched_execution()
             raise
         # The phase the dispatched execution still has to reach, when its
         # advance below did not land (mctlhq/mctl-agents#461); "" otherwise.
         dispatched_advance_pending = ""
-        if dispatched is not None:
+        if self._canonical_open:
+            # Held non-terminal through the approval (#636): the phase it ends
+            # with is the investigator's, applied at the approve flip or on
+            # whichever exit comes first.
+            self._canonical_end_phase = "Succeeded" if investigate_result.succeeded else "Failed"
+        elif dispatched is not None:
             # The dispatched execution IS this investigator run: it ends
             # here, whatever the loop does next, so the item's one
             # non-terminal slot is free again for a later request.
@@ -3001,7 +3423,7 @@ class DevLoopWorkflow:
                     "received_at": hi_outcome.received_at,
                 })
                 continuation_params = dict(investigate_params)
-                if dispatched is not None:
+                if dispatched is not None or self._canonical_open:
                     # The dispatched `we_` ended with the first run and sealed
                     # that run's context; a continuation is a different
                     # context, which the store would refuse as a divergence
@@ -3010,6 +3432,11 @@ class DevLoopWorkflow:
                     continuation_params.pop("execution_id", None)
                 continuation_params["human_input_responses"] = json.dumps(accepted_answers)
                 investigate_result = await _run_cwft("mctl-agents-investigate", continuation_params)
+                if self._canonical_open:
+                    # The own `we_` is still open (#636): it ends with the
+                    # latest investigate's phase (agy P2 on #651). A raise
+                    # ends it Failed through `run`'s own exit handling.
+                    self._canonical_end_phase = "Succeeded" if investigate_result.succeeded else "Failed"
                 await _record("issue-investigator", investigator_release, investigate_result, target_repo)
                 if not investigate_result.succeeded:
                     return DevLoopResult(
@@ -3037,16 +3464,28 @@ class DevLoopWorkflow:
         # clarification park): once more, patiently, before the approval
         # park, which may last days with the loop RUNNING. Still best effort.
         dispatched_advance_pending = await self._land_pending_advance(dispatched_advance_pending, before="approval")
+        if self._canonical:
+            # #636: the grant this park waits for exists before the wait
+            # starts. It is bound to this loop's own `we_` and to exactly the
+            # proposal that will be flipped, so mctl-api can tell the human
+            # what they are deciding and signal back its id.
+            self._grant_refresh = False
+            ended = await self._request_canonical_approval(
+                issue, target_repo, investigate_result, human_input_outcome
+            )
+            if ended is not None:
+                return ended
+        approval_wait = CANONICAL_APPROVAL_WAIT if self._canonical else APPROVAL_WAIT_DEADLINE
         approval_ended: str | None = None
         if workflow.patched("approval-watch"):
-            approval_deadline = workflow.now() + APPROVAL_WAIT_DEADLINE
+            approval_deadline = workflow.now() + approval_wait
             while workflow.now() < approval_deadline:
                 try:
                     # wait_condition with a timeout raises asyncio.TimeoutError
                     # on expiry rather than returning False -- it never
                     # returns a value at all (see its own signature).
                     await workflow.wait_condition(
-                        lambda: self._approved or self._abandoned,
+                        lambda: self._is_approved() or self._abandoned or (self._canonical and self._grant_refresh),
                         timeout=APPROVAL_POLL_INTERVAL,
                     )
                 except TimeoutError:
@@ -3058,11 +3497,24 @@ class DevLoopWorkflow:
                         )
                         break
                     continue
+                if self._canonical and self._grant_refresh and not (self._is_approved() or self._abandoned):
+                    # #636 (claude P2 on #651): a transition landed while
+                    # parked, so the grant asked for is the wrong attempt's.
+                    # Ask for the fresh one.
+                    self._grant_refresh = False
+                    ended = await self._request_canonical_approval(
+                        issue, target_repo, investigate_result, human_input_outcome
+                    )
+                    if ended is not None:
+                        return ended
+                    # The deadline stays: the park is bounded from its start,
+                    # however many transitions land in it (#420).
+                    continue
                 break
             else:
                 approval_ended = "approval wait expired"
         else:
-            await workflow.wait_condition(lambda: self._approved or self._abandoned)
+            await workflow.wait_condition(lambda: self._is_approved() or self._abandoned)
 
         # mctl-agents#420: an approve or abandon signal landing while the final
         # poll's in-flight get_issue_state activity was executing must not be
@@ -3071,7 +3523,7 @@ class DevLoopWorkflow:
         # approve must NOT resurrect it.
         if approval_ended is not None:
             if approval_ended == "approval wait expired" and (
-                self._approved or self._abandoned
+                self._is_approved() or self._abandoned
             ):
                 pass
             else:
@@ -3195,18 +3647,42 @@ class DevLoopWorkflow:
                 # implement CWFT covers the later gaps (implementer resolve,
                 # the flip itself).
                 if workflow.patched("work-context-resume"):
-                    ended = await self._await_reapproval(investigate_result, human_input=human_input_outcome)
+                    if self._canonical:
+                        # A transition cleared the grant: ask for a fresh one
+                        # on the same `we_` (a new attempt), or nobody could
+                        # ever decide this loop again.
+                        ended = await self._await_canonical_reapproval(
+                            issue, target_repo, investigate_result, human_input=human_input_outcome
+                        )
+                    else:
+                        ended = await self._await_reapproval(
+                            investigate_result, human_input=human_input_outcome, needs_grant=True
+                        )
                     if ended is not None:
                         return ended
-                approve_result = await _run_cwft(
-                    "mctl-agents-approve",
-                    {
-                        "service": target_repo,
-                        "slug": slug,
-                        "approver": self._approver or "unknown",
-                    },
-                    step_timeout=APPROVE_STEP_TIMEOUT,
-                )
+                if self._canonical:
+                    # #636: the flip is the delegated operation under the
+                    # grant a human decided, with a run token for this `we_`.
+                    # No branch below this one is a fallback: every refusal
+                    # ends the loop, none reaches the legacy relay.
+                    approve_result, refused = await self._delegated_approve(target_repo, slug)
+                    if approve_result is None:
+                        return DevLoopResult(
+                            investigate=investigate_result,
+                            implement=None,
+                            human_input=human_input_outcome,
+                            ended=refused,
+                        )
+                else:
+                    approve_result = await _run_cwft(
+                        "mctl-agents-approve",
+                        {
+                            "service": target_repo,
+                            "slug": slug,
+                            "approver": self._approver or "unknown",
+                        },
+                        step_timeout=APPROVE_STEP_TIMEOUT,
+                    )
                 # No record_execution here: the executions ledger is for
                 # SDK-backed agent runs (see docs/agent-inventory.yaml), and
                 # this deterministic flip is already triply audited — the
@@ -3220,6 +3696,10 @@ class DevLoopWorkflow:
                         human_input=human_input_outcome,
                         ended=f"approve flip ended {approve_result.phase}",
                     )
+        if self._canonical:
+            # The grant is spent and the proposal is accepted: this loop's
+            # `we_` ends here with the phase the investigator's run had.
+            await self._end_canonical_execution(self._canonical_end_phase or "Failed")
         if atomic_approve:
             # Resolve the implementer only AFTER the approval flip is
             # durable: _resolve can fail permanently (registry outage
@@ -3276,9 +3756,18 @@ class DevLoopWorkflow:
         # Same abandon/deadline semantics as its twin — see the comment
         # there and #420.
         if workflow.patched("work-context-resume"):
-            ended = await self._await_reapproval(
-                investigate_result, approve=approve_result, human_input=human_input_outcome
-            )
+            if self._canonical:
+                # #636: a transition after the flip cleared the decision, and
+                # a login (or a bare signal) is never the authority that
+                # releases the implementer: a human decides a fresh grant.
+                ended = await self._await_canonical_reapproval(
+                    issue, target_repo, investigate_result,
+                    approve=approve_result, human_input=human_input_outcome, after_flip=True,
+                )
+            else:
+                ended = await self._await_reapproval(
+                    investigate_result, approve=approve_result, human_input=human_input_outcome
+                )
             if ended is not None:
                 return ended
 

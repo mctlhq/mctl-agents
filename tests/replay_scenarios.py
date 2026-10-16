@@ -157,7 +157,7 @@ async def _dev_loop_drive(handle: WorkflowHandle, state: dict[str, Any]) -> None
     # history has the real command order rather than a race's.
     with anyio.fail_after(30):
         await state["investigate_ran"].wait()
-    await handle.signal(DevLoopWorkflow.approve)
+    await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
     await handle.result()
 
 

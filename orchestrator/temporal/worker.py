@@ -45,6 +45,8 @@ from temporalio.worker import Interceptor, Worker
 from orchestrator import tracing
 from orchestrator.temporal.activities.action_approval import read_action_approval
 from orchestrator.temporal.activities.argo import submit_and_wait
+from orchestrator.temporal.activities.canonical_execution import ensure_issue_execution
+from orchestrator.temporal.activities.delegated_approval import request_devloop_approval, submit_delegated_approve
 from orchestrator.temporal.activities.deploy_state import (
     get_deploy_status,
     get_release_after,
@@ -708,6 +710,10 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         find_stranded_accepted,
         bind_dispatched_execution,
         advance_dispatched_execution,
+        # The DevLoop's canonical WorkItem/`we_` and its `aar_` (#636): bounded
+        # mctl-api round trips, the same shape as the two above.
+        ensure_issue_execution,
+        request_devloop_approval,
         # The approval wait's read-only poll (#198, ADR-014 §7): one GET of
         # one ActionApprovalRequest, never a mutation.
         read_action_approval,
@@ -739,7 +745,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
     execution_plan = WorkerPlan(
         task_queue=EXECUTION_TASK_QUEUE,
         workflows=[],
-        activities=[submit_and_wait],
+        activities=[submit_and_wait, submit_delegated_approve],
         max_concurrent_activities=EXECUTION_MAX_CONCURRENT_ACTIVITIES,
     )
 
@@ -767,7 +773,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
             # the execution queue until the patched flip lands, so removing
             # it now would strand every Argo submit in the gap between the
             # two PRs.
-            activities=[*short_activities, submit_and_wait],
+            activities=[*short_activities, submit_and_wait, submit_delegated_approve],
             max_concurrent_activities=CONTROL_MAX_CONCURRENT_ACTIVITIES,
             max_concurrent_workflow_tasks=CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
         )]
@@ -780,7 +786,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         WorkerPlan(
             task_queue=TASK_QUEUE,
             workflows=workflows,
-            activities=[*short_activities, submit_and_wait],
+            activities=[*short_activities, submit_and_wait, submit_delegated_approve],
         ),
         execution_plan,
         implementation_plan(),

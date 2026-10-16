@@ -17,23 +17,32 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC as _UTC
 from datetime import datetime as _datetime
 from datetime import timedelta
+from typing import Any
 
 import anyio
 import pytest
 from temporalio import activity
-from temporalio.client import WorkflowFailureError
+from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner
 
 import orchestrator.human_input as hi
+from orchestrator import action_approvals, tracing
 from orchestrator import policy_checkpoint as pc
-from orchestrator import tracing
 from orchestrator.context_snapshot import ExecutionCorrelation as _ExecutionCorrelation
 from orchestrator.lifecycle.contract import Owner, answer_from
 from orchestrator.temporal.activities.action_approval import ApprovalPoll, GatedActionInput, GatedActionResult
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
+from orchestrator.temporal.activities.canonical_execution import EnsuredExecution, EnsureExecutionInput
+from orchestrator.temporal.activities.delegated_approval import (
+    ApprovalRequestInput,
+    ApprovalRequestResult,
+    DelegatedApproveInput,
+    DelegatedApproveResult,
+)
 from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTarget, ReleaseInfo
+from orchestrator.temporal.activities.execution_requests import AdvanceInput
 from orchestrator.temporal.activities.identity import MintedContext, MintRequest
 from orchestrator.temporal.activities.incidents import Incident, IncidentQueryResult
 from orchestrator.temporal.activities.issue_state import IssueState
@@ -47,6 +56,7 @@ from orchestrator.temporal.constants import (
     argo_admission_width,
     implementation_max_concurrent_activities,
 )
+from orchestrator.temporal.issue_ref import is_run_engine_ref, loop_id_of_engine_ref
 from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.action_approval import ActionApprovalWaitWorkflow, ApprovalWaitResult
 from orchestrator.temporal.workflows.dev_loop import (
@@ -209,10 +219,77 @@ async def env():
         yield env
 
 
+def _canonical_activities(
+    *,
+    calls: list[str] | None = None,
+    ensure_calls: list[EnsureExecutionInput] | None = None,
+    ensure_result: EnsuredExecution | None = None,
+    ensure_raises: bool = False,
+    approval_requests: list[ApprovalRequestInput] | None = None,
+    approval_result: ApprovalRequestResult | None = None,
+    approval_hook: Any = None,
+    delegated_log: list[DelegatedApproveInput] | None = None,
+    delegated_result: DelegatedApproveResult | None = None,
+    advance_log: list[AdvanceInput] | None = None,
+    seen_queues: dict[str, list[str]] | None = None,
+) -> list:
+    """Fakes for the activities a canonical DevLoop (#636) adds: its own
+    WorkItem/`we_`, the grant request, the delegated approve flip, and the
+    `we_`'s advance. Tests that build their own activity list append these."""
+
+    @activity.defn(name="ensure_issue_execution")
+    async def fake_ensure_issue_execution(inp: EnsureExecutionInput) -> EnsuredExecution:
+        if ensure_calls is not None:
+            ensure_calls.append(inp)
+        if ensure_raises:
+            raise ApplicationError("work items unavailable", non_retryable=True)
+        return ensure_result or EnsuredExecution(
+            ok=True, work_item_id=inp.work_item_id or "wi_test", execution_id="we_test_own", sequence=1,
+        )
+
+    @activity.defn(name="request_devloop_approval")
+    async def fake_request_devloop_approval(inp: ApprovalRequestInput) -> ApprovalRequestResult:
+        if approval_requests is not None:
+            approval_requests.append(inp)
+        if approval_hook is not None and (hooked := await approval_hook(inp)) is not None:
+            return hooked
+        # Like mctl-api, a new attempt is a new idempotency key and so a new
+        # `aar_`; asking again for the same attempt finds the same one.
+        ref = "aar_test" if inp.attempt == 0 else f"aar_test_a{inp.attempt}"
+        return approval_result or ApprovalRequestResult(ok=True, approval_ref=ref, state="pending")
+
+    @activity.defn(name="submit_delegated_approve")
+    async def fake_submit_delegated_approve(inp: DelegatedApproveInput) -> DelegatedApproveResult:
+        if calls is not None:
+            calls.append("delegated-approve")
+        if delegated_log is not None:
+            delegated_log.append(inp)
+        if seen_queues is not None:
+            seen_queues.setdefault("delegated-approve", []).append(activity.info().task_queue)
+        return delegated_result or DelegatedApproveResult(
+            result=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Succeeded"),
+        )
+
+    @activity.defn(name="advance_dispatched_execution")
+    async def fake_advance_dispatched_execution(inp: AdvanceInput) -> str:
+        if advance_log is not None:
+            advance_log.append(inp)
+        return "execution-existing we_test_own"
+
+    return [
+        fake_ensure_issue_execution,
+        fake_request_devloop_approval,
+        fake_submit_delegated_approve,
+        fake_advance_dispatched_execution,
+    ]
+
+
 def _fake_activities(
     *,
     released: bool,
     investigate_phase: str = "Succeeded",
+    # The phase of a human-input continuation's investigate, when it differs.
+    continuation_phase: str | None = None,
     # mctlhq/mctl-agents#542: `read_proposal_status` is only ever scheduled
     # for a DISPATCHED execution (`dispatched is not None`), so this default
     # is inert for every pre-existing, non-dispatched test in this module.
@@ -281,6 +358,18 @@ def _fake_activities(
     # `human_input_requests` sequence. Both None for every other test.
     investigate_hook: Callable[[dict], Awaitable[None]] | None = None,
     human_input_reader: Callable[[], str | None] | None = None,
+    # #636: the canonical path's three activities. `ensure_*` is the
+    # issue's own WorkItem/`we_`; `approval_requests` logs the grant request;
+    # `delegated_log` logs the delegated flip's input.
+    ensure_calls: list[EnsureExecutionInput] | None = None,
+    ensure_result: EnsuredExecution | None = None,
+    ensure_raises: bool = False,
+    approval_requests: list[ApprovalRequestInput] | None = None,
+    approval_result: ApprovalRequestResult | None = None,
+    approval_hook: Any = None,
+    delegated_log: list[DelegatedApproveInput] | None = None,
+    delegated_result: DelegatedApproveResult | None = None,
+    advance_log: list[AdvanceInput] | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -338,7 +427,10 @@ def _fake_activities(
             if investigate_hook is not None:
                 await investigate_hook(dict(input.params))
             investigate_ran.set()
-            return WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase=investigate_phase)
+            phase = investigate_phase
+            if continuation_phase is not None and "human_input_responses" in input.params:
+                phase = continuation_phase
+            return WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase=phase)
         if input.operation == "mctl-agents-shepherd":
             # In-loop tick (#213) must be scoped to exactly this proposal.
             assert input.params.get("service")
@@ -662,6 +754,18 @@ def _fake_activities(
         return proposal_status
 
     activities = [
+        *_canonical_activities(
+            calls=calls,
+            ensure_calls=ensure_calls,
+            ensure_result=ensure_result,
+            ensure_raises=ensure_raises,
+            approval_requests=approval_requests,
+            approval_result=approval_result,
+            approval_hook=approval_hook,
+            delegated_log=delegated_log,
+            delegated_result=delegated_result,
+            advance_log=advance_log,
+        ),
         fake_resolve_agent_release,
         fake_submit_and_wait,
         fake_record_execution,
@@ -708,7 +812,7 @@ class TestDevLoopWorkflow:
             with anyio.fail_after(10):
                 await investigate_ran.wait()
 
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.investigate.phase == "Succeeded"
@@ -716,7 +820,7 @@ class TestDevLoopWorkflow:
         assert result.implement.phase == "Succeeded"
         assert result.approve is not None
         assert result.approve.phase == "Succeeded"
-        assert calls == ["mctl-agents-investigate", "mctl-agents-approve", "mctl-agents-implement"]
+        assert calls == ["mctl-agents-investigate", "delegated-approve", "mctl-agents-implement"]
 
     async def test_closed_issue_skips_approve_and_implement(self, env):
         """mctl-agents#410: an issue closed while this loop sat at the
@@ -739,7 +843,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.investigate.phase == "Succeeded"
@@ -769,14 +873,14 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.implement is not None
         assert result.implement.phase == "Succeeded"
         assert result.approve is not None
         assert result.approve.phase == "Succeeded"
-        assert calls == ["mctl-agents-investigate", "mctl-agents-approve", "mctl-agents-implement"]
+        assert calls == ["mctl-agents-investigate", "delegated-approve", "mctl-agents-implement"]
 
     # --- mctl-agents#420: the approval park is bounded and observant -------
 
@@ -903,7 +1007,7 @@ class TestDevLoopWorkflow:
                 # wait_condition loop observes the approval.
                 info = activity.info()
                 handle = env.client.get_workflow_handle(info.workflow_id)
-                await handle.signal(DevLoopWorkflow.approve)
+                await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
                 raise ApplicationError("github unreachable", non_retryable=True)
             return IssueState(state="open")
 
@@ -933,7 +1037,7 @@ class TestDevLoopWorkflow:
         assert result.implement.phase == "Succeeded"
         assert result.approve is not None
         assert result.approve.phase == "Succeeded"
-        assert calls == ["mctl-agents-investigate", "mctl-agents-approve", "mctl-agents-implement"]
+        assert calls == ["mctl-agents-investigate", "delegated-approve", "mctl-agents-implement"]
         assert poll_count["i"] >= 2
 
     async def test_approve_signal_landing_during_final_poll_proceeds_to_implement(self, env):
@@ -945,10 +1049,11 @@ class TestDevLoopWorkflow:
         @activity.defn(name="get_issue_state")
         async def fake_get_issue_state_signal_on_final(repo: str, issue_number: int) -> IssueState:
             poll_count["i"] += 1
-            if poll_count["i"] == 56:
+            # The canonical park is bounded by the grant's own lifetime.
+            if poll_count["i"] == int(dev_loop.CANONICAL_APPROVAL_WAIT / dev_loop.APPROVAL_POLL_INTERVAL):
                 info = activity.info()
                 handle = env.client.get_workflow_handle(info.workflow_id)
-                await handle.signal(DevLoopWorkflow.approve, {"approver": "reviewer"})
+                await handle.signal(DevLoopWorkflow.approve, {"approver": "reviewer", "approval_ref": "aar_test"})
             return IssueState(state="open")
 
         activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
@@ -989,7 +1094,7 @@ class TestDevLoopWorkflow:
             info = activity.info()
             handle = env.client.get_workflow_handle(info.workflow_id)
             # Concurrently signal approve while returning closed state
-            await handle.signal(DevLoopWorkflow.approve, {"approver": "late_approver"})
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "late_approver", "approval_ref": "aar_test"})
             return IssueState(state="closed", state_reason="completed")
 
         activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
@@ -1047,7 +1152,9 @@ class TestDevLoopWorkflow:
         async def fake_record_execution(record: ExecutionRecord) -> None:
             return None
 
+        delegated: list[DelegatedApproveInput] = []
         activities = [
+            *_canonical_activities(delegated_log=delegated),
             fake_resolve_agent_release,
             capturing_submit_and_wait,
             fake_record_execution,
@@ -1070,14 +1177,14 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.result()
 
         assert seen_params["mctl-agents-implement"]["service"] == "mctl-telegram"
         assert seen_params["mctl-agents-implement"]["slug"] == "issue-42-fake-title"
         # The atomic approve flip is scoped to exactly the same proposal.
-        assert seen_params["mctl-agents-approve"]["service"] == "mctl-telegram"
-        assert seen_params["mctl-agents-approve"]["slug"] == "issue-42-fake-title"
+        assert "mctl-agents-approve" not in seen_params
+        assert [(d.service, d.slug) for d in delegated] == [("mctl-telegram", "issue-42-fake-title")]
 
     async def test_failed_investigate_never_implements(self, env):
         """A Failed investigate short-circuits before implement.
@@ -1135,6 +1242,7 @@ class TestDevLoopWorkflow:
             return None
 
         activities = [
+            *_canonical_activities(),
             fake_resolve_agent_release,
             fake_submit_and_wait,
             fake_record_execution,
@@ -1184,6 +1292,7 @@ class TestDevLoopWorkflow:
             return None
 
         activities = [
+            *_canonical_activities(),
             fake_resolve_agent_release,
             fake_submit_and_wait,
             fake_record_execution,
@@ -1240,6 +1349,7 @@ class TestDevLoopWorkflow:
             return None
 
         activities = [
+            *_canonical_activities(calls=calls),
             fake_resolve_agent_release,
             fake_submit_and_wait,
             fake_record_execution,
@@ -1258,7 +1368,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             with pytest.raises(WorkflowFailureError) as caught:
                 await handle.result()
         return calls, caught
@@ -1282,7 +1392,7 @@ class TestDevLoopWorkflow:
         assert "implementer" in str(caught.value.cause)
         # The flip ran and the implement did not: the exact window this
         # trade-off accepts.
-        assert calls == ["mctl-agents-investigate", "mctl-agents-approve"]
+        assert calls == ["mctl-agents-investigate", "delegated-approve"]
 
     async def test_an_unpinned_shepherd_declines_the_claim_instead_of_failing(self, env):
         """The shepherd gate is fail-open-to-sweeper, not fatal (#241).
@@ -1321,7 +1431,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
             owned = await handle.query(DevLoopWorkflow.shepherd_in_loop)
 
@@ -1366,7 +1476,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
             owned = await handle.query(DevLoopWorkflow.shepherd_in_loop)
 
@@ -1397,6 +1507,7 @@ class TestDevLoopWorkflow:
             raise ValueError("mctl-api executions endpoint unreachable")
 
         activities = [
+            *_canonical_activities(),
             fake_resolve_agent_release,
             fake_submit_and_wait,
             always_failing_record_execution,
@@ -1417,7 +1528,7 @@ class TestDevLoopWorkflow:
                 id=f"dev-loop-test-{uuid.uuid4()}",
                 task_queue=TASK_QUEUE,
             )
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.investigate.phase == "Succeeded"
@@ -1461,6 +1572,7 @@ class TestDevLoopWorkflow:
             task_queue=TASK_QUEUE,
             workflows=[DevLoopWorkflow],
             activities=[
+                *_canonical_activities(),
                 fake_resolve_agent_release,
                 fake_submit_and_wait,
                 fake_record_execution,
@@ -1476,51 +1588,85 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             with pytest.raises(WorkflowFailureError) as excinfo:
                 await handle.result()
 
-        assert "refusing an unscoped implement run" in str(excinfo.value.cause)
+        assert "refusing to request an approval for it" in str(excinfo.value.cause)
 
-    async def test_approve_signal_payload_carries_approver_identity(self, env):
-        """A structured approve payload ({"approver": ...}) must reach the
-        approve CWFT's params for the audit trail; a legacy bare signal (see
-        the other tests) falls back to "unknown" — both are exercised across
-        this file."""
-        seen_params: dict[str, dict[str, str]] = {}
-        investigate_ran = anyio.Event()
+    async def test_a_restarted_loop_attaches_a_new_execution_of_its_own(self, env):
+        """P1 on #651: a failed loop is restarted under the same workflow id
+        (ALLOW_DUPLICATE_FAILED_ONLY). Its first run's `we_` has ended, and
+        mctl-api never re-opens an ended execution, so a run keyed only by
+        the loop id could never start again. Each run asks for its own."""
+        ensure_calls: list[EnsureExecutionInput] = []
+        activities, _calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, ensure_calls=ensure_calls
+        )
+        wf_id = f"dev-loop-test-{uuid.uuid4()}"
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            for n in (1, 2):
+                handle = await env.client.start_workflow(
+                    DevLoopWorkflow.run,
+                    IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/12"),
+                    id=wf_id,
+                    task_queue=TASK_QUEUE,
+                )
+                with anyio.fail_after(10):
+                    while len(ensure_calls) < n:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                        await anyio.sleep(0.05)
+                await handle.signal(DevLoopWorkflow.abandon, {"reason": "restart"})
+                await handle.result()
 
-        @activity.defn(name="resolve_agent_release")
-        async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
-            # Every agent resolves: since A4 an unpinned agent is fatal,
-            # so a test about something else must not trip that gate.
-            return ResolvedRelease(
-                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+        refs = [c.engine_ref for c in ensure_calls]
+        assert len(refs) == 2 and refs[0] != refs[1]
+        assert all(is_run_engine_ref(r) and loop_id_of_engine_ref(r) == wf_id for r in refs)
+
+    @pytest.mark.parametrize("ref", ["", "aar_x\r\nX-Evil: 1", "not-a-grant"])
+    async def test_a_malformed_requested_ref_ends_the_loop_before_any_flip(self, env, ref):
+        """claude P3 on #651: the ref mctl-api answers the request with is a
+        header value at the flip, like a signalled one, so it gets the same
+        shape check; a malformed one is a refusal, never exercised."""
+        delegated: list[DelegatedApproveInput] = []
+        activities, calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True,
+            delegated_log=delegated,
+            approval_result=ApprovalRequestResult(ok=True, approval_ref=ref, state="approved"),
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await env.client.execute_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/13"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
             )
 
-        @activity.defn(name="submit_and_wait")
-        async def capturing_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
-            seen_params[input.operation] = input.params
-            if input.operation == "mctl-agents-investigate":
-                investigate_ran.set()
-            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+        assert result.ended.startswith("approval request refused")
+        assert delegated == [] and "mctl-agents-implement" not in calls
 
-        @activity.defn(name="record_execution")
-        async def fake_record_execution(record: ExecutionRecord) -> None:
-            return None
+    def test_the_canonical_park_is_as_long_as_the_grant_it_waits_for(self):
+        """P3 on #651: the park is a literal (replay-stable), the grant's TTL
+        cap is mctl-api's. A grant that expires before the park, or a park
+        that ends while its grant is still decidable, are both wrong."""
+        assert dev_loop.CANONICAL_APPROVAL_WAIT.total_seconds() == action_approvals.MAX_TTL_S
 
+    async def test_the_signalled_approval_ref_is_the_one_exercised_and_no_approver_travels(self, env):
+        """#636, mutation pins 4 and 6: the flip exercises exactly the `aar_`
+        this loop requested and the signal carried, and no human identity
+        reaches the delegated operation: the legacy `approver` the same signal
+        also carries is dropped on the floor. A signal carrying any other
+        `aar_` (a stale grant of an earlier attempt, say) releases nothing."""
+        delegated: list[DelegatedApproveInput] = []
+        requests: list[ApprovalRequestInput] = []
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, delegated_log=delegated, approval_requests=requests
+        )
         async with Worker(
-            env.client,
-            task_queue=TASK_QUEUE,
-            workflows=[DevLoopWorkflow],
-            activities=[
-                fake_resolve_agent_release,
-                capturing_submit_and_wait,
-                fake_record_execution,
-                _fake_find_proposal_slug,
-                _fake_find_human_input_request_none,
-                _fake_get_issue_state_open,
-            ],
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):
             handle = await env.client.start_workflow(
                 DevLoopWorkflow.run,
@@ -1530,48 +1676,44 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve, {"approver": "mashkovd"})
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_a_stale_one"})
+            with anyio.fail_after(10):
+                while not requests:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await anyio.sleep(0.05)
+            await anyio.sleep(0.5)
+            assert delegated == []
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "mashkovd", "approval_ref": "aar_test"})
             await handle.result()
 
-        assert seen_params["mctl-agents-approve"]["approver"] == "mashkovd"
+        assert [d.approval_ref for d in delegated] == ["aar_test"]
+        assert not [f for f in dataclasses.fields(DelegatedApproveInput) if "approver" in f.name]
+        assert "mctl-agents-approve" not in calls
+        # The grant was asked for this loop's own `we_` and the flip's target.
+        assert [(r.execution_id, r.service, r.slug) for r in requests] == [
+            ("we_test_own", "mctl-telegram", "issue-8-fake-title")
+        ]
+        assert [d.execution_id for d in delegated] == ["we_test_own"]
 
-    async def test_bare_approve_signal_records_unknown_approver(self, env):
-        """Legacy senders signal approve() with no payload — that must stay
-        valid, with the approve CWFT told approver=unknown."""
-        seen_params: dict[str, dict[str, str]] = {}
-        investigate_ran = anyio.Event()
-
-        @activity.defn(name="resolve_agent_release")
-        async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
-            # Every agent resolves: since A4 an unpinned agent is fatal,
-            # so a test about something else must not trip that gate.
-            return ResolvedRelease(
-                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
-            )
-
-        @activity.defn(name="submit_and_wait")
-        async def capturing_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
-            seen_params[input.operation] = input.params
-            if input.operation == "mctl-agents-investigate":
-                investigate_ran.set()
-            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
-
-        @activity.defn(name="record_execution")
-        async def fake_record_execution(record: ExecutionRecord) -> None:
-            return None
-
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            None,
+            {"approver": "mashkovd"},
+            {"approval_ref": "not-a-grant"},
+            # claude P3 on #651: the ref becomes an HTTP header value.
+            {"approval_ref": "aar_x\r\nX-Evil: 1"},
+            {"approval_ref": "aar_"},
+            {"approval_ref": "aar_" + "a" * 200},
+        ],
+    )
+    async def test_a_signal_without_a_grant_never_approves_a_canonical_loop(self, env, payload):
+        """#636: a bare signal, an `approver` string and a malformed ref are
+        none of them authority. The loop keeps waiting for the grant, so an
+        abandon is what ends it, with no flip and no implement."""
+        delegated: list[DelegatedApproveInput] = []
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True, delegated_log=delegated)
         async with Worker(
-            env.client,
-            task_queue=TASK_QUEUE,
-            workflows=[DevLoopWorkflow],
-            activities=[
-                fake_resolve_agent_release,
-                capturing_submit_and_wait,
-                fake_record_execution,
-                _fake_find_proposal_slug,
-                _fake_find_human_input_request_none,
-                _fake_get_issue_state_open,
-            ],
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):
             handle = await env.client.start_workflow(
                 DevLoopWorkflow.run,
@@ -1581,10 +1723,101 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            if payload is None:
+                await handle.signal(DevLoopWorkflow.approve)
+            else:
+                await handle.signal(DevLoopWorkflow.approve, payload)
+            await env.sleep(timedelta(days=1))
+            await handle.signal(DevLoopWorkflow.abandon, "no grant")
+            result = await handle.result()
+
+        assert delegated == []
+        assert result.approve is None and result.implement is None
+        assert result.ended.startswith("abandoned")
+        assert "mctl-agents-approve" not in calls and "mctl-agents-implement" not in calls
+
+    async def test_a_grant_found_already_approved_is_adopted_without_a_signal(self, env):
+        """claude P2 on #651: signals are per run, so a run that re-finds the
+        grant a human approved for an earlier run must act on it, not park
+        until it expires. Only `approved` is adopted."""
+        delegated: list[DelegatedApproveInput] = []
+        activities, calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True,
+            delegated_log=delegated,
+            approval_result=ApprovalRequestResult(ok=True, approval_ref="aar_decided_earlier", state="approved"),
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/8"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                result = await handle.result()
+
+        assert [d.approval_ref for d in delegated] == ["aar_decided_earlier"]
+        assert result.implement is not None and "mctl-agents-approve" not in calls
+
+    async def test_a_pending_grant_found_again_still_waits_for_the_decision(self, env):
+        delegated: list[DelegatedApproveInput] = []
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True, delegated_log=delegated)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/8"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await env.sleep(timedelta(days=1))
+            await handle.signal(DevLoopWorkflow.abandon, "nobody decided")
+            result = await handle.result()
+
+        assert delegated == [] and result.ended.startswith("abandoned")
+
+    async def test_an_end_that_did_not_land_is_retried_on_exit_with_its_own_phase(self, env):
+        """agy P2 on #651: the flip's end of the own `we_` (Succeeded) did not
+        land; the exit retry must land Succeeded, never Failed."""
+        attempts: list[str] = []
+        landed: list[str] = []
+
+        @activity.defn(name="advance_dispatched_execution")
+        async def flaky_advance(inp: AdvanceInput) -> str:
+            attempts.append(inp.phase)
+            if len(attempts) <= 10:  # the whole first activity's retry policy
+                raise ApplicationError("mctl-api down")
+            landed.append(inp.phase)
+            return "execution-existing we_test_own"
+
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in activities if getattr(a, "__temporal_activity_definition").name != "advance_dispatched_execution"
+        ]
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=[*activities, flaky_advance],
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/8"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await env.sleep(timedelta(days=30))
             await handle.result()
 
-        assert seen_params["mctl-agents-approve"]["approver"] == "unknown"
+        assert set(attempts) == {"Succeeded"} and landed == ["Succeeded"]
 
     async def test_failed_approve_flip_never_implements(self, env):
         """If the approve CWFT fails (missing proposal dir, unexpected
@@ -1621,6 +1854,12 @@ class TestDevLoopWorkflow:
             task_queue=TASK_QUEUE,
             workflows=[DevLoopWorkflow],
             activities=[
+                *_canonical_activities(
+                    calls=calls,
+                    delegated_result=DelegatedApproveResult(
+                        result=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Failed"),
+                    ),
+                ),
                 fake_resolve_agent_release,
                 failing_approve_submit_and_wait,
                 fake_record_execution,
@@ -1637,13 +1876,13 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.approve is not None
         assert result.approve.phase == "Failed"
         assert result.implement is None
-        assert calls == ["mctl-agents-investigate", "mctl-agents-approve"]
+        assert calls == ["mctl-agents-investigate", "delegated-approve"]
         # The implementer registry lookup must be skipped entirely on a
         # failed flip — the resolve happens only after approval is durable
         # (codex P1 on PR #212).
@@ -1676,7 +1915,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.implement is not None and result.implement.phase == "Succeeded"
@@ -1710,7 +1949,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.pr is not None
@@ -1746,7 +1985,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.pr is not None
@@ -1799,7 +2038,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             # Wait for at least one PR poll (so ownership is claimed) before
             # abandoning, or the watch could exit before ever acquiring the
             # row it is supposed to release.
@@ -1854,7 +2093,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.implement is not None and result.implement.phase == "Succeeded"
@@ -1910,7 +2149,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             with anyio.fail_after(30):
                 await handle.result()
             claim = await handle.query(DevLoopWorkflow.lifecycle_claim)
@@ -1934,7 +2173,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             # Bounded on purpose. A workflow-code AttributeError is not a
             # FailureError: the workflow TASK fails and, because replay is
             # deterministic, keeps failing the same way forever. Without a
@@ -3599,7 +3838,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.implement is not None and result.implement.phase == "Succeeded"
@@ -3633,7 +3872,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(30):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.pr is not None
@@ -3675,7 +3914,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.implement is not None and result.implement.phase == "Succeeded"
@@ -3709,7 +3948,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.pr is not None
@@ -3745,7 +3984,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.pr is not None
@@ -3784,7 +4023,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.implement is not None and result.implement.phase == "Succeeded"
@@ -3825,7 +4064,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.pr is not None
@@ -3867,13 +4106,13 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.pr is not None and result.pr.state == "MERGED"
         assert calls == [
             "mctl-agents-investigate",
-            "mctl-agents-approve",
+            "delegated-approve",
             "mctl-agents-implement",
             "mctl-agents-shepherd",
         ]
@@ -3912,7 +4151,7 @@ class TestDevLoopWorkflow:
                 await investigate_ran.wait()
             # Before the watch exists the workflow is not shepherding.
             seen.append(await handle.query(DevLoopWorkflow.shepherd_in_loop))
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.result()
             seen.append(await handle.query(DevLoopWorkflow.shepherd_in_loop))
 
@@ -3928,7 +4167,7 @@ class TestDevLoopWorkflow:
         )
         with anyio.fail_after(10):
             await investigate_ran.wait()
-        await handle.signal(DevLoopWorkflow.approve)
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
         return await handle.result()
 
     async def test_deploy_observed_healthy_on_the_released_tag(self, env):
@@ -4308,7 +4547,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.implement is not None and result.implement.phase == "Succeeded"
@@ -4354,7 +4593,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.pr is not None and result.pr.state == "MERGED"
@@ -4396,7 +4635,7 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.pr is not None and result.pr.state == "MERGED"
@@ -4441,7 +4680,7 @@ class TestProposalTerminalEnd:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         # The watch kept going through the reconcile repair (status flips
@@ -4482,7 +4721,7 @@ class TestProposalTerminalEnd:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.pr is not None and result.pr.state == "MERGED"
@@ -4537,7 +4776,7 @@ class TestProposalTerminalEnd:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             with anyio.fail_after(10):
                 result = await handle.result()
 
@@ -4587,7 +4826,7 @@ class TestProposalTerminalEnd:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             with anyio.fail_after(10):
                 result = await handle.result()
 
@@ -4631,7 +4870,7 @@ class TestProposalTerminalEnd:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         # Ended via the pre-existing grace-polls give-up, not the new exit --
@@ -4672,7 +4911,7 @@ class TestProposalTerminalEnd:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         # No `pr:` link ever appeared (no `number` recorded), so this rides
@@ -4705,7 +4944,7 @@ class TestProposalTerminalEnd:
                 )
                 with anyio.fail_after(10):
                     await investigate_ran.wait()
-                await handle.signal(DevLoopWorkflow.approve)
+                await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
                 result = await handle.result()
 
             assert result.ended == "", (status, result.ended)
@@ -4798,7 +5037,7 @@ class TestLaunchCorrelation:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.result()
 
         assert len(params_log) == 1
@@ -4834,7 +5073,7 @@ class TestLaunchCorrelation:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.result()
 
         assert len(implement_log) == 1
@@ -4875,7 +5114,7 @@ class TestLaunchCorrelation:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.result()
 
         assert implement_log[0]["work_item_id"] == "wi-505"
@@ -4907,11 +5146,7 @@ class TestLaunchCorrelation:
 
             return BoundExecution(BOUND, execution_id="we_ctx_test", sequence=1)
 
-        @activity.defn(name="advance_dispatched_execution")
-        async def fake_advance_dispatched_execution(input) -> str:
-            return "ok"
-
-        activities = [*activities, fake_bind_dispatched_execution, fake_advance_dispatched_execution]
+        activities = [*activities, fake_bind_dispatched_execution]
 
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
@@ -4953,10 +5188,12 @@ class TestLaunchCorrelation:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.result()
 
-        assert "work_item_id" not in params_log[0]
+        # A canonical loop (#636) always has its own WorkItem, so the
+        # implementer is told which one (the same id the grant is bound to).
+        assert params_log[0]["work_item_id"] == "wi_test"
 
     async def test_neither_submit_carries_an_execution_id(self, env):
         """T4: pins the deliberate omission argued in design.md -- an
@@ -4991,18 +5228,22 @@ class TestLaunchCorrelation:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.result()
 
         assert "execution_id" not in implement_log[0]
         assert "execution_id" not in shepherd_log[0]
 
-    async def test_approve_submit_is_unaffected(self, env):
-        """T5 (approve half): the approve CWFT runs no agent and produces no
-        usage record, so it must carry no correlation parameters."""
+    async def test_the_flip_runs_no_approve_cwft_and_carries_no_identity(self, env):
+        """T5 (approve half), #636: the flip is the delegated operation, so no
+        `mctl-agents-approve` is submitted to Argo by the workflow at all, and
+        the activity input is exactly the loop's `we_`, the signalled grant
+        and the proposal's service and slug -- no approver, login, e-mail or
+        principal."""
         approve_log: list[dict] = []
+        delegated: list[DelegatedApproveInput] = []
         activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
-            released=True, approve_params_log=approve_log
+            released=True, approve_params_log=approve_log, delegated_log=delegated
         )
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
@@ -5015,11 +5256,14 @@ class TestLaunchCorrelation:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.result()
 
-        assert approve_log, "approve was never submitted"
-        assert set(approve_log[0]) == {"service", "slug", "approver"}
+        assert approve_log == [], "the legacy approve CWFT must not run on the canonical path"
+        assert len(delegated) == 1
+        assert {f.name for f in dataclasses.fields(delegated[0])} == {
+            "execution_id", "approval_ref", "service", "slug",
+        }
 
 
 class TestWorkContextResume:
@@ -5064,7 +5308,8 @@ class TestWorkContextResume:
             assert after.execution_id == "e2"
             assert after.execution_sequence == 2
 
-            await handle.signal(DevLoopWorkflow.approve)
+            # carol's transition asked for a fresh grant (a new attempt).
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test_a1"})
             result = await handle.result()
 
         assert result.implement is not None
@@ -5099,7 +5344,7 @@ class TestWorkContextResume:
             assert len(twice.executions) == 2
             assert twice.resume_rejections == ()
 
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.result()
 
     async def test_a_differing_execution_id_is_rejected_while_one_resume_is_pending(self, env):
@@ -5141,7 +5386,7 @@ class TestWorkContextResume:
                 r.execution_id == "e3" and r.reason == "resume-already-pending" for r in state.resume_rejections
             )
 
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.result()
 
     async def test_a_mismatched_work_item_id_is_rejected(self, env):
@@ -5167,8 +5412,137 @@ class TestWorkContextResume:
                 r.execution_id == "e2" and r.reason == "work-item-mismatch" for r in state.resume_rejections
             )
 
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.result()
+
+    async def test_a_transition_while_parked_asks_for_a_fresh_grant(self, env):
+        """claude P2 on #651: a transition that lands while the loop is
+        already parked on its grant must not strand it. The park wakes, asks
+        for the new attempt's grant, and a decision on that one releases it."""
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        activities, calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, approval_requests=requests, delegated_log=delegated
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/268", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                while not requests:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await anyio.sleep(0.05)
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            with anyio.fail_after(10):
+                while len(requests) < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await anyio.sleep(0.05)
+            # The grant asked before the transition releases nothing now.
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await handle.query(DevLoopWorkflow.work_context)
+            assert delegated == []
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test_a1"})
+            result = await handle.result()
+
+        assert [r.attempt for r in requests] == [0, 1]
+        assert [d.approval_ref for d in delegated] == ["aar_test_a1"]
+        assert result.implement is not None and calls.count("mctl-agents-implement") == 1
+
+    async def test_a_transition_during_the_grant_request_never_adopts_the_old_attempt(self, env):
+        """claude P2 on #651: the transition lands while the grant request is
+        in flight. Its answer is the ended attempt's, so it is not adopted:
+        a decision on it releases nothing, and the loop asks again."""
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        handles: list[Any] = []
+
+        async def transition_once(inp: ApprovalRequestInput) -> ApprovalRequestResult | None:
+            if inp.attempt != 0:
+                return None
+            await handles[0].signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            # alice had already approved attempt 0's grant: adopting that
+            # answer now would hand bob her decision.
+            return ApprovalRequestResult(ok=True, approval_ref="aar_test", state="approved")
+
+        activities, calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, approval_requests=requests, approval_hook=transition_once, delegated_log=delegated
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/268", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            handles.append(handle)
+            with anyio.fail_after(10):
+                while len(requests) < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await anyio.sleep(0.05)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await handle.query(DevLoopWorkflow.work_context)
+            await anyio.sleep(0.5)
+            assert delegated == []
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test_a1"})
+            result = await handle.result()
+
+        assert [r.attempt for r in requests] == [0, 1]
+        assert [d.approval_ref for d in delegated] == ["aar_test_a1"]
+        assert result.implement is not None and calls.count("mctl-agents-implement") == 1
+
+    async def test_a_transition_while_parked_does_not_extend_the_park(self, env):
+        """claude P3 on #651: the park is bounded from its start (#420). A
+        transition on day 4 asks for a fresh grant, but must not restart the
+        wait: the loop still ends when the original wait runs out."""
+        requests: list[ApprovalRequestInput] = []
+        activities, _calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, approval_requests=requests
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/268", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                while not requests:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await anyio.sleep(0.05)
+            await env.sleep(timedelta(days=4))
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            with anyio.fail_after(10):
+                while len(requests) < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await anyio.sleep(0.05)
+            await env.sleep(timedelta(days=3, hours=1))
+            # Not `result()`: the time-skipping server would skip to any later deadline.
+            assert (await handle.describe()).status == WorkflowExecutionStatus.COMPLETED
+            result = await handle.result()
+
+        assert result.ended == "approval wait expired" and result.implement is None
 
     async def test_a_surface_transition_clears_approval_until_a_fresh_approve(self, env):
         activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
@@ -5184,7 +5558,7 @@ class TestWorkContextResume:
             with anyio.fail_after(10):
                 await investigate_ran.wait()
 
-            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice", "approval_ref": "aar_test"})
 
             # A resume from a different surface/actor must re-arm the wait —
             # approval granted by alice on the original surface must not be
@@ -5204,7 +5578,12 @@ class TestWorkContextResume:
             assert state.executions[-1].surface_transition is True
             assert "mctl-agents-implement" not in calls  # approval cleared, not inherited
 
-            await handle.signal(DevLoopWorkflow.approve, {"approver": "bob"})
+            # alice's grant does not carry over either: bob decides the
+            # fresh one the transition asked for.
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "bob", "approval_ref": "aar_test"})
+            await handle.query(DevLoopWorkflow.work_context)
+            assert "mctl-agents-implement" not in calls
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "bob", "approval_ref": "aar_test_a1"})
             result = await handle.result()
 
         assert calls.count("mctl-agents-implement") == 1
@@ -5234,7 +5613,7 @@ class TestWorkContextResume:
                     "actor_kind": "human", "actor_id": "alice",
                 },
             )
-            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice", "approval_ref": "aar_test_a1"})
 
             # A second resume from the SAME surface and actor must not
             # re-litigate a decision nobody changed.
@@ -5254,7 +5633,8 @@ class TestWorkContextResume:
         assert result.implement is not None
         assert result.implement.phase == "Succeeded"
 
-    async def test_prod_shaped_start_resume_transition_fires_and_flip_waits(self, env):
+    @pytest.mark.parametrize("again_while_parked", [False, True])
+    async def test_prod_shaped_start_resume_transition_fires_and_flip_waits(self, env, again_while_parked):
         """The two production-shaped guarantees, on a loop started WITHOUT a
         work_item_id (exactly what orchestrator/temporal/start.py submits):
 
@@ -5265,6 +5645,10 @@ class TestWorkContextResume:
            was consumed by the first gate) re-arms approval BEFORE the
            approve CWFT, so the durable flip is attributed to the actor who
            re-approved, never to "unknown".
+
+        `again_while_parked` (claude P2 on #651): a second transition that
+        lands while the loop is parked at that pre-flip gate wakes it, and
+        it asks for that attempt's grant in turn.
         """
         seen_params: dict[str, dict[str, str]] = {}
         investigate_ran = anyio.Event()
@@ -5288,17 +5672,34 @@ class TestWorkContextResume:
         async def fake_record_execution(record: ExecutionRecord) -> None:
             return None
 
+        slug_lookups: list[str] = []
+
         @activity.defn(name="find_proposal_slug")
         async def gated_find_proposal_slug(service: str, issue_number: str) -> str | None:
-            slug_lookup_entered.set()
-            await slug_release.wait()
+            # #636: the lookups before the grant name its target; the gap
+            # under test is the first one after it, right before the flip.
+            if requests and not slug_lookups:
+                slug_lookups.append(issue_number)
+                slug_lookup_entered.set()
+                await slug_release.wait()
             return f"issue-{issue_number}-fake-title"
 
+        delegated: list[DelegatedApproveInput] = []
+        requests: list[ApprovalRequestInput] = []
         async with Worker(
             env.client,
             task_queue=TASK_QUEUE,
             workflows=[DevLoopWorkflow],
             activities=[
+                *_canonical_activities(
+                    delegated_log=delegated,
+                    approval_requests=requests,
+                    # The loop's own canonical WorkItem (#636) is the one the
+                    # resume names; a production start carries none of its own.
+                    ensure_result=EnsuredExecution(
+                        ok=True, work_item_id="wi-1", execution_id="we_own", sequence=1
+                    ),
+                ),
                 fake_resolve_agent_release,
                 capturing_submit_and_wait,
                 fake_record_execution,
@@ -5316,7 +5717,7 @@ class TestWorkContextResume:
             with anyio.fail_after(10):
                 await investigate_ran.wait()
 
-            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice", "approval_ref": "aar_test"})
             # The first gate consumes alice's approval and the loop enters
             # the slug lookup, where it now blocks.
             with anyio.fail_after(10):
@@ -5331,7 +5732,8 @@ class TestWorkContextResume:
                 },
             )
             state = await handle.query(DevLoopWorkflow.work_context)
-            # No seeded execution existed, and the transition still fired.
+            # The only execution was the loop's own, with no recorded surface or
+            # actor, and the transition still fired.
             assert state.executions[-1].surface_transition is True
 
             slug_release.set()
@@ -5339,14 +5741,46 @@ class TestWorkContextResume:
             # approve CWFT, no implement. The query round-trips the event
             # loop so these are ordered assertions, not races.
             state = await handle.query(DevLoopWorkflow.work_context)
-            assert "mctl-agents-approve" not in seen_params
+            assert delegated == []
             assert "mctl-agents-implement" not in seen_params
 
-            await handle.signal(DevLoopWorkflow.approve, {"approver": "bob"})
+            decided = "aar_test_a1"
+            if again_while_parked:
+                with anyio.fail_after(10):
+                    while len(requests) < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                        await anyio.sleep(0.05)
+                # A stale decision (alice's spent grant) releases nothing, but
+                # closes bob's pending window, so carol's resume is accepted.
+                await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+                await handle.signal(
+                    DevLoopWorkflow.resume,
+                    {
+                        "work_item_id": "wi-1", "execution_id": "e3", "surface": "github",
+                        "actor_kind": "human", "actor_id": "carol",
+                    },
+                )
+                with anyio.fail_after(10):
+                    while len(requests) < 3:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                        await anyio.sleep(0.05)
+                await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test_a1"})
+                await handle.query(DevLoopWorkflow.work_context)
+                assert delegated == []
+                decided = "aar_test_a2"
+            # The fresh grant the (last) transition asked for is decided.
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "bob", "approval_ref": decided})
             with anyio.fail_after(10):
                 result = await handle.result()
 
-        assert seen_params["mctl-agents-approve"]["approver"] == "bob"
+        assert [d.approval_ref for d in delegated] == [decided]
+        # claude P2 on #651: the resume recorded `e2` after the grant was
+        # requested, but the grant, the run token and the flip all name the
+        # loop's own `we_`, the one the grant is bound to.
+        assert [d.execution_id for d in delegated] == ["we_own"]
+        # agy P2 on #651: the transition cleared the grant, so a fresh one was
+        # asked for (a new attempt: a new key), on the same `we_`.
+        assert [(r.execution_id, r.attempt) for r in requests] == [
+            ("we_own", n) for n in range(3 if again_while_parked else 2)
+        ]
         assert result.implement is not None
         assert result.implement.phase == "Succeeded"
 
@@ -5388,6 +5822,7 @@ class TestWorkContextResume:
             task_queue=TASK_QUEUE,
             workflows=[DevLoopWorkflow],
             activities=[
+                *_canonical_activities(),
                 fake_resolve_agent_release,
                 capturing_submit_and_wait,
                 fake_record_execution,
@@ -5404,7 +5839,7 @@ class TestWorkContextResume:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice", "approval_ref": "aar_test"})
             with anyio.fail_after(10):
                 await slug_lookup_entered.wait()
             # A surface transition parks the loop on re-approval…
@@ -5470,7 +5905,7 @@ class TestWorkContextResume:
                 "surface-or-actor-unrecognised",
             ]
 
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             with anyio.fail_after(10):
                 result = await handle.result()
 
@@ -5716,9 +6151,11 @@ class TestDevLoopHumanInput:
     async def test_answered_request_resubmits_investigate_and_records_outcome(self, env):
         wf_id = f"dev-loop-test-{uuid.uuid4()}"
         request = _sealed_request(ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60, workflow_id=wf_id)
+        advances: list[AdvanceInput] = []
         activities, calls, investigate_ran, _ = _fake_activities(
             released=True,
-            human_input_requests=[_request_json(request), None]
+            human_input_requests=[_request_json(request), None],
+            advance_log=advances,
         )
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
@@ -5737,7 +6174,7 @@ class TestDevLoopHumanInput:
             with anyio.fail_after(15):
                 while calls.count("mctl-agents-investigate") < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
                     await asyncio.sleep(0.05)
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert calls.count("mctl-agents-investigate") == 2
@@ -5747,6 +6184,40 @@ class TestDevLoopHumanInput:
         assert result.human_input.value == "library A"
         assert result.human_input.resume_count == 1
         assert result.implement is not None and result.implement.phase == "Succeeded"
+        # The own `we_` ends with the continuation's phase at the flip (#636).
+        assert [a.phase for a in advances] == ["Succeeded"]
+
+    async def test_a_failed_continuation_ends_the_canonical_execution_failed(self, env):
+        """agy P2 on #651: the loop's own `we_` is still open through the
+        human-input round (#636), so a continuation that fails must end it
+        Failed, not with the first investigate's Succeeded."""
+        wf_id = f"dev-loop-test-{uuid.uuid4()}"
+        request = _sealed_request(ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60, workflow_id=wf_id)
+        advances: list[AdvanceInput] = []
+        activities, calls, investigate_ran, _ = _fake_activities(
+            released=True,
+            continuation_phase="Failed",
+            human_input_requests=[_request_json(request), None],
+            advance_log=advances,
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=wf_id,
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await _wait_for_pending_request(handle, request.request_id)
+            await handle.signal(DevLoopWorkflow.human_input_response, _response_payload(request))
+            result = await handle.result()
+
+        assert calls.count("mctl-agents-investigate") == 2
+        assert result.ended == "investigate ended Failed" and result.implement is None
+        assert [a.phase for a in advances] == ["Failed"]
 
     async def test_unanswered_request_times_out_and_ends_the_loop(self, env):
         wf_id = f"dev-loop-test-{uuid.uuid4()}"
@@ -5806,7 +6277,7 @@ class TestDevLoopHumanInput:
             with anyio.fail_after(15):
                 while calls.count("mctl-agents-investigate") < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
                     await asyncio.sleep(0.05)
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.human_input is not None
@@ -5836,7 +6307,7 @@ class TestDevLoopHumanInput:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.human_input is None
@@ -5942,7 +6413,7 @@ class TestDevLoopHumanInput:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.human_input is None
@@ -5972,7 +6443,7 @@ class TestDevLoopHumanInput:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.human_input is None
@@ -6005,7 +6476,7 @@ class TestDevLoopHumanInput:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.human_input is None
@@ -6048,7 +6519,7 @@ class TestDevLoopHumanInput:
             with anyio.fail_after(15):
                 while calls.count("mctl-agents-investigate") < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
                     await asyncio.sleep(0.05)
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.human_input is not None
@@ -6080,7 +6551,7 @@ class TestDevLoopHumanInput:
             for request in (first, second):
                 await _wait_for_pending_request(handle, request.request_id)
                 await handle.signal(DevLoopWorkflow.human_input_response, _response_payload(request))
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.human_input is not None and result.human_input.resume_count == 2
@@ -6204,6 +6675,7 @@ def _admission_activities(implement_results, *, seen_queues=None, running=None):
         records.append(record)
 
     activities = [
+        *_canonical_activities(seen_queues=seen_queues),
         fake_resolve_agent_release,
         fake_submit_and_wait,
         fake_record_execution,
@@ -6326,6 +6798,7 @@ def _admission_activities_with_fake_mutex(mutex: _FakeArgoMutex, *, seen_queues=
         records.append(record)
 
     activities = [
+        *_canonical_activities(),
         fake_resolve_agent_release,
         fake_submit_and_wait,
         fake_record_execution,
@@ -6348,13 +6821,13 @@ class TestImplementationAdmission:
             handle = await _start_and_approve(env, 1)
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
 
         assert result.implement is not None and result.implement.succeeded
         assert seen["mctl-agents-implement"] == [IMPLEMENTATION_TASK_QUEUE]
         assert seen["mctl-agents-investigate"] == [EXECUTION_TASK_QUEUE]
-        assert seen["mctl-agents-approve"] == [EXECUTION_TASK_QUEUE]
+        assert seen["delegated-approve"] == [EXECUTION_TASK_QUEUE]
 
     async def test_a_burst_of_approvals_is_admitted_n_at_a_time(self, env):
         """The 2026-09-19 incident as a regression test (#395 DoD).
@@ -6377,7 +6850,7 @@ class TestImplementationAdmission:
         async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
             handles = [await _start_and_approve(env, 100 + i) for i in range(9)]
             for handle in handles:
-                await handle.signal(DevLoopWorkflow.approve)
+                await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
 
             # Wait until the pool is full, then hold there long enough for a
             # fourth to start if admission were not working.
@@ -6424,7 +6897,7 @@ class TestImplementationAdmission:
         async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
             handles = [await _start_and_approve(env, 300 + i) for i in range(6)]
             for handle in handles:
-                await handle.signal(DevLoopWorkflow.approve)
+                await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             results = [await handle.result() for handle in handles]
             states = [await handle.query(DevLoopWorkflow.implement_execution) for handle in handles]
 
@@ -6446,7 +6919,7 @@ class TestImplementationAdmission:
             handle = await _start_and_approve(env, 2)
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
             state = await handle.query(DevLoopWorkflow.implement_execution)
 
@@ -6470,7 +6943,7 @@ class TestImplementationAdmission:
             handle = await _start_and_approve(env, 3)
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             with pytest.raises(WorkflowFailureError) as excinfo:
                 await handle.result()
 
@@ -6503,7 +6976,7 @@ class TestImplementationAdmission:
             handle = await _start_and_approve(env, 4)
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             with pytest.raises(WorkflowFailureError) as excinfo:
                 await handle.result()
             state = await handle.query(DevLoopWorkflow.implement_execution)
@@ -6776,7 +7249,7 @@ class TestMergeWatchContinueAsNew:
             )
             with anyio.fail_after(30):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             with anyio.fail_after(30):
                 result = await handle.result()
 
@@ -6827,7 +7300,7 @@ class TestMergeWatchContinueAsNew:
             )
             with anyio.fail_after(30):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice", "approval_ref": "aar_test"})
             with anyio.fail_after(30):
                 result = await handle.result()
 
@@ -6973,7 +7446,7 @@ class TestMergeWatchContinueAsNew:
             )
             with anyio.fail_after(30):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             with anyio.fail_after(30):
                 result = await handle.result()
 
@@ -7021,7 +7494,7 @@ class TestMergeWatchContinueAsNew:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             with anyio.fail_after(10):
                 await first_poll.wait()
             await handle.signal(DevLoopWorkflow.abandon, "operator cleanup during a pending hop")
@@ -7069,7 +7542,7 @@ class TestMergeWatchContinueAsNew:
             )
             with anyio.fail_after(30):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             with anyio.fail_after(30):
                 result = await handle.result()
             claim = await handle.query(DevLoopWorkflow.lifecycle_claim)
@@ -7244,7 +7717,7 @@ class TestMergeGateInTheWatch:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             result = await handle.result()
         return result, gate_calls
 
