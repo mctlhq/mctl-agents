@@ -2962,9 +2962,10 @@ class DevLoopWorkflow:
 
     async def _ensure_canonical_execution(self, issue: IssueRef) -> None:
         """Resolve this loop's WorkItem and attach its own engine run, or fail
-        the start (#636). Both mctl-api routes are idempotent, so a retry — of
-        the activity or of the whole workflow under the same id — lands on the
-        same `wi_` and `we_`. A refusal, `external_key_in_use` included, and an
+        the start (#636). Both mctl-api routes are idempotent, so a retry of
+        the activity lands on the same `wi_` and `we_`; a new run under the
+        same id attaches its own `we_` (and creates the next `wi_` if the
+        previous one ended). A refusal, `external_key_in_use` included, and an
         unreadable store alike stop the loop before it runs anything: it never
         creates another WorkItem and never runs without one."""
         # Per run (`run_engine_ref`): an ended `we_` is never re-opened, and a
@@ -3423,7 +3424,14 @@ class DevLoopWorkflow:
                     continuation_params.pop("work_item_id", None)
                     continuation_params.pop("execution_id", None)
                 continuation_params["human_input_responses"] = json.dumps(accepted_answers)
+                if self._canonical_open:
+                    # The own `we_` is still open (#636): it ends with the
+                    # latest investigate's phase, and Failed if this one
+                    # never finishes (agy P2 on #651).
+                    self._canonical_end_phase = "Failed"
                 investigate_result = await _run_cwft("mctl-agents-investigate", continuation_params)
+                if self._canonical_open:
+                    self._canonical_end_phase = "Succeeded" if investigate_result.succeeded else "Failed"
                 await _record("issue-investigator", investigator_release, investigate_result, target_repo)
                 if not investigate_result.succeeded:
                     return DevLoopResult(

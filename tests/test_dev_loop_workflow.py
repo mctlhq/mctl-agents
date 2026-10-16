@@ -284,6 +284,8 @@ def _fake_activities(
     *,
     released: bool,
     investigate_phase: str = "Succeeded",
+    # The phase of a human-input continuation's investigate, when it differs.
+    continuation_phase: str | None = None,
     # mctlhq/mctl-agents#542: `read_proposal_status` is only ever scheduled
     # for a DISPATCHED execution (`dispatched is not None`), so this default
     # is inert for every pre-existing, non-dispatched test in this module.
@@ -420,7 +422,10 @@ def _fake_activities(
             if investigate_hook is not None:
                 await investigate_hook(dict(input.params))
             investigate_ran.set()
-            return WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase=investigate_phase)
+            phase = investigate_phase
+            if continuation_phase is not None and "human_input_responses" in input.params:
+                phase = continuation_phase
+            return WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase=phase)
         if input.operation == "mctl-agents-shepherd":
             # In-loop tick (#213) must be scoped to exactly this proposal.
             assert input.params.get("service")
@@ -6091,9 +6096,11 @@ class TestDevLoopHumanInput:
     async def test_answered_request_resubmits_investigate_and_records_outcome(self, env):
         wf_id = f"dev-loop-test-{uuid.uuid4()}"
         request = _sealed_request(ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60, workflow_id=wf_id)
+        advances: list[AdvanceInput] = []
         activities, calls, investigate_ran, _ = _fake_activities(
             released=True,
-            human_input_requests=[_request_json(request), None]
+            human_input_requests=[_request_json(request), None],
+            advance_log=advances,
         )
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
@@ -6122,6 +6129,40 @@ class TestDevLoopHumanInput:
         assert result.human_input.value == "library A"
         assert result.human_input.resume_count == 1
         assert result.implement is not None and result.implement.phase == "Succeeded"
+        # The own `we_` ends with the continuation's phase at the flip (#636).
+        assert [a.phase for a in advances] == ["Succeeded"]
+
+    async def test_a_failed_continuation_ends_the_canonical_execution_failed(self, env):
+        """agy P2 on #651: the loop's own `we_` is still open through the
+        human-input round (#636), so a continuation that fails must end it
+        Failed, not with the first investigate's Succeeded."""
+        wf_id = f"dev-loop-test-{uuid.uuid4()}"
+        request = _sealed_request(ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60, workflow_id=wf_id)
+        advances: list[AdvanceInput] = []
+        activities, calls, investigate_ran, _ = _fake_activities(
+            released=True,
+            continuation_phase="Failed",
+            human_input_requests=[_request_json(request), None],
+            advance_log=advances,
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=wf_id,
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await _wait_for_pending_request(handle, request.request_id)
+            await handle.signal(DevLoopWorkflow.human_input_response, _response_payload(request))
+            result = await handle.result()
+
+        assert calls.count("mctl-agents-investigate") == 2
+        assert result.ended == "investigate ended Failed" and result.implement is None
+        assert [a.phase for a in advances] == ["Failed"]
 
     async def test_unanswered_request_times_out_and_ends_the_loop(self, env):
         wf_id = f"dev-loop-test-{uuid.uuid4()}"

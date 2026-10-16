@@ -116,6 +116,10 @@ async def ensure_issue_execution(input: EnsureExecutionInput) -> EnsuredExecutio
     else:
         # The run suffix alone scopes the key to this run; the issue is
         # already in it (claude P3 on #651: the whole ref repeated it).
+        if not is_run_engine_ref(input.engine_ref):
+            # Without a run suffix the key would be issue-wide again, and an
+            # ended item would answer every later run (claude P3 on #651).
+            return EnsuredExecution(ok=False, reason=f"engine ref {input.engine_ref!r} names no run")
         run_scope = input.engine_ref.rpartition("#")[2]
         created = await asyncio.to_thread(client.create_work_item, tenant, input.issue_url, run_scope)
         if created.verdict == creation.UNKNOWN:
@@ -150,7 +154,8 @@ async def _fail_dead_runs(client: WorkItemClient, work_item_id: str, engine_ref:
     P2 on #651). Returns whether any was failed, so the attach is worth
     one more try. Only `#run_` refs of exactly this loop id are touched:
     another loop's, a dispatched request's (`#xr_`) or another engine's
-    execution is never this run's to end. Uncertainty raises."""
+    execution is never this run's to end. A refusal to end one returns
+    False; uncertainty raises."""
     if not is_run_engine_ref(engine_ref):
         return False
     answer = await asyncio.to_thread(client.get, work_item_id)
@@ -173,6 +178,15 @@ async def _fail_dead_runs(client: WorkItemClient, work_item_id: str, engine_ref:
         ended = await asyncio.to_thread(
             client.attach_execution, work_item_id, EngineRun(engine=ENGINE_TEMPORAL, engine_ref=ref), PHASE_FAILED
         )
+        if ended.verdict == EXECUTION_REFUSED:
+            # A definite no (e.g. an invalid transition) will not change on
+            # a retry: the caller answers the attach's own refusal (claude
+            # P3 on #651). Only uncertainty is raised.
+            activity.logger.warning(
+                "the dead run's execution %s (%s) of %s cannot be ended: %s",
+                execution.execution_id, ref, work_item_id, ended.reason,
+            )
+            return False
         if not ended.usable:
             raise ApplicationError(
                 f"end the dead run {ref} of {work_item_id}: {ended.verdict} {ended.reason}".strip(),

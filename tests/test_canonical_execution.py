@@ -198,11 +198,11 @@ def fake(monkeypatch) -> _Client:
 
 
 async def test_an_ordinary_start_creates_one_item_and_attaches_its_own_run(fake):
-    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1"))
+    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1#run_r1"))
 
     assert out.ok and (out.work_item_id, out.execution_id) == (WI, "we_1")
-    assert fake.creates == [("mctl", URL)] and fake.runs == ["wf-1"]
-    assert fake.attaches == [(WI, ex.EngineRun("temporal", "wf-1"), "Running")]
+    assert fake.creates == [("mctl", URL)] and fake.runs == ["run_r1"]
+    assert fake.attaches == [(WI, ex.EngineRun("temporal", "wf-1#run_r1"), "Running")]
 
 
 async def test_a_retry_lands_on_the_same_item_and_execution(fake):
@@ -210,14 +210,14 @@ async def test_a_retry_lands_on_the_same_item_and_execution(fake):
     fake.attach = ex.ExecutionAnswer(ex.EXECUTION_EXISTING, execution_id="we_1", attempt=1)
     env = ActivityEnvironment()
 
-    first = await env.run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1"))
-    second = await env.run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1"))
+    first = await env.run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1#run_r1"))
+    second = await env.run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1#run_r1"))
 
     assert first == second and first.execution_id == "we_1"
 
 
 async def test_a_given_work_item_skips_creation(fake):
-    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1", WI))
+    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1#run_r1", WI))
 
     assert out.ok and fake.creates == [] and fake.gets == [WI] and fake.attaches[0][0] == WI
 
@@ -237,7 +237,7 @@ async def test_a_given_work_item_of_another_issue_or_tenant_is_refused_and_nothi
     another issue's or tenant's item while the flip targets this issue."""
     fake.item = WorkItemAnswer(WORK_ITEM_FOUND, item)
 
-    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1", WI))
+    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1#run_r1", WI))
 
     assert not out.ok and fake.attaches == [] and fake.creates == []
 
@@ -245,7 +245,7 @@ async def test_a_given_work_item_of_another_issue_or_tenant_is_refused_and_nothi
 async def test_a_given_work_item_that_does_not_exist_is_refused(fake):
     fake.item = WorkItemAnswer(WORK_ITEM_ABSENT)
 
-    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1", WI))
+    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1#run_r1", WI))
 
     assert not out.ok and "does not exist" in out.reason and fake.attaches == []
 
@@ -254,7 +254,7 @@ async def test_an_unreadable_given_work_item_is_raised_never_trusted(fake):
     fake.item = WorkItemAnswer(WORK_ITEM_UNKNOWN, reason="HTTP 503")
 
     with pytest.raises(ApplicationError) as caught:
-        await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1", WI))
+        await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1#run_r1", WI))
 
     assert caught.value.type == ce.UNAVAILABLE_TYPE and fake.attaches == []
 
@@ -267,7 +267,7 @@ async def test_an_issue_opens_its_item_where_the_telegram_surface_does(fake, ser
     would split one issue into two WorkItems."""
     await ActivityEnvironment().run(
         ce.ensure_issue_execution,
-        ce.EnsureExecutionInput(f"https://github.com/mctlhq/{service}/issues/2", "wf-2"),
+        ce.EnsureExecutionInput(f"https://github.com/mctlhq/{service}/issues/2", "wf-2#run_r2"),
     )
 
     assert fake.creates[0][0] == "mctl"
@@ -275,7 +275,8 @@ async def test_an_issue_opens_its_item_where_the_telegram_surface_does(fake, ser
 
 async def test_an_unmapped_service_is_a_refusal_with_no_request(fake):
     out = await ActivityEnvironment().run(
-        ce.ensure_issue_execution, ce.EnsureExecutionInput("https://github.com/mctlhq/unknown-svc/issues/2", "wf-2")
+        ce.ensure_issue_execution,
+        ce.EnsureExecutionInput("https://github.com/mctlhq/unknown-svc/issues/2", "wf-2#run_r2"),
     )
 
     assert not out.ok and "no tenant" in out.reason and fake.creates == [] and fake.attaches == []
@@ -285,7 +286,7 @@ async def test_an_unmapped_service_is_a_refusal_with_no_request(fake):
 async def test_a_refused_create_is_a_value_and_nothing_is_attached(fake, verdict):
     fake.create = creation.CreateAnswer(verdict, reason="HTTP 409 external_key_in_use", code="external_key_in_use")
 
-    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1"))
+    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1#run_r1"))
 
     assert not out.ok and fake.attaches == [] and len(fake.creates) == 1
 
@@ -294,7 +295,7 @@ async def test_an_unknown_create_is_raised_for_a_bounded_retry_and_nothing_is_at
     fake.create = creation.CreateAnswer(creation.UNKNOWN, reason="HTTP 503")
 
     with pytest.raises(ApplicationError) as caught:
-        await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1"))
+        await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1#run_r1"))
 
     assert caught.value.type == ce.UNAVAILABLE_TYPE and fake.attaches == []
 
@@ -303,7 +304,7 @@ async def test_an_unknown_create_is_raised_for_a_bounded_retry_and_nothing_is_at
 async def test_an_active_or_refused_attach_stops_the_start(fake, verdict):
     fake.attach = ex.ExecutionAnswer(verdict, reason="execution_active")
 
-    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1"))
+    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1#run_r1"))
 
     assert not out.ok and out.execution_id == ""
 
@@ -312,13 +313,13 @@ async def test_an_unknown_attach_is_raised_never_a_local_identity(fake):
     fake.attach = ex.ExecutionAnswer(ex.EXECUTION_UNKNOWN, reason="HTTP 503")
 
     with pytest.raises(ApplicationError) as caught:
-        await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1"))
+        await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "wf-1#run_r1"))
 
     assert caught.value.type == ce.UNAVAILABLE_TYPE
 
 
 async def test_a_malformed_issue_url_is_a_refusal(fake):
-    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput("nope", "wf-1"))
+    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput("nope", "wf-1#run_r1"))
 
     assert not out.ok and fake.creates == []
 
@@ -427,3 +428,29 @@ async def test_a_dead_run_that_cannot_be_ended_is_raised_never_attached_beside(f
         await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, RUN))
 
     assert caught.value.type == ce.UNAVAILABLE_TYPE and len(fake.attaches) == 2
+
+
+async def test_a_dead_run_whose_end_is_refused_answers_the_refusal_without_retrying(fake):
+    """claude P3 on #651: a definite no (an invalid transition, the policy
+    checkpoint) will not change on a retry, so it is the attach's own
+    refusal, never uncertainty, and nothing is attached beside the run."""
+    fake.item = _held_by(ExecutionRef(execution_id="we_dead", temporal_workflow_id=DEAD, phase="Pending"))
+    fake.attach = [
+        ex.ExecutionAnswer(ex.EXECUTION_ACTIVE, reason="execution_active"),
+        ex.ExecutionAnswer(ex.EXECUTION_REFUSED, reason="invalid_transition"),
+    ]
+
+    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, RUN))
+
+    assert not out.ok and "execution_active" in out.reason and len(fake.attaches) == 2
+
+
+async def test_a_create_for_a_ref_that_names_no_run_is_refused(fake):
+    """claude P3 on #651: without a `#run_` suffix the create key would be
+    issue-wide, so an ended item would answer every later run."""
+    out = await ActivityEnvironment().run(
+        ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, "dev-loop-mctlhq-mctl-telegram-7")
+    )
+
+    assert not out.ok and "names no run" in out.reason
+    assert fake.runs == [] and fake.attaches == []
