@@ -1,0 +1,27 @@
+name: mctl-devloop
+version: 1
+description: MCTL DevLoop planning artifacts as an OpenSpec-style change (candidate; spike #655, target OpenSpec v1.14.2 / f80d860)
+artifacts:
+  - id: proposal
+    generates: proposal.md
+    description: Context, user stories, out of scope, open questions
+    template: proposal.md
+    requires: []
+  - id: specs
+    generates: specs/**/spec.md
+    description: Capability deltas (ADDED/MODIFIED/REMOVED/RENAMED requirements) carrying the EARS acceptance criteria
+    template: spec.md
+    requires: [proposal]
+  - id: design
+    generates: design.md
+    description: Current state, proposed solution, alternatives, platform impact
+    template: design.md
+    requires: [proposal]
+  - id: tasks
+    generates: tasks.md
+    description: Implementation tasks, tests and rollback
+    template: tasks.md
+    requires: [specs, design]
+apply:
+  requires: [tasks]
+  tracks: tasks.md

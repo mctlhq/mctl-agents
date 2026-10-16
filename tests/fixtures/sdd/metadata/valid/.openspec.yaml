@@ -1,0 +1,5 @@
+schema: mctl-devloop
+created: '2026-10-16'
+goal: Evaluate OpenSpec compatibility
+affected_areas: [mctl-agents]
+x-mctl-issue: https://github.com/mctlhq/mctl-agents/issues/655
