@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.77.1](https://github.com/mctlhq/mctl-agents/compare/1.77.0...1.77.1) (2026-10-16)
+
+
+### Bug Fixes
+
+* **deps:** bump claude-agent-sdk to 0.2.168 (bundled CLI 2.1.301) ([597c8fc](https://github.com/mctlhq/mctl-agents/commit/597c8fc3ca5409a3db28c031f4b2ff8bbc3c4d6e))
+* **deps:** bump claude-agent-sdk to 0.2.168 (bundled CLI 2.1.301) ([25fa862](https://github.com/mctlhq/mctl-agents/commit/25fa862da6431bc6704ac108c4f039056bad8b09))
+
 ## [1.77.0](https://github.com/mctlhq/mctl-agents/compare/1.76.0...1.77.0) (2026-10-16)
 
 
