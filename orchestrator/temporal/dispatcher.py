@@ -561,9 +561,10 @@ class Dispatcher:
             if await self._temporal.loop_state(owner) == LOOP_RUNNING:
                 if not is_request_engine_ref(ref):
                     # A pre-option-A `dev-loop-xr_<id>` loop is its own
-                    # request, and a running canonical loop may still end its
-                    # own `we_` (a later run re-adopts it: the attach is
-                    # idempotent on the engine ref): running means it holds it.
+                    # request. A RUNNING canonical loop id is either the run
+                    # that holds this `we_` (it ends it), or a later run,
+                    # which failed every dead run's `we_` of its loop id
+                    # before it attached its own (`ensure_issue_execution`).
                     continue
                 # The id is the issue's, shared by every run: only the run
                 # that took the request will end its execution. A later run

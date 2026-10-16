@@ -21,7 +21,7 @@ from datetime import timedelta
 import anyio
 import pytest
 from temporalio import activity
-from temporalio.client import WorkflowFailureError
+from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner
@@ -5445,6 +5445,44 @@ class TestWorkContextResume:
         assert [r.attempt for r in requests] == [0, 1]
         assert [d.approval_ref for d in delegated] == ["aar_test_a1"]
         assert result.implement is not None and calls.count("mctl-agents-implement") == 1
+
+    async def test_a_transition_while_parked_does_not_extend_the_park(self, env):
+        """claude P3 on #651: the park is bounded from its start (#420). A
+        transition on day 4 asks for a fresh grant, but must not restart the
+        wait: the loop still ends when the original wait runs out."""
+        requests: list[ApprovalRequestInput] = []
+        activities, _calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, approval_requests=requests
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/268", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                while not requests:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await anyio.sleep(0.05)
+            await env.sleep(timedelta(days=4))
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            with anyio.fail_after(10):
+                while len(requests) < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await anyio.sleep(0.05)
+            await env.sleep(timedelta(days=3, hours=1))
+            # Not `result()`: the time-skipping server would skip to any later deadline.
+            assert (await handle.describe()).status == WorkflowExecutionStatus.COMPLETED
+            result = await handle.result()
+
+        assert result.ended == "approval wait expired" and result.implement is None
 
     async def test_a_surface_transition_clears_approval_until_a_fresh_approve(self, env):
         activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)

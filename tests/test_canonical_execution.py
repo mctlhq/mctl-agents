@@ -21,6 +21,7 @@ from orchestrator.work_context.contract import (
     WORK_ITEM_ABSENT,
     WORK_ITEM_FOUND,
     WORK_ITEM_UNKNOWN,
+    ExecutionRef,
     WorkItem,
     WorkItemAnswer,
 )
@@ -185,7 +186,8 @@ class _Client:
 
     def attach_execution(self, work_item_id, run, phase):
         self.attaches.append((work_item_id, run, phase))
-        return self.attach
+        # A list answers in turn: one answer per call.
+        return self.attach.pop(0) if isinstance(self.attach, list) else self.attach
 
 
 @pytest.fixture
@@ -337,3 +339,91 @@ def test_a_read_work_item_carries_its_tenant():
     item = WorkItem.from_payload({"id": WI, "state": "active", "state_version": 1, "tenant": "mctl"})
 
     assert item is not None and item.tenant == "mctl"
+
+
+async def test_the_create_key_is_scoped_by_the_run_suffix_alone(fake):
+    """claude P3 on #651: the issue is already in the key, so the run part
+    is `run_<run id>`, not the whole engine ref repeating the issue."""
+    await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, RUN))
+
+    assert fake.runs == ["run_r1"]
+    assert fake.attaches[0][1] == ex.EngineRun("temporal", RUN)
+
+
+async def test_a_repo_named_in_another_case_resolves_the_same_tenant(fake):
+    """agy P3 on #651: GitHub repo names are case-insensitive."""
+    out = await ActivityEnvironment().run(
+        ce.ensure_issue_execution, ce.EnsureExecutionInput(URL.replace("mctl-telegram", "Mctl-Telegram"), RUN)
+    )
+
+    assert out.ok and fake.creates[0][0] == "mctl"
+
+
+DEAD = "dev-loop-mctlhq-mctl-telegram-7#run_r0"
+
+
+def _held_by(*executions: ExecutionRef) -> WorkItemAnswer:
+    return WorkItemAnswer(
+        WORK_ITEM_FOUND,
+        WorkItem(work_item_id=WI, state="active", external_key=KEY, tenant="mctl", executions=executions),
+    )
+
+
+async def test_a_dead_run_of_this_loop_is_failed_and_the_attach_retried(fake):
+    """claude P2 on #651: a terminated run never ends its own `we_`, and the
+    next run's per-run ref no longer re-adopts it, so it would hold the item
+    (`execution_active`) for ever. At most one run of a workflow id is open,
+    so another run's non-terminal `we_` of this loop id is a dead one: the new
+    run fails it and attaches. Nothing else on the item is touched."""
+    fake.item = _held_by(
+        ExecutionRef(execution_id="we_dead", temporal_workflow_id=DEAD, phase="Running"),
+        ExecutionRef(execution_id="we_done", temporal_workflow_id=DEAD.replace("r0", "rx"), phase="Succeeded"),
+        ExecutionRef(
+            execution_id="we_req", temporal_workflow_id="dev-loop-mctlhq-mctl-telegram-7#xr_1", phase="Running"
+        ),
+        ExecutionRef(
+            execution_id="we_other", temporal_workflow_id="dev-loop-mctlhq-mctl-telegram-8#run_r9", phase="Running"
+        ),
+    )
+    fake.attach = [
+        ex.ExecutionAnswer(ex.EXECUTION_ACTIVE, reason="execution_active"),
+        ex.ExecutionAnswer(ex.EXECUTION_EXISTING, execution_id="we_dead", attempt=1),
+        ex.ExecutionAnswer(ex.EXECUTION_ATTACHED, execution_id="we_2", attempt=2),
+    ]
+
+    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, RUN))
+
+    assert out.ok and out.execution_id == "we_2"
+    assert fake.attaches == [
+        (WI, ex.EngineRun("temporal", RUN), "Running"),
+        (WI, ex.EngineRun("temporal", DEAD), "Failed"),
+        (WI, ex.EngineRun("temporal", RUN), "Running"),
+    ]
+
+
+async def test_an_item_held_by_anything_but_a_dead_run_of_this_loop_stays_refused(fake):
+    fake.item = _held_by(
+        ExecutionRef(
+            execution_id="we_req", temporal_workflow_id="dev-loop-mctlhq-mctl-telegram-7#xr_1", phase="Running"
+        ),
+        ExecutionRef(execution_id="we_argo", temporal_workflow_id="", phase="Running"),
+    )
+    fake.attach = ex.ExecutionAnswer(ex.EXECUTION_ACTIVE, reason="execution_active")
+
+    out = await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, RUN))
+
+    assert not out.ok and "execution_active" in out.reason
+    assert [a[2] for a in fake.attaches] == ["Running"]
+
+
+async def test_a_dead_run_that_cannot_be_ended_is_raised_never_attached_beside(fake):
+    fake.item = _held_by(ExecutionRef(execution_id="we_dead", temporal_workflow_id=DEAD, phase="Running"))
+    fake.attach = [
+        ex.ExecutionAnswer(ex.EXECUTION_ACTIVE, reason="execution_active"),
+        ex.ExecutionAnswer(ex.EXECUTION_UNKNOWN, reason="503"),
+    ]
+
+    with pytest.raises(ApplicationError) as caught:
+        await ActivityEnvironment().run(ce.ensure_issue_execution, ce.EnsureExecutionInput(URL, RUN))
+
+    assert caught.value.type == ce.UNAVAILABLE_TYPE and len(fake.attaches) == 2

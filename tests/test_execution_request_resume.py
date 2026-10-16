@@ -330,6 +330,51 @@ async def test_a_resume_onto_a_live_loop_is_delivered_and_the_loop_continues_und
     assert audit[1]["workflow_id"] == loop and audit[1]["verdict"] == dx.DELIVERED
 
 
+async def test_the_re_approval_is_asked_on_the_latest_transitions_execution_not_an_earlier_one(api, env):
+    """claude P2 on #651: carol resumed by signal before the flip, so the
+    loop records her execution; alice's delivery after the flip is a second
+    transition whose `we_` is bound only at the fulfil, after the Update
+    answered. The fresh grant must wait for alice's `we_`: "any execution
+    but the loop's own" is already carol's, and a grant asked there is
+    bound to the wrong execution (or refused, once it ended)."""
+    gate = _Gate()
+    submit, _ = _submit_log()
+    carol = "we_carol_signalled"
+
+    class FulfilsLate(_Port):
+        async def deliver(self, issue: Any, delivery: Any) -> dx.DeliveryAnswer:
+            answer = await super().deliver(issue, delivery)
+            await gate.release()  # on to the re-approval gate, before the bind
+            await anyio.sleep(1.0)
+            return answer
+
+    async with _worker(env, submit, gate=gate):
+        api.create_request("start")
+        outcome = await _dispatcher(env).dispatch_once()
+        loop = outcome.workflow_id
+        handle = env.client.get_workflow_handle(loop)
+        await _wait_for(lambda: bool(gate.requests))
+        await handle.signal(
+            DevLoopWorkflow.resume,
+            {
+                "work_item_id": WID, "execution_id": carol,
+                "surface": "github", "actor_kind": "human", "actor_id": "user:carol",
+            },
+        )
+        await _wait_for(lambda: len(gate.requests) == 2)
+        await handle.signal(DevLoopWorkflow.approve, {"approval_ref": f"aar_test_a{gate.requests[-1].attempt}"})
+        await _wait_for(lambda: api.executions[0]["phase"] == "Succeeded")
+        await _wait_for(gate.entered.is_set)
+
+        rid = api.create_request("resume")
+        fulfilled = await dx.Dispatcher(WorkItemClient(), FulfilsLate(env.client), lease=60).dispatch_once()
+        assert fulfilled.action == dx.FULFILLED and fulfilled.engine_ref == f"{loop}#{rid}"
+        await _wait_for(lambda: len(gate.requests) == 3)
+        await anyio.sleep(0.5)
+        assert [r.execution_id for r in gate.requests[2:]] == [fulfilled.execution_id]
+        await _finish(env, loop, gate)
+
+
 # -- crash windows -------------------------------------------------------------
 
 

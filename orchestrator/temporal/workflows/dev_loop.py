@@ -1664,6 +1664,8 @@ class DevLoopWorkflow:
         self._signalled_refs: list[str] = []
         #: Set by a transition, cleared when the fresh grant is asked for.
         self._grant_refresh = False
+        #: `len(self._executions)` at the latest transition.
+        self._transition_mark = 0
         self._approval_slug = ""
         # Bumped by every surface/actor transition: the re-asked grant gets a
         # new idempotency key, so a decision made before the transition is
@@ -1964,6 +1966,9 @@ class DevLoopWorkflow:
             # Wakes a canonical park, whose grant is now the wrong attempt's,
             # so it asks for a fresh one (claude P2 on #651).
             self._grant_refresh = True
+            # The execution this transition opens is the first one recorded
+            # after it (bound at its fulfil, or appended by the signal).
+            self._transition_mark = len(self._executions)
             self._approval_attempt += 1
             self._resume_pending = True
         return transition
@@ -2102,6 +2107,7 @@ class DevLoopWorkflow:
         approve: WorkflowResult | None = None,
         human_input: HumanInputOutcome | None = None,
         needs_grant: bool = False,
+        wait: timedelta | None = None,
     ) -> DevLoopResult | None:
         """Park until a resume-cleared approval is re-granted — releasable
         and bounded, per #420's rule for every approval park in this
@@ -2121,7 +2127,8 @@ class DevLoopWorkflow:
                     or (self._canonical and needs_grant and self._grant_refresh)
                 ),
                 # A canonical grant is decidable for at most its TTL.
-                timeout=CANONICAL_APPROVAL_WAIT if (self._canonical and needs_grant) else APPROVAL_WAIT_DEADLINE,
+                timeout=wait
+                or (CANONICAL_APPROVAL_WAIT if (self._canonical and needs_grant) else APPROVAL_WAIT_DEADLINE),
             )
         except TimeoutError:
             # A signal landing while the timeout fired must not be
@@ -2162,52 +2169,60 @@ class DevLoopWorkflow:
         whenever a transition cleared the decision, and wait for a decision
         on exactly that grant. A transition can land while parked (claude P2
         on #651), so the ask is repeated after every wake it caused, not
-        only before the first.
+        only before the first. The whole park is bounded by one
+        CANONICAL_APPROVAL_WAIT from its start, however many transitions
+        land in it (#420).
 
         Before the flip the grant is asked on this loop's own `we_`; after it
         that `we_` has ended and its grant is spent, so it is asked on the
-        execution the transition opened (the resume's)."""
-        own = self._canonical_execution_id()
+        execution the LATEST transition opened (claude P2 on #651: not any
+        execution but the own one, which an earlier resume's also is)."""
+        deadline = workflow.now() + CANONICAL_APPROVAL_WAIT
+
+        def ended(reason: str) -> DevLoopResult:
+            return DevLoopResult(
+                investigate=investigate_result,
+                implement=None,
+                approve=approve,
+                human_input=human_input,
+                ended=reason,
+            )
+
+        def opened() -> bool:
+            return len(self._executions) > self._transition_mark
+
         while True:
+            if self._abandoned:
+                return ended(f"abandoned: {self._abandon_reason}")
+            remaining = deadline - workflow.now()
+            if remaining <= timedelta(0) and not self._is_approved(needs_grant=True):
+                return ended("re-approval wait expired")
             if not self._is_approved(needs_grant=True):
                 if after_flip:
                     # The resume's `we_` is bound at its fulfil, after the
-                    # transition; a grant asked before that would be asked on
-                    # the ended one, and refused.
+                    # transition; a grant asked before that would be asked
+                    # on an ended one, and refused.
                     try:
-                        await workflow.wait_condition(
-                            lambda: self._abandoned
-                            or bool(self._executions and self._executions[-1].execution_id != own),
-                            timeout=CANONICAL_APPROVAL_WAIT,
-                        )
+                        await workflow.wait_condition(lambda: self._abandoned or opened(), timeout=remaining)
                     except TimeoutError:
                         pass
-                    if not (self._executions and self._executions[-1].execution_id != own):
-                        return DevLoopResult(
-                            investigate=investigate_result,
-                            implement=None,
-                            approve=approve,
-                            human_input=human_input,
-                            ended=(
-                                f"abandoned: {self._abandon_reason}"
-                                if self._abandoned
-                                else "re-approval wait expired"
-                            ),
-                        )
+                    if self._abandoned:
+                        return ended(f"abandoned: {self._abandon_reason}")
+                    if not opened():
+                        return ended("re-approval wait expired")
                 self._grant_refresh = False
-                ended = await self._request_canonical_approval(
+                refused = await self._request_canonical_approval(
                     issue, target_repo, investigate_result, human_input,
-                    execution_id=(
-                        self._executions[-1].execution_id if after_flip and self._executions else ""
-                    ),
+                    execution_id=self._executions[-1].execution_id if after_flip else "",
                 )
-                if ended is not None:
-                    return dataclasses.replace(ended, approve=approve)
-            ended = await self._await_reapproval(
-                investigate_result, approve=approve, human_input=human_input, needs_grant=True
+                if refused is not None:
+                    return dataclasses.replace(refused, approve=approve)
+            result = await self._await_reapproval(
+                investigate_result, approve=approve, human_input=human_input, needs_grant=True,
+                wait=max(deadline - workflow.now(), timedelta(seconds=1)),
             )
-            if ended is not None or self._is_approved(needs_grant=True):
-                return ended
+            if result is not None or self._is_approved(needs_grant=True):
+                return result
 
     @workflow.signal
     def resume(self, *args: object) -> None:
@@ -3472,14 +3487,15 @@ class DevLoopWorkflow:
                 if self._canonical and self._grant_refresh and not (self._is_approved() or self._abandoned):
                     # #636 (claude P2 on #651): a transition landed while
                     # parked, so the grant asked for is the wrong attempt's.
-                    # Ask for the fresh one; the park is as long as its TTL.
+                    # Ask for the fresh one.
                     self._grant_refresh = False
                     ended = await self._request_canonical_approval(
                         issue, target_repo, investigate_result, human_input_outcome
                     )
                     if ended is not None:
                         return ended
-                    approval_deadline = workflow.now() + approval_wait
+                    # The deadline stays: the park is bounded from its start,
+                    # however many transitions land in it (#420).
                     continue
                 break
             else:

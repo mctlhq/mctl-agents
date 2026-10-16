@@ -123,9 +123,10 @@ def approval_intent(execution_id: str, service: str, slug: str) -> aa.ActionInte
 async def request_devloop_approval(input: ApprovalRequestInput) -> ApprovalRequestResult:
     """Create the `aar_` for this DevLoop's approval, or find it again.
 
-    Deterministic idempotency (`aa.idempotency_key`, attempt 0): a Temporal
-    retry, or a replayed workflow task, finds the request instead of opening a
-    second one, so the human is asked once for one intent."""
+    Deterministic idempotency (`aa.idempotency_key`, keyed on
+    `input.attempt`): a Temporal retry or a replayed workflow task of the SAME
+    attempt finds the request instead of opening a second one, while a new
+    attempt (bumped on every surface/actor transition) asks a new decision."""
     intent = approval_intent(input.execution_id, input.service, input.slug)
     ttl = min(max(input.ttl_seconds, aa.MIN_TTL_S), aa.MAX_TTL_S)
     answer = await asyncio.to_thread(
