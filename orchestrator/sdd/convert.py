@@ -49,8 +49,7 @@ def _parse_ac(chunk: str) -> list[tuple[str | None, list[str]]]:
         if not ln.strip():
             continue
         if ln.startswith("- "):
-            items.append((group, [ln[2:]]))
-            group = None
+            items.append((group, [ln[2:]]))  # a label covers every bullet until the next label
         elif ln[0] in " \t" and items:
             items[-1][1].append(ln)
         else:
@@ -143,17 +142,19 @@ def change_to_triplet(pkg: ChangePackage) -> tuple[dict[str, str], dict[str, Any
     head, sections = _split_sections(pkg.files["proposal.md"])
     spec = pkg.files.get(f"specs/{pkg.capability}/spec.md", "")
     out_lines: list[str] = []
+    prev_group: str | None = None
     for r in parse_delta(spec).added if spec else []:
         body = r.text.split("\n\n#### Scenario:")[0].splitlines()[1:]
         group = None
         if body and (m := _GROUP.match(body[0])):
             group, body = m.group(1), body[1:]
-        if group:
+        if group and group != prev_group:
             if out_lines:
                 out_lines.append("")
             out_lines.append(group)
             out_lines.append("")
         out_lines.append("- " + "\n".join(body))
+        prev_group = group
     ac = ""
     if out_lines:
         ac = meta.get("x-mctl-acceptance-heading", "## Acceptance criteria (EARS)") + "\n\n"
@@ -183,7 +184,8 @@ def change_to_triplet(pkg: ChangePackage) -> tuple[dict[str, str], dict[str, Any
     }
     triplet = {
         "requirements.md": text,
-        "design.md": pkg.files["design.md"],
+        # A `trivial` package (skip_specs) has no design.md; the triplet keeps an empty one.
+        "design.md": pkg.files.get("design.md", ""),
         "tasks.md": pkg.files["tasks.md"],
     }
     return triplet, source
