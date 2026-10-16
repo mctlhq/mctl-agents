@@ -1,5 +1,43 @@
 # Changelog
 
+## [1.76.0](https://github.com/mctlhq/mctl-agents/compare/1.75.2...1.76.0) (2026-10-16)
+
+
+### Features
+
+* **commerce:** e2e integration for projects-mcp paid capability ([7189793](https://github.com/mctlhq/mctl-agents/commit/718979324f6f1ac500a071b9e75171c9f93653d8))
+* **commerce:** e2e integration for projects-mcp paid capability ([28cdd13](https://github.com/mctlhq/mctl-agents/commit/28cdd13b2f2042fd624afe05b7746700612115b2))
+* **devloop:** approve through WorkItem, aar_ and agent run token ([4fa3808](https://github.com/mctlhq/mctl-agents/commit/4fa3808958e91d49de2dc9ea1efe1592a86de8b2))
+* **devloop:** approve through WorkItem, aar_ and agent run token ([61eb4c6](https://github.com/mctlhq/mctl-agents/commit/61eb4c6d2b9cef0efd5b6264fde2f4650ada95a4))
+
+
+### Bug Fixes
+
+* **commerce:** align pre-acceptance hints and permit tool execution errors ([d191f5e](https://github.com/mctlhq/mctl-agents/commit/d191f5e5ffd6390b5ccfe6a740522e19331ceb8d))
+* **commerce:** anchor domain non-visibility hints with delimiters ([38fe996](https://github.com/mctlhq/mctl-agents/commit/38fe996c541f408446deb11e1639503b2b8110de))
+* **commerce:** anchor domain refusal noun phrases with regex patterns ([28a899f](https://github.com/mctlhq/mctl-agents/commit/28a899feb8228c1a2cc1408b85055f0c05e48640))
+* **commerce:** anchor refusal hints and route unclassified tool errors ([885eec8](https://github.com/mctlhq/mctl-agents/commit/885eec8275b95173f4b26cbb661d2fa2fea48ea8))
+* **commerce:** anchor unknown tool and timezone hints in refusal table ([29b79a0](https://github.com/mctlhq/mctl-agents/commit/29b79a0525ecefeecfd22f44e2f3a92b28c48e19))
+* **commerce:** default unmarked errors to outcome check ([23b8590](https://github.com/mctlhq/mctl-agents/commit/23b85902dd949c066a65fedc6b77bfbb00cbef5f))
+* **commerce:** fast-path direct json, specific refusal phrases, and canonical test IDs ([ee0b551](https://github.com/mctlhq/mctl-agents/commit/ee0b55198f36edc049a0a5d1c097728108a551d2))
+* **commerce:** handle jsonrpc errors, network exceptions, and robust sse parsing ([dd06e60](https://github.com/mctlhq/mctl-agents/commit/dd06e60d218dce09240984ab43a870ed1676c8f7))
+* **commerce:** live test post-acceptance settlement and harden client ([2d5b247](https://github.com/mctlhq/mctl-agents/commit/2d5b2471b4dd2c9a7f3d07ab2db2291e8105b6e3))
+* **commerce:** remove dead task cleanup and tighten test hygiene ([253eb6f](https://github.com/mctlhq/mctl-agents/commit/253eb6fbb49b1bea2caae42a1abd20efaa25cd66))
+* **commerce:** remove unobserved live status refusal wording ([c544c7e](https://github.com/mctlhq/mctl-agents/commit/c544c7eed06e39c1fa3b09b9ed8e3c8b1461cfd3))
+* **commerce:** require structured outcome 404 and harden lookup ([7ed3871](https://github.com/mctlhq/mctl-agents/commit/7ed387197c1384593142ac95cda08323f43c1695))
+* **commerce:** resolve post-acceptance mapping, derived schema hash, and CRLF SSE parsing ([2078dc5](https://github.com/mctlhq/mctl-agents/commit/2078dc5d13c919a5c8501473e4ae4d8a50402219))
+* **commerce:** scope authorization missing field hints to exact fields ([5c59a05](https://github.com/mctlhq/mctl-agents/commit/5c59a05090d63b157f788e2106fc64236b907fe5))
+* **commerce:** structured refusal markers, transport pooling, and fixture draining ([e091d92](https://github.com/mctlhq/mctl-agents/commit/e091d924795cac436e862192c217e0c22f8fbbe9))
+* **commerce:** track client event loop and verify outcome failure route ([bf81d19](https://github.com/mctlhq/mctl-agents/commit/bf81d198147e216cc4985612ec27550b40d9b05c))
+* **dev-loop:** end the own we_ with the continuation's phase ([8feed15](https://github.com/mctlhq/mctl-agents/commit/8feed15184e7605e37ca3cb3650cda1027ee8c23))
+* **dev-loop:** give the start's execution activity room for a heal ([c1604f3](https://github.com/mctlhq/mctl-agents/commit/c1604f3fa927864d017c9619842c101802569f35))
+* **dev-loop:** give the start's execution activity room for a heal ([4de1421](https://github.com/mctlhq/mctl-agents/commit/4de14217214bed55ceed7197bd8cf4a9c582dbfb))
+* **dev-loop:** heal dead runs, bind re-approval to latest resume ([06223cf](https://github.com/mctlhq/mctl-agents/commit/06223cff6bc9fa648094a107a2ef8de402873ee7))
+* **dev-loop:** ignore a grant answer whose attempt moved in flight ([afe54ee](https://github.com/mctlhq/mctl-agents/commit/afe54ee5f3e02b4088f087126bb0002f369ee3a9))
+* **dev-loop:** per-run we_, pinned grants, fresh re-approval ([d717358](https://github.com/mctlhq/mctl-agents/commit/d717358eb5bdadb546ee8ead578ebb2cf504c7d3))
+* **dev-loop:** pin own we_, adopt decided grants, heal stranded runs ([e74a664](https://github.com/mctlhq/mctl-agents/commit/e74a6648186bc1c28e8a8706c19b879600d87f9e))
+* **work-context:** open every issue's item in the mctl tenant ([85cc6d4](https://github.com/mctlhq/mctl-agents/commit/85cc6d4b937310da6c96af18d45df68ac51f5f63))
+
 ## [1.75.2](https://github.com/mctlhq/mctl-agents/compare/1.75.1...1.75.2) (2026-10-13)
 
 
