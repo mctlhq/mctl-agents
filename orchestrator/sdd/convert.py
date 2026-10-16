@@ -97,15 +97,17 @@ def triplet_to_change(
     after = ""
     prev = ""
     for heading, chunk in sections:
-        if heading.startswith(_AC_PREFIX) and not ac_chunk:
+        if heading.lower().startswith(_AC_PREFIX.lower()) and not ac_chunk:
             ac_chunk, ac_heading, after = chunk, heading, prev
         else:
             prop += chunk
             prev = heading
     items = _parse_ac(ac_chunk)
+    if ac_chunk.strip() and not items:
+        raise ValueError("acceptance criteria section has no '- ' bullet items; refusing to drop it silently")
     blocks = [_requirement_block(i, g, ls) for i, (g, ls) in enumerate(items, 1)]
     spec = "## ADDED Requirements\n\n" + "\n\n".join(blocks) + "\n" if blocks else ""
-    src = source_info.get("source", {})
+    src = (source_info.get("source") or {})
     meta: dict[str, Any] = {
         "schema": SCHEMA_NAME,
         "created": created,
@@ -219,9 +221,9 @@ def loss_report(triplet: Mapping[str, str], source_info: Mapping[str, Any], pkg:
             target = next((f for f in search if needle in pkg.files[f]), None)
             out.append(LossEntry(name, n, kind, ln.strip(), target))
     flat = {
-        "source.url": source_info.get("source", {}).get("url"),
-        "source.repo": source_info.get("source", {}).get("repo"),
-        "source.issue": source_info.get("source", {}).get("issue"),
+        "source.url": (source_info.get("source") or {}).get("url"),
+        "source.repo": (source_info.get("source") or {}).get("repo"),
+        "source.issue": (source_info.get("source") or {}).get("issue"),
         "service": source_info.get("service"),
         "slug": source_info.get("slug"),
     }

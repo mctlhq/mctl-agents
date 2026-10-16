@@ -63,9 +63,10 @@ class ChangeMetadata:
 
 
 def _forbidden(key: str) -> str | None:
-    if key in FORBIDDEN_EXECUTION_KEYS:
+    k = key.lower()
+    if k in FORBIDDEN_EXECUTION_KEYS:
         return key
-    if key.startswith("x-mctl-") and key[len("x-mctl-") :] in FORBIDDEN_EXECUTION_KEYS:
+    if k.startswith("x-mctl-") and k[len("x-mctl-") :] in FORBIDDEN_EXECUTION_KEYS:
         return key
     return None
 

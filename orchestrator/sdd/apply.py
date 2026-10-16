@@ -131,6 +131,19 @@ def apply_change(canonical: Mapping[str, str], deltas: Mapping[str, str], *, mod
     return ApplyResult(out, warnings)
 
 
+def _collect_specs(base: Path, *, strict: bool) -> dict[str, str]:
+    """Map capability (path under base, posix) to spec.md text, at any depth."""
+    out: dict[str, str] = {}
+    for p in sorted(base.rglob("spec.md")):
+        cap = p.parent.relative_to(base).as_posix()
+        if cap == ".":
+            if strict:
+                raise ApplyAbort(f"spec.md directly under {base.name}/ has no capability directory")
+            continue
+        out[cap] = p.read_text(encoding="utf-8")
+    return out
+
+
 def archive_change(root: Path, change: str, *, today: _dt.date | None = None) -> Path:
     """Apply ``root/changes/<change>`` to ``root/specs`` and move it to the archive.
 
@@ -141,10 +154,12 @@ def archive_change(root: Path, change: str, *, today: _dt.date | None = None) ->
     change_dir = root / "changes" / change
     stamp = (today or _dt.date.today()).isoformat()
     target = root / "changes" / "archive" / f"{stamp}-{change}"
+    if not change_dir.is_dir():
+        raise ApplyAbort(f"change not found: {change}")
     if target.exists():
         raise ApplyAbort(f"archive target already exists: {target.name}")
-    deltas = {p.parent.name: p.read_text(encoding="utf-8") for p in sorted((change_dir / "specs").glob("*/spec.md"))}
-    canonical = {p.parent.name: p.read_text(encoding="utf-8") for p in sorted((root / "specs").glob("*/spec.md"))}
+    deltas = _collect_specs(change_dir / "specs", strict=True)
+    canonical = _collect_specs(root / "specs", strict=False)
     result = apply_change(canonical, deltas)  # raises before any write
     for cap in deltas:
         dest = root / "specs" / cap / "spec.md"

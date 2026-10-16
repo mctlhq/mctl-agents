@@ -113,14 +113,17 @@ class Delta:
 def parse_delta(text: str) -> Delta:
     sections: dict[str, list[str]] = {}
     current: str | None = None
+    in_fence = False
     for ln in text.splitlines():
-        m = _OP.match(ln)
+        if _FENCE.match(ln):
+            in_fence = not in_fence
+        m = None if in_fence else _OP.match(ln)
         if m:
             current = m.group(1)
             if current in sections:
                 raise GrammarError(f"duplicate '## {current} Requirements' section")
             sections[current] = []
-        elif ln.startswith("## "):
+        elif not in_fence and ln.startswith("## "):
             raise GrammarError(f"unknown delta section: {ln!r}")
         elif current is not None:
             sections[current].append(ln)
@@ -131,6 +134,8 @@ def parse_delta(text: str) -> Delta:
             for ln in lines:
                 mf, mt = _FROM.match(ln), _TO.match(ln)
                 if mf:
+                    if pending is not None:
+                        raise GrammarError("RENAMED FROM without TO")
                     pending = mf.group(1)
                 elif mt:
                     if pending is None:
