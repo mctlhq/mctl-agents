@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import timedelta
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -35,7 +36,7 @@ from temporalio.exceptions import ApplicationError
 from config.settings import tenant_for_service
 from orchestrator.temporal.issue_ref import is_run_engine_ref, loop_id_of_engine_ref, parse_issue_url
 from orchestrator.work_context import creation
-from orchestrator.work_context.client import WorkItemClient
+from orchestrator.work_context.client import DEFAULT_TIMEOUT_S, WorkItemClient
 from orchestrator.work_context.contract import WORK_ITEM_ABSENT, WORK_ITEM_FOUND
 from orchestrator.work_context.executions import EXECUTION_ACTIVE, EXECUTION_REFUSED, EngineRun
 
@@ -46,6 +47,21 @@ _TERMINAL_PHASES = frozenset({"Succeeded", "Failed", "Error"})
 
 #: Raised when the store (or the policy checkpoint) gave no usable answer.
 UNAVAILABLE_TYPE = "CanonicalExecutionUnavailable"
+
+#: The HTTP round trips one attempt can make while it heals one dead run:
+#: a supplied item's `get` (up to four, see `WorkItemClient.get`), the
+#: attach, the heal's `get` (up to four), the dead run's end and the second
+#: attach. A created item costs one round trip instead of that first `get`.
+WORST_CASE_ROUND_TRIPS = 11
+#: The longest a store that is slow (not down) can hold those round trips:
+#: each one up to the client's own timeout, plus `get`'s two re-read pauses.
+WORST_CASE_SECONDS = WORST_CASE_ROUND_TRIPS * DEFAULT_TIMEOUT_S + 2 * WorkItemClient.RE_READ_PAUSE_S
+#: The activity's own start-to-close timeout (limitation 8 on #651): the
+#: shared 30s FAST timeout fit the plain create + attach but not a heal, so
+#: a store that stayed slow failed the start. This one covers the worst
+#: case above. A loop id with several dead runs still converges: every end
+#: that landed is terminal, so the next attempt skips it and ends the rest.
+ENSURE_EXECUTION_TIMEOUT = timedelta(minutes=2)
 
 
 @dataclass(frozen=True)

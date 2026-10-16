@@ -34,7 +34,12 @@ from orchestrator.context_snapshot import ExecutionCorrelation as _ExecutionCorr
 from orchestrator.lifecycle.contract import Owner, answer_from
 from orchestrator.temporal.activities.action_approval import ApprovalPoll, GatedActionInput, GatedActionResult
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
-from orchestrator.temporal.activities.canonical_execution import EnsuredExecution, EnsureExecutionInput
+from orchestrator.temporal.activities.canonical_execution import (
+    ENSURE_EXECUTION_TIMEOUT,
+    WORST_CASE_SECONDS,
+    EnsuredExecution,
+    EnsureExecutionInput,
+)
 from orchestrator.temporal.activities.delegated_approval import (
     ApprovalRequestInput,
     ApprovalRequestResult,
@@ -60,6 +65,7 @@ from orchestrator.temporal.issue_ref import is_run_engine_ref, loop_id_of_engine
 from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.action_approval import ActionApprovalWaitWorkflow, ApprovalWaitResult
 from orchestrator.temporal.workflows.dev_loop import (
+    FAST_ACTIVITY_TIMEOUT,
     INCIDENT_WATCH_WINDOW,
     LIFECYCLE_HEARTBEAT_EVERY_POLLS,
     LIFECYCLE_REFUSAL_BACKOFF_POLLS,
@@ -223,6 +229,7 @@ def _canonical_activities(
     *,
     calls: list[str] | None = None,
     ensure_calls: list[EnsureExecutionInput] | None = None,
+    ensure_timeouts: list[timedelta | None] | None = None,
     ensure_result: EnsuredExecution | None = None,
     ensure_raises: bool = False,
     approval_requests: list[ApprovalRequestInput] | None = None,
@@ -241,6 +248,8 @@ def _canonical_activities(
     async def fake_ensure_issue_execution(inp: EnsureExecutionInput) -> EnsuredExecution:
         if ensure_calls is not None:
             ensure_calls.append(inp)
+        if ensure_timeouts is not None:
+            ensure_timeouts.append(activity.info().start_to_close_timeout)
         if ensure_raises:
             raise ApplicationError("work items unavailable", non_retryable=True)
         return ensure_result or EnsuredExecution(
@@ -362,6 +371,7 @@ def _fake_activities(
     # issue's own WorkItem/`we_`; `approval_requests` logs the grant request;
     # `delegated_log` logs the delegated flip's input.
     ensure_calls: list[EnsureExecutionInput] | None = None,
+    ensure_timeouts: list[timedelta | None] | None = None,
     ensure_result: EnsuredExecution | None = None,
     ensure_raises: bool = False,
     approval_requests: list[ApprovalRequestInput] | None = None,
@@ -757,6 +767,7 @@ def _fake_activities(
         *_canonical_activities(
             calls=calls,
             ensure_calls=ensure_calls,
+            ensure_timeouts=ensure_timeouts,
             ensure_result=ensure_result,
             ensure_raises=ensure_raises,
             approval_requests=approval_requests,
@@ -1623,6 +1634,34 @@ class TestDevLoopWorkflow:
         refs = [c.engine_ref for c in ensure_calls]
         assert len(refs) == 2 and refs[0] != refs[1]
         assert all(is_run_engine_ref(r) and loop_id_of_engine_ref(r) == wf_id for r in refs)
+
+    async def test_the_start_gives_the_execution_activity_room_for_a_heal(self, env):
+        """Limitation 8 on #651: a dead-run heal adds HTTP round trips to
+        `ensure_issue_execution`, so the shared 30s FAST timeout could fail
+        the start against a slow store. The activity is scheduled with its
+        own timeout, which covers the worst case."""
+        timeouts: list[timedelta | None] = []
+        activities, _calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, ensure_timeouts=timeouts
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/12"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                while not timeouts:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await anyio.sleep(0.05)
+            await handle.signal(DevLoopWorkflow.abandon, {"reason": "done"})
+            await handle.result()
+
+        assert timeouts == [ENSURE_EXECUTION_TIMEOUT]
+        assert ENSURE_EXECUTION_TIMEOUT > FAST_ACTIVITY_TIMEOUT
+        assert ENSURE_EXECUTION_TIMEOUT.total_seconds() >= WORST_CASE_SECONDS
 
     @pytest.mark.parametrize("ref", ["", "aar_x\r\nX-Evil: 1", "not-a-grant"])
     async def test_a_malformed_requested_ref_ends_the_loop_before_any_flip(self, env, ref):

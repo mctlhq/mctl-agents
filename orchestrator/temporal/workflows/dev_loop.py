@@ -79,6 +79,7 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.action_approval import GatedActionInput
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.canonical_execution import (
+        ENSURE_EXECUTION_TIMEOUT,
         EnsuredExecution,
         EnsureExecutionInput,
         ensure_issue_execution,
@@ -2984,7 +2985,10 @@ class DevLoopWorkflow:
                 EnsureExecutionInput(
                     issue_url=issue.issue_url, engine_ref=engine_ref, work_item_id=issue.work_item_id or "",
                 ),
-                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                # Its own timeout, not FAST's 30s: a dead-run heal adds HTTP
+                # round trips (limitation 8 on #651). Replay does not compare
+                # an activity's timeout, so no patch marker is needed.
+                start_to_close_timeout=ENSURE_EXECUTION_TIMEOUT,
                 retry_policy=FAST_ACTIVITY_RETRY_POLICY,
             )
         except ActivityError as exc:
