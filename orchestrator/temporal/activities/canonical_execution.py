@@ -156,9 +156,9 @@ async def _fail_dead_runs(client: WorkItemClient, work_item_id: str, engine_ref:
     one more try. Only `#run_` refs of exactly this loop id are touched:
     another loop's, a dispatched request's (`#xr_`) or another engine's
     execution is never this run's to end. A refusal to end one returns
-    False; uncertainty raises."""
-    if not is_run_engine_ref(engine_ref):
-        return False
+    False; uncertainty raises. `ensure_issue_execution` has already refused
+    an `engine_ref` that is not a run ref, so only the ledger's refs are
+    checked here."""
     answer = await asyncio.to_thread(client.get, work_item_id)
     if answer.verdict != WORK_ITEM_FOUND or answer.item is None:
         raise ApplicationError(

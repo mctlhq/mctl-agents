@@ -37,6 +37,11 @@ async def _fake_short() -> None:
     return None
 
 
+@activity.defn(name="submit_delegated_approve")
+async def _fake_delegated() -> None:
+    return None
+
+
 class _RecordingWorker:
     """Stands in for temporalio.worker.Worker: records kwargs, scripted lifecycle."""
 
@@ -95,6 +100,18 @@ def test_no_long_queue_workers_without_submit_and_wait(recording):
     temporal_harness.Worker(object(), task_queue=TASK_QUEUE, workflows=[], activities=[_fake_short])
 
     assert set(_by_queue(recording)) == {TASK_QUEUE}
+
+
+def test_the_delegated_flip_alone_gets_the_execution_worker_and_not_admission(recording):
+    """claude P3 on #651: `submit_delegated_approve` runs on the execution
+    queue only, so a test that fakes it without `submit_and_wait` must still
+    get that queue's poller (else it hangs instead of failing), and it is
+    never offered to the admission pool."""
+    temporal_harness.Worker(object(), task_queue=TASK_QUEUE, workflows=[], activities=[_fake_short, _fake_delegated])
+
+    workers = _by_queue(recording)
+    assert set(workers) == {TASK_QUEUE, EXECUTION_TASK_QUEUE}
+    assert workers[EXECUTION_TASK_QUEUE].kwargs["activities"] == [_fake_delegated]
 
 
 def test_the_implementation_worker_carries_the_admission_limit(recording):

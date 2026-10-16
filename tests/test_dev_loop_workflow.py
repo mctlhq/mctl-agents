@@ -5468,6 +5468,11 @@ class TestWorkContextResume:
         async def transition_once(inp: ApprovalRequestInput) -> ApprovalRequestResult | None:
             if inp.attempt != 0:
                 return None
+            # The handle is appended once `start_workflow` returns; never
+            # race it (claude P3 on #651).
+            with anyio.fail_after(10):
+                while not handles:  # noqa: ASYNC110 — polling a local list; no event to await
+                    await anyio.sleep(0.01)
             await handles[0].signal(
                 DevLoopWorkflow.resume,
                 {
