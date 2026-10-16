@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.77.0](https://github.com/mctlhq/mctl-agents/compare/1.76.0...1.77.0) (2026-10-16)
+
+
+### Features
+
+* **agents:** issue-655-spike-devloop-evaluate-openspec-compatib ([6ac1f1f](https://github.com/mctlhq/mctl-agents/commit/6ac1f1f1ac45a58645802d90713808f33fe02aa4))
+* **agents:** issue-655-spike-devloop-evaluate-openspec-compatib ([ddf2fa7](https://github.com/mctlhq/mctl-agents/commit/ddf2fa7ba1edddec4fb488bd15f35456cb398969))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-655-spike-devloop-evaluate-openspec-compatib ([3bbb29b](https://github.com/mctlhq/mctl-agents/commit/3bbb29bd1cfb1f2781817b2ea88ea40d1ff7e1c0))
+* **agents:** address P1/P2 codex findings on issue-655-spike-devloop-evaluate-openspec-compatib ([dbcba11](https://github.com/mctlhq/mctl-agents/commit/dbcba112fd95e1c1a2910580e09eef44c24cd971))
+* **sdd:** keep AC group on every bullet; tolerate missing design.md ([8fe7bf4](https://github.com/mctlhq/mctl-agents/commit/8fe7bf49b27ea773d620db9d4bcac4bb41eb42b9))
+* **sdd:** keep AC group on every bullet; tolerate missing design.md ([2d9f746](https://github.com/mctlhq/mctl-agents/commit/2d9f746ea1198af67412cf5491a872413414b3f0))
+
 ## [1.76.0](https://github.com/mctlhq/mctl-agents/compare/1.75.2...1.76.0) (2026-10-16)
 
 
