@@ -74,8 +74,10 @@ class Worker:
         )
         routed = [fn for fn in activities if _activity_name(fn) == EXECUTION_ACTIVITY]
         execution_routed = routed + [fn for fn in activities if _activity_name(fn) in EXECUTION_ONLY_ACTIVITIES]
-        # No submit_and_wait fake means this test never routes anything, so
-        # a second worker would only slow it down.
+        # Nothing registered for the execution queue means this test never
+        # routes anything there, so a second worker would only slow it down.
+        # Decided by the execution queue's own list (claude P3 on #651): a
+        # test that fakes only the delegated flip still needs its poller.
         self._execution = (
             _TemporalWorker(
                 client,
@@ -83,7 +85,7 @@ class Worker:
                 activities=execution_routed,
                 **kwargs,
             )
-            if routed
+            if execution_routed
             else None
         )
         # The admission limit is a default a caller may override, not a
