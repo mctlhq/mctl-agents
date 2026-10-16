@@ -1,0 +1,7 @@
+service: mctl-agents
+slug: issue-596-test-agent-platform-add-an-inert-authori
+source:
+  type: github_issue
+  repo: mctlhq/mctl-agents
+  issue: 596
+  url: https://github.com/mctlhq/mctl-agents/issues/596

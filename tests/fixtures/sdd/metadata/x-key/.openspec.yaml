@@ -1,0 +1,4 @@
+schema: mctl-devloop
+x-mctl-slug: abc
+x-other:
+  a: 1

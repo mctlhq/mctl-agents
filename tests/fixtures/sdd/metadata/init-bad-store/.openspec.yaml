@@ -1,0 +1,4 @@
+schema: mctl-devloop
+initiative:
+  store: My_Store
+  id: a-b

@@ -1,0 +1,4 @@
+schema: mctl-devloop
+initiative:
+  store: my-store
+  x-foo: bar
