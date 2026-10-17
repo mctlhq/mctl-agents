@@ -11,7 +11,7 @@ Keep the MCTL triplet as the authored format and `.status.yaml` as execution sta
 Do not make OpenSpec the authored source now.
 
 Why not `ADOPT_CONTRACT`:
-- The spec/delta markdown grammar is **unverified** (see the list below). That alone bars `ADOPT_CONTRACT`.
+- The spec/delta markdown grammar was **unverified** when this was written. It has since been verified against f80d860 (#659, `docs/spikes/659-openspec-grammar.md`), which removes this reason but not the others; the decision stays `ADAPTER_ONLY` until the authoring-cost evidence of #661 is in.
 - Schema commands are experimental at v1.14.2.
 - Existing proposals have no capability decomposition; canonical specs would have to be authored before deltas mean anything.
 - Adoption touches the investigator's publish guards (`TRIPLET`, `_landed_triplet_defects`, prompts) and context assembly.
@@ -127,15 +127,13 @@ Candidate: `tests/fixtures/sdd/schemas/mctl-devloop/schema.yaml` (proposal -> sp
 
 ## OpenSpec coupling inventory
 
-Runtime coupling: **none**. No import, binary, network call or package. The only coupling is the documented file layout and the assumed grammar, isolated in `spec_model.py` behind `GRAMMAR_VERIFIED = False`. The import boundary is enforced by T13.
+Runtime coupling: **none**. No import, binary, network call or package. The only coupling is the documented file layout and the grammar, isolated in `spec_model.py` (verified against f80d860 in #659; deliberate deviations are the named `PROFILE` rules there). The import boundary is enforced by T13.
 
 ## Unverified facts
 
-- Markdown grammar of spec and delta files (`### Requirement:`, `#### Scenario:`, `## ADDED|MODIFIED|REMOVED|RENAMED Requirements`, RENAMED FROM/TO syntax), and whether SHALL/MUST is required.
-- `proposal.md` section names.
-- Exact near-miss and content-normalization rules (assumed casefold + whitespace collapse).
-- Behavior of `retire_capabilities` at archive (not modeled).
-- Real CLI v1.14.2 behavior: not run (dev-only cross-check, default off).
+Resolved by #659, see `docs/spikes/659-openspec-grammar.md`: the spec and delta grammar, SHALL/MUST (a WARNING upstream, not an error), `proposal.md` sections (advisory warnings only at archive), near-miss and content-normalization rules, and `retire_capabilities` (a boolean upstream; refused by the MCTL profile). Still open:
+
+- Real CLI v1.14.2 behavior: not run; every verdict comes from reading the source at f80d860.
 
 ## Migration cost and effect on state machine / APIs
 
@@ -150,6 +148,6 @@ Runtime coupling: **none**. No import, binary, network call or package. The only
 ## Follow-up issue drafts
 
 1. **Record proposal content digest in approval.** Store a digest of the triplet in `approval` at approve time; refuse implementation if it differs.
-2. **Verify OpenSpec grammar against f80d860.** Read the source at the pinned commit, flip `GRAMMAR_VERIFIED` only with tests from upstream fixtures; optionally add a dev-only CLI cross-check.
+2. **Verify OpenSpec grammar against f80d860.** Read the source at the pinned commit, port its rules with tests derived from upstream's (done in #659: `GRAMMAR_VERIFIED` removed); optionally add a dev-only CLI cross-check.
 3. **Optional Shepherd `spec` input.** Add `spec: SpecVerdict | None = None` to `decide`, blocking-only.
 4. **Capability catalogue.** Author canonical specs for the DevLoop approval gate and one more capability, to measure real authoring cost.

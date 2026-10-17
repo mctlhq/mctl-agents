@@ -1,5 +1,8 @@
 # devloop-approval Specification
 
+## Purpose
+When a DevLoop proposal counts as human-approved, and what that approval binds.
+
 ## Requirements
 
 ### Requirement: Anonymous approver refused

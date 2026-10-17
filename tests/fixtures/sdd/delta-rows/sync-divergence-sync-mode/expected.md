@@ -1,5 +1,8 @@
 # cap Specification
 
+## Purpose
+A one-capability fixture for a single delta-application row.
+
 ## Requirements
 
 ### Requirement: Alpha

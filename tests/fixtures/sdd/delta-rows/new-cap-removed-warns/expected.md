@@ -1,5 +1,8 @@
 # cap Specification
 
+## Purpose
+TBD - created by archiving change change. Update Purpose after archive.
+
 ## Requirements
 
 ### Requirement: Bravo
