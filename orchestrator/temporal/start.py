@@ -129,7 +129,9 @@ async def restart_if_abandoned(issue_url: str, client: Client) -> WorkflowHandle
     if desc.status != WorkflowExecutionStatus.COMPLETED:
         return None
     result = await client.get_workflow_handle_for(DevLoopWorkflow.run, workflow_id, run_id=desc.run_id).result()
-    if not result.ended.startswith(ABANDONED_ENDED_PREFIX) or result.implement is not None:
+    # `ended` is typed `str`, but a result payload carrying JSON null for it
+    # would decode as None; that is "no abandon marker", not a crash.
+    if result.implement is not None or not (result.ended or "").startswith(ABANDONED_ENDED_PREFIX):
         return None
     return await client.start_workflow(
         DevLoopWorkflow.run,

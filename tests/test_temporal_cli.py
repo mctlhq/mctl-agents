@@ -146,6 +146,7 @@ def test_restart_if_abandoned_refuses_everything_else():
         dict(status="COMPLETED", ended="abandoned: cleanup", implement=SimpleNamespace(phase="Succeeded")),
         dict(status="COMPLETED", ended="approval wait expired"),
         dict(status="COMPLETED", ended=""),
+        dict(status="COMPLETED", ended=None),
     ]
     for case in cases:
         client, _ = _restart_client(**case)
