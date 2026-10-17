@@ -24,7 +24,12 @@ from orchestrator.temporal.activities.discovery import (
     StaleDirective,
 )
 from orchestrator.temporal.activities.lifecycle_reconcile import LifecycleReconcileResult
-from orchestrator.temporal.activities.orphans import OrphanDetectionResult, OrphanSignal
+from orchestrator.temporal.activities.orphans import (
+    NEVER_STARTED_REASON,
+    NeverStartedSignal,
+    OrphanDetectionResult,
+    OrphanSignal,
+)
 from orchestrator.temporal.workflows.reconcile import ReconcileWorkflow, ReconcileWorkflowInput
 from tests.temporal_harness import Worker  # polls the execution queue too — see #251
 
@@ -87,6 +92,17 @@ def _fake_activities(
                     reason="No active DevLoopWorkflow found for open PR proposal",
                 )
             ],
+            never_started=[
+                NeverStartedSignal(
+                    service="mctl-agents",
+                    slug="issue-5-never-started",
+                    status="accepted",
+                    approved_at="2026-10-01T10:00:00Z",
+                    age_minutes=60,
+                    reason=NEVER_STARTED_REASON,
+                )
+            ],
+            never_started_unauthorized=2,
         )
 
     @activity.defn(name="reconcile_lifecycle_ownership")
@@ -147,6 +163,9 @@ class TestReconcileWorkflow:
         assert len(result.orphans.orphans) == 1
         # A tick that actually ran detection carries no skipped marker.
         assert result.orphans.skipped_reason is None
+        # mctl-agents#413 (T11): the never-started signal rides the same result.
+        assert [n.slug for n in result.orphans.never_started] == ["issue-5-never-started"]
+        assert result.orphans.never_started_unauthorized == 2
         # The ownership sweep (#353) runs in the same arm and gets the SAME
         # active set: it uses it to tell a live worker from a stale record,
         # and an empty one there would read as "no workflow is running" for
@@ -175,6 +194,9 @@ class TestReconcileWorkflow:
 
         assert "active_workflow_ids" not in received
         assert result.orphans.orphans == []
+        # mctl-agents#413 (T11): skipped covers both signals.
+        assert result.orphans.never_started == []
+        assert result.orphans.never_started_unauthorized == 0
         assert result.orphans.total_actionable == 0
         # A skipped tick is distinguishable from a genuinely clean one, and
         # the reason carries the underlying error for the on-call engineer.

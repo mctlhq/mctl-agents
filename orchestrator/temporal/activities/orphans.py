@@ -133,7 +133,9 @@ def _local_state_refs(state_dir: Path, refs) -> tuple[list[ProposalStateRef], in
     unreadable = 0
     for ref in refs:
         try:
-            parsed = _parse_status_yaml((Path(state_dir) / ref.status_path).read_text())
+            # status_path is already rooted at state_dir by _discover_refs;
+            # joining it again would double a relative state_dir.
+            parsed = _parse_status_yaml(Path(ref.status_path).read_text())
         except (OSError, ValueError, yaml.YAMLError):
             unreadable += 1
             continue
@@ -333,7 +335,8 @@ async def detect_orphans(
             ns.reason,
         )
     activity.logger.info(
-        "detect_orphans: actionable=%d orphans=%d never_started=%d never_started_unauthorized=%d never_started_unreadable=%d",
+        "detect_orphans: actionable=%d orphans=%d never_started=%d "
+        "never_started_unauthorized=%d never_started_unreadable=%d",
         result.total_actionable,
         len(result.orphans),
         len(result.never_started),
