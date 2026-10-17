@@ -29,10 +29,19 @@ TRIPLET = {
     "tasks.md": b"- [ ] 1. do\n",
 }
 # The shell's answer for TRIPLET (an empty design.md is present, not absent).
-TRIPLET_DIGEST = "sha256:dc011937884806e3b3d50cbfb2e7cad9d644d35d729ca37514d14774097dfb8c"
+TRIPLET_DIGEST = "sha256:1330ca7acd9c5878e4d0ec7ffc530502af358d7a77e82df76b8a502eb0e183c3"
 # The shell's answer for no design.md and a requirements.md without a newline.
 NO_DESIGN = {"requirements.md": b"no trailing newline", "tasks.md": b"x\n"}
-NO_DESIGN_DIGEST = "sha256:ab7786d322a03c5489648488f378bbe2838d6aec652771ec3a987aeff56f6710"
+NO_DESIGN_DIGEST = "sha256:89880e19174c855c2242644ae19398c9f4e74351ff6df171ddbfea11c6489e8f"
+# The shell's answer for an mctl-docs proposal, whose proposed-content.md is
+# the verbatim deliverable (claude P2 on #675).
+WITH_CONTENT = {
+    "requirements.md": b"r\n",
+    "design.md": b"d\n",
+    "tasks.md": b"- [ ] 1. t\n",
+    "proposed-content.md": b"# Page\n\nverbatim \xe2\x80\x94 body\n",
+}
+WITH_CONTENT_DIGEST = "sha256:dd25e016dd1087d9f95488f3dcde3cab47a6e7c241255afa26a8734d9ad27da9"
 
 
 def _write_triplet(proposal_dir: Path, files: dict[str, bytes]) -> None:
@@ -65,8 +74,10 @@ def _proposal(tmp_path: Path, status: dict, files: dict[str, bytes] = TRIPLET) -
 def test_the_digest_matches_the_cwft_shell(tmp_path: Path) -> None:
     _write_triplet(tmp_path / "a", TRIPLET)
     _write_triplet(tmp_path / "b", NO_DESIGN)
+    _write_triplet(tmp_path / "c", WITH_CONTENT)
     assert proposal_content_digest(tmp_path / "a") == TRIPLET_DIGEST
     assert proposal_content_digest(tmp_path / "b") == NO_DESIGN_DIGEST
+    assert proposal_content_digest(tmp_path / "c") == WITH_CONTENT_DIGEST
 
 
 def test_a_missing_file_is_not_an_empty_one(tmp_path: Path) -> None:
@@ -106,21 +117,27 @@ def test_an_unchanged_proposal_has_no_problem(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("name", PROPOSAL_DIGEST_FILES)
 def test_a_one_byte_edit_to_any_file_is_drift(tmp_path: Path, name: str) -> None:
-    _write_triplet(tmp_path, TRIPLET)
+    _write_triplet(tmp_path, WITH_CONTENT)
     path = tmp_path / name
     path.write_bytes(path.read_bytes() + b" ")
-    problem = approval_digest_problem(_approved(), tmp_path)
+    problem = approval_digest_problem(_approved(WITH_CONTENT_DIGEST), tmp_path)
     assert problem is not None
     code, recorded, current = problem
     assert code == BLOCKED_APPROVAL_DIGEST_MISMATCH
-    assert recorded == TRIPLET_DIGEST
+    assert recorded == WITH_CONTENT_DIGEST
     assert current == proposal_content_digest(tmp_path)
 
 
-def test_deleting_a_file_is_drift(tmp_path: Path) -> None:
-    _write_triplet(tmp_path, TRIPLET)
-    (tmp_path / "design.md").unlink()
-    problem = approval_digest_problem(_approved(), tmp_path)
+@pytest.mark.parametrize("name", PROPOSAL_DIGEST_FILES)
+def test_deleting_or_adding_a_file_is_drift(tmp_path: Path, name: str) -> None:
+    _write_triplet(tmp_path, WITH_CONTENT)
+    (tmp_path / name).unlink()
+    problem = approval_digest_problem(_approved(WITH_CONTENT_DIGEST), tmp_path)
+    assert problem is not None and problem[0] == BLOCKED_APPROVAL_DIGEST_MISMATCH
+    # ...and a file that appears after the flip is drift too.
+    _write_triplet(tmp_path / "later", TRIPLET)
+    (tmp_path / "later" / "proposed-content.md").write_bytes(b"added after approval\n")
+    problem = approval_digest_problem(_approved(), tmp_path / "later")
     assert problem is not None and problem[0] == BLOCKED_APPROVAL_DIGEST_MISMATCH
 
 
@@ -150,8 +167,9 @@ def test_a_proposal_that_never_asked_for_approval_is_not_checked(tmp_path: Path)
 
 # --- the gate, through the implementer's own entry point ---------------------
 
-def test_an_unchanged_approved_proposal_passes_the_gate(tmp_path: Path) -> None:
-    ref = _proposal(tmp_path, _approved())
+@pytest.mark.parametrize(("files", "digest"), [(TRIPLET, TRIPLET_DIGEST), (WITH_CONTENT, WITH_CONTENT_DIGEST)])
+def test_an_unchanged_approved_proposal_passes_the_gate(tmp_path: Path, files: dict, digest: str) -> None:
+    ref = _proposal(tmp_path, _approved(digest), files)
     result = run_implementer.implement_one(ref, dry_run=True)
     assert result.blocked is None
     assert result.skipped_reason == "dry-run"
@@ -159,7 +177,7 @@ def test_an_unchanged_approved_proposal_passes_the_gate(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("name", PROPOSAL_DIGEST_FILES)
 def test_the_implementer_refuses_drift_in_any_file(tmp_path: Path, name: str) -> None:
-    ref = _proposal(tmp_path, _approved())
+    ref = _proposal(tmp_path, _approved(WITH_CONTENT_DIGEST), WITH_CONTENT)
     path = ref.proposal_dir / name
     path.write_bytes(path.read_bytes() + b"!")
 
@@ -168,13 +186,13 @@ def test_the_implementer_refuses_drift_in_any_file(tmp_path: Path, name: str) ->
     assert result.blocked == BLOCKED_APPROVAL_DIGEST_MISMATCH
     assert result.pr_url is None
     assert result.counts_toward_limit is False
-    assert TRIPLET_DIGEST in (result.skipped_reason or "")
+    assert WITH_CONTENT_DIGEST in (result.skipped_reason or "")
     data = yaml.safe_load(ref.status_path.read_text(encoding="utf-8"))
     assert data["status"] == "accepted"
     assert data["blocked"]["code"] == BLOCKED_APPROVAL_DIGEST_MISMATCH
     assert "content_digest" in data["blocked"]["remedy"]
     # The approval itself is never rewritten to match.
-    assert data["approval"]["content_digest"] == TRIPLET_DIGEST
+    assert data["approval"]["content_digest"] == WITH_CONTENT_DIGEST
 
 
 def test_the_implementer_refuses_an_approval_without_a_digest(tmp_path: Path) -> None:

@@ -142,15 +142,20 @@ def requires_human_approval(data: dict[str, Any]) -> bool:
 # implementer recomputes it before it starts. The two implementations must
 # agree byte for byte, so the framing is deliberately shell-friendly:
 #
-#   for name in requirements.md, design.md, tasks.md (this order, always):
+#   for name in requirements.md, design.md, tasks.md, proposed-content.md
+#   (this order, always):
 #     a regular file:  "<name>\n<byte length>\n" followed by its exact bytes
 #     anything else:   "<name>\n-\n"
 #   content_digest = "sha256:" + hex(SHA-256 of the concatenation)
 #
+# The files are the ones the implementer prompt directs the agent to read:
+# the triplet, plus proposed-content.md, the verbatim deliverable of an
+# mctl-docs proposal (absent elsewhere, which hashes as "-").
+#
 # The length prefix keeps the framing unambiguous whatever the files hold,
 # and "-" keeps a missing file distinct from an empty one. Pinned by the
 # vectors in tests/test_proposal_digest.py, which the CWFT's shell must match.
-PROPOSAL_DIGEST_FILES = ("requirements.md", "design.md", "tasks.md")
+PROPOSAL_DIGEST_FILES = ("requirements.md", "design.md", "tasks.md", "proposed-content.md")
 PROPOSAL_DIGEST_PREFIX = "sha256:"
 
 # There is no grandfathering: an approval that requires a human and carries no
@@ -163,7 +168,7 @@ BLOCKED_APPROVAL_DIGEST_MISMATCH = "approval-digest-mismatch"
 
 
 def proposal_content_digest(proposal_dir: Path) -> str:
-    """The ``approval.content_digest`` of a proposal directory's triplet.
+    """The ``approval.content_digest`` of a proposal directory's approved files.
 
     A read failure on a file that exists raises: content that could not be
     read has no digest, and must never be hashed as if it were absent.
@@ -187,7 +192,7 @@ def approval_digest_problem(data: dict[str, Any], proposal_dir: Path) -> tuple[s
     Only a proposal that requires a human approval is checked; one that never
     asked for approval has nothing to bind. A missing or non-string digest is
     ``BLOCKED_APPROVAL_DIGEST_MISSING`` and never counts as a match. Raises
-    ``OSError`` when a triplet file cannot be read.
+    ``OSError`` when one of the files cannot be read.
     """
     if not requires_human_approval(data):
         return None
