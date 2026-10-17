@@ -73,6 +73,9 @@ NOT_FOUND_CODE = "work_item_not_found"
 # trailing slash), so the two never disagree about what an issue URL is.
 _ISSUE_URL_RE = re.compile(r"^https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/\d+/?$")
 
+#: A canonical principal id, as mctl-api's `auth.ValidPrincipalID` checks it.
+PRINCIPAL_ID_RE = re.compile(r"^prn_[0-9A-HJKMNP-TV-Z]{26}$")
+
 # The four answers to "does this WorkItem exist, and is it usable" — the same
 # shape as orchestrator/lifecycle/contract.py's OWNED_BY_OTHER/OWNED_BY_ME/
 # UNOWNED/UNKNOWN vocabulary, and UNKNOWN is the whole point: an unreachable
@@ -270,7 +273,8 @@ class WorkItem:
     `from_payload` reads mctl-api's `work_item` object (`workitems.WorkItem`):
     `id` -> `work_item_id`, `state_version` -> `state_version` and, as a
     string, `revision`; `origin_surface` -> `origin.kind`; `external_key` ->
-    `issue_url` only when it is a GitHub issue URL. `executions` is not part
+    `issue_url` only when it is a GitHub issue URL; `owner_principal_id` ->
+    `owner_principal_id` only when it is a canonical `prn_` id. `executions` is not part
     of that object: the client fills it from the executions route.
     `service` and `slug` are not part of `workitem/v1` and stay empty for a
     record read from mctl-api.
@@ -289,6 +293,12 @@ class WorkItem:
     external_key: str = ""
     #: mctl-api's `tenant`; empty when the record carries none.
     tenant: str = ""
+    #: The owner's canonical principal (mctl-api#661), or "" when the record
+    #: carries none or one that is not a canonical `prn_` id. Only ever used
+    #: to name the owner as a human-input respondent (mctl-agents#668), so
+    #: an unreadable value reads as no principal: that names fewer
+    #: respondents, never a guessed one.
+    owner_principal_id: str = ""
 
     @staticmethod
     def from_payload(data: Any) -> WorkItem | None:
@@ -326,7 +336,13 @@ class WorkItem:
             schema_version=_str(data.get("schema_version")),
             external_key=external_key,
             tenant=_str(data.get("tenant")),
+            owner_principal_id=_principal_id(data.get("owner_principal_id")),
         )
+
+
+def _principal_id(value: Any) -> str:
+    """`value` if it is a canonical principal id, else ""."""
+    return value if isinstance(value, str) and PRINCIPAL_ID_RE.fullmatch(value) else ""
 
 
 def work_item_verdict_for(item: WorkItem) -> str:

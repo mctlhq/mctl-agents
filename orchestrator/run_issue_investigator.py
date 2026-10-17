@@ -1804,6 +1804,20 @@ def _read_draft_nofollow(human_dir: Path) -> bytes | None:
     return _read_plain_file_nofollow(human_dir, HUMAN_INPUT_DRAFT, HUMAN_INPUT_DRAFT_MAX_BYTES)
 
 
+def _owner_actor_refs(issue_author: str, owner_principal_id: str) -> tuple[str, ...]:
+    """`requested_from.actor_refs` for the work item's owner: the GitHub
+    login, plus `principal:<prn_...>` when `owner_principal_id` is a
+    canonical principal id. mctl-api signals a principal respondent as
+    `{actor_type: "principal", actor_id: "prn_..."}`, which
+    `validate_response` rebuilds as exactly that string."""
+    from orchestrator.work_context.contract import PRINCIPAL_ID_RE
+
+    refs: tuple[str, ...] = (f"github:{issue_author}",)
+    if PRINCIPAL_ID_RE.fullmatch(owner_principal_id or ""):
+        refs += (f"principal:{owner_principal_id}",)
+    return refs
+
+
 def _seal_draft(
     proposal_dir: Path,
     *,
@@ -1814,8 +1828,15 @@ def _seal_draft(
     issue_url: str,
     now: datetime | None = None,
     issue_author_is_bot: bool = False,
+    owner_principal_id: str = "",
 ) -> tuple[Any, str]:
     """Turn `human-input/draft.json` into a sealed `human-input/request.json`.
+
+    The request names the issue author as `github:<login>` and, when the
+    resolved work item records its owner's principal, also as
+    `principal:<prn_...>`, so an owner with no GitHub identity can answer
+    (mctl-agents#668). The principal comes only from the work item, never
+    from the login; a missing or malformed one names no principal ref.
 
     Returns `(request, rejection)`. `rejection` is "" when there was no draft
     or it was sealed, else a short code for why the draft was discarded. Every
@@ -1892,7 +1913,7 @@ def _seal_draft(
             reason=draft["reason"],
             response=human_input.ResponseSpec.from_dict(draft["response"]),
             requested_from=human_input.RequestedFrom(
-                audience="work_item_owner", actor_refs=(f"github:{issue_author}",)
+                audience="work_item_owner", actor_refs=_owner_actor_refs(issue_author, owner_principal_id),
             ),
             created_at=created_at,
             expires_at=expires_at,
@@ -3425,6 +3446,9 @@ def _investigate(
     # function body, never at module scope (see the import-discipline note
     # at the top of this file and tests/test_worker_isolation.py).
     work_context_ref: WorkContextRef | None = None
+    # The resolved work item's owner principal, set only together with
+    # work_context_ref: a work item about another issue names nobody here.
+    work_item_owner_prn = ""
     if work_item_id:
         from orchestrator.work_context import rollout as _work_context_rollout
         from orchestrator.work_context.contract import (
@@ -3514,6 +3538,7 @@ def _investigate(
                             outcome_code="refused", outcome_reason="work-context-refused",
                         )
                     if work_context_ref is not None:
+                        work_item_owner_prn = answer.item.owner_principal_id
                         tracing.annotate(
                             execution_id=work_context_ref.execution_id,
                             work_item_id=work_context_ref.work_item_id,
@@ -3888,6 +3913,7 @@ def _investigate(
             ),
             issue_author=issue.author,
             issue_author_is_bot=issue.author_is_bot,
+            owner_principal_id=work_item_owner_prn,
             prior_answers=human_answers,
             issue_url=issue.ref.url,
         )

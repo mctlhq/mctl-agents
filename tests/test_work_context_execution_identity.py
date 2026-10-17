@@ -44,6 +44,10 @@ class FakeStore:
         self.requests: list[tuple[str, str, dict | None]] = []
         self.snapshots: dict[str, dict] = {}
         self._next = 100
+        #: What the view carries as `owner_principal_id` and `external_key`
+        #: (mctl-agents#668); an empty owner principal is left out.
+        self.owner_principal_id = ""
+        self.external_key = URL
 
     @property
     def writes(self) -> list[tuple[str, str, dict | None]]:
@@ -78,7 +82,9 @@ class FakeStore:
 
     def _view(self) -> dict:
         item = {"id": WID, "state": self.state, "state_version": 1, "origin_surface": "github",
-                "external_key": URL, "schema_version": "workitem/v1"}
+                "external_key": self.external_key, "schema_version": "workitem/v1"}
+        if self.owner_principal_id:
+            item["owner_principal_id"] = self.owner_principal_id
         view = {"schema_version": "workitem/v1", "work_item": item, "state_version": 1}
         if self.executions:
             view["latest_execution"] = self.executions[-1]
