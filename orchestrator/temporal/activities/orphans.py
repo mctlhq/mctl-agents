@@ -17,7 +17,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
-
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
@@ -91,19 +90,20 @@ def _classify_never_started(
             continue
         if ref.unrunnable or ref.blocked:
             continue
-        if ref.execution_authorization is None:
-            unauthorized += 1
-            continue
         expected = expected_dev_loop_id(ref.slug, None, ref.service)
         if expected and expected in active_ids:
             continue
         started = parse_iso(ref.approved_at) or parse_iso(ref.updated_at)
-        age_minutes: int | None = None
-        if started is not None:
-            age = now - started
-            if age.total_seconds() < threshold_minutes * 60:
-                continue
-            age_minutes = int(age.total_seconds() // 60)
+        if started is None:
+            # Age cannot be confirmed: do not bypass the grace period.
+            continue
+        age = now - started
+        if age.total_seconds() < threshold_minutes * 60:
+            continue
+        if ref.execution_authorization is None:
+            unauthorized += 1
+            continue
+        age_minutes = int(age.total_seconds() // 60)
         signals.append(
             NeverStartedSignal(
                 service=ref.service,
@@ -282,6 +282,8 @@ async def detect_orphans(
     distinguished "no orphans" from "never ran".
     """
     active_set = set(active_workflow_ids) if active_workflow_ids else set()
+    # None (unknown active set) must stay distinguishable from empty.
+    known_active = set(active_workflow_ids) if active_workflow_ids is not None else None
 
     if state_dir_path:
         state_dir = Path(state_dir_path)
@@ -289,7 +291,7 @@ async def detect_orphans(
             raise ApplicationError(
                 f"state_dir {state_dir} does not exist", non_retryable=True
             )
-        result = await asyncio.to_thread(_sync_detect_orphans, state_dir, active_set)
+        result = await asyncio.to_thread(_sync_detect_orphans, state_dir, known_active)
     else:
         result = await _detect_from_github(
             active_set, classify_never_started=active_workflow_ids is not None
