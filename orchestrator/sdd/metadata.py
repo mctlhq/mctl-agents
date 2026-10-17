@@ -96,8 +96,10 @@ def validate_mapping(data: Mapping[str, Any], *, strict: bool = False, change_di
     if areas is not None and not (isinstance(areas, list) and all(isinstance(a, str) for a in areas)):
         raise MetadataError("'affected_areas' must be a list of strings")
     retire = data.get("retire_capabilities")
-    if retire is not None and not (isinstance(retire, list) and all(isinstance(a, str) for a in retire)):
-        raise MetadataError("'retire_capabilities' must be a list of strings")
+    if retire is not None and not isinstance(retire, bool):
+        # Upstream: retire_capabilities: z.boolean().optional()
+        # (src/core/change-metadata/schema.ts L54-61 @ f80d860).
+        raise MetadataError("'retire_capabilities' must be a boolean")
     if "skip_specs" in data and not isinstance(data["skip_specs"], bool):
         raise MetadataError("'skip_specs' must be a boolean")
     init = data.get("initiative")
