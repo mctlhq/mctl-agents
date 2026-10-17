@@ -1655,6 +1655,21 @@ def _parse_human_input_responses(raw: str | None) -> list[dict]:
     return data
 
 
+def _parse_owner_principal_id(raw: str | None) -> str:
+    """Validate `--work-item-owner-principal-id`: absent or empty is "", a
+    canonical `prn_` id is itself, and anything else raises SystemExit, so a
+    bad value ends the run before any clone or model call, like
+    `_parse_human_input_responses`. The DevLoopWorkflow sends only an id it
+    read from an earlier request of the same execution (mctl-agents#684)."""
+    from orchestrator.work_context.contract import PRINCIPAL_ID_RE
+
+    if not raw:
+        return ""
+    if not PRINCIPAL_ID_RE.fullmatch(raw):
+        raise SystemExit("--work-item-owner-principal-id must be a canonical prn_ id")
+    return raw
+
+
 def _human_input_ask_block(granted: bool, answered_count: int) -> str:
     """How to ask for clarification. "" (zero bytes added) unless the plan
     grants `human.request_input` and a round remains. Appended by
@@ -3197,6 +3212,7 @@ def investigate(
     temporal_run_id: str | None = None,
     execution_request_id: str | None = None,
     human_input_responses: str | None = None,
+    work_item_owner_principal_id: str | None = None,
 ) -> InvestigateResult:
     """Investigate one GitHub issue and write a `proposed` proposal.
 
@@ -3225,6 +3241,7 @@ def investigate(
             temporal_run_id=temporal_run_id,
             execution_request_id=execution_request_id,
             human_input_responses=human_input_responses,
+            work_item_owner_principal_id=work_item_owner_principal_id,
         )
         evidence_producer.safely(_note_investigation_evidence, evidence, result)
         return result
@@ -3295,6 +3312,7 @@ def _investigate(
     temporal_run_id: str | None = None,
     execution_request_id: str | None = None,
     human_input_responses: str | None = None,
+    work_item_owner_principal_id: str | None = None,
     own_execution: _OwnExecution,
 ) -> InvestigateResult:
     """Investigate one GitHub issue and write a `proposed` proposal.
@@ -3319,11 +3337,18 @@ def _investigate(
     sealed beside it. The request id is correlation only, logged here: the
     snapshot schema has no slot for it, and this run's execution identity is
     `execution_id`. All three default to None, which is today's behaviour.
+
+    `work_item_owner_principal_id` (mctlhq/mctl-agents#684) is the owner
+    principal a clarification continuation carries: the continuation runs
+    without the work item, so it cannot resolve the owner itself. It is used
+    only by a continuation (one with `human_input_responses`) that has no work
+    context; a resolved work item's own owner always wins.
     """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
     # Before any clone or model call (mctlhq/mctl-agents#473).
     human_answers = _parse_human_input_responses(human_input_responses)
+    carried_owner_prn = _parse_owner_principal_id(work_item_owner_principal_id)
     if temporal_workflow_id or execution_request_id:
         print(
             f"info: loop correlation temporal_workflow_id={temporal_workflow_id or '-'} "
@@ -3913,7 +3938,14 @@ def _investigate(
             ),
             issue_author=issue.author,
             issue_author_is_bot=issue.author_is_bot,
-            owner_principal_id=work_item_owner_prn,
+            # A continuation has no work context (dev_loop.py drops the
+            # sealed execution identity), so it names the owner the earlier
+            # round named, carried by the workflow (#684). A run that is not a
+            # continuation never takes a carried value.
+            owner_principal_id=(
+                work_item_owner_prn if work_context_ref is not None
+                else (carried_owner_prn if human_answers else "")
+            ),
             prior_answers=human_answers,
             issue_url=issue.ref.url,
         )
@@ -4526,6 +4558,14 @@ def main() -> None:
             "(mctl-agents#473); rendered into the prompt as resolved questions"
         ),
     )
+    ap.add_argument(
+        "--work-item-owner-principal-id", default=None,
+        help=(
+            "The work item owner's principal (prn_...) that an earlier round of "
+            "the same DevLoop execution named (mctl-agents#684); a continuation "
+            "without work context names it in a further clarification request"
+        ),
+    )
     ap.add_argument("--surface", default=None, help="Surface this execution runs on (closed vocabulary)")
     ap.add_argument("--actor-kind", default=None, help="Kind of actor driving this execution (closed vocabulary)")
     ap.add_argument("--actor-id", default=None, help="Identity of the actor driving this execution")
@@ -4585,6 +4625,7 @@ def main() -> None:
             temporal_run_id=args.temporal_run_id,
             execution_request_id=args.execution_request_id,
             human_input_responses=args.human_input_responses,
+            work_item_owner_principal_id=args.work_item_owner_principal_id,
         )
     except ProposalAmbiguityError as exc:
         # The process boundary is where a clean exit belongs — the library

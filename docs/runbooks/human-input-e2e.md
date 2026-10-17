@@ -9,6 +9,9 @@ equivalent is `tests/test_human_input_e2e.py`.
   as `--human-input-responses`.
 - mctl-api: `human_input_responses` is on the parameter allow-list (mctl-api#372 strips
   undeclared parameters).
+- For a round-2 question to name the owner by principal (mctl-agents#684), both also carry
+  `work_item_owner_principal_id` (`--work-item-owner-principal-id`). Without it a further
+  question names only `github:<issue author>`, as before.
 - The `issue-investigator-default` ExecutionProfile grants `human.request_input`, and
   `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative`.
 - mctl-telegram#571 (Telegram adapter), or use `temporal workflow signal` below.

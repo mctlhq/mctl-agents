@@ -13,7 +13,7 @@ from orchestrator import human_input as hi
 from orchestrator import run_issue_investigator as rii
 from orchestrator.work_context.contract import WorkItem
 from tests import human_input_harness as harness_mod
-from tests.test_human_input_producer import NOW, _correlation, _draft, _seal
+from tests.test_human_input_producer import NOW, _answer, _correlation, _draft, _seal
 from tests.test_work_context_execution_identity import (
     URL,
     WID,
@@ -90,7 +90,7 @@ class TestSealedActorRefs:
                 hi.validate_response(request, response(actor_type, actor_id), now=NOW)
 
 
-def _investigate_with_draft(tmp_path, monkeypatch, engine_run=True):
+def _investigate_with_draft(tmp_path, monkeypatch, engine_run=True, **investigate_kwargs):
     if engine_run:
         monkeypatch.setenv(executions.WORKFLOW_NAME_ENV_VAR, "mctl-agents-investigate-hi")
     rii.gh_issue_view(URL).author = "alice"
@@ -101,8 +101,9 @@ def _investigate_with_draft(tmp_path, monkeypatch, engine_run=True):
         return _correlation()
 
     monkeypatch.setattr(rii, "_run_agent", agent)
+    investigate_kwargs.setdefault("work_item_id", WID)
     result = rii.investigate(URL, state_dir=tmp_path, temporal_workflow_id="dev-loop-1",
-                             temporal_run_id="run-1", work_item_id=WID)
+                             temporal_run_id="run-1", **investigate_kwargs)
     assert result.error is None, result.error
     return json.loads((result.proposal_dir / "human-input" / "request.json").read_text())
 
@@ -134,3 +135,69 @@ def test_a_run_without_work_context_names_no_principal(tmp_path, monkeypatch, st
     store.owner_principal_id = PRN
     request = _investigate_with_draft(tmp_path, monkeypatch, engine_run=False)
     assert request["requested_from"]["actor_refs"] == ["github:alice"]
+
+
+# mctl-agents#684: a continuation runs without the work item (dev_loop.py
+# drops the sealed execution identity), so the DevLoopWorkflow carries the
+# owner principal round 1 named as `--work-item-owner-principal-id`.
+OTHER_PRN = "prn_01JQTHER000000000000000000"
+
+
+def _continuation(**over):
+    return {"work_item_id": None, "human_input_responses": json.dumps([_answer()]), **over}
+
+
+def test_a_continuation_names_the_carried_owner_principal(tmp_path, monkeypatch, store):  # noqa: F811
+    request = _investigate_with_draft(
+        tmp_path, monkeypatch, **_continuation(work_item_owner_principal_id=PRN),
+    )
+    assert request["round"] == 2
+    assert request["requested_from"]["actor_refs"] == ["github:alice", f"principal:{PRN}"]
+
+
+def test_a_continuation_without_a_carried_principal_names_the_login_only(tmp_path, monkeypatch, store):  # noqa: F811
+    request = _investigate_with_draft(tmp_path, monkeypatch, **_continuation())
+    assert request["requested_from"]["actor_refs"] == ["github:alice"]
+
+
+def test_a_carried_principal_outside_a_continuation_is_ignored(tmp_path, monkeypatch, store):  # noqa: F811
+    """Only a continuation takes it: a first round without work context
+    still names no principal, whatever the caller sends."""
+    request = _investigate_with_draft(
+        tmp_path, monkeypatch, work_item_id=None, work_item_owner_principal_id=PRN,
+    )
+    assert request["requested_from"]["actor_refs"] == ["github:alice"]
+
+
+def test_the_resolved_owner_wins_over_a_carried_one(tmp_path, monkeypatch, store):  # noqa: F811
+    store.owner_principal_id = PRN
+    request = _investigate_with_draft(
+        tmp_path, monkeypatch,
+        human_input_responses=json.dumps([_answer()]), work_item_owner_principal_id=OTHER_PRN,
+    )
+    assert request["requested_from"]["actor_refs"] == ["github:alice", f"principal:{PRN}"]
+
+
+@pytest.mark.parametrize("value", [v for v in MALFORMED if v])
+def test_a_malformed_carried_principal_ends_the_run_before_any_work(tmp_path, value):
+    with pytest.raises(SystemExit, match="work-item-owner-principal-id"):
+        rii.investigate(URL, state_dir=tmp_path, human_input_responses=json.dumps([_answer()]),
+                        work_item_owner_principal_id=value)
+
+
+def test_the_cli_forwards_the_carried_principal(monkeypatch):
+    seen = {}
+
+    def fake_investigate(**kwargs):
+        seen.update(kwargs)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(rii, "investigate", fake_investigate)
+    monkeypatch.setattr(rii, "_work_context_from_args", lambda args: None)
+    monkeypatch.setattr("sys.argv", [
+        "run_issue_investigator", "--issue-url", URL, "--dry-run",
+        "--work-item-owner-principal-id", PRN,
+    ])
+    with pytest.raises(SystemExit):
+        rii.main()
+    assert seen["work_item_owner_principal_id"] == PRN

@@ -152,6 +152,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from orchestrator.work_context.contract import (
         ACTOR_KINDS,
+        PRINCIPAL_ID_RE,
         SURFACE_KINDS,
         ActorRef,
         ExecutionRef,
@@ -1286,6 +1287,24 @@ def _at_or_after(later: str | None, earlier: str) -> bool:
         return False
 
 
+def _owner_principal_of(request: human_input.HumanInputRequest) -> str:
+    """The `prn_` a sealed request names its work-item owner by, else "".
+
+    Exactly one `principal:` ref, canonical, under the `work_item_owner`
+    audience: the shape `_owner_actor_refs` seals (mctl-agents#668). Anything
+    else names no owner principal rather than a guessed one."""
+    if request.requested_from.audience != "work_item_owner":
+        return ""
+    prns = [
+        ref.removeprefix("principal:")
+        for ref in request.requested_from.actor_refs
+        if ref.startswith("principal:")
+    ]
+    if len(prns) != 1 or not PRINCIPAL_ID_RE.fullmatch(prns[0]):
+        return ""
+    return prns[0]
+
+
 def _as_utc(value: str) -> datetime:
     """Parse an ISO-8601 timestamp as UTC, tolerating a missing offset.
 
@@ -1746,6 +1765,10 @@ class DevLoopWorkflow:
         self._resolved_question_hashes: set[str] = set()
         self._human_input_resume_count = 0
         self._human_input_rejected_count = 0
+        # The owner principal an earlier request of THIS execution named
+        # (mctl-agents#684), handed to every continuation: a continuation
+        # runs without the work item, so it cannot resolve the owner itself.
+        self._human_input_owner_principal_id = ""
         # Work-context resume state (mctlhq/mctl-agents#267, ADR 011).
         self._work_item_id = ""
         self._executions: list[ExecutionRef] = []
@@ -2796,6 +2819,12 @@ class DevLoopWorkflow:
                 non_retryable=True,
             )
 
+        # This run's own request, past every guard. Learned once and kept:
+        # a later round sealed by a continuation names the same owner only
+        # because this value was carried to it.
+        self._human_input_owner_principal_id = (
+            self._human_input_owner_principal_id or _owner_principal_of(request)
+        )
         workflow.logger.info("human_input.requested", extra={"human_input": human_input.request_log_dict(request)})
         workflow.logger.info("human_input.wait_started", extra={"human_input": human_input.request_log_dict(request)})
 
@@ -3442,6 +3471,15 @@ class DevLoopWorkflow:
                     continuation_params.pop("work_item_id", None)
                     continuation_params.pop("execution_id", None)
                 continuation_params["human_input_responses"] = json.dumps(accepted_answers)
+                if self._human_input_owner_principal_id:
+                    # Popping the identity above also dropped the owner the
+                    # first run resolved from the work item. Carried on its
+                    # own (mctl-agents#684), so a further question still
+                    # names `principal:<prn>`; a loop whose requests never
+                    # named one sends nothing. Replay-safe without a marker:
+                    # it changes only an existing activity's input, which
+                    # replay does not compare, and schedules no command.
+                    continuation_params["work_item_owner_principal_id"] = self._human_input_owner_principal_id
                 investigate_result = await _run_cwft("mctl-agents-investigate", continuation_params)
                 if self._canonical_open:
                     # The own `we_` is still open (#636): it ends with the
