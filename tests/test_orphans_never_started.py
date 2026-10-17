@@ -36,9 +36,10 @@ def test_young_skipped():
     assert _classify_never_started([r], set(), 45, NOW) == ([], 0)
 
 
-def test_unknown_age_skipped():
+def test_unknown_age_reported_with_none():
     r = _ref(approved_at=None, updated_at=None)
-    assert _classify_never_started([r], set(), 45, NOW) == ([], 0)
+    sigs, unauth = _classify_never_started([r], set(), 45, NOW)
+    assert len(sigs) == 1 and sigs[0].age_minutes is None and unauth == 0
 
 
 def test_active_workflow_skipped():
@@ -46,15 +47,29 @@ def test_active_workflow_skipped():
     assert _classify_never_started([_ref()], active, 45, NOW) == ([], 0)
 
 
-def test_unauthorized_counted_only_when_otherwise_eligible():
+def test_unauthorized_counted_before_active_and_age_checks():
     old = _ref(execution_authorization=None)
     young = _ref(
         slug="issue-6-y",
         execution_authorization=None,
         approved_at=(NOW - timedelta(minutes=1)).isoformat(),
     )
-    sigs, unauth = _classify_never_started([old, young], set(), 45, NOW)
-    assert sigs == [] and unauth == 1
+    live = _ref(slug="issue-7-z", execution_authorization=None)
+    sigs, unauth = _classify_never_started(
+        [old, young, live], {"dev-loop-mctlhq-mctl-agents-7"}, 45, NOW
+    )
+    assert sigs == [] and unauth == 3
+
+
+def test_unreadable_status_counted(tmp_path):
+    from types import SimpleNamespace
+
+    from orchestrator.temporal.activities.orphans import _local_state_refs
+
+    ref = SimpleNamespace(service="s", slug="issue-1-a", status="accepted",
+                          status_path="missing/.status.yaml")
+    out, unreadable = _local_state_refs(tmp_path, [ref])
+    assert out == [] and unreadable == 1
 
 
 def test_pr_present_skipped():

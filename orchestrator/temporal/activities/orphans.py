@@ -71,6 +71,9 @@ class OrphanDetectionResult:
     # Accepted/in-progress candidates excluded only for lack of execution
     # authorization (the legacy shape); counted, not listed.
     never_started_unauthorized: int = 0
+    # Local-checkout proposals whose .status.yaml could not be read; they are
+    # absent from never_started, so this count keeps them visible.
+    never_started_unreadable: int = 0
 
 
 def _classify_never_started(
@@ -90,20 +93,23 @@ def _classify_never_started(
             continue
         if ref.unrunnable or ref.blocked:
             continue
+        # Authorization is checked before the active-set and age checks
+        # (design section 3): an unauthorized proposal cannot be executing.
+        if ref.execution_authorization is None:
+            unauthorized += 1
+            continue
         expected = expected_dev_loop_id(ref.slug, None, ref.service)
         if expected and expected in active_ids:
             continue
         started = parse_iso(ref.approved_at) or parse_iso(ref.updated_at)
-        if started is None:
-            # Age cannot be confirmed: do not bypass the grace period.
-            continue
-        age = now - started
-        if age.total_seconds() < threshold_minutes * 60:
-            continue
-        if ref.execution_authorization is None:
-            unauthorized += 1
-            continue
-        age_minutes = int(age.total_seconds() // 60)
+        age_minutes: int | None = None
+        if started is not None:
+            age = now - started
+            if age.total_seconds() < threshold_minutes * 60:
+                continue
+            age_minutes = int(age.total_seconds() // 60)
+        # else: neither timestamp parses -> report with age_minutes=None
+        # (design section 3: fail toward visibility).
         signals.append(
             NeverStartedSignal(
                 service=ref.service,
@@ -117,13 +123,19 @@ def _classify_never_started(
     return signals, unauthorized
 
 
-def _local_state_refs(state_dir: Path, refs) -> list[ProposalStateRef]:
-    """ProposalStateRefs for local-checkout proposals, parsed like the GitHub path."""
+def _local_state_refs(state_dir: Path, refs) -> tuple[list[ProposalStateRef], int]:
+    """ProposalStateRefs for local-checkout proposals, parsed like the GitHub path.
+
+    Returns (refs, unreadable_count): unreadable files are counted, never
+    treated as "nothing to report".
+    """
     out: list[ProposalStateRef] = []
+    unreadable = 0
     for ref in refs:
         try:
-            parsed = _parse_status_yaml(Path(ref.status_path).read_text())
+            parsed = _parse_status_yaml((Path(state_dir) / ref.status_path).read_text())
         except (OSError, ValueError, yaml.YAMLError):
+            unreadable += 1
             continue
         (status, pr_url, updated_at, attempt_expires_at, unrunnable, blocked,
          authorization, unauthorized_reason, approved_at) = parsed
@@ -142,7 +154,7 @@ def _local_state_refs(state_dir: Path, refs) -> list[ProposalStateRef]:
                 unauthorized_reason=unauthorized_reason,
             )
         )
-    return out
+    return out, unreadable
 
 
 def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None = None) -> OrphanDetectionResult:
@@ -176,9 +188,11 @@ def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None =
 
     never_started: list[NeverStartedSignal] = []
     unauthorized = 0
+    unreadable = 0
     if active_workflow_ids is not None:
+        state_refs, unreadable = _local_state_refs(state_dir, actionable_refs)
         never_started, unauthorized = _classify_never_started(
-            _local_state_refs(state_dir, actionable_refs),
+            state_refs,
             active_ids,
             never_started_threshold_minutes(),
             datetime.now(UTC),
@@ -189,6 +203,7 @@ def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None =
         orphans=orphans,
         never_started=never_started,
         never_started_unauthorized=unauthorized,
+        never_started_unreadable=unreadable,
     )
 
 
@@ -318,11 +333,12 @@ async def detect_orphans(
             ns.reason,
         )
     activity.logger.info(
-        "detect_orphans: actionable=%d orphans=%d never_started=%d never_started_unauthorized=%d",
+        "detect_orphans: actionable=%d orphans=%d never_started=%d never_started_unauthorized=%d never_started_unreadable=%d",
         result.total_actionable,
         len(result.orphans),
         len(result.never_started),
         result.never_started_unauthorized,
+        result.never_started_unreadable,
     )
 
     return result
