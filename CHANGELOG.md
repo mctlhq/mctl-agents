@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.84.0](https://github.com/mctlhq/mctl-agents/compare/1.83.0...1.84.0) (2026-10-17)
+
+
+### Features
+
+* **agents:** issue-428-architecture-implementer-define-bounded ([4d9f168](https://github.com/mctlhq/mctl-agents/commit/4d9f1686927c6a9ef1fc2dac5e0dbcb2c9f1aa28))
+* **agents:** issue-428-architecture-implementer-define-bounded ([95e97a2](https://github.com/mctlhq/mctl-agents/commit/95e97a2f8e62b4be41a31249644084a6f67f572c))
+* **approval:** bind the proposal content digest into the DevLoop grant ([68a8e9f](https://github.com/mctlhq/mctl-agents/commit/68a8e9f5b000e7c20b957e5509d0584e4f386a31))
+* **approval:** bind the proposal content digest into the DevLoop grant ([da39cb9](https://github.com/mctlhq/mctl-agents/commit/da39cb972d11e0251d75cb4d3210e96ca7e063fc)), closes [#681](https://github.com/mctlhq/mctl-agents/issues/681)
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-428-architecture-implementer-define-bounded ([ddb6095](https://github.com/mctlhq/mctl-agents/commit/ddb6095edac3a65134f770dad5f418e9d5f2b536))
+* **agents:** address P1/P2 codex findings on issue-428-architecture-implementer-define-bounded ([66422e8](https://github.com/mctlhq/mctl-agents/commit/66422e8d22348b881211ffd79023b139b060d470))
+* **proposals:** treat a contents answer without a body as a failed read ([a00c546](https://github.com/mctlhq/mctl-agents/commit/a00c546238e500fdb6f53aa93df89163e8e2c2b0))
+
 ## [1.83.0](https://github.com/mctlhq/mctl-agents/compare/1.82.0...1.83.0) (2026-10-17)
 
 
