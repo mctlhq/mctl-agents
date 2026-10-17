@@ -201,10 +201,10 @@ def redact_text(text: str, *, max_chars: int) -> str:
 
     Same policy as `orchestrator.redaction`: a value that carries a credential
     shape is dropped (replaced by a marker), never partially masked."""
-    flat = " ".join(str(text).split())[:max_chars]
+    flat = " ".join(str(text).split())
     if not flat or contains_credential(flat):
         return _REDACTED
-    return flat
+    return flat[:max_chars]
 
 
 # ---------------------------------------------------------------------------

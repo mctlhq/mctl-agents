@@ -440,6 +440,10 @@ class RefusalMarker:
 def _parse_marker_remaining(raw: Any) -> tuple[tuple[str, str], ...]:
     """Validate the optional `remaining` list of a refusal marker.
 
+    NOTE: `incomplete` / `known_work_remains` is reserved and intentionally
+    unreachable in v1alpha1: the agent prompt gives the agent no channel to
+    write `remaining` next to a commit (see ADR 021).
+
     Bounded like the completion contract's `remaining_work` (at most
     `MAX_REMAINING_ITEMS` entries, a short `item_id`, a capped `summary`).
     An entry that does not qualify is dropped, never repaired: a malformed
@@ -5107,6 +5111,10 @@ def _classify_result(result: ImplementResult, *, remaining: bool) -> tuple[str, 
         code = EXIT_RATE_LIMITED
     elif result.stale_source:
         return ic.OUTCOME_DETERMINISTIC_FAILURE, "stale_source", None
+    elif result.budget_terminal or result.budget_handback:
+        # The verification-budget arms carry prose errors with no sentinel
+        # prefix; classify on the flag, not the message.
+        return ic.OUTCOME_BUDGET_EXHAUSTED, "verification_budget", None
     elif result.error:
         code = _review_feedback_exit_code(result.error)
         if code == EXIT_GENERIC_FAILURE:
@@ -5163,10 +5171,10 @@ def _verification_records(outcome: str, code: str, obs: _AttemptObservations) ->
     else:
         chart = "not_run"
     pushed_check = "pass" if pushed else "not_run"
-    if pushed:
-        claim = "pass"
-    elif code in ("fenced", "claim_refused"):
+    if code in ("fenced", "claim_refused"):
         claim = "fail"
+    elif pushed:
+        claim = "pass"
     else:
         claim = "not_run"
     records = [
@@ -5210,7 +5218,7 @@ def completion_from_result(
     """
     detail: str | None = None
     if result is None:
-        outcome, code, _exit = ic.OUTCOME_HARNESS_FAILURE, "unexpected_error", EXIT_GENERIC_FAILURE
+        outcome, code = ic.OUTCOME_HARNESS_FAILURE, "unexpected_error"
         detail = "the attempt raised past its own error arms"
     else:
         outcome, code, _exit = _classify_result(result, remaining=bool(obs.remaining))
@@ -5422,7 +5430,7 @@ def _finish_attempt(
         completion = completion_from_result(ref, result, obs, override_code=override)
         # A stale claim, or a claim refusal, means this attempt does not own the
         # entity: it reports through `--completion-out` only.
-        if project and override is None and completion.stop_reason.code != "claim_refused":
+        if project and override is None and completion.stop_reason.code not in ("claim_refused", "fenced"):
             _project_completion(ref, completion)
         if result is not None:
             result.completion = completion

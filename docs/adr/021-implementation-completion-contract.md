@@ -101,9 +101,12 @@ added without an entry):
 | 54 `POLICY_UNDECIDED` | `harness_failure` | `policy_undecided` |
 | 1 generic / unexpected exception | `harness_failure` | `unexpected_error` |
 
-`incomplete` is reachable only through the new optional, bounded `remaining:
-[{item_id, summary}]` list in `.implementer-refusal.json`, read after a
-successful push. A marker without `remaining` behaves exactly as before.
+`incomplete` is reserved and intentionally unreachable in v1alpha1. The
+classifier maps the new optional, bounded `remaining: [{item_id, summary}]`
+list in `.implementer-refusal.json` (read after a successful push) to
+`incomplete`, but the agent prompt forbids writing the marker next to a commit
+and does not mention `remaining`, so there is no agent-facing channel yet. A
+marker without `remaining` behaves exactly as before.
 
 Exits before the attempt starts (approval and approval-digest blocks, GitHub
 preflight, admission, `ensure_auth_for_sdk` failure, a refused acquire, the
@@ -232,8 +235,8 @@ Not part of this change; each extends this ADR with its own section:
 
 ## Open questions
 
-- `incomplete` has a single source in v1alpha1 (the marker's `remaining`
-  list). Confirm that is intended.
+- `incomplete` is reserved and unreachable in v1alpha1 (no agent-facing
+  channel for `remaining`). Decide when and how to expose one.
 - The record carries `proposal_content_digest`, which the implementer already
   checks against `approval.content_digest` before starting (#658). Whether to
   also carry the recorded `approval.content_digest` is deferred to a later

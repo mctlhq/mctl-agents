@@ -144,6 +144,15 @@ def test_implement_mode_arms_without_a_sentinel_prefix(tmp_path: Path) -> None:
             ("harness_failure", "claim_refused"),
         ),
         (
+            ri.ImplementResult(
+                ref=ref,
+                pr_url=None,
+                error="verification budget exhausted on 3 consecutive attempts",
+                budget_terminal=True,
+            ),
+            ("budget_exhausted", "verification_budget"),
+        ),
+        (
             ri.ImplementResult(ref=ref, pr_url=None, error="shell step failed: git push\nstdout: x"),
             ("harness_failure", "unexpected_error"),
         ),
