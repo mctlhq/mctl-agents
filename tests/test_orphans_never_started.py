@@ -287,3 +287,25 @@ def test_local_path_with_a_relative_state_dir(tmp_path, monkeypatch):
     result = orphans._sync_detect_orphans(Path(tmp_path.name), set())
     assert result.never_started_unreadable == 0
     assert [s.slug for s in result.never_started] == ["issue-5-never-started"]
+
+
+def test_local_path_never_reports_an_open_pr_as_never_started(tmp_path, monkeypatch):
+    """A proposal whose .status.yaml lost its `pr:` but whose implementer
+    branch has an open PR is an orphan, not never-started: reporting it as
+    both would claim "no PR" for a proposal that demonstrably has one."""
+    from types import SimpleNamespace
+
+    from orchestrator.temporal.activities import orphans
+
+    _local_fixture(tmp_path)
+    open_pr = SimpleNamespace(
+        repo="mctlhq/mctl-agents", number=7, closed_unmerged=False, merged=False
+    )
+    monkeypatch.setattr(
+        orphans,
+        "find_pr_for_proposal",
+        lambda service, slug, **k: open_pr if slug == "issue-5-never-started" else None,
+    )
+    result = orphans._sync_detect_orphans(tmp_path, set())
+    assert [o.slug for o in result.orphans] == ["issue-5-never-started"]
+    assert result.never_started == []
