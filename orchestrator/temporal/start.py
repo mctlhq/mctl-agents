@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 
-from temporalio.client import Client, WithStartWorkflowOperation, WorkflowHandle
+from temporalio.client import Client, WithStartWorkflowOperation, WorkflowExecutionStatus, WorkflowHandle
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 
 from orchestrator.temporal.constants import TASK_QUEUE
@@ -18,7 +18,7 @@ from orchestrator.temporal.constants import TASK_QUEUE
 # callers can import it without the SDK; re-exported here because this
 # module is where every Temporal-side caller historically found it.
 from orchestrator.temporal.issue_ref import workflow_id_for
-from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
+from orchestrator.temporal.workflows.dev_loop import ABANDONED_ENDED_PREFIX, DevLoopWorkflow, IssueRef
 
 #: The one DevLoop per issue (mctlhq/mctl-agents#461 option A): every start,
 #: the intake poller's and the execution-request dispatcher's alike, names
@@ -40,6 +40,11 @@ DEV_LOOP_ID_REUSE_POLICY = WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY
 #: (`_bind_dispatched_execution`, `_deliver`), so a closed run that took it
 #: never ran it; a fulfilled request is closed for good.
 DISPATCH_ID_REUSE_POLICY = WorkflowIDReusePolicy.ALLOW_DUPLICATE
+#: The operator restart's reuse policy (mctl-api#640): a run that COMPLETED
+#: may be followed by a new one, but only after `restart_if_abandoned` has
+#: read that the run was abandoned before implement. Temporal cannot make the
+#: reuse conditional on how the run ended, so the check is the caller's.
+RESTART_ID_REUSE_POLICY = WorkflowIDReusePolicy.ALLOW_DUPLICATE
 
 
 async def connect() -> Client:
@@ -89,6 +94,49 @@ async def start_dev_loop_workflow(issue_url: str, client: Client | None = None) 
         id=workflow_id_for(issue_url),
         task_queue=TASK_QUEUE,
         id_reuse_policy=DEV_LOOP_ID_REUSE_POLICY,
+        id_conflict_policy=DEV_LOOP_ID_CONFLICT_POLICY,
+    )
+
+
+async def restart_if_abandoned(issue_url: str, client: Client) -> WorkflowHandle | None:
+    """Start a new DevLoopWorkflow for ``issue_url`` when its latest run was
+    abandoned before the implement step, and return None for every other
+    closed run (mctl-api#640).
+
+    An operator's abandon is not a verdict on the issue. Since the legacy
+    approver relay was turned off (mctl-gitops#1913), a running DevLoop is
+    the only way to implement a proposal, so without this a loop abandoned at
+    its approval park would close its issue to DevLoop for good:
+    `start_dev_loop_workflow` refuses any COMPLETED run.
+
+    The marker is the run's own result: every abandon path returns
+    ``ended=f"{ABANDONED_ENDED_PREFIX}{reason}"``. The runs this exists for
+    were abandoned before any memo or search attribute could have been
+    written. An abandon during implement or the merge watch leaves a PR
+    behind, which a fresh investigate would not resume, so ``implement`` must
+    also be None. Only a COMPLETED run is read, because abandon never ends a
+    run any other way. The result is read pinned to the described run, so a
+    run started in between cannot answer for it. A failed describe or result
+    read raises: an unreadable run is never restarted blind.
+
+    Same rule as mctl-api's `POST /api/v1/agents/dev-loop/start`. Only the
+    operator CLI calls this. The intake poller deliberately does not: a
+    label left on an abandoned issue would otherwise undo the abandon on the
+    next poll.
+    """
+    workflow_id = workflow_id_for(issue_url)
+    desc = await client.get_workflow_handle(workflow_id).describe()
+    if desc.status != WorkflowExecutionStatus.COMPLETED:
+        return None
+    result = await client.get_workflow_handle_for(DevLoopWorkflow.run, workflow_id, run_id=desc.run_id).result()
+    if not result.ended.startswith(ABANDONED_ENDED_PREFIX) or result.implement is not None:
+        return None
+    return await client.start_workflow(
+        DevLoopWorkflow.run,
+        IssueRef(issue_url=issue_url),
+        id=workflow_id,
+        task_queue=TASK_QUEUE,
+        id_reuse_policy=RESTART_ID_REUSE_POLICY,
         id_conflict_policy=DEV_LOOP_ID_CONFLICT_POLICY,
     )
 
