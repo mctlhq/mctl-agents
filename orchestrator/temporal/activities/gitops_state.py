@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from datetime import UTC, datetime
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -56,7 +57,7 @@ TREE_URL = (
 # enough that a worker that never restarts cannot grow it without limit.
 _BLOB_CACHE_MAX = 4096
 _ParsedStatus = tuple[
-    str, str | None, str | None, str | None, bool, bool, str | None, str | None
+    str, str | None, str | None, str | None, bool, bool, str | None, str | None, str | None
 ]
 _blob_cache: OrderedDict[str, _ParsedStatus] = OrderedDict()
 
@@ -86,6 +87,9 @@ class ProposalStateRef:
     #: mctl-agents#417's directive-staleness report, which compares a
     #: comment's timestamp against this value.
     updated_at: str | None = None
+    #: `.status.yaml` `approval.approved_at`, normalized with `str(...)`.
+    #: Feeds the never-started signal (mctl-agents#413).
+    approved_at: str | None = None
     # The three fields below feed only the implement-sweep's stranding
     # predicate; reconcile/orphans never read them. Defaulted so a result
     # recorded by a worker before this change still deserializes — the
@@ -222,6 +226,9 @@ def _parse_status_yaml(text: str) -> _ParsedStatus:
     unrunnable = unrunnable_reason(data) is not None
     blocked = bool(data.get("blocked"))
     authorization, unauthorized = execution_authorization(data)
+    approval = data.get("approval")
+    raw_approved_at = approval.get("approved_at") if isinstance(approval, dict) else None
+    approved_at = str(raw_approved_at) if raw_approved_at is not None else None
     return (
         status,
         str(pr) if pr else None,
@@ -231,7 +238,25 @@ def _parse_status_yaml(text: str) -> _ParsedStatus:
         blocked,
         authorization,
         unauthorized,
+        approved_at,
     )
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    """Best-effort ISO-8601 parse, `Z`-suffixed or not; None on anything else.
+
+    A naive result is assumed to be UTC so comparison against an aware `now`
+    cannot raise.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 async def _resolve_token_async() -> str:
@@ -353,6 +378,7 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
                         blocked,
                         authorization,
                         unauthorized,
+                        approved_at,
                     ) = await _read_blob(client, sha, token)
                 except (ValueError, yaml.YAMLError) as exc:
                     # One unparseable status file must not blind the sweep to
@@ -370,6 +396,7 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
                 status=status,
                 pr_url=pr_url,
                 updated_at=updated_at,
+                approved_at=approved_at,
                 attempt_expires_at=attempt_expires_at,
                 unrunnable=unrunnable,
                 blocked=blocked,

@@ -210,6 +210,18 @@ IMPLEMENT_SWEEP_MAX_SUBMITS_ENV = "IMPLEMENT_SWEEP_MAX_SUBMITS"
 DEFAULT_IMPLEMENT_SWEEP_MAX_SUBMITS = 5
 
 
+# Never-started threshold (mctl-agents#413): how long an approved,
+# PR-less proposal may sit with no live DevLoopWorkflow before reconcile
+# reports it. 45 minutes exceeds the implement-sweep grace (20 minutes) plus
+# one sweep interval (15 minutes), so a healthy sweep claims it first.
+NEVER_STARTED_THRESHOLD_MINUTES_ENV = "NEVER_STARTED_THRESHOLD_MINUTES"
+DEFAULT_NEVER_STARTED_THRESHOLD_MINUTES = 45
+
+
+def never_started_threshold_minutes() -> int:
+    return _int_env(NEVER_STARTED_THRESHOLD_MINUTES_ENV, DEFAULT_NEVER_STARTED_THRESHOLD_MINUTES)
+
+
 def implement_sweep_grace_minutes() -> int:
     return _int_env(IMPLEMENT_SWEEP_GRACE_MINUTES_ENV, DEFAULT_IMPLEMENT_SWEEP_GRACE_MINUTES)
 
