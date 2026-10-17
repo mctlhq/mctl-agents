@@ -65,6 +65,5 @@ After this change `grep -rn claude-haiku-4-5` (excluding `.venv`) shows only:
 | `docs/benchmarks/capability-discovery.md` | earlier benchmark that describes the CLI side calls of its time | kept: historical |
 | `tests/fixtures/model-usage-records.json` | recorded usage of a dated model id | kept: historical data |
 | `tests/test_usage_ledger.py` | asserts on that fixture | kept: historical data |
-| `.env.example` | rollback value in a comment | rollback docs |
 | `tools/model_smoke.py` docstring | rollback smoke and eval commands | rollback docs |
 | `tests/test_model_policy.py` | rollback test (T3) | rollback docs |
