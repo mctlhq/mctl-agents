@@ -178,7 +178,9 @@ from orchestrator.options import (
 )
 from orchestrator.proc import describe_output, run_capturing
 from orchestrator.proposal_state import (
+    BLOCKED_APPROVAL_DIGEST_MISMATCH,
     BLOCKED_APPROVAL_MISSING,
+    approval_digest_problem,
     human_approval_satisfied,
     load_status,
     now_iso,
@@ -3441,6 +3443,31 @@ def _issue_closing_line(ref: ProposalRef) -> str:
     return f"\n\nCloses {repo}#{issue}"
 
 
+def _approval_digest_message(code: str, recorded: str, current: str) -> tuple[str, str]:
+    """Return ``(message, remedy)`` for a proposal whose approval does not
+    cover its current triplet. Both are stable for unchanged content, so
+    ``_mark_blocked`` writes the marker once, not once per tick."""
+    if code == BLOCKED_APPROVAL_DIGEST_MISMATCH:
+        message = (
+            "requirements.md / design.md / tasks.md changed after approval: "
+            f"approved {recorded}, now {current}; the implementer runs only "
+            "the content a human approved"
+        )
+    else:
+        message = (
+            "requires_human_approval is set but the approval records no "
+            f"approval.content_digest (content now {current}), so nothing "
+            "binds it to the content that was approved"
+        )
+    remedy = (
+        "restore the approved requirements.md / design.md / tasks.md, or "
+        "re-publish the proposal in 'proposed' status so mctl-agents-approve "
+        "records an approval of the current content. Never hand-edit "
+        "approval.content_digest."
+    )
+    return message, remedy
+
+
 def _approval_blocked_message(ref: ProposalRef) -> tuple[str, str]:
     """Return ``(message, remedy)`` for a proposal blocked on missing approval.
 
@@ -4103,6 +4130,27 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             ref=ref,
             pr_url=None,
             blocked=BLOCKED_APPROVAL_MISSING,
+            blocked_is_new=blocked_is_new,
+            skipped_reason=message,
+            counts_toward_limit=False,
+        )
+
+    # An approval binds the content a human approved, not just the proposal's
+    # name (mctl-agents#658): a triplet edited after the flip, or a flip that
+    # recorded no digest, is content nobody approved. Same durable refusal as
+    # the missing approval above; an OSError reading the triplet propagates
+    # as an attempt error, never as a match.
+    digest_problem = approval_digest_problem(_load_status(ref.status_path), ref.proposal_dir)
+    if digest_problem is not None:
+        digest_code, approved_digest, current_digest = digest_problem
+        message, remedy = _approval_digest_message(digest_code, approved_digest, current_digest)
+        blocked_is_new = False
+        if not dry_run:
+            blocked_is_new = _mark_blocked(ref, code=digest_code, message=message, remedy=remedy)
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            blocked=digest_code,
             blocked_is_new=blocked_is_new,
             skipped_reason=message,
             counts_toward_limit=False,
