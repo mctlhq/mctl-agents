@@ -343,7 +343,12 @@ async def _read_file_at(client: httpx.AsyncClient, headers: dict[str, str], url:
         raise ProposalListingError(f"reading {url}: malformed response") from exc
     if not isinstance(payload, dict) or payload.get("type") != "file" or payload.get("encoding") != "base64":
         raise ProposalListingError(f"reading {url}: not an inlined regular file")
+    content = payload.get("content")
+    if not isinstance(content, str):
+        # A missing body is a failed read, never an empty file.
+        raise ProposalListingError(f"reading {url}: no inlined content")
     try:
-        return base64.b64decode(payload.get("content", ""), validate=False)
+        # GitHub wraps the base64 at 60 columns; anything else is malformed.
+        return base64.b64decode(content.replace("\n", ""), validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ProposalListingError(f"reading {url}: undecodable content") from exc
