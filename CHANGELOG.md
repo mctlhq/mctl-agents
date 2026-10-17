@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.81.0](https://github.com/mctlhq/mctl-agents/compare/1.80.0...1.81.0) (2026-10-17)
+
+
+### Features
+
+* **human-input:** name the work item owner by principal ([a9410fc](https://github.com/mctlhq/mctl-agents/commit/a9410fc6a95f1b164e82babc9568639039e509d0))
+* **human-input:** name the work item owner by principal ([c7fa660](https://github.com/mctlhq/mctl-agents/commit/c7fa660f85ffb791bb0cbea518e2b43091842194))
+
 ## [1.80.0](https://github.com/mctlhq/mctl-agents/compare/1.79.0...1.80.0) (2026-10-17)
 
 
