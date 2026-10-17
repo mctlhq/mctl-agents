@@ -6,6 +6,7 @@ writer must therefore preserve fields it does not explicitly change.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import stat
@@ -78,15 +79,37 @@ def human_approval_satisfied(data: dict[str, Any]) -> bool:
     watching — see ``execution_authorization`` below, which answers that
     separately and fails closed.
     """
-    control = data.get("control")
-    if control is None:
+    if not requires_human_approval(data):
         return True
+    control = data.get("control")
     if not isinstance(control, dict):
         # A control block that is present but not a mapping is corrupt, not
         # absent. "Absent means not required" is a statement about proposals
         # that never asked for approval; a malformed one asked for something
         # unreadable, so it fails closed (agy P2).
         return False
+
+    approval = data.get("approval")
+    if not isinstance(approval, dict):
+        return False
+    approved_by = approval.get("approved_by")
+    if not isinstance(approved_by, str):
+        return False
+    return approved_by.strip().lower() not in _ANONYMOUS_APPROVERS
+
+
+def requires_human_approval(data: dict[str, Any]) -> bool:
+    """Whether a proposal's own ``control`` block asks for a human approval.
+
+    The requirement half of ``human_approval_satisfied``: absent ``control``
+    means never asked; a ``control`` that is not a mapping is corrupt and
+    counts as asking.
+    """
+    control = data.get("control")
+    if control is None:
+        return False
+    if not isinstance(control, dict):
+        return True
 
     # Only a value that recognisably says "no" waives the gate. Everything
     # else — including anything unrecognised — requires an approval.
@@ -105,19 +128,82 @@ def human_approval_satisfied(data: dict[str, Any]) -> bool:
     # require approval. An absent key still means "never asked".
     required = control.get("requires_human_approval")
     if required is None or required is False:
-        return True
+        return False
     if isinstance(required, str) and required.strip().lower() in _FALSEY:
-        return True
+        return False
     if isinstance(required, int) and not isinstance(required, bool) and required == 0:
-        return True
+        return False
+    return True
 
+
+# Approval content digest (mctl-agents#658). An approval names who and when;
+# this binds it to WHAT. `cwft-mctl-agents-approve.yaml` (mctl-gitops) writes
+# `approval.content_digest` at the proposed -> accepted flip, and the
+# implementer recomputes it before it starts. The two implementations must
+# agree byte for byte, so the framing is deliberately shell-friendly:
+#
+#   for name in requirements.md, design.md, tasks.md, proposed-content.md
+#   (this order, always):
+#     a regular file:  "<name>\n<byte length>\n" followed by its exact bytes
+#     anything else:   "<name>\n-\n"
+#   content_digest = "sha256:" + hex(SHA-256 of the concatenation)
+#
+# The files are the ones the implementer prompt directs the agent to read:
+# the triplet, plus proposed-content.md, the verbatim deliverable of an
+# mctl-docs proposal (absent elsewhere, which hashes as "-").
+#
+# The length prefix keeps the framing unambiguous whatever the files hold,
+# and "-" keeps a missing file distinct from an empty one. Pinned by the
+# vectors in tests/test_proposal_digest.py, which the CWFT's shell must match.
+PROPOSAL_DIGEST_FILES = ("requirements.md", "design.md", "tasks.md", "proposed-content.md")
+PROPOSAL_DIGEST_PREFIX = "sha256:"
+
+# There is no grandfathering: an approval that requires a human and carries no
+# digest is refused like a drifted one. At rollout no proposal that requires
+# approval was `accepted` (all 120 accepted records were incident-* without a
+# control block), so nothing approved earlier is stranded by this; anything
+# flipped by a writer that predates the digest is re-published as `proposed`.
+BLOCKED_APPROVAL_DIGEST_MISSING = "approval-digest-missing"
+BLOCKED_APPROVAL_DIGEST_MISMATCH = "approval-digest-mismatch"
+
+
+def proposal_content_digest(proposal_dir: Path) -> str:
+    """The ``approval.content_digest`` of a proposal directory's approved files.
+
+    A read failure on a file that exists raises: content that could not be
+    read has no digest, and must never be hashed as if it were absent.
+    """
+    digest = hashlib.sha256()
+    for name in PROPOSAL_DIGEST_FILES:
+        path = proposal_dir / name
+        if path.is_file():
+            content = path.read_bytes()
+            digest.update(f"{name}\n{len(content)}\n".encode())
+            digest.update(content)
+        else:
+            digest.update(f"{name}\n-\n".encode())
+    return PROPOSAL_DIGEST_PREFIX + digest.hexdigest()
+
+
+def approval_digest_problem(data: dict[str, Any], proposal_dir: Path) -> tuple[str, str, str] | None:
+    """``(code, recorded, current)`` when the approved content is not the
+    content on disk, else ``None``.
+
+    Only a proposal that requires a human approval is checked; one that never
+    asked for approval has nothing to bind. A missing or non-string digest is
+    ``BLOCKED_APPROVAL_DIGEST_MISSING`` and never counts as a match. Raises
+    ``OSError`` when one of the files cannot be read.
+    """
+    if not requires_human_approval(data):
+        return None
+    current = proposal_content_digest(proposal_dir)
     approval = data.get("approval")
-    if not isinstance(approval, dict):
-        return False
-    approved_by = approval.get("approved_by")
-    if not isinstance(approved_by, str):
-        return False
-    return approved_by.strip().lower() not in _ANONYMOUS_APPROVERS
+    recorded = approval.get("content_digest") if isinstance(approval, dict) else None
+    if not isinstance(recorded, str) or not recorded.strip():
+        return BLOCKED_APPROVAL_DIGEST_MISSING, "", current
+    if recorded.strip() != current:
+        return BLOCKED_APPROVAL_DIGEST_MISMATCH, recorded.strip(), current
+    return None
 
 
 # Execution authorization (mctl-agents#412, the 2026-09-19 product decision).
