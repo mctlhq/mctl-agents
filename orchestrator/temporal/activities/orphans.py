@@ -169,10 +169,12 @@ def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None =
     orphans: list[OrphanSignal] = []
     active_ids = active_workflow_ids or set()
 
+    pr_seen: set[tuple[str, str]] = set()
     for ref in actionable_refs:
         pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
         if pr is None or pr.closed_unmerged or pr.merged:
             continue
+        pr_seen.add((ref.service, ref.slug))
 
         expected_workflow_id = _expected_workflow_id(ref.slug, pr.repo, ref.service)
         if expected_workflow_id and expected_workflow_id in active_ids:
@@ -192,7 +194,10 @@ def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None =
     unauthorized = 0
     unreadable = 0
     if active_workflow_ids is not None:
-        state_refs, unreadable = _local_state_refs(state_dir, actionable_refs)
+        state_refs, unreadable = _local_state_refs(
+            state_dir,
+            [r for r in actionable_refs if (r.service, r.slug) not in pr_seen],
+        )
         never_started, unauthorized = _classify_never_started(
             state_refs,
             active_ids,
