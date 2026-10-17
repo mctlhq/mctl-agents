@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.79.0](https://github.com/mctlhq/mctl-agents/compare/1.78.0...1.79.0) (2026-10-17)
+
+
+### Features
+
+* **temporal:** cli start restarts a DevLoop abandoned before implement ([f85b8c8](https://github.com/mctlhq/mctl-agents/commit/f85b8c842305f4b16bd5246898e8e15b5174a55f))
+* **temporal:** cli start restarts a DevLoop abandoned before implement ([10c9e78](https://github.com/mctlhq/mctl-agents/commit/10c9e78281fa87b6273fa5f8973397b3cdfc1d8d))
+
+
+### Bug Fixes
+
+* **temporal:** treat a null ended as no abandon marker ([f324c52](https://github.com/mctlhq/mctl-agents/commit/f324c52c75176bd750db9ed6147df6fb7f7df25a))
+
 ## [1.78.0](https://github.com/mctlhq/mctl-agents/compare/1.77.1...1.78.0) (2026-10-17)
 
 
