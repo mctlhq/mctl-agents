@@ -5428,9 +5428,11 @@ def _finish_attempt(
     try:
         override = _claim_problem_at_emission(obs.claim_ctx)
         completion = completion_from_result(ref, result, obs, override_code=override)
-        # A stale claim, or a claim refusal, means this attempt does not own the
-        # entity: it reports through `--completion-out` only.
-        if project and override is None and completion.stop_reason.code not in ("claim_refused", "fenced"):
+        # A stale claim at emission, or a claim refusal, means this attempt does
+        # not own the entity: it reports through `--completion-out` only. A
+        # `fenced` attempt that still owns `.status.yaml` projects; the
+        # `_project_completion` compare-and-swap guards ownership.
+        if project and override is None and completion.stop_reason.code != "claim_refused":
             _project_completion(ref, completion)
         if result is not None:
             result.completion = completion
