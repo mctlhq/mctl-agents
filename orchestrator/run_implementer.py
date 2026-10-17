@@ -105,6 +105,16 @@ Idempotency:
     deriving `primary`/`secondary` from the active token env var, else
     `"unknown"`); it names no credential and is safe to set in a workflow spec.
 
+Completion handoff (mctl-agents#428, ADR 021):
+    Once an attempt has started (past the approval, preflight, admission and
+    auth exits), each step ends with exactly one sealed
+    `ImplementationCompletion` (`orchestrator/implementation_completion.py`).
+    It is projected as a bounded `completion:` block into `.status.yaml` on
+    the implement path and, with `--completion-out PATH`, written in full as
+    JSON. `complete` means only "the attempt pushed a head that passed the
+    orchestrator gates". Exit codes, `--refusal-out` and status transitions
+    are unchanged.
+
 Usage:
     python -m orchestrator.run_implementer
     python -m orchestrator.run_implementer --service mctl-web
@@ -123,7 +133,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -141,7 +151,10 @@ from config.settings import (
     SERVICES,
 )
 from orchestrator import evidence_producer, policy_checkpoint, tracing, usage_ledger
+from orchestrator import implementation_completion as ic
 from orchestrator.auth import ensure_auth_for_sdk
+from orchestrator.context_snapshot import canonical_json as _canonical_json
+from orchestrator.context_snapshot import hash_bytes as _hash_bytes
 from orchestrator.exec_budget import CommandBudgetLedger
 from orchestrator.execution_identity import (
     ExecutionContextRequiredError,
@@ -186,6 +199,7 @@ from orchestrator.proposal_state import (
     human_approval_satisfied,
     load_status,
     now_iso,
+    proposal_content_digest,
     update_status_file,
 )
 from orchestrator.rate_limit import (
@@ -390,6 +404,7 @@ MAX_REFUSAL_REASON_CHARS = 600
 # whose `reason` is itself capped at MAX_REFUSAL_REASON_CHARS, so nothing
 # honest is anywhere near it.
 MAX_REFUSAL_MARKER_BYTES = 64 * 1024
+MAX_REMAINING_ITEMS = ic.MAX_LIST_ITEMS
 
 
 @dataclass(frozen=True)
@@ -415,6 +430,40 @@ class RefusalMarker:
     reason: str
     insufficient_evidence: bool = False
     verification_budget_exhausted: bool = False
+    # Optional, bounded `[(item_id, summary)]` the agent left undone on an
+    # otherwise SUCCESSFUL push (mctl-agents#428). Not a refusal signal: it is
+    # only read after a push and makes the attempt's completion `incomplete`.
+    # A marker without it behaves exactly as before.
+    remaining: tuple[tuple[str, str], ...] = ()
+
+
+def _parse_marker_remaining(raw: Any) -> tuple[tuple[str, str], ...]:
+    """Validate the optional `remaining` list of a refusal marker.
+
+    NOTE: `incomplete` / `known_work_remains` is reserved and intentionally
+    unreachable in v1alpha1: the agent prompt gives the agent no channel to
+    write `remaining` next to a commit (see ADR 021).
+
+    Bounded like the completion contract's `remaining_work` (at most
+    `MAX_REMAINING_ITEMS` entries, a short `item_id`, a capped `summary`).
+    An entry that does not qualify is dropped, never repaired: a malformed
+    list must not turn a refusal into a different outcome by accident.
+    """
+    if not isinstance(raw, list):
+        return ()
+    items: list[tuple[str, str]] = []
+    for entry in raw[:MAX_REMAINING_ITEMS]:
+        if not isinstance(entry, dict):
+            continue
+        item_id, summary = entry.get("item_id"), entry.get("summary")
+        if not (isinstance(item_id, str) and isinstance(summary, str)):
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", item_id):
+            continue
+        summary = " ".join(summary.split())[: ic.MAX_SUMMARY_CHARS]
+        if summary:
+            items.append((item_id, summary))
+    return tuple(items)
 
 
 def _read_refusal_marker(repo_dir: Path) -> RefusalMarker | None:
@@ -549,6 +598,7 @@ def _read_refusal_marker(repo_dir: Path) -> RefusalMarker | None:
         reason=" ".join(reason.split())[:MAX_REFUSAL_REASON_CHARS],
         insufficient_evidence=data.get("insufficient_evidence") is True,
         verification_budget_exhausted=data.get("verification_budget_exhausted") is True,
+        remaining=_parse_marker_remaining(data.get("remaining")),
     )
 
 
@@ -802,6 +852,11 @@ class ImplementResult:
     # batch summary can print the stable, greppable stderr line without
     # touching `.status.yaml` again. `None` whenever `rate_limited` is False.
     rate_limit_observation: RateLimitObservation | None = None
+    # The sealed `ImplementationCompletion` of this attempt step
+    # (mctl-agents#428), attached by `_complete_attempt` after the attempt
+    # ends so `main()` can hand it to `--completion-out`. `None` for every
+    # exit before the attempt started (approval, preflight, auth, ...).
+    completion: ic.ImplementationCompletion | None = None
 
 
 @dataclass(frozen=True)
@@ -1357,10 +1412,17 @@ def _parse_pr_url(url: str) -> tuple[str, int] | None:
     return m.group(1), int(m.group(2))
 
 
+# Claim ids this process has already released: the completion emitter checks
+# the claim only while it is still held (a released claim answers "gone" for
+# every attempt, which is not a stale-claim finding).
+_RELEASED_CLAIM_IDS: set[str] = set()
+
+
 def _release_claim(ctx: _ClaimContext | None, *, reason: str) -> None:
     """Best-effort release. Must never fail the run it is cleaning up after."""
     if ctx is None:
         return
+    _RELEASED_CLAIM_IDS.add(getattr(ctx, "claim_id", ""))
     try:
         ctx.client.release(
             ctx.claim_id, ctx.entity, ctx.phase, ctx.owner_epoch, ctx.executor, ctx.attempt, reason=reason[:200]
@@ -2860,6 +2922,34 @@ def _review_feedback_one(
         print(f"[dry-run] would address review on {ref.service}/{ref.slug}")
         return ImplementResult(ref=ref, pr_url=None, skipped_reason="dry-run")
 
+    # One ImplementationCompletion per attempt step (mctl-agents#428). The
+    # shepherd owns `.status.yaml` in this mode, so the record is handed back
+    # on the result (for `--completion-out`) and never projected into it.
+    resolved_branch = branch or f"feat/agents-{ref.slug}"
+    obs = _AttemptObservations(
+        phase="review-remediation", branch=resolved_branch, base_ref=resolved_branch
+    )
+    try:
+        obs.review_bundle_digest = _hash_bytes(_canonical_json(bundle))
+    except Exception:  # noqa: BLE001 — the bundle digest is bookkeeping, never a gate
+        obs.review_bundle_digest = None
+    try:
+        obs.ordinal = int(_load_status(ref.status_path).get("review_attempts", 0) or 0)
+    except Exception:  # noqa: BLE001 — same
+        obs.ordinal = 0
+    return _complete_attempt(
+        ref, obs, lambda: _review_feedback_attempt(ref, bundle, branch, obs), project=False
+    )
+
+
+def _review_feedback_attempt(
+    ref: ProposalRef,
+    bundle: dict,
+    branch: str | None,
+    obs: _AttemptObservations,
+) -> ImplementResult:
+    """The body of `_review_feedback_one` after the dry-run check, split out
+    unchanged so the caller can emit the attempt's completion around it."""
     target = None
     result: ImplementResult | None = None
     claim_ctx: _ClaimContext | None = None
@@ -2918,6 +3008,7 @@ def _review_feedback_one(
         # an existing PR branch (it includes the original implementer
         # commit). See codex P1 on PR #12.
         old_head = _capture_head_sha(target)
+        obs.base_sha = old_head
 
         # 4b. ExecutionClaim on (pull-request, review-remediation), pinned to
         # the head just captured (ADR-010 phase 2, #352). Acquired BEFORE the
@@ -2934,6 +3025,8 @@ def _review_feedback_one(
         # fallback can and should use it to keep distinct attempts distinct.
         attempt_ordinal = int(pre_status.get("review_attempts", 0) or 0)
         attempt_id = _resolve_attempt_id(ref.service, ref.slug, owner_epoch=0, attempt_ordinal=attempt_ordinal)
+        obs.attempt_id = attempt_id
+        obs.ordinal = attempt_ordinal
         if parsed_pr is not None:
             repo, number = parsed_pr
             claim_ctx = _acquire_claim(
@@ -2945,6 +3038,7 @@ def _review_feedback_one(
                     "LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW", _review_claim_lease_default()
                 ),
             )
+            obs.claim_ctx = claim_ctx
 
         # 4c. Resolve this run's ServiceSkillBundle (mctlhq/mctl-agents#305,
         # R24) BEFORE the SDK call — a ServiceSkillError aborts here, before
@@ -2967,6 +3061,7 @@ def _review_feedback_one(
         n_checks = len(bundle.get("ci_failures") or [])
         envelope_s = implementer_envelope(work_class, n_checks=n_checks)
         budget_ledger = CommandBudgetLedger()
+        obs.budget_ledger = budget_ledger
         prompt = _build_prompt(
             ref,
             review_feedback=bundle,
@@ -2995,7 +3090,8 @@ def _review_feedback_one(
             _keep_commits_past_late_rate_limit(exc, target, base=old_head)
 
         # 6. Did the agent commit anything new (beyond the captured pre-SDK SHA)?
-        if not _has_new_commits(target, base=old_head):
+        obs.commits_present = _has_new_commits(target, base=old_head)
+        if not obs.commits_present:
             # No commit is not automatically a failure: the agent may have
             # decided, on the evidence, that changing nothing is correct.
             # Only a valid marker separates the two (mctl-agents#360).
@@ -3079,6 +3175,7 @@ def _review_feedback_one(
         # check could not (store unreachable, rollout below `enforce`).
         _push_followup(target, branch, old_head, claim_context=claim_ctx, repo=f"mctlhq/{ref.service}")
         _note_pushed_head(target)
+        _note_pushed(target, obs)
 
         # 8. Read the existing PR URL from `.status.yaml` for the result
         # surface; do NOT rewrite the status — that belongs to the shepherd.
@@ -4414,6 +4511,46 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         ref, "in-progress", attempt=attempt, failure=None, blocked=None, rate_limited=None,
     )
 
+    # From here the attempt owns (or, below `enforce`, would own) the proposal:
+    # exactly one ImplementationCompletion is emitted for this step however it
+    # ends (mctl-agents#428). Exits above this line emit none.
+    obs = _AttemptObservations(
+        phase="implement",
+        branch=f"feat/agents-{ref.slug}",
+        attempt_id=attempt_id,
+        claim_ctx=claim_ctx,
+        context_id=execution_context.context_id,
+        ordinal=0,
+    )
+    return _complete_attempt(
+        ref,
+        obs,
+        lambda: _implement_attempt(
+            ref,
+            obs,
+            attempt=attempt,
+            attempt_id=attempt_id,
+            claim_ctx=claim_ctx,
+            execution_context=execution_context,
+            prior_rate_limited=prior_rate_limited,
+        ),
+        project=True,
+    )
+
+
+def _implement_attempt(
+    ref: ProposalRef,
+    obs: _AttemptObservations,
+    *,
+    attempt: dict[str, Any],
+    attempt_id: str,
+    claim_ctx: _ClaimContext | None,
+    execution_context: Any,
+    prior_rate_limited: Any,
+) -> ImplementResult:
+    """The body of `_implement_one` after the claim is acquired and the
+    proposal is `in-progress`. Split out unchanged so the caller can emit the
+    attempt's completion around it."""
     target = None
     result: ImplementResult | None = None
     try:
@@ -4455,6 +4592,7 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             ref, service_skills_block=skill_bundle.to_prompt_block(repo_slug=f"mctlhq/{ref.service}")
         )
         budget_ledger = CommandBudgetLedger()
+        obs.budget_ledger = budget_ledger
         try:
             # No PR yet: it is opened after the session, from its commits.
             with usage_ledger.correlate(
@@ -4469,7 +4607,8 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         print(f"info: command budget ledger: {budget_ledger.describe()}")
 
         # 6. Did the agent actually commit something?
-        if not _has_new_commits(target):
+        obs.commits_present = _has_new_commits(target)
+        if not obs.commits_present:
             if budget_ledger.exhausted:
                 prior_handbacks = int(
                     _load_status(ref.status_path).get("budget_handbacks", 0) or 0
@@ -4598,9 +4737,12 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             )
             return ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
 
+        obs.chart_guard_passed = True
+
         # 7. Push + PR.
         pr_url = _push_and_open_pr(target, ref, claim_context=claim_ctx)
         _note_pushed_head(target)
+        _note_pushed(target, obs)
 
         # 8. Mark implemented.
         completed_attempt = dict(attempt)
@@ -4881,6 +5023,468 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
 
 
 # ---------------------------------------------------------------------------
+# ImplementationCompletion emission (mctl-agents#428, ADR 021)
+#
+# One sealed record per attempt step, built by ONE pure mapping function from
+# what the attempt already produced (an `ImplementResult` plus orchestrator-
+# side observations). Emission is purely additive: it runs after the attempt
+# has ended, logs and swallows its own errors, and never changes an exit code,
+# a `--refusal-out` payload or a `.status.yaml` status transition.
+# ---------------------------------------------------------------------------
+# Where the CWFT's optional input artifact lands (mctlhq/mctl-gitops#1947):
+# the primary step's handoff, visible to the fallback step only. Absent today.
+PRIOR_STATE_DIR = Path("/tmp/prior-state")  # noqa: S108 — the CWFT input-artifact mount point
+MAX_PRIOR_HANDOFF_BYTES = 256 * 1024
+MAX_COMPLETION_OUT_BYTES = 256 * 1024
+
+# Every exit code mapped to exactly one (outcome, stop_reason) pair.
+# `EXIT_BLOCKED_ONLY` is batch-only and pre-claim: no attempt ran, so it
+# deliberately maps to no completion. tests/test_run_implementer_completion.py
+# fails if an `EXIT_*` constant is added without an entry here.
+_EXIT_CODE_COMPLETIONS: dict[int, tuple[str, str] | None] = {
+    EXIT_OK: (ic.OUTCOME_COMPLETE, "gates_passed"),
+    EXIT_GENERIC_FAILURE: (ic.OUTCOME_HARNESS_FAILURE, "unexpected_error"),
+    EXIT_NO_FOLLOWUP_COMMITS: (ic.OUTCOME_DETERMINISTIC_FAILURE, "no_commits"),
+    EXIT_BRANCH_MISSING_ON_ORIGIN: (ic.OUTCOME_DETERMINISTIC_FAILURE, "branch_missing"),
+    EXIT_OPERATION_TIMEOUT: (ic.OUTCOME_BUDGET_EXHAUSTED, "operation_timeout"),
+    EXIT_BLOCKED_ONLY: None,
+    EXIT_ORPHANED_SUBAGENT: (ic.OUTCOME_HARNESS_FAILURE, "orphaned_subagent"),
+    EXIT_DELIBERATE_NO_OP: (ic.OUTCOME_BOUNDED_REFUSAL, "deliberate_no_op"),
+    EXIT_FENCED: (ic.OUTCOME_HARNESS_FAILURE, "fenced"),
+    EXIT_CLAIM_REFUSED: (ic.OUTCOME_HARNESS_FAILURE, "claim_refused"),
+    EXIT_CI_EVIDENCE_INSUFFICIENT: (ic.OUTCOME_BOUNDED_REFUSAL, "evidence_insufficient"),
+    EXIT_VERIFICATION_BUDGET_EXHAUSTED: (ic.OUTCOME_BUDGET_EXHAUSTED, "verification_budget"),
+    EXIT_RATE_LIMITED: (ic.OUTCOME_BUDGET_EXHAUSTED, "rate_limited"),
+    EXIT_POLICY_REFUSED: (ic.OUTCOME_BOUNDED_REFUSAL, "policy_refused"),
+    EXIT_POLICY_UNDECIDED: (ic.OUTCOME_HARNESS_FAILURE, "policy_undecided"),
+}
+
+_CHART_GUARD_ERROR_PREFIX = "chart MAJOR-version bump"
+_IMPLEMENT_NO_COMMITS_PREFIX = "implementer produced no commits"
+
+
+@dataclass
+class _AttemptObservations:
+    """What the orchestrator itself saw during one attempt step.
+
+    Filled in by the attempt body as it goes and read once, after the attempt
+    ends, by `completion_from_result`. Nothing here comes from model prose.
+    """
+
+    phase: str
+    branch: str
+    attempt_id: str | None = None
+    claim_ctx: _ClaimContext | None = None
+    context_id: str | None = None
+    ordinal: int | None = None
+    proposal_digest: str | None = None
+    review_bundle_digest: str | None = None
+    base_ref: str = "origin/HEAD"
+    base_sha: str | None = None
+    head_sha: str | None = None
+    commits_present: bool | None = None
+    chart_guard_passed: bool | None = None
+    pushed: bool = False
+    budget_ledger: CommandBudgetLedger | None = None
+    remaining: tuple[tuple[str, str], ...] = ()
+
+
+def _workflow_step() -> str:
+    """`fallback` iff the CWFT's `IS_FALLBACK` says so; anything else is the
+    primary step (the shell prelude reads the same variable)."""
+    return ic.STEP_FALLBACK if os.environ.get("IS_FALLBACK", "").strip().lower() == "true" else ic.STEP_PRIMARY
+
+
+def _workflow_run_id(attempt_id: str) -> str:
+    """The Argo workflow name; a stable local stand-in outside Argo."""
+    return os.environ.get("WORKFLOW_NAME", "").strip() or f"local-{attempt_id[:16]}"
+
+
+def _classify_result(result: ImplementResult, *, remaining: bool) -> tuple[str, str, int | None]:
+    """`(outcome, stop_reason_code, exit_code)` for one `ImplementResult`.
+
+    THE one mapping from an attempt's end to a completion: every exit code
+    and every `ImplementResult` arm goes through `_EXIT_CODE_COMPLETIONS`.
+    `exit_code` is None for the incomplete arm, which no exit code names.
+    """
+    if result.rate_limited:
+        code = EXIT_RATE_LIMITED
+    elif result.stale_source:
+        return ic.OUTCOME_DETERMINISTIC_FAILURE, "stale_source", None
+    elif result.budget_terminal or result.budget_handback:
+        # The verification-budget arms carry prose errors with no sentinel
+        # prefix; classify on the flag, not the message.
+        return ic.OUTCOME_BUDGET_EXHAUSTED, "verification_budget", None
+    elif result.error:
+        code = _review_feedback_exit_code(result.error)
+        if code == EXIT_GENERIC_FAILURE:
+            # New-branch (implement) arms whose messages carry no sentinel
+            # prefix: they only exist as `needs-triage` codes today.
+            if result.error.startswith(_IMPLEMENT_NO_COMMITS_PREFIX):
+                code = EXIT_NO_FOLLOWUP_COMMITS
+            elif result.error.startswith(_CHART_GUARD_ERROR_PREFIX):
+                return ic.OUTCOME_DETERMINISTIC_FAILURE, "policy_gate", None
+    elif result.skipped_reason:
+        reason = result.skipped_reason
+        if reason.startswith(POLICY_UNDECIDED_ERROR_PREFIX):
+            code = EXIT_POLICY_UNDECIDED
+        elif reason.startswith(CLAIM_REFUSED_ERROR_PREFIX):
+            code = EXIT_CLAIM_REFUSED
+        elif reason.startswith(FENCED_ERROR_PREFIX):
+            code = EXIT_FENCED
+        else:
+            code = EXIT_GENERIC_FAILURE
+    else:
+        code = EXIT_OK
+    # `EXIT_BLOCKED_ONLY` (None) is unreachable from an attempt; fall back to
+    # the generic arm rather than invent a completion for a pre-claim exit.
+    mapped = _EXIT_CODE_COMPLETIONS.get(code) or (ic.OUTCOME_HARNESS_FAILURE, "unexpected_error")
+    if mapped[0] == ic.OUTCOME_COMPLETE and remaining:
+        return ic.OUTCOME_INCOMPLETE, "known_work_remains", None
+    return mapped[0], mapped[1], code
+
+
+def _check_record(check_id: str, result: str) -> ic.VerificationRecord:
+    classification = {"pass": "exit_zero", "fail": "exit_nonzero"}.get(result, "not_applicable")
+    return ic.VerificationRecord(
+        check_id=check_id,
+        result=result,
+        classification=classification,
+        required=check_id in ic.REQUIRED_CHECKS_V1ALPHA1,
+    )
+
+
+def _verification_records(outcome: str, code: str, obs: _AttemptObservations) -> list[ic.VerificationRecord]:
+    """The four required orchestrator gates plus the non-required ledger
+    observation. Classification only: no stdout / stderr rides along."""
+    pushed = obs.pushed or outcome in (ic.OUTCOME_COMPLETE, ic.OUTCOME_INCOMPLETE)
+    if obs.commits_present or pushed:
+        commits = "pass"
+    elif obs.commits_present is False or code == "no_commits":
+        commits = "fail"
+    else:
+        commits = "not_run"
+    if pushed or obs.chart_guard_passed:
+        chart = "pass"
+    elif code == "policy_gate":
+        chart = "fail"
+    else:
+        chart = "not_run"
+    pushed_check = "pass" if pushed else "not_run"
+    if code in ("fenced", "claim_refused"):
+        claim = "fail"
+    elif pushed:
+        claim = "pass"
+    else:
+        claim = "not_run"
+    records = [
+        _check_record("commits_present", commits),
+        _check_record("chart_major_guard", chart),
+        _check_record("push_succeeded", pushed_check),
+        _check_record("claim_valid_at_push", claim),
+    ]
+    # Phases / modes where a gate does not apply keep the record honest: the
+    # result is `pass`, the classification says why.
+    if pushed and obs.phase == "review-remediation":
+        records[1] = ic.VerificationRecord("chart_major_guard", "pass", "not_applicable", True)
+    if pushed and obs.claim_ctx is None:
+        records[3] = ic.VerificationRecord("claim_valid_at_push", "pass", "not_applicable", True)
+    if obs.budget_ledger is not None:
+        exhausted = obs.budget_ledger.exhausted
+        records.append(
+            ic.VerificationRecord(
+                check_id="command_budget",
+                result="fail" if exhausted else "pass",
+                classification="budget_denied" if exhausted else "exit_zero",
+                required=False,
+            )
+        )
+    return records
+
+
+def completion_from_result(
+    ref: ProposalRef,
+    result: ImplementResult | None,
+    obs: _AttemptObservations,
+    *,
+    override_code: str | None = None,
+) -> ic.ImplementationCompletion:
+    """Build the one sealed `ImplementationCompletion` for an attempt step.
+
+    Pure over its inputs (no I/O, no clock beyond `created_at`, which is not
+    hashed). `result` is None when the attempt raised past its own arms.
+    `override_code` re-states the record as a `harness_failure` with a code
+    the emission-time claim check found (`fenced` / `claim_refused`).
+    """
+    detail: str | None = None
+    if result is None:
+        outcome, code = ic.OUTCOME_HARNESS_FAILURE, "unexpected_error"
+        detail = "the attempt raised past its own error arms"
+    else:
+        outcome, code, _exit = _classify_result(result, remaining=bool(obs.remaining))
+        message = result.error or result.skipped_reason
+        if outcome != ic.OUTCOME_COMPLETE and message:
+            detail = message.strip().splitlines()[0] if message.strip() else None
+    if override_code is not None:
+        outcome, code = ic.OUTCOME_HARNESS_FAILURE, override_code
+    head_sha = _sha_or_none(obs.head_sha)
+    if outcome in (ic.OUTCOME_COMPLETE, ic.OUTCOME_INCOMPLETE) and head_sha is None:
+        # A push the attempt cannot name a head for is not a verifiable
+        # completion; say so rather than seal an unverifiable `complete`.
+        outcome, code = ic.OUTCOME_HARNESS_FAILURE, "unexpected_error"
+        detail = "the pushed head could not be captured"
+    attempt_id = obs.attempt_id or _resolve_attempt_id(
+        ref.service, ref.slug, owner_epoch=0, attempt_ordinal=obs.ordinal or 0
+    )
+    claim_id = obs.claim_ctx.claim_id if obs.claim_ctx is not None else None
+    return ic.seal(
+        subject=ic.CompletionSubject(service=ref.service, slug=ref.slug),
+        attempt=ic.AttemptBinding(
+            attempt_id=attempt_id,
+            run_id=_workflow_run_id(attempt_id),
+            step=ic.STEP_PRIMARY if obs.phase == "review-remediation" else _workflow_step(),
+            phase=obs.phase,
+            ordinal=obs.ordinal,
+            context_id=obs.context_id if obs.context_id and re.fullmatch(r"ex-[0-9a-f]{16}", obs.context_id) else None,
+            claim_id=claim_id if claim_id and len(claim_id) <= ic.MAX_ID_CHARS else None,
+            owner_epoch=obs.claim_ctx.owner_epoch if obs.claim_ctx is not None else None,
+        ),
+        source=ic.SourceBinding(
+            repository=f"mctlhq/{ref.service}",
+            base_ref=obs.base_ref,
+            base_sha=_sha_or_none(obs.base_sha),
+            branch=obs.branch,
+            head_sha=head_sha if outcome in (ic.OUTCOME_COMPLETE, ic.OUTCOME_INCOMPLETE) or obs.pushed else None,
+        ),
+        proposal=ic.ProposalBinding(
+            # No digest, no record: a placeholder would claim a binding to
+            # content nobody hashed.
+            proposal_digest=obs.proposal_digest,  # type: ignore[arg-type]
+            review_bundle_digest=obs.review_bundle_digest,
+        ),
+        outcome=outcome,
+        stop_reason=ic.stop_reason(code, detail),
+        verification=_verification_records(outcome, code, obs),
+        remaining_work=(
+            [ic.remaining_item(i, s) for i, s in obs.remaining[: ic.MAX_LIST_ITEMS]]
+            if outcome == ic.OUTCOME_INCOMPLETE
+            else []
+        ),
+    )
+
+
+def _sha_or_none(value: str | None) -> str | None:
+    """A git object id, or None: the contract binds hex SHAs only."""
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{7,64}", value) else None
+
+
+def _read_remaining_work(repo_dir: Path) -> tuple[tuple[str, str], ...]:
+    """The refusal marker's optional `remaining` list, read after a push.
+
+    Never fatal: a marker that cannot be read leaves the outcome `complete`."""
+    try:
+        marker = _read_refusal_marker(repo_dir)
+    except Exception:  # noqa: BLE001 — advisory read after a successful push
+        return ()
+    return marker.remaining if marker is not None else ()
+
+
+def _note_pushed(repo_dir: Path, obs: _AttemptObservations) -> None:
+    """Record, for the completion, that a push landed and which head it sent."""
+    obs.pushed = True
+    try:
+        obs.head_sha = _capture_head_sha(repo_dir, timeout=10)
+    except Exception:  # noqa: BLE001 — observation bookkeeping must never fail the run
+        obs.head_sha = None
+    obs.remaining = _read_remaining_work(repo_dir)
+
+
+def _claim_problem_at_emission(ctx: _ClaimContext | None) -> str | None:
+    """`fenced` / `claim_refused` when the attempt's claim, still held, fails
+    its check at emission; None otherwise (no claim, already released, or ok).
+    """
+    if ctx is None or getattr(ctx, "claim_id", "") in _RELEASED_CLAIM_IDS:
+        return None
+    try:
+        _check_claim_or_raise(ctx)
+    except ImplementerFenced:
+        return "fenced"
+    except ImplementerClaimRefused:
+        return "claim_refused"
+    except Exception as exc:  # noqa: BLE001 — the check is advisory here
+        print(f"warn: completion claim check failed ({type(exc).__name__}: {exc}); not treating it as stale")
+    return None
+
+
+def _prior_handoff_candidates(root: Path, ref: ProposalRef) -> list[Path]:
+    rel = Path(ref.service) / "proposals" / ref.slug / ".status.yaml"
+    return [root / rel, root / "platform-gitops" / "agents-state" / rel, root / ".status.yaml"]
+
+
+def _load_prior_handoff(root: Path, ref: ProposalRef, run_id: str) -> ic.CompletionSummary | None:
+    """The primary step's `completion.authoritative`, or None.
+
+    A bounded read of the primary's `.status.yaml` out of the optional
+    `/tmp/prior-state` input (mctlhq/mctl-gitops#1947). Accepted only when it
+    validates, carries THIS run's `run_id` and names the `primary` step; a
+    stale handoff from another run, a fallback summary, or anything unreadable
+    is treated as absent (fail closed: `primary_observed: false`).
+    """
+    try:
+        if not root.is_dir():
+            return None
+        for path in _prior_handoff_candidates(root, ref):
+            if not path.is_file():
+                continue
+            with path.open("rb") as fh:
+                raw = fh.read(MAX_PRIOR_HANDOFF_BYTES + 1)
+            if len(raw) > MAX_PRIOR_HANDOFF_BYTES:
+                print(f"warn: prior handoff {path} is over the {MAX_PRIOR_HANDOFF_BYTES}-byte cap; ignoring")
+                return None
+            data = yaml.safe_load(raw)
+            block = data.get("completion") if isinstance(data, dict) else None
+            if not isinstance(block, dict):
+                return None
+            projection = ic.CompletionProjection.from_dict(block)
+            if projection.run_id != run_id or projection.authoritative.step != ic.STEP_PRIMARY:
+                print("info: prior handoff is from another run or not the primary step; treating it as absent")
+                return None
+            return projection.authoritative
+    except Exception as exc:  # noqa: BLE001 — a bad handoff is an absent one
+        print(f"warn: could not use the prior handoff ({type(exc).__name__}: {exc}); treating it as absent")
+    return None
+
+
+def _completion_write_allowed(existing: Any, completion: ic.ImplementationCompletion) -> bool:
+    """Replay guard keyed on `(run_id, step, attempt_id)`.
+
+    Same key and same `completion_id`: a no-op (False: nothing to write).
+    Same key and a different `completion_id`: refused and logged, so a pod
+    restart or Argo retry inside one step can never flip a
+    `budget_exhausted` / `harness_failure` record into `complete`. Any other
+    key (or an unreadable block) may be written.
+    """
+    if not isinstance(existing, dict):
+        return True
+    try:
+        held = ic.CompletionProjection.from_dict(existing)
+    except ic.ImplementationCompletionError:
+        return True
+    if held.run_id != completion.attempt.run_id:
+        return True
+    for summary in held.summaries():
+        if summary.step == completion.attempt.step and summary.attempt_id == completion.attempt.attempt_id:
+            if summary.completion_id == completion.completion_id:
+                return False
+            print(
+                f"lifecycle: {completion.subject.service}/{completion.subject.slug}: refusing to replace "
+                f"completion {summary.completion_id} ({summary.outcome}) with {completion.completion_id} "
+                f"({completion.outcome}) for the same (run, step, attempt)"
+            )
+            return False
+    return True
+
+
+def _project_completion(ref: ProposalRef, completion: ic.ImplementationCompletion) -> bool:
+    """Write the bounded `completion:` projection into `.status.yaml`.
+
+    Returns True when a write landed. The status itself is re-written
+    unchanged: only the `completion:` key moves. Refused when `.status.yaml`
+    names a newer attempt (`_status_is_still_ours`'s invariant: a vacant
+    `attempt` block is fine, an attempt hand-back clears our own).
+    """
+    held = _status_attempt_id(ref)
+    if held is not None and held != completion.attempt.attempt_id:
+        print(
+            f"lifecycle: {ref.service}/{ref.slug}: not projecting completion — `.status.yaml` names attempt "
+            f"{held}, not this one ({completion.attempt.attempt_id}); leaving the current holder's status alone"
+        )
+        return False
+    status = _load_status(ref.status_path)
+    if not _completion_write_allowed(status.get("completion"), completion):
+        return False
+    if completion.attempt.step == ic.STEP_FALLBACK:
+        prior = _load_prior_handoff(PRIOR_STATE_DIR, ref, completion.attempt.run_id)
+        projection = ic.select_authoritative(prior, completion)
+    else:
+        projection = ic.project_primary(completion)
+    update_status_file(
+        ref.status_path,
+        str(status.get("status") or ref.status),
+        actor=str(status.get("updated_by") or "mctl-agents[bot]"),
+        completion=projection.to_dict(),
+    )
+    return True
+
+
+def _finish_attempt(
+    ref: ProposalRef,
+    result: ImplementResult | None,
+    obs: _AttemptObservations,
+    *,
+    project: bool,
+) -> ic.ImplementationCompletion | None:
+    """Seal, project and attach the completion. Never raises."""
+    try:
+        override = _claim_problem_at_emission(obs.claim_ctx)
+        completion = completion_from_result(ref, result, obs, override_code=override)
+        # A stale claim at emission, or a claim refusal, means this attempt does
+        # not own the entity: it reports through `--completion-out` only. A
+        # `fenced` attempt that still owns `.status.yaml` projects; the
+        # `_project_completion` compare-and-swap guards ownership.
+        if project and override is None and completion.stop_reason.code != "claim_refused":
+            _project_completion(ref, completion)
+        if result is not None:
+            result.completion = completion
+        return completion
+    except Exception as exc:  # noqa: BLE001 — emission must never change the attempt's outcome
+        print(f"warn: could not emit the implementation completion ({type(exc).__name__}: {exc})")
+        return None
+
+
+def _complete_attempt(
+    ref: ProposalRef,
+    obs: _AttemptObservations,
+    run: Callable[[], ImplementResult],
+    *,
+    project: bool,
+) -> ImplementResult:
+    """Run one attempt body and emit exactly one completion for it, however
+    it ends (a return, or an exception that escapes its own arms)."""
+    try:
+        obs.proposal_digest = proposal_content_digest(ref.proposal_dir)
+    except (OSError, ValueError) as exc:
+        print(f"warn: could not digest the proposal for the completion ({exc})")
+    try:
+        result = run()
+    except BaseException:
+        _finish_attempt(ref, None, obs, project=project)
+        raise
+    _finish_attempt(ref, result, obs, project=project)
+    return result
+
+
+def _write_completion_out(path: Path, completion: ic.ImplementationCompletion | None) -> None:
+    """Hand the full sealed record to the caller as JSON (`--completion-out`).
+
+    Best effort and bounded, mirroring `_write_refusal_out`: the exit code
+    stays the fallback signal, so an unwritable path is a warning."""
+    if completion is None:
+        return
+    try:
+        payload = completion.to_json()
+        if len(payload.encode("utf-8")) > MAX_COMPLETION_OUT_BYTES:
+            print(
+                f"warn: completion for {path} is over the {MAX_COMPLETION_OUT_BYTES}-byte cap; not written",
+                file=sys.stderr,
+            )
+            return
+        path.write_text(payload, encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — advisory write; see _write_refusal_out
+        print(f"warn: could not write completion to {path} ({type(e).__name__}: {e})", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def _implement_refs(
@@ -5038,6 +5642,19 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--completion-out",
+        default="",
+        metavar="PATH",
+        help=(
+            "Where to write the full sealed ImplementationCompletion record "
+            "(completion.mctl.ai/v1alpha1) as JSON when an attempt ran "
+            "(mctl-agents#428, ADR 021). Best effort and bounded; the exit "
+            "code and --refusal-out are unchanged and remain the signal "
+            "current consumers read. Nothing is written for an exit before "
+            "the attempt started (approval, preflight, auth)."
+        ),
+    )
+    ap.add_argument(
         "--adopted-pr",
         default="",
         metavar="URL",
@@ -5133,6 +5750,8 @@ def main() -> None:
                 )
                 sys.exit(1)
             result = review_feedback_one(refs[0], bundle, dry_run=args.dry_run)
+        if args.completion_out:
+            _write_completion_out(Path(args.completion_out), result.completion)
         print("\n=== Review-feedback summary ===")
         if result.error:
             print(f"  fail {result.ref.service}/{result.ref.slug}: {result.error}")
@@ -5197,6 +5816,11 @@ def main() -> None:
         max_proposals=args.max_proposals,
         dry_run=args.dry_run,
     )
+
+    if args.completion_out:
+        _write_completion_out(
+            Path(args.completion_out), next((r.completion for r in results if r.completion), None)
+        )
 
     print("\n=== Summary ===")
     for result in results:
