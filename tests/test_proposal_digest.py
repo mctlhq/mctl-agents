@@ -267,3 +267,14 @@ def test_an_unreadable_triplet_is_this_proposals_error_not_a_batch_abort(tmp_pat
     assert result.counts_toward_limit is False
     # A transient read failure leaves no durable marker behind.
     assert "blocked" not in yaml.safe_load(ref.status_path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("code", [BLOCKED_APPROVAL_DIGEST_MISMATCH, BLOCKED_APPROVAL_DIGEST_MISSING])
+def test_the_refusal_names_every_file_the_digest_covers(code: str) -> None:
+    # claude P2 on 450a6da: the message named three files after the digest
+    # grew to four, misdescribing a proposed-content.md-only drift.
+    message, remedy = run_implementer._approval_digest_message(code, TRIPLET_DIGEST, WITH_CONTENT_DIGEST)
+    for name in PROPOSAL_DIGEST_FILES:
+        assert name in remedy
+        if code == BLOCKED_APPROVAL_DIGEST_MISMATCH:
+            assert name in message

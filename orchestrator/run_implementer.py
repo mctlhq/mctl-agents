@@ -181,6 +181,7 @@ from orchestrator.proc import describe_output, run_capturing
 from orchestrator.proposal_state import (
     BLOCKED_APPROVAL_DIGEST_MISMATCH,
     BLOCKED_APPROVAL_MISSING,
+    PROPOSAL_DIGEST_FILES,
     approval_digest_problem,
     human_approval_satisfied,
     load_status,
@@ -3446,11 +3447,14 @@ def _issue_closing_line(ref: ProposalRef) -> str:
 
 def _approval_digest_message(code: str, recorded: str, current: str) -> tuple[str, str]:
     """Return ``(message, remedy)`` for a proposal whose approval does not
-    cover its current triplet. Both are stable for unchanged content, so
-    ``_mark_blocked`` writes the marker once, not once per tick."""
+    cover its current content. Both are stable for unchanged content, so
+    ``_mark_blocked`` writes the marker once, not once per tick. The file
+    list comes from PROPOSAL_DIGEST_FILES, so it cannot drift from what the
+    digest actually covers."""
+    files = " / ".join(PROPOSAL_DIGEST_FILES)
     if code == BLOCKED_APPROVAL_DIGEST_MISMATCH:
         message = (
-            "requirements.md / design.md / tasks.md changed after approval: "
+            f"approved content changed after approval ({files}): "
             f"approved {recorded}, now {current}; the implementer runs only "
             "the content a human approved"
         )
@@ -3461,7 +3465,7 @@ def _approval_digest_message(code: str, recorded: str, current: str) -> tuple[st
             "binds it to the content that was approved"
         )
     remedy = (
-        "restore the approved requirements.md / design.md / tasks.md, or "
+        f"restore the approved {files}, or "
         "re-publish the proposal in 'proposed' status so mctl-agents-approve "
         "records an approval of the current content. Never hand-edit "
         "approval.content_digest."
@@ -4137,9 +4141,9 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         )
 
     # An approval binds the content a human approved, not just the proposal's
-    # name (mctl-agents#658): a triplet edited after the flip, or a flip that
+    # name (mctl-agents#658): content edited after the flip, or a flip that
     # recorded no digest, is content nobody approved. Same durable refusal as
-    # the missing approval above. A triplet or status file that cannot be read
+    # the missing approval above. A proposal or status file that cannot be read
     # is this proposal's error, never a match, and never aborts the batch.
     try:
         digest_problem = approval_digest_problem(_load_status(ref.status_path), ref.proposal_dir)
