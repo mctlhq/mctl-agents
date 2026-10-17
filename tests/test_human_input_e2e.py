@@ -80,6 +80,7 @@ class _Loop:
             temporal_workflow_id=params.get("temporal_workflow_id"),
             temporal_run_id=params.get("temporal_run_id"),
             human_input_responses=params.get("human_input_responses"),
+            work_item_owner_principal_id=params.get("work_item_owner_principal_id"),
         ))
         assert result.error is None, result.error
         self.results.append(result)

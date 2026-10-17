@@ -6147,6 +6147,8 @@ def _sealed_request(
     ttl_seconds: int = 3600,
     round: int = 1,
     workflow_id: str = "dev-loop-mctlhq-mctl-telegram-1",
+    actor_refs: tuple[str, ...] = ("github:alice",),
+    audience: str = "work_item_owner",
 ) -> hi.HumanInputRequest:
     created_dt = created or _datetime.now(_UTC)
     return hi.seal_request(
@@ -6155,7 +6157,7 @@ def _sealed_request(
         question=question,
         reason="the issue is ambiguous",
         response=hi.ResponseSpec(type="free_text"),
-        requested_from=hi.RequestedFrom(audience="work_item_owner", actor_refs=("github:alice",)),
+        requested_from=hi.RequestedFrom(audience=audience, actor_refs=actor_refs),
         created_at=created_dt.isoformat(),
         expires_at=(created_dt + timedelta(seconds=ttl_seconds)).isoformat(),
         round=round,
@@ -6605,6 +6607,51 @@ class TestDevLoopHumanInput:
         second_round = _json.loads(continuations[1]["human_input_responses"])
         assert [a["request_id"] for a in first_round] == [first.request_id]
         assert [a["request_id"] for a in second_round] == [first.request_id, second.request_id]
+
+    async def _owner_principal_params(self, env, first_refs: tuple[str, ...]) -> list[dict]:
+        """Two answered rounds; round 1 names `first_refs`, round 2 (sealed
+        by a continuation) names the login only. Returns the continuations'
+        params."""
+        wf_id = f"dev-loop-test-{uuid.uuid4()}"
+        ttl = hi.MAX_REQUEST_TTL_SECONDS - 60
+        first = _sealed_request("Question one?", ttl_seconds=ttl, workflow_id=wf_id, actor_refs=first_refs)
+        second = _sealed_request("Question two?", ttl_seconds=ttl, workflow_id=wf_id, round=2)
+        params_log: list[dict] = []
+        activities, _calls, _investigate_ran, _ = _fake_activities(
+            released=True,
+            human_input_requests=[_request_json(first), _request_json(second), None],
+            investigate_params_log=params_log,
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=wf_id,
+                task_queue=TASK_QUEUE,
+            )
+            for request in (first, second):
+                await _wait_for_pending_request(handle, request.request_id)
+                await handle.signal(DevLoopWorkflow.human_input_response, _response_payload(request))
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await handle.result()
+        assert "work_item_owner_principal_id" not in params_log[0]
+        continuations = [p for p in params_log if "human_input_responses" in p]
+        assert len(continuations) == 2
+        return continuations
+
+    async def test_continuations_carry_the_owner_principal_round_one_named(self, env):
+        """mctl-agents#684: a continuation runs without the work item, so the
+        owner principal round 1 named reaches it as its own param, on every
+        later round too."""
+        prn = "prn_01JZED00000000000000000000"
+        continuations = await self._owner_principal_params(env, ("github:alice", f"principal:{prn}"))
+        assert [p.get("work_item_owner_principal_id") for p in continuations] == [prn, prn]
+
+    async def test_a_loop_whose_requests_name_no_principal_carries_none(self, env):
+        continuations = await self._owner_principal_params(env, ("github:alice",))
+        assert all("work_item_owner_principal_id" not in p for p in continuations)
 
     async def test_workflow_owned_resume_count_bounds_agent_written_rounds(self, env):
         """Every request claims round=1 (the producer bug the reviewer's P2
@@ -7947,3 +7994,31 @@ class TestMergeGateSettling:
             await running.wait()
         await wf._settle_gate(gate_task, SERVICE, SLUG, repo="r", number=1)
         assert gate_task.cancelled()
+
+
+class TestOwnerPrincipalOf:
+    """`_owner_principal_of` reads exactly the shape `_owner_actor_refs`
+    seals, and names nobody for anything else (mctl-agents#684)."""
+
+    PRN = "prn_01JZED00000000000000000000"
+
+    def test_the_sealed_owner_principal_is_read(self):
+        request = _sealed_request(actor_refs=("github:alice", f"principal:{self.PRN}"))
+        assert dev_loop._owner_principal_of(request) == self.PRN
+
+    @pytest.mark.parametrize(
+        ("audience", "refs"),
+        [
+            ("work_item_owner", ("github:alice",)),
+            ("repo_operators", ("github:alice", "principal:prn_01JZED00000000000000000000")),
+            (
+                "work_item_owner",
+                ("principal:prn_01JZED00000000000000000000", "principal:prn_01JQTHER000000000000000000"),
+            ),
+            ("work_item_owner", ("github:alice", "principal:prn_01jzed00000000000000000000")),
+            ("work_item_owner", ("github:alice", "principal:01JZED00000000000000000000")),
+            ("work_item_owner", ("github:alice", "principal:")),
+        ],
+    )
+    def test_anything_else_names_no_principal(self, audience, refs):
+        assert dev_loop._owner_principal_of(_sealed_request(actor_refs=refs, audience=audience)) == ""
