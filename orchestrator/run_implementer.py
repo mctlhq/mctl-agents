@@ -132,6 +132,7 @@ from typing import Any, cast
 from urllib.parse import quote
 
 import anyio
+import yaml
 from claude_agent_sdk import ClaudeSDKClient, ResultMessage
 
 from config.settings import (
@@ -4138,9 +4139,17 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     # An approval binds the content a human approved, not just the proposal's
     # name (mctl-agents#658): a triplet edited after the flip, or a flip that
     # recorded no digest, is content nobody approved. Same durable refusal as
-    # the missing approval above; an OSError reading the triplet propagates
-    # as an attempt error, never as a match.
-    digest_problem = approval_digest_problem(_load_status(ref.status_path), ref.proposal_dir)
+    # the missing approval above. A triplet or status file that cannot be read
+    # is this proposal's error, never a match, and never aborts the batch.
+    try:
+        digest_problem = approval_digest_problem(_load_status(ref.status_path), ref.proposal_dir)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=f"approval digest could not be checked: {exc}",
+            counts_toward_limit=False,
+        )
     if digest_problem is not None:
         digest_code, approved_digest, current_digest = digest_problem
         message, remedy = _approval_digest_message(digest_code, approved_digest, current_digest)

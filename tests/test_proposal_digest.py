@@ -227,3 +227,25 @@ def test_the_refusal_is_recorded_in_the_execution_evidence(tmp_path: Path) -> No
 
     run_implementer._note_implement_evidence(_Evidence(), result, success_reason="pr-opened")  # type: ignore[arg-type]
     assert recorded == [("refused", "blocked-approval-digest-mismatch")]
+
+
+def test_an_unreadable_triplet_is_this_proposals_error_not_a_batch_abort(tmp_path: Path, monkeypatch) -> None:
+    # claude P2 on #675: an OSError raised out of implement_one escapes
+    # _implement_refs' try/finally and stops every other proposal in the run.
+    ref = _proposal(tmp_path, _approved())
+    real = Path.read_bytes
+
+    def failing(self: Path) -> bytes:
+        if self.name == "tasks.md":
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", failing)
+    result = run_implementer.implement_one(ref, dry_run=False)
+
+    assert result.error is not None and "approval digest could not be checked" in result.error
+    assert result.blocked is None
+    assert result.pr_url is None
+    assert result.counts_toward_limit is False
+    # A transient read failure leaves no durable marker behind.
+    assert "blocked" not in yaml.safe_load(ref.status_path.read_text(encoding="utf-8"))
