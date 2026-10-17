@@ -124,6 +124,9 @@ def _apply_one(cap: str, canonical: str | None, delta: Delta, mode: str, change:
         raise ApplyAbort(f"{cap}: target spec is structurally invalid: {'; '.join(issues)}")
 
     spec = parse_spec(canonical)
+    names = [r.name for r in spec.requirements]
+    if dup := next((n for i, n in enumerate(names) if n in names[:i]), None):
+        raise ApplyAbort(f"{cap}: target spec repeats requirement {dup!r}: {PROFILE['duplicate-guard']}")
     blocks: dict[str, Requirement] = {r.name: r for r in spec.requirements}
     order = [r.name for r in spec.requirements]
 

@@ -343,7 +343,18 @@ def test_profile_lf_output_a_crlf_spec_is_rebuilt_with_lf():
     assert "\r" not in res.specs["billing"]
 
 
+def test_profile_duplicate_guard_a_spaceless_duplicate_is_refused():
+    dup = BASE.replace(
+        "## Requirements\n",
+        "## Requirements\n\n###Requirement: Late Fees\nThe system SHALL x.\n\n#### Scenario: d\n- ok\n\n",
+        1,
+    )
+    with pytest.raises(ApplyAbort, match="repeats requirement 'Late Fees'"):
+        apply("## ADDED Requirements\n\n" + req("A"), canonical=dup)
+
+
 def test_every_profile_rule_has_a_test():
     # sync-mode is exercised by tests/fixtures/sdd/delta-rows/sync-divergence-sync-mode.
-    tested = {"no-retirement", "validator-subset", "purpose-level", "lf-output", "sync-mode"}
-    assert set(PROFILE) == tested
+    named = {k[len("test_profile_") :] for k in globals() if k.startswith("test_profile_")}
+    tested = {slug for slug in PROFILE if any(n.startswith(slug.replace("-", "_") + "_") for n in named)}
+    assert set(PROFILE) - tested == {"sync-mode"}

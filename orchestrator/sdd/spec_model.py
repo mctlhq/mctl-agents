@@ -29,6 +29,11 @@ PROFILE: dict[str, str] = {
         "apply_change(mode='sync') mirrors upstream's agent workflow template "
         "(ADDED on an existing requirement acts as MODIFIED), not any CLI command"
     ),
+    "duplicate-guard": (
+        "a main spec whose requirements repeat a name is refused; upstream's "
+        "structure check misses a spaceless '###Requirement:' duplicate and the "
+        "rebuild then emits one block twice and drops the other"
+    ),
 }
 
 # RB = src/core/parsers/requirement-blocks.ts, RT = requirement-text.ts,
@@ -232,6 +237,7 @@ def has_requirements_section(text: str) -> bool:
 
 
 def _collapse_blank_runs(text: str) -> str:
+    """SA:collapseBlankRunsOutsideFences (L989), applied by buildUpdatedSpec (L650)."""
     lines = text.split("\n")
     mask = fence_mask(lines)
     kept: list[str] = []
