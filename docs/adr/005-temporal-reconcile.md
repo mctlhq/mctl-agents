@@ -150,6 +150,20 @@ A proposal is an **orphan** when ALL hold:
   `dev-loop-{owner}-{repo}-{slug}` (or service/slug key) is currently running
   in namespace `mctl-agents`.
 
+#### Never-started signal
+
+Reported separately (`OrphanDetectionResult.never_started`, log prefix
+`NEVER_STARTED`) and report-only. A proposal is "never started" when its
+status is `accepted` or `in-progress`, it has no `pr:`, no unexpired
+`attempt.expires_at`, is not `unrunnable`/`blocked`, carries an explicit
+execution authorization, has no live `dev-loop-*` workflow, and its age
+(from `approval.approved_at`, else `updated_at`) is at least
+`NEVER_STARTED_THRESHOLD_MINUTES` (default 45: the implement-sweep's 20-minute
+grace plus its 15-minute interval, plus margin). Unauthorized legacy records
+are only counted (`never_started_unauthorized`). It is skipped when the active
+workflow set is unknown. `ImplementSweepWorkflow` (#412) does the recovery;
+this signal makes a regressed or paused sweep visible.
+
 ### Gitops commit
 
 Gitops commits for `.status.yaml` updates remain delegated to the existing Argo CWFT

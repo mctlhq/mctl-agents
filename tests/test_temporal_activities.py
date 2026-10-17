@@ -2163,6 +2163,106 @@ class TestReconcileReadsGitHub:
         adopted = await env.run(detect_orphans, "", ["dev-loop-mctlhq-mctl-web-66"])
         assert adopted.orphans == []
 
+    # mctl-agents#413: the never-started signal on the GitHub path.
+    NS_AUTHORIZED_OLD = (
+        "status: accepted\n"
+        "approval:\n  approved_by: mashkovd\n  approved_at: '2026-10-01T10:00:00Z'\n"
+    )
+    NS_LEGACY = "status: accepted\n"
+
+    def _never_started_tree(self, monkeypatch):
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [
+                    ("mctl-web/proposals/issue-66-turnstile/.status.yaml", "sha-orphan"),
+                    ("mctl-agents/proposals/issue-5-never-started/.status.yaml", "sha-ns"),
+                    ("mctl-agents/proposals/issue-6-legacy/.status.yaml", "sha-legacy"),
+                ]
+            ),
+            blobs={
+                "sha-orphan": (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-web/pull/76\n"
+                ),
+                "sha-ns": self.NS_AUTHORIZED_OLD,
+                "sha-legacy": self.NS_LEGACY,
+            },
+            pulls={"mctlhq/mctl-web/pulls/76": {"merged": False, "state": "open"}},
+        )
+
+    async def test_never_started_is_reported_beside_the_orphan(self, env, monkeypatch, caplog):
+        """T7: both signals come back, in separate fields, with distinct
+        reasons; the PR orphan is reported exactly as before."""
+        import logging
+
+        from orchestrator.temporal.activities.orphans import (
+            NEVER_STARTED_REASON,
+            detect_orphans,
+        )
+
+        self._clear_cache()
+        self._never_started_tree(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            result = await env.run(detect_orphans, "", [])
+
+        assert [o.slug for o in result.orphans] == ["issue-66-turnstile"]
+        assert [s.slug for s in result.never_started] == ["issue-5-never-started"]
+        assert result.never_started[0].reason == NEVER_STARTED_REASON
+        assert result.orphans[0].reason != NEVER_STARTED_REASON
+        assert result.never_started_unauthorized == 1
+        # Task 6: one WARNING per signal, one INFO summary with the counts.
+        warnings = [r for r in caplog.records if r.getMessage().startswith("NEVER_STARTED ")]
+        assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+        assert "slug=issue-5-never-started" in warnings[0].getMessage()
+        summary = [r for r in caplog.records if r.getMessage().startswith("detect_orphans:")]
+        assert len(summary) == 1
+        assert "never_started=1 never_started_unauthorized=1" in summary[0].getMessage()
+
+    async def test_never_started_needs_a_known_active_set(self, env, monkeypatch):
+        """T8: None is "visibility unknown", [] is "nothing running"."""
+        from orchestrator.temporal.activities.orphans import detect_orphans
+
+        self._clear_cache()
+        self._never_started_tree(monkeypatch)
+        unknown = await env.run(detect_orphans, "", None)
+        assert unknown.never_started == []
+        assert unknown.never_started_unauthorized == 0
+
+        self._clear_cache()
+        live = await env.run(detect_orphans, "", ["dev-loop-mctlhq-mctl-agents-5"])
+        assert live.never_started == []
+
+    async def test_local_and_github_paths_agree(self, env, monkeypatch, tmp_path):
+        """T9: the same proposals give the same never-started answer on both
+        paths, because both parse the file with _parse_status_yaml."""
+        from orchestrator.temporal.activities import orphans
+
+        self._clear_cache()
+        self._never_started_tree(monkeypatch)
+        remote = await env.run(orphans.detect_orphans, "", [])
+
+        for service, slug, body in [
+            ("mctl-agents", "issue-5-never-started", self.NS_AUTHORIZED_OLD),
+            ("mctl-agents", "issue-6-legacy", self.NS_LEGACY),
+        ]:
+            d = tmp_path / service / "proposals" / slug
+            d.mkdir(parents=True)
+            (d / ".status.yaml").write_text(body)
+        monkeypatch.setattr(orphans, "find_pr_for_proposal", lambda *a, **k: None)
+        local = await env.run(orphans.detect_orphans, str(tmp_path), [])
+
+        def key(r):
+            return [(s.service, s.slug, s.status, s.approved_at) for s in r.never_started]
+
+        assert key(local) == key(remote) != []
+        assert local.never_started_unauthorized == remote.never_started_unauthorized == 1
+
+        # T8 on the local path, through the activity itself: detect_orphans
+        # must hand None (not an empty set) down to _sync_detect_orphans.
+        unknown = await env.run(orphans.detect_orphans, str(tmp_path), None)
+        assert unknown.never_started == []
+
     async def test_a_named_state_dir_that_is_missing_raises(self, env, tmp_path):
         """The old default silently swallowed exactly this."""
         from orchestrator.temporal.activities.orphans import detect_orphans

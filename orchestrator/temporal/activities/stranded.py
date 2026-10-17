@@ -41,7 +41,11 @@ from datetime import UTC, datetime, timedelta
 
 from temporalio import activity
 
-from orchestrator.temporal.activities.gitops_state import ProposalStateRef, list_proposal_refs
+from orchestrator.temporal.activities.gitops_state import (
+    ProposalStateRef,
+    list_proposal_refs,
+    parse_iso,
+)
 from orchestrator.temporal.activities.orphans import expected_dev_loop_id
 
 # The sweep submits execution on records nobody is watching, so it fails
@@ -85,25 +89,7 @@ class StrandedScanResult:
     unauthorized: list[tuple[str, str]] = field(default_factory=list)
 
 
-def _parse_iso(value: str | None) -> datetime | None:
-    """Best-effort ISO-8601 parse, `Z`-suffixed or not; None on anything else.
-
-    Mirrors run_shepherd._attempt_is_fresh's own parse: an unparseable
-    timestamp is treated as absent rather than raised, so one hand-edited
-    `.status.yaml` cannot take the whole scan down.
-    """
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-    # A naive result (no offset in `value`) would raise on comparison
-    # against the aware `now` both call sites use — assume UTC rather than
-    # let one offset-less `.status.yaml` timestamp take the scan down.
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed
+_parse_iso = parse_iso
 
 
 def _scan(
