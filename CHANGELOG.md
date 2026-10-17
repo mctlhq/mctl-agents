@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.80.0](https://github.com/mctlhq/mctl-agents/compare/1.79.0...1.80.0) (2026-10-17)
+
+
+### Features
+
+* **agents:** issue-413-detect-orphans-cannot-see-a-proposal-who ([7f08e4c](https://github.com/mctlhq/mctl-agents/commit/7f08e4cee61229fae14a28aa8bada70a08025985))
+* **agents:** issue-413-detect-orphans-cannot-see-a-proposal-who ([7730b41](https://github.com/mctlhq/mctl-agents/commit/7730b41746370a17584a08dfc2c4aa388130fdf3))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-413-detect-orphans-cannot-see-a-proposal-who ([757eb7f](https://github.com/mctlhq/mctl-agents/commit/757eb7f645f6a8d9597094c3812988f74ae8eb22))
+* **agents:** address P1/P2 codex findings on issue-413-detect-orphans-cannot-see-a-proposal-who ([1ae65c5](https://github.com/mctlhq/mctl-agents/commit/1ae65c5f0068ffad98e6722ac4328ba85693fcdd))
+* **agents:** address P1/P2 codex findings on issue-413-detect-orphans-cannot-see-a-proposal-who ([819d9de](https://github.com/mctlhq/mctl-agents/commit/819d9de3b002dae87a1c55edc2803bfcb889cc00))
+
 ## [1.79.0](https://github.com/mctlhq/mctl-agents/compare/1.78.0...1.79.0) (2026-10-17)
 
 
