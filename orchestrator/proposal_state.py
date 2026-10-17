@@ -10,6 +10,7 @@ import hashlib
 import os
 import secrets
 import stat
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -173,15 +174,25 @@ def proposal_content_digest(proposal_dir: Path) -> str:
     A read failure on a file that exists raises: content that could not be
     read has no digest, and must never be hashed as if it were absent.
     """
+    return content_digest_of(
+        {name: (proposal_dir / name).read_bytes() if (proposal_dir / name).is_file() else None
+         for name in PROPOSAL_DIGEST_FILES}
+    )
+
+
+def content_digest_of(files: Mapping[str, bytes | None]) -> str:
+    """The digest of `PROPOSAL_DIGEST_FILES` given each one's bytes, or None
+    for a file that is not there. Shared by the local read above and the
+    DevLoop worker, which reads the same files from GitHub (mctl-agents#681).
+    A name missing from `files` is a caller bug, not an absent file."""
     digest = hashlib.sha256()
     for name in PROPOSAL_DIGEST_FILES:
-        path = proposal_dir / name
-        if path.is_file():
-            content = path.read_bytes()
+        content = files[name]
+        if content is None:
+            digest.update(f"{name}\n-\n".encode())
+        else:
             digest.update(f"{name}\n{len(content)}\n".encode())
             digest.update(content)
-        else:
-            digest.update(f"{name}\n-\n".encode())
     return PROPOSAL_DIGEST_PREFIX + digest.hexdigest()
 
 

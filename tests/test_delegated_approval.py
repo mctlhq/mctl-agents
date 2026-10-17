@@ -21,6 +21,7 @@ from temporalio.testing import ActivityEnvironment
 
 from orchestrator import action_approvals as aa
 from orchestrator.temporal.activities import delegated_approval as da
+from orchestrator.temporal.activities.proposals import ProposalListingError
 from tests.test_action_approvals import FakeMctlApi, _Clock
 
 pytestmark = pytest.mark.anyio
@@ -318,9 +319,21 @@ def aar_api(monkeypatch: pytest.MonkeyPatch) -> FakeMctlApi:
         return client
 
     monkeypatch.setattr(da.aa, "ActionApprovalClient", factory)
+    content = {"digest": DIGEST_A}
+
+    async def read_digest(service: str, slug: str) -> tuple[str, str]:
+        if isinstance(content["digest"], Exception):
+            raise content["digest"]
+        return content["digest"], COMMIT
+
+    monkeypatch.setattr(da, "read_proposal_content_digest", read_digest)
+    fake.content = content  # type: ignore[attr-defined]
     return fake
 
 
+DIGEST_A = "sha256:" + "a" * 64
+DIGEST_B = "sha256:" + "b" * 64
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
 REQUEST = da.ApprovalRequestInput(execution_id=WE, service="mctl-telegram", slug="issue-7-title", ttl_seconds=3600)
 
 
@@ -333,7 +346,37 @@ async def test_the_grant_is_bound_to_the_exact_we_and_the_flips_target(env, aar_
     assert record["action_kind"] == "mctl-agents-approve"
     assert record["target"] == "mctl-telegram/issue-7-title"
     assert record["policy_rule_id"] == "dev-loop.human-approval" and record["policy_version"] == "v1"
-    assert record["args_digest"] == da.approval_intent(WE, "mctl-telegram", "issue-7-title").args_digest
+    assert record["args_digest"] == da.approval_intent(WE, "mctl-telegram", "issue-7-title", DIGEST_A).args_digest
+
+
+async def test_the_grant_binds_the_proposal_content_the_human_is_asked_about(env, aar_api):
+    """mctl-agents#681: the content digest is the intent's artifact_hash, so
+    it is inside the intent hash mctl-api stores and the human decides."""
+    result = await env.run(da.request_devloop_approval, REQUEST)
+
+    record = aar_api.only()
+    assert record["artifact_hash"] == DIGEST_A
+    assert record["intent_hash"] == aa.intent_hash(da.approval_intent(WE, "mctl-telegram", "issue-7-title", DIGEST_A))
+    assert result.content_digest == DIGEST_A and result.content_commit == COMMIT
+
+
+async def test_changed_content_is_another_grant_not_the_approved_one(env, aar_api):
+    first = await env.run(da.request_devloop_approval, REQUEST)
+    aar_api.content["digest"] = DIGEST_B
+
+    second = await env.run(da.request_devloop_approval, REQUEST)
+
+    assert second.approval_ref != first.approval_ref
+    assert aar_api.records[second.approval_ref]["artifact_hash"] == DIGEST_B
+
+
+async def test_unreadable_content_is_raised_and_no_grant_is_asked_for(env, aar_api):
+    aar_api.content["digest"] = ProposalListingError("HTTP 500")
+
+    with pytest.raises(ApplicationError) as caught:
+        await env.run(da.request_devloop_approval, REQUEST)
+
+    assert caught.value.type == da.UNAVAILABLE_TYPE and aar_api.records == {}
 
 
 async def test_asking_twice_finds_the_same_grant(env, aar_api):

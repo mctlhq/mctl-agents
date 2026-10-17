@@ -52,6 +52,7 @@ from orchestrator.temporal.activities.argo import (
     TERMINAL_PHASES,
     WorkflowResult,
 )
+from orchestrator.temporal.activities.proposals import ProposalListingError, read_proposal_content_digest
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
 
 APPROVE_OPERATION = "mctl-agents-approve"
@@ -98,16 +99,26 @@ class ApprovalRequestResult:
     approval_ref: str = ""
     state: str = ""
     reason: str = ""
+    #: The proposal content digest the request binds, and the gitops commit
+    #: it was read at (mctl-agents#681). For the record only: mctl-api holds
+    #: the bound value and hands it to the approve CWFT itself.
+    content_digest: str = ""
+    content_commit: str = ""
 
 
 def approval_target(service: str, slug: str) -> str:
     return f"{service}/{slug}"
 
 
-def approval_intent(execution_id: str, service: str, slug: str) -> aa.ActionIntent:
+def approval_intent(execution_id: str, service: str, slug: str, content_digest: str) -> aa.ActionIntent:
     """The intent the human decides: this execution, this operation, this
-    `<service>/<slug>`, under the DevLoop approval policy. The digest covers
-    exactly the operation parameters, which carry no identity."""
+    `<service>/<slug>`, under the DevLoop approval policy. The args digest
+    covers exactly the operation parameters, which carry no identity.
+
+    `artifact_hash` is the proposal content digest (mctl-agents#681), so the
+    human decides these bytes, not whatever the slug holds at flip time.
+    mctl-api treats it as opaque: it is in the intent hash, and the approve
+    CWFT refuses to flip content that no longer hashes to it."""
     params = json.dumps({"service": service, "slug": slug}, sort_keys=True, separators=(",", ":"))
     return aa.ActionIntent(
         execution_id=execution_id,
@@ -116,6 +127,7 @@ def approval_intent(execution_id: str, service: str, slug: str) -> aa.ActionInte
         args_digest="sha256:" + hashlib.sha256(params.encode()).hexdigest(),
         policy_rule_id=POLICY_RULE_ID,
         policy_version=POLICY_VERSION,
+        artifact_hash=content_digest,
     )
 
 
@@ -126,8 +138,19 @@ async def request_devloop_approval(input: ApprovalRequestInput) -> ApprovalReque
     Deterministic idempotency (`aa.idempotency_key`, keyed on
     `input.attempt`): a Temporal retry or a replayed workflow task of the SAME
     attempt finds the request instead of opening a second one, while a new
-    attempt (bumped on every surface/actor transition) asks a new decision."""
-    intent = approval_intent(input.execution_id, input.service, input.slug)
+    attempt (bumped on every surface/actor transition) asks a new decision.
+
+    The proposal content is read here, from gitops main at one commit, and
+    bound as the intent's `artifact_hash`. Content that cannot be read is
+    raised for a bounded retry, never asked for without a digest."""
+    try:
+        digest, commit = await read_proposal_content_digest(input.service, input.slug)
+    except ProposalListingError as exc:
+        raise ApplicationError(
+            f"proposal content of {approval_target(input.service, input.slug)} could not be read: {exc}",
+            type=UNAVAILABLE_TYPE,
+        ) from exc
+    intent = approval_intent(input.execution_id, input.service, input.slug, digest)
     ttl = min(max(input.ttl_seconds, aa.MIN_TTL_S), aa.MAX_TTL_S)
     answer = await asyncio.to_thread(
         aa.ActionApprovalClient().create,
@@ -149,7 +172,9 @@ async def request_devloop_approval(input: ApprovalRequestInput) -> ApprovalReque
             ok=False, approval_ref=answer.record.id, state=aa.MISMATCH,
             reason=f"approval {answer.record.id} is not bound to this intent",
         )
-    return ApprovalRequestResult(ok=True, approval_ref=answer.record.id, state=answer.status)
+    return ApprovalRequestResult(
+        ok=True, approval_ref=answer.record.id, state=answer.status, content_digest=digest, content_commit=commit
+    )
 
 
 @dataclass(frozen=True)
