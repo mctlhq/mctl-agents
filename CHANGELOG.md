@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.82.0](https://github.com/mctlhq/mctl-agents/compare/1.81.0...1.82.0) (2026-10-17)
+
+
+### Features
+
+* **approval:** refuse to implement content nobody approved ([230a31e](https://github.com/mctlhq/mctl-agents/commit/230a31e129f523adb87bdac9c368087138af2f37))
+
 ## [1.81.0](https://github.com/mctlhq/mctl-agents/compare/1.80.0...1.81.0) (2026-10-17)
 
 
