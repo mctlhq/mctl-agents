@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.83.0](https://github.com/mctlhq/mctl-agents/compare/1.82.0...1.83.0) (2026-10-17)
+
+
+### Features
+
+* **sdd:** port the OpenSpec f80d860 grammar and archive rules ([ec012ce](https://github.com/mctlhq/mctl-agents/commit/ec012cebecc33ccb08cffe7f3fc1746c7c02bd2d))
+
+
+### Bug Fixes
+
+* **human-input:** carry the owner principal into continuations ([30aaee9](https://github.com/mctlhq/mctl-agents/commit/30aaee955c1f8cb6e83ef916f64d8915391aed94))
+* **human-input:** carry the owner principal into continuations ([46b0e41](https://github.com/mctlhq/mctl-agents/commit/46b0e41ce4121943e8d7c3bb00833d7e8f75bd35)), closes [#684](https://github.com/mctlhq/mctl-agents/issues/684)
+
 ## [1.82.0](https://github.com/mctlhq/mctl-agents/compare/1.81.0...1.82.0) (2026-10-17)
 
 
