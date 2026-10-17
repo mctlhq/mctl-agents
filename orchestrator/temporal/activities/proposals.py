@@ -43,6 +43,7 @@ from orchestrator.proposal_identity import (
     ProposalCandidate,
     select_proposal_slug,
 )
+from orchestrator.proposal_state import PROPOSAL_DIGEST_FILES, content_digest_of
 
 GITOPS_REPO = "mctlhq/mctl-gitops"
 AGENTS_STATE_PREFIX = "platform-gitops/agents-state"
@@ -283,3 +284,66 @@ async def _read_proposal_status(
         return None
     status = data.get("status")
     return status if isinstance(status, str) else None
+
+
+async def read_proposal_content_digest(service: str, slug: str) -> tuple[str, str]:
+    """``(content_digest, commit)``: the ``approval.content_digest`` of a
+    proposal as it stands at one gitops main commit (mctl-agents#681).
+
+    The DevLoop binds this digest into the approval request before the human
+    is asked, so the human decides these bytes and the approve CWFT refuses
+    others. Every file is read at the same resolved commit, never at a
+    moving ``main``, so the four reads cannot straddle a push.
+
+    Only GitHub's 404 for a path at that commit means "not there". Any other
+    answer -- a transport error, another status, a directory or symlink
+    where a file belongs, content the API does not inline (over 1 MB), bad
+    base64 -- raises ``ProposalListingError``: content that could not be read
+    has no digest, and must never be hashed as if it were absent.
+    """
+    token = await asyncio.to_thread(_resolve_token)
+    if not token:
+        raise ProposalListingError(
+            "no GitHub token available (GITHUB_TOKEN_FILE unreadable and "
+            "GITHUB_TOKEN unset); refusing an unauthenticated read"
+        )
+    headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"}
+    base = f"https://api.github.com/repos/{GITOPS_REPO}"
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            head = await client.get(f"{base}/commits/main", headers=headers)
+        except httpx.RequestError as exc:
+            raise ProposalListingError(f"resolving {GITOPS_REPO} main failed: {exc}") from exc
+        try:
+            body = head.json() if head.status_code == 200 else None
+        except ValueError:
+            body = None
+        sha = body.get("sha") if isinstance(body, dict) else None
+        if not isinstance(sha, str) or len(sha) != 40:
+            raise ProposalListingError(f"resolving {GITOPS_REPO} main returned HTTP {head.status_code}")
+        files: dict[str, bytes | None] = {}
+        for name in PROPOSAL_DIGEST_FILES:
+            path = f"{AGENTS_STATE_PREFIX}/{service}/proposals/{slug}/{name}"
+            files[name] = await _read_file_at(client, headers, f"{base}/contents/{path}", sha)
+    return content_digest_of(files), sha
+
+
+async def _read_file_at(client: httpx.AsyncClient, headers: dict[str, str], url: str, sha: str) -> bytes | None:
+    try:
+        response = await client.get(url, params={"ref": sha}, headers=headers)
+    except httpx.RequestError as exc:
+        raise ProposalListingError(f"reading {url} failed: {exc}") from exc
+    if response.status_code == 404:
+        return None
+    if response.status_code != 200:
+        raise ProposalListingError(f"reading {url} returned HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ProposalListingError(f"reading {url}: malformed response") from exc
+    if not isinstance(payload, dict) or payload.get("type") != "file" or payload.get("encoding") != "base64":
+        raise ProposalListingError(f"reading {url}: not an inlined regular file")
+    try:
+        return base64.b64decode(payload.get("content", ""), validate=False)
+    except (binascii.Error, ValueError) as exc:
+        raise ProposalListingError(f"reading {url}: undecodable content") from exc
