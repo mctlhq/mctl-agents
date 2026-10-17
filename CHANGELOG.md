@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.78.0](https://github.com/mctlhq/mctl-agents/compare/1.77.1...1.78.0) (2026-10-17)
+
+
+### Features
+
+* **agents:** issue-663-feat-models-migrate-cheap-profile-from-c ([c3ac92c](https://github.com/mctlhq/mctl-agents/commit/c3ac92cd6fded8a0a0d773efd6b75f6a75b31dc7))
+* **agents:** issue-663-feat-models-migrate-cheap-profile-from-c ([e2681da](https://github.com/mctlhq/mctl-agents/commit/e2681dade5edbf1ccf375e9f25e13ebafd3e21d9))
+* **tools:** add cheap-profile eval mode and Haiku 5.5 benchmark ([5c026c1](https://github.com/mctlhq/mctl-agents/commit/5c026c123084bfe176db4674da4206839b2b672f))
+
 ## [1.77.1](https://github.com/mctlhq/mctl-agents/compare/1.77.0...1.77.1) (2026-10-16)
 
 
