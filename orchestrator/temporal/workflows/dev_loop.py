@@ -1056,6 +1056,13 @@ class WorkContextState:
     resume_rejections: tuple[ResumeRejection, ...] = ()
 
 
+#: How `DevLoopResult.ended` starts on every path where an operator abandoned
+#: the run. A restart keys on it: `start.restart_if_abandoned` here and
+#: mctl-api's `restartIfAbandoned` (temporalclient.AbandonedEndedPrefix),
+#: which must stay byte-for-byte identical (mctl-api#640).
+ABANDONED_ENDED_PREFIX = "abandoned: "
+
+
 @dataclass(frozen=True)
 class DevLoopResult:
     investigate: WorkflowResult
@@ -2159,7 +2166,7 @@ class DevLoopWorkflow:
                 implement=None,
                 approve=approve,
                 human_input=human_input,
-                ended=f"abandoned: {self._abandon_reason}",
+                ended=f"{ABANDONED_ENDED_PREFIX}{self._abandon_reason}",
             )
         return None
 
@@ -2201,7 +2208,7 @@ class DevLoopWorkflow:
 
         while True:
             if self._abandoned:
-                return ended(f"abandoned: {self._abandon_reason}")
+                return ended(f"{ABANDONED_ENDED_PREFIX}{self._abandon_reason}")
             remaining = deadline - workflow.now()
             if remaining <= timedelta(0) and not self._is_approved(needs_grant=True):
                 return ended("re-approval wait expired")
@@ -2215,7 +2222,7 @@ class DevLoopWorkflow:
                     except TimeoutError:
                         pass
                     if self._abandoned:
-                        return ended(f"abandoned: {self._abandon_reason}")
+                        return ended(f"{ABANDONED_ENDED_PREFIX}{self._abandon_reason}")
                     if not opened():
                         return ended("re-approval wait expired")
                 self._grant_refresh = False
@@ -3398,7 +3405,7 @@ class DevLoopWorkflow:
                     return DevLoopResult(
                         investigate=investigate_result, implement=None,
                         human_input=human_input_outcome,
-                        ended=f"abandoned: {self._abandon_reason}",
+                        ended=f"{ABANDONED_ENDED_PREFIX}{self._abandon_reason}",
                     )
                 if hi_outcome.outcome == "timed_out":
                     return DevLoopResult(
@@ -3541,7 +3548,7 @@ class DevLoopWorkflow:
                 investigate=investigate_result,
                 implement=None,
                 human_input=human_input_outcome,
-                ended=f"abandoned: {self._abandon_reason}",
+                ended=f"{ABANDONED_ENDED_PREFIX}{self._abandon_reason}",
             )
 
         # mctl-agents#410: the issue that started this loop can close between
@@ -3788,7 +3795,7 @@ class DevLoopWorkflow:
                 implement=implement_result,
                 approve=approve_result,
                 human_input=human_input_outcome,
-                ended=f"abandoned: {self._abandon_reason}",
+                ended=f"{ABANDONED_ENDED_PREFIX}{self._abandon_reason}",
             )
 
         # Stage 6.1 merge detection (ADR-006, #214): watch the implement PR
@@ -4101,7 +4108,7 @@ class DevLoopWorkflow:
             # check ever runs -- but if a future change made them race, an
             # operator's explicit abandon should still be what the result
             # reports.
-            ended=(f"abandoned: {self._abandon_reason}" if self._abandoned else outcome.ended),
+            ended=(f"{ABANDONED_ENDED_PREFIX}{self._abandon_reason}" if self._abandoned else outcome.ended),
         )
 
     def _launch_correlation(self) -> dict[str, str]:

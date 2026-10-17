@@ -12,8 +12,10 @@ import argparse
 import asyncio
 import sys
 
+from temporalio.exceptions import WorkflowAlreadyStartedError
+
 from orchestrator.temporal.issue_ref import parse_issue_url
-from orchestrator.temporal.start import connect, start_dev_loop_workflow
+from orchestrator.temporal.start import connect, restart_if_abandoned, start_dev_loop_workflow
 from orchestrator.temporal.workflows.dev_loop import DevLoopResult, DevLoopWorkflow
 
 
@@ -23,7 +25,23 @@ async def start(issue_url: str) -> None:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
-    handle = await start_dev_loop_workflow(issue_url)
+    client = await connect()
+    try:
+        handle = await start_dev_loop_workflow(issue_url, client=client)
+    except WorkflowAlreadyStartedError as exc:
+        # The latest run COMPLETED. Only one abandoned before implement is
+        # restarted (mctl-api#640); any other completed run means the issue
+        # was handled.
+        restarted = await restart_if_abandoned(issue_url, client)
+        if restarted is None:
+            print(
+                f"not started: {exc.workflow_id} already completed and was not abandoned before "
+                f"implement (see `status {exc.workflow_id}`)",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from exc
+        print(f"restarted {restarted.id} after an abandoned run (run_id={restarted.result_run_id})")
+        return
     print(f"started {handle.id} (run_id={handle.result_run_id})")
 
 
