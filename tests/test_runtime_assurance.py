@@ -501,6 +501,7 @@ def test_held_cannot_rest_on_a_non_observed_observation(run, result, shadow, sta
         **{
             **_result_kwargs(result),
             "run_id": weak_run.run_id,
+            "evidence_ids": ("ev-0123456789abcdef",),
             "invariant_verdicts": (
                 result.invariant_verdicts[0],
                 ra.InvariantVerdict("policy-gate-hit", "unknown", ("obs-2",)),
@@ -789,3 +790,56 @@ def test_deep_copy_and_unknown_fixture_isolation():
     clone = copy.deepcopy(doc)
     ra.AssuranceRun.from_dict(doc)
     assert doc == clone
+
+
+# Review follow-ups -----------------------------------------------------------
+def test_read_only_scenario_refuses_mutating_mcp_tools():
+    kwargs = _scenario_kwargs()
+    kwargs["mutation_mode"] = "none"
+    kwargs["permitted_action_kinds"] = ("mcp.tool.call",)
+    for tool in ("resolve_incident", "mctl_acknowledge_incident", "mctl_deploy_service", "unknown_tool"):
+        with pytest.raises(ra.RuntimeAssuranceError, match="read-only"):
+            ra.seal_scenario(**{**kwargs, "permitted_tools": ("mctl_get_service_config", tool)})
+    ok = ra.seal_scenario(**{**kwargs, "permitted_tools": ("mctl_get_service_config", "whoami", "list_apps")})
+    assert ok.permitted_tools
+
+
+def test_result_evidence_must_come_from_run_observations(run, result, shadow):
+    ra.check_result_against_run(result, run, shadow)
+    bad = ra.seal_result(**{**_result_kwargs(result), "evidence_ids": (*result.evidence_ids, "ev-ffffffffffffffff")})
+    with pytest.raises(ra.RuntimeAssuranceError, match="evidence"):
+        ra.check_result_against_run(bad, run, shadow)
+
+
+def test_check_finding_confirmation_matches_transition():
+    cand = parse("finding-candidate.json")
+    replay, rres = _replay_kwargs()
+    assert ra.check_finding_confirmation(cand, replay, rres) in ("observed", "derived")
+    with pytest.raises(ra.RuntimeAssuranceError):
+        ra.check_finding_confirmation(cand, None, None)
+
+
+def test_check_finding_against_result(result, shadow):
+    cand = parse("finding-candidate.json")
+    ra.check_finding_against_result(cand, result, shadow)
+    k = {
+        f.name: getattr(cand, f.name) for f in dataclasses.fields(cand) if f.name not in ("finding_id", "content_hash")
+    }
+    for change in (
+        {"invariant_id": "not-an-invariant"},
+        {"origin_result_id": "ars-" + "1" * 16},
+        {"evidence_ids": ("ev-ffffffffffffffff",)},
+    ):
+        with pytest.raises(ra.RuntimeAssuranceError):
+            ra.check_finding_against_result(ra.seal_finding(**{**k, **change}), result, shadow)
+
+
+def test_confirmed_validation_result_must_differ_from_origin_result():
+    k = {
+        f.name: getattr(parse("finding-confirmed.json"), f.name)
+        for f in dataclasses.fields(ra.AssuranceFinding)
+        if f.name not in ("finding_id", "content_hash")
+    }
+    bad = dataclasses.replace(k["validation"], replay_result_id=k["origin_result_id"])
+    with pytest.raises(ra.RuntimeAssuranceError, match="result"):
+        ra.seal_finding(**{**k, "validation": bad})

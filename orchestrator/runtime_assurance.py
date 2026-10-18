@@ -114,6 +114,14 @@ VALIDATION_AUTHORITIES = frozenset({"observed", "derived"})
 #: Every governed action kind except a read-only tool call counts as mutating.
 MUTATING_ACTION_KINDS = frozenset(_pc.ACTION_KINDS - {_pc.MCP_TOOL_CALL})
 
+
+def is_read_only_tool(name: str) -> bool:
+    """Whether `policy_checkpoint` classes the MCP tool as a read (verb prefix
+    or named read tool, bare, `mctl_`- or `mcp__mctl__`-prefixed). Anything
+    else - a known mutation or a tool the policy does not know - is not."""
+    bare = name.removeprefix("mcp__mctl__").removeprefix("mctl_")
+    return bare.startswith(_pc._READ_VERBS) or bare in _pc._READ_TOOLS
+
 # ---------------------------------------------------------------------------
 # Bounds
 # ---------------------------------------------------------------------------
@@ -1002,13 +1010,17 @@ class AssuranceScenario:
         kinds = _str_seq(self, "permitted_action_kinds", max_items=len(_pc.ACTION_KINDS), pattern=_TOOL_RE, sort=True)
         for kind in kinds:
             _one_of(kind, frozenset(_pc.ACTION_KINDS), where="scenario.permitted_action_kinds")
-        _str_seq(self, "permitted_tools", max_items=MAX_TOOLS, pattern=_TOOL_RE, max_chars=128, sort=True)
+        tools = _str_seq(self, "permitted_tools", max_items=MAX_TOOLS, pattern=_TOOL_RE, max_chars=128, sort=True)
         templates = _typed_seq(self, "followup_templates", FollowupTemplate, max_items=MAX_TEMPLATES)
         _unique([t.template_id for t in templates], where="scenario.followup_templates")
         if self.target.environment == ENV_PRODUCTION and self.mutation_mode != MUTATION_NONE:
             raise _fail("scenario: production mutation cannot be represented in v1alpha1")
         if self.mutation_mode == MUTATION_NONE and MUTATING_ACTION_KINDS.intersection(kinds):
             raise _fail("scenario: a mutating action kind requires mutation_mode other than none")
+        if self.mutation_mode == MUTATION_NONE:
+            for tool in tools:
+                if not is_read_only_tool(tool):
+                    raise _fail(f"scenario: tool {tool!r} is not read-only; mutation_mode none permits reads only")
         if self.execution_mode == EXEC_DETERMINISTIC and (self.budgets.max_followups != 0 or templates):
             raise _fail("scenario: a deterministic scenario allows no follow-ups")
         _verify_seal(self, "scenario_id", SCENARIO_ID_PREFIX)
@@ -1355,6 +1367,9 @@ def check_result_against_run(result: AssuranceResult, run: AssuranceRun, scenari
             raise _fail(f"result: {verdict.invariant_id!r} has no observed support")
     if not result.consumed.within(run.granted_budgets) and result.outcome != OUTCOME_BUDGET_EXHAUSTED:
         raise _fail("result: consumed exceeds the granted budget but the outcome is not budget_exhausted")
+    known_evidence = {o.evidence_id for o in run.observations if o.evidence_id}
+    if not set(result.evidence_ids) <= known_evidence:
+        raise _fail("result: evidence_ids cite evidence the run did not observe")
 
 
 # ---------------------------------------------------------------------------
@@ -1460,6 +1475,8 @@ class AssuranceFinding:
                 raise _fail("finding: a confirmed finding requires a validation block")
             if self.validation.replay_run_id == self.origin_run_id:
                 raise _fail("finding: the replay run must differ from the originating run")
+            if self.validation.replay_result_id == self.origin_result_id:
+                raise _fail("finding: the replay result must differ from the originating result")
             if self.disposition is not None or self.disposition_note is not None:
                 raise _fail("finding: a confirmed finding carries no disposition")
         if self.state == STATE_REJECTED:
@@ -1508,6 +1525,53 @@ def seal_finding(**fields_: Any) -> AssuranceFinding:
     return _seal(AssuranceFinding(**fields_), "finding_id", FINDING_ID_PREFIX)
 
 
+def check_finding_confirmation(
+    finding: AssuranceFinding, replay_run: AssuranceRun | None, replay_result: AssuranceResult | None
+) -> str:
+    """Check that a replay confirms `finding`; return the validation authority
+    (`observed` or `derived`). Raises `RuntimeAssuranceError` otherwise."""
+    if replay_run is None or replay_result is None:
+        raise _fail("finding: confirmation requires a replay run and result")
+    if replay_result.result_id == finding.origin_result_id:
+        raise _fail("finding: the replay result must differ from the originating result")
+    if replay_run.run_id == finding.origin_run_id:
+        raise _fail("finding: the replay run must differ from the originating run")
+    if replay_run.relation != RELATION_REPLAY or replay_run.parent_run_id != finding.origin_run_id:
+        raise _fail("finding: the replay run must be a replay of the originating run")
+    if replay_run.binding != finding.binding or replay_result.binding != finding.binding:
+        raise _fail("finding: the replay is bound to a different scenario, runtime or target revision")
+    if replay_result.run_id != replay_run.run_id:
+        raise _fail("finding: the replay result belongs to a different run")
+    verdict = next((v for v in replay_result.invariant_verdicts if v.invariant_id == finding.invariant_id), None)
+    if replay_result.outcome != OUTCOME_VIOLATED or verdict is None or verdict.verdict != VERDICT_VIOLATED:
+        raise _fail("finding: the replay did not violate the same invariant")
+    by_id = {o.observation_id: o for o in replay_run.observations}
+    backing = [
+        by_id[i]
+        for i in verdict.observation_ids
+        if i in by_id and by_id[i].status == OBS_OBSERVED and by_id[i].authority != "asserted"
+    ]
+    if not backing:
+        raise _fail("finding: the replay has no observed, non-asserted support")
+    return "observed" if any(o.authority == "observed" for o in backing) else "derived"
+
+
+def check_finding_against_result(
+    finding: AssuranceFinding, result: AssuranceResult, scenario: AssuranceScenario
+) -> None:
+    """Cross-record check of a finding against its originating result: the
+    invariant is one of the scenario's, and the result and evidence are the
+    origin's."""
+    if finding.binding != result.binding:
+        raise _fail("finding: binding differs from the originating result")
+    if finding.origin_result_id != result.result_id or finding.origin_run_id != result.run_id:
+        raise _fail("finding: origin ids differ from the originating result")
+    if finding.invariant_id not in {i.invariant_id for i in scenario.invariants}:
+        raise _fail("finding: invariant_id is not an invariant of the scenario")
+    if not set(finding.evidence_ids) <= set(result.evidence_ids):
+        raise _fail("finding: evidence_ids are not a subset of the originating result's")
+
+
 def transition_finding(
     finding: AssuranceFinding,
     to_state: str,
@@ -1534,34 +1598,15 @@ def transition_finding(
         )
     if to_state != STATE_CONFIRMED:
         raise _fail(f"finding: cannot transition to {to_state!r}")
-    if replay_run is None or replay_result is None:
-        raise _fail("finding: confirmation requires a replay run and result")
-    if replay_run.run_id == finding.origin_run_id:
-        raise _fail("finding: the replay run must differ from the originating run")
-    if replay_run.relation != RELATION_REPLAY or replay_run.parent_run_id != finding.origin_run_id:
-        raise _fail("finding: the replay run must be a replay of the originating run")
-    if replay_run.binding != finding.binding or replay_result.binding != finding.binding:
-        raise _fail("finding: the replay is bound to a different scenario, runtime or target revision")
-    if replay_result.run_id != replay_run.run_id:
-        raise _fail("finding: the replay result belongs to a different run")
-    verdict = next((v for v in replay_result.invariant_verdicts if v.invariant_id == finding.invariant_id), None)
-    if replay_result.outcome != OUTCOME_VIOLATED or verdict is None or verdict.verdict != VERDICT_VIOLATED:
-        raise _fail("finding: the replay did not violate the same invariant")
-    by_id = {o.observation_id: o for o in replay_run.observations}
-    backing = [
-        by_id[i]
-        for i in verdict.observation_ids
-        if i in by_id and by_id[i].status == OBS_OBSERVED and by_id[i].authority != "asserted"
-    ]
-    if not backing:
-        raise _fail("finding: the replay has no observed, non-asserted support")
-    authority = "observed" if any(o.authority == "observed" for o in backing) else "derived"
+    authority = check_finding_confirmation(finding, replay_run, replay_result)
     return seal_finding(
         **{
             **common,
             "state": STATE_CONFIRMED,
             "validation": FindingValidation(
-                replay_run_id=replay_run.run_id, replay_result_id=replay_result.result_id, authority=authority
+                replay_run_id=replay_run.run_id,  # type: ignore[union-attr]
+                replay_result_id=replay_result.result_id,  # type: ignore[union-attr]
+                authority=authority,
             ),
         }
     )
