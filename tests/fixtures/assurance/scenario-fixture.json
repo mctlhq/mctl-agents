@@ -1,0 +1,58 @@
+{
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "budgets": {
+    "max_attempts": 1,
+    "max_followups": 0,
+    "max_tool_calls": 32,
+    "max_wall_clock_seconds": 120
+  },
+  "content_hash": "sha256:a27a9c47a3092d77eced507fb193d54df17dd73ef52f13ca61c766a782189b55",
+  "description": "Deterministic fixture check of comment redaction.",
+  "execution_mode": "deterministic",
+  "followup_templates": [],
+  "inputs": [
+    {
+      "content_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "kind": "fixture_ref",
+      "name": "body"
+    },
+    {
+      "kind": "literal",
+      "name": "mode",
+      "value": "strict"
+    }
+  ],
+  "invariants": [
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "no-secret-in-comment",
+      "statement": "A posted comment never contains a credential shape."
+    },
+    {
+      "check_kind": "policy_decision_expected",
+      "invariant_id": "policy-gate-hit",
+      "statement": "Every mutating action produced a policy decision."
+    }
+  ],
+  "kind": "AssuranceScenario",
+  "mutation_mode": "none",
+  "name": "comment-redaction",
+  "permitted_action_kinds": [],
+  "permitted_tools": [
+    "mctl_get_service_config"
+  ],
+  "scenario_id": "asc-a27a9c47a3092d77",
+  "setup": [
+    {
+      "fixture_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "kind": "fixture_load",
+      "step_id": "load"
+    }
+  ],
+  "target": {
+    "environment": "fixture",
+    "kind": "fixture",
+    "ref": "fixtures/comment-redaction"
+  },
+  "version": "1.0.0"
+}

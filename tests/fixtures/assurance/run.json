@@ -1,0 +1,67 @@
+{
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "approvals": [],
+  "attempt": 1,
+  "binding": {
+    "runtime": {
+      "agent": "mctl-agents",
+      "definition_content_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "definition_version": "1.84.0",
+      "environment": "prod",
+      "profile_content_hash": "",
+      "profile_name": "default",
+      "profile_version": "3",
+      "release_revision": null
+    },
+    "scenario": {
+      "content_hash": "sha256:ab8e10452d92006b85fe30a5de90e8b7c354fdd24f9d8693f0477876cff7581d",
+      "name": "shadow-pr-flow",
+      "scenario_id": "asc-ab8e10452d92006b",
+      "version": "0.2.0"
+    },
+    "target": {
+      "kind": "repository",
+      "ref": "mctlhq/mctl-agents",
+      "revision": "0123456789abcdef0123456789abcdef01234567"
+    }
+  },
+  "content_hash": "sha256:c5821fe1d045faca4016d54a15bce9fd0d6c570fe4e2fd1fc58d7b04fad83d31",
+  "ended_at": "2026-10-18T10:02:00Z",
+  "execution": {
+    "execution_id": "we_abc123",
+    "runtime_execution_id": "ex-0123456789abcdef",
+    "trace_id": "",
+    "work_item_id": ""
+  },
+  "granted_budgets": {
+    "max_attempts": 2,
+    "max_followups": 2,
+    "max_tool_calls": 64,
+    "max_wall_clock_seconds": 600
+  },
+  "kind": "AssuranceRun",
+  "mutation_mode": "fixture_only",
+  "observations": [
+    {
+      "authority": "observed",
+      "evidence_id": "ev-0123456789abcdef",
+      "invariant_ids": [
+        "no-secret-in-comment"
+      ],
+      "observation_id": "obs-1",
+      "status": "observed"
+    },
+    {
+      "authority": "derived",
+      "evidence_id": "ev-fedcba9876543210",
+      "invariant_ids": [
+        "policy-gate-hit"
+      ],
+      "observation_id": "obs-2",
+      "status": "observed"
+    }
+  ],
+  "policy_decisions": [],
+  "run_id": "arn-c5821fe1d045faca",
+  "started_at": "2026-10-18T10:00:00Z"
+}

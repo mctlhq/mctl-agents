@@ -1,0 +1,27 @@
+{
+  "allowlist_id": "atl-a358c7f714118cc3",
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "content_hash": "sha256:a358c7f714118cc373e3b6933120b4c2f03b07d5a2dfc968c04d957c54cc6514",
+  "entries": [
+    {
+      "entry_id": "mctl-agents-shadow",
+      "environments": [
+        "shadow"
+      ],
+      "ref": "mctlhq/mctl-agents",
+      "target_kind": "repository"
+    },
+    {
+      "entry_id": "checkout-prod-ro",
+      "environments": [
+        "production",
+        "shadow"
+      ],
+      "ref": "admins/checkout",
+      "target_kind": "mctl_service"
+    }
+  ],
+  "kind": "AssuranceTargetAllowlist",
+  "name": "assurance-targets",
+  "version": "1"
+}
