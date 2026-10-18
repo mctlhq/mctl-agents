@@ -25,7 +25,12 @@ from temporalio.api.enums.v1 import EventType
 
 from orchestrator import human_input as hi
 from orchestrator import run_issue_investigator as rii
-from orchestrator.temporal.workflows.dev_loop import APPROVAL_POLL_INTERVAL, DevLoopWorkflow, IssueRef
+from orchestrator.temporal.workflows.dev_loop import (
+    APPROVAL_POLL_INTERVAL,
+    GRANT_FRESHNESS_INTERVAL,
+    DevLoopWorkflow,
+    IssueRef,
+)
 from tests import human_input_harness as harness_mod
 from tests.temporal_harness import Worker
 from tests.test_dev_loop_workflow import (
@@ -127,7 +132,7 @@ async def _wait_for_approval_park(handle, *, resume_count: int) -> None:
             approval_timer = any(
                 e.event_type == EventType.EVENT_TYPE_TIMER_STARTED and i > last_scheduled
                 and e.timer_started_event_attributes.start_to_fire_timeout.ToTimedelta()
-                == APPROVAL_POLL_INTERVAL
+                in (APPROVAL_POLL_INTERVAL, GRANT_FRESHNESS_INTERVAL)
                 for i, e in enumerate(events)
             )
             if (

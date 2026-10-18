@@ -113,15 +113,31 @@ async def get_issue_state(repo: str, issue_number: int) -> IssueState:
 @activity.defn
 async def post_issue_comment(repo: str, issue_number: int, body: str) -> bool:
     """Best-effort comment on `repo#issue_number` (mctl-agents#701). Returns
-    whether it was posted; never raises, so an audit comment can never fail
-    or retry-storm the loop that asked for it."""
+    whether it was posted. A missing token or a 4xx answer is a logged quiet
+    `False`; transport errors, 429 and 5xx raise `IssueStateError` so the
+    caller's bounded retry policy can re-run it (the workflow treats a final
+    failure as best effort, so it can never fail the loop)."""
     token = await asyncio.to_thread(_resolve_token)
     if not token:
+        activity.logger.warning(
+            "post_issue_comment repo=%s issue=%s skipped: no GitHub token", repo, issue_number
+        )
         return False
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments"
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             response = await client.post(url, headers=_headers(token), json={"body": body})
-    except httpx.RequestError:
-        return False
-    return response.status_code == 201
+    except httpx.RequestError as exc:
+        activity.logger.warning(
+            "post_issue_comment repo=%s issue=%s transport error: %s", repo, issue_number, exc
+        )
+        raise IssueStateError(f"posting {url} failed: {exc}") from exc
+    if response.status_code == 201:
+        return True
+    activity.logger.warning(
+        "post_issue_comment repo=%s issue=%s returned HTTP %s: %s",
+        repo, issue_number, response.status_code, response.text[:200],
+    )
+    if response.status_code == 429 or response.status_code >= 500:
+        raise IssueStateError(f"posting {url} returned HTTP {response.status_code}")
+    return False

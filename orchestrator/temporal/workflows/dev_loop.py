@@ -325,8 +325,12 @@ _MAX_SIGNALLED_REFS = 16
 #: `@MCTL reinvestigate`) changed them. Evaluated once when the canonical
 #: park begins; a history without the marker replays the old commands.
 GRANT_FRESHNESS_PATCH = "grant-freshness"
-#: How often a parked canonical loop re-reads the proposal digest.
-GRANT_FRESHNESS_INTERVAL = timedelta(minutes=15)
+#: How often a parked canonical loop re-reads the proposal digest. Budget: one
+#: hour over a ~7 day `CANONICAL_APPROVAL_WAIT` is at most ~168 ticks (about
+#: 1,700 history events, ~840 gitops API reads), well under Temporal's
+#: 10,240-event warn limit. A 15-minute cadence would be ~672 ticks and
+#: ~7,000 events, the same history-budget problem the merge watch hops around.
+GRANT_FRESHNESS_INTERVAL = timedelta(hours=1)
 #: Supersedes one loop tolerates before it ends rather than ask again.
 MAX_GRANT_SUPERSEDES = 8
 SUPERSEDE_REASON = "superseded: proposal rewritten"
