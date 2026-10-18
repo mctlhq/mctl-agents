@@ -24,7 +24,7 @@ jobs:
       # maintainer triggers a review by hand.
       #
       # mctl-agents is the App whose token release-please now runs under
-      # (release-please.yml, AGENTS_APP_ID). It is the *actor* of the run,
+      # (release-please.yml, AGENTS_APP_CLIENT_ID). It is the *actor* of the run,
       # which is what claude-code-action checks — distinct from the PR
       # author. Its absence is what failed the review on release PR #141
       # with the same "non-human actor" error (mctlhq/mctl-gitops#819).
