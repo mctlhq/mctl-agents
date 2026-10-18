@@ -1094,6 +1094,23 @@ class WorkContextState:
 #: which must stay byte-for-byte identical (mctl-api#640).
 ABANDONED_ENDED_PREFIX = "abandoned: "
 
+#: How `DevLoopResult.ended` starts when a loop ends because its approval was
+#: refused / failed (#702). Together with ABANDONED_ENDED_PREFIX these mark a
+#: run that may be restarted on its own workflow id. mctl-api must mirror them
+#: byte for byte.
+APPROVAL_REFUSED_ENDED_PREFIX = "approval refused: "
+APPROVAL_FAILED_ENDED_PREFIX = "approval failed: "
+RESTARTABLE_ENDED_PREFIXES = (
+    ABANDONED_ENDED_PREFIX,
+    APPROVAL_REFUSED_ENDED_PREFIX,
+    APPROVAL_FAILED_ENDED_PREFIX,
+)
+#: Gates every command the typed approval outcomes add (#702).
+APPROVAL_FAILURE_OUTCOME_PATCH = "approval-failure-outcome"
+#: A delegated refusal whose code contains one of these denotes a stale or
+#: drifted grant: re-ask a fresh grant instead of ending the loop.
+STALE_GRANT_REFUSAL_CODES = ("digest", "drift", "stale-slug")
+
 
 @dataclass(frozen=True)
 class DevLoopResult:
@@ -1129,6 +1146,9 @@ class DevLoopResult:
     # wait expired". Empty on the full-pipeline path. Defaulted so results
     # recorded before this field existed still deserialize.
     ended: str = ""
+    # #702: typed terminal outcome of a failed approval: "approval_refused",
+    # "approval_failed", or "" for every other ending.
+    outcome: str = ""
 
 
 async def _resolve(agent: str) -> ResolvedRelease | None:
@@ -1703,6 +1723,7 @@ class DevLoopWorkflow:
         self._canonical = False
         self._canonical_open = False
         self._canonical_end_phase = ""
+        self._approve_refusal_code = ""
         # The phase an end of the own `we_` still has to reach when its
         # advance did not land; `run`'s exit retries it with this phase.
         self._canonical_pending_phase = ""
@@ -2272,8 +2293,10 @@ class DevLoopWorkflow:
         """Flip the proposal through mctl-api's delegated operation, under the
         signalled grant. Returns (result, "") or (None, why the loop ends)."""
         if slug != self._approval_slug:
+            self._approve_refusal_code = "stale-slug"
             return None, "approve flip refused: the proposal changed since the approval was requested"
         if not self._approval_ref:
+            self._approve_refusal_code = "missing-grant"
             return None, "approve flip refused: no approval grant was signalled"
         try:
             delegated: DelegatedApproveResult = await workflow.execute_activity(
@@ -2290,12 +2313,38 @@ class DevLoopWorkflow:
                 retry_policy=DELEGATED_APPROVE_RETRY_POLICY,
             )
         except ActivityError as exc:
+            self._approve_refusal_code = ""
             return None, f"approve flip unavailable: {type(exc.cause).__name__ if exc.cause else 'unknown'}"
         if delegated.refusal or delegated.result is None:
+            self._approve_refusal_code = delegated.code or ""
             return None, f"approve flip refused: {delegated.refusal or 'no result'}" + (
                 f" ({delegated.code})" if delegated.code else ""
             )
         return delegated.result, ""
+
+    def _approval_ended(
+        self,
+        kind: str,
+        detail: str,
+        investigate_result: WorkflowResult,
+        approve: WorkflowResult | None,
+        human_input: HumanInputOutcome | None,
+    ) -> DevLoopResult:
+        """A typed terminal approval outcome (#702): the own `we_` ends Failed
+        on every exit path, never with the investigator's phase."""
+        prefix = APPROVAL_REFUSED_ENDED_PREFIX if kind == "approval_refused" else APPROVAL_FAILED_ENDED_PREFIX
+        workflow.logger.warning(
+            "APPROVAL_OUTCOME outcome=%s we=%s detail=%s", kind, self._canonical_execution_id(), detail
+        )
+        self._canonical_end_phase = "Failed"
+        return DevLoopResult(
+            investigate=investigate_result,
+            implement=None,
+            approve=approve,
+            human_input=human_input,
+            ended=prefix + detail,
+            outcome=kind,
+        )
 
     def _canonical_execution_id(self) -> str:
         """This canonical loop's own `we_`, pinned when it was opened or
@@ -3377,7 +3426,8 @@ class DevLoopWorkflow:
         # Still open here: either the flip's own end did not land (retry it
         # with that phase), or the loop exited before any flip: the `we_`
         # then ends with the investigator's phase, as a dispatched one always
-        # did (claude P2 on #651), and Failed if it never got that far.
+        # did (claude P2 on #651), and Failed if it never got that far. An
+        # approval outcome (#702) sets the end phase to Failed first.
         await self._end_canonical_execution(
             self._canonical_pending_phase or self._canonical_end_phase or "Failed"
         )
@@ -3919,26 +3969,76 @@ class DevLoopWorkflow:
                         )
                     if ended is not None:
                         return ended
+                typed = workflow.patched(APPROVAL_FAILURE_OUTCOME_PATCH)
                 if self._canonical:
                     # #636: the flip is the delegated operation under the
                     # grant a human decided, with a run token for this `we_`.
                     # No branch below this one is a fallback: every refusal
                     # ends the loop, none reaches the legacy relay.
-                    if self._grant_freshness:
-                        # #701: never spend a grant bound to bytes that are
-                        # no longer the proposal's.
-                        stale = await self._ensure_fresh_grant(
-                            issue, target_repo, slug, investigate_result, human_input_outcome
+                    while True:
+                        if self._grant_freshness:
+                            # #701: never spend a grant bound to bytes that are
+                            # no longer the proposal's.
+                            stale = await self._ensure_fresh_grant(
+                                issue, target_repo, slug, investigate_result, human_input_outcome
+                            )
+                            if stale is not None:
+                                if typed and not stale.ended.startswith(ABANDONED_ENDED_PREFIX):
+                                    kind = (
+                                        "approval_failed"
+                                        if stale.ended == "approval freshness unreadable"
+                                        else "approval_refused"
+                                    )
+                                    return self._approval_ended(
+                                        kind, stale.ended, investigate_result, None, human_input_outcome
+                                    )
+                                return stale
+                        approve_result, refused = await self._delegated_approve(target_repo, slug)
+                        if not typed:
+                            if approve_result is None:
+                                return DevLoopResult(
+                                    investigate=investigate_result,
+                                    implement=None,
+                                    human_input=human_input_outcome,
+                                    ended=refused,
+                                )
+                            break
+                        if approve_result is not None and approve_result.succeeded:
+                            break
+                        # Failed or refused: a provably stale grant is re-asked
+                        # on the same `we_`; anything else ends the loop Failed.
+                        code = self._approve_refusal_code
+                        maybe_stale = approve_result is not None or any(
+                            c in code.lower() for c in STALE_GRANT_REFUSAL_CODES
                         )
-                        if stale is not None:
-                            return stale
-                    approve_result, refused = await self._delegated_approve(target_repo, slug)
-                    if approve_result is None:
-                        return DevLoopResult(
-                            investigate=investigate_result,
-                            implement=None,
-                            human_input=human_input_outcome,
-                            ended=refused,
+                        fresh = await self._supersede_grant_if_stale(target_repo, slug) if maybe_stale else "fresh"
+                        if fresh == "superseded":
+                            reasked = await self._await_canonical_reapproval(
+                                issue, target_repo, investigate_result, human_input=human_input_outcome
+                            )
+                            if reasked is not None:
+                                return reasked
+                            continue
+                        if fresh == "capped":
+                            return self._approval_ended(
+                                "approval_refused",
+                                "approval superseded too many times",
+                                investigate_result,
+                                approve_result,
+                                human_input_outcome,
+                            )
+                        if approve_result is None:
+                            unavailable = refused.startswith("approve flip unavailable")
+                            kind = "approval_failed" if unavailable else "approval_refused"
+                            return self._approval_ended(
+                                kind, refused, investigate_result, None, human_input_outcome
+                            )
+                        return self._approval_ended(
+                            "approval_failed",
+                            f"approve flip ended {approve_result.phase}",
+                            investigate_result,
+                            approve_result,
+                            human_input_outcome,
                         )
                 else:
                     approve_result = await _run_cwft(
@@ -3956,6 +4056,14 @@ class DevLoopWorkflow:
                 # .status.yaml approval block, the gitops commit message,
                 # and this workflow's own history all carry the approver.
                 if not approve_result.succeeded:
+                    if typed and not self._canonical:
+                        return self._approval_ended(
+                            "approval_failed",
+                            f"approve flip ended {approve_result.phase}",
+                            investigate_result,
+                            approve_result,
+                            human_input_outcome,
+                        )
                     return DevLoopResult(
                         investigate=investigate_result,
                         implement=None,

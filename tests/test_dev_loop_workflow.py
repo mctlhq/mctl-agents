@@ -1954,6 +1954,8 @@ class TestDevLoopWorkflow:
         assert result.approve is not None
         assert result.approve.phase == "Failed"
         assert result.implement is None
+        assert result.outcome == "approval_failed"
+        assert result.ended.startswith("approval failed")
         assert calls == ["mctl-agents-investigate", "delegated-approve"]
         # The implementer registry lookup must be skipped entirely on a
         # failed flip — the resolve happens only after approval is durable
@@ -8197,8 +8199,36 @@ class TestGrantFreshness:
                 await handle.signal(DevLoopWorkflow.approve, {"approval_ref": ref})
             with anyio.fail_after(60):
                 result = await handle.result()
-        assert result.ended == "approval superseded too many times"
+        assert result.ended == "approval refused: approval superseded too many times"
+        assert result.outcome == "approval_refused"
         assert delegated == []
+
+    async def test_a_non_stale_refusal_ends_typed_approval_refused(self, env):
+        # #702: a refused flip that is not a stale-grant signal ends the loop
+        # Failed with a typed outcome and never reaches the implementer.
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        worker, investigate_ran = await self._start(
+            env,
+            approval_requests=requests,
+            delegated_log=delegated,
+            delegated_result=DelegatedApproveResult(refusal="HTTP 403 forbidden", code="forbidden"),
+        )
+        async with worker:
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run, IssueRef(issue_url=self.URL),
+                id=f"dev-loop-test-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await self._wait_for(lambda: len(requests) == 1)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            with anyio.fail_after(60):
+                result = await handle.result()
+        assert result.outcome == "approval_refused"
+        assert result.ended.startswith("approval refused")
+        assert result.implement is None
+        assert len(delegated) == 1
 
     @staticmethod
     def _ref_for(req: ApprovalRequestInput) -> str:

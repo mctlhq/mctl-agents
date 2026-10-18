@@ -20,7 +20,7 @@ from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from orchestrator.temporal import cli
-from orchestrator.temporal.start import restart_if_abandoned, workflow_id_for
+from orchestrator.temporal.start import restart_if_restartable, workflow_id_for
 from orchestrator.temporal.workflows.dev_loop import ABANDONED_ENDED_PREFIX, AbandonState
 
 
@@ -102,7 +102,7 @@ _WF = "dev-loop-mctlhq-mctl-telegram-1"
 
 
 def _restart_client(*, status, ended="", implement=None, result_error=None):
-    """A Temporal client stub for `restart_if_abandoned`: describe answers
+    """A Temporal client stub for `restart_if_restartable`: describe answers
     `status` with run id run-old, the pinned result read answers
     `ended`/`implement` (or raises `result_error`), and start_workflow
     records what it was asked to start."""
@@ -130,9 +130,9 @@ def test_abandoned_prefix_matches_mctl_api():
     assert ABANDONED_ENDED_PREFIX == "abandoned: "
 
 
-def test_restart_if_abandoned_restarts_a_run_abandoned_before_implement():
+def test_restart_if_restartable_restarts_a_run_abandoned_before_implement():
     client, reads = _restart_client(status="COMPLETED", ended="abandoned: superseded")
-    handle = _run(restart_if_abandoned(_ISSUE, client))
+    handle = _run(restart_if_restartable(_ISSUE, client))
     assert handle is not None and handle.result_run_id == "run-new"
     assert reads == [(_WF, "run-old")], "the result must be read pinned to the described run"
     kwargs = client.start_workflow.await_args.kwargs
@@ -141,28 +141,37 @@ def test_restart_if_abandoned_restarts_a_run_abandoned_before_implement():
     assert kwargs["id_conflict_policy"] == WorkflowIDConflictPolicy.USE_EXISTING
 
 
-def test_restart_if_abandoned_refuses_everything_else():
+def test_restart_if_restartable_restarts_a_terminal_approval_outcome():
+    for ended in ("approval refused: stale", "approval failed: approve flip ended Failed"):
+        client, _ = _restart_client(status="COMPLETED", ended=ended)
+        assert _run(restart_if_restartable(_ISSUE, client)) is not None, ended
+        client.start_workflow.assert_awaited_once()
+
+
+def test_restart_if_restartable_refuses_everything_else():
     cases = [
         dict(status="COMPLETED", ended="abandoned: cleanup", implement=SimpleNamespace(phase="Succeeded")),
         dict(status="COMPLETED", ended="approval wait expired"),
+        dict(status="COMPLETED", ended="approve flip ended Failed"),
+        dict(status="COMPLETED", ended="approval failed: x", implement=SimpleNamespace(phase="Succeeded")),
         dict(status="COMPLETED", ended=""),
         dict(status="COMPLETED", ended=None),
     ]
     for case in cases:
         client, _ = _restart_client(**case)
-        assert _run(restart_if_abandoned(_ISSUE, client)) is None, case
+        assert _run(restart_if_restartable(_ISSUE, client)) is None, case
         client.start_workflow.assert_not_awaited()
     for status in ("FAILED", "TERMINATED", "TIMED_OUT", "CANCELED", "CONTINUED_AS_NEW"):
         client, reads = _restart_client(status=status, ended="abandoned: x")
-        assert _run(restart_if_abandoned(_ISSUE, client)) is None, status
+        assert _run(restart_if_restartable(_ISSUE, client)) is None, status
         assert reads == [], f"read the result of a {status} run"
         client.start_workflow.assert_not_awaited()
 
 
-def test_restart_if_abandoned_never_restarts_an_unreadable_run():
+def test_restart_if_restartable_never_restarts_an_unreadable_run():
     client, _ = _restart_client(status="COMPLETED", result_error=RuntimeError("frontend unreachable"))
     with pytest.raises(RuntimeError):
-        _run(restart_if_abandoned(_ISSUE, client))
+        _run(restart_if_restartable(_ISSUE, client))
     client.start_workflow.assert_not_awaited()
 
 
@@ -178,7 +187,7 @@ def _cli_start(monkeypatch, *, restarted):
 
     monkeypatch.setattr(cli, "connect", _connect)
     monkeypatch.setattr(cli, "start_dev_loop_workflow", _start)
-    monkeypatch.setattr(cli, "restart_if_abandoned", _restart)
+    monkeypatch.setattr(cli, "restart_if_restartable", _restart)
 
 
 def test_cli_start_restarts_after_abandon(monkeypatch, capsys):
