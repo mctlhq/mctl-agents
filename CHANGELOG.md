@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.86.0](https://github.com/mctlhq/mctl-agents/compare/1.85.0...1.86.0) (2026-10-18)
+
+
+### Features
+
+* **agents:** issue-702-fix-devloop-a-failed-approval-must-not-p ([56b9224](https://github.com/mctlhq/mctl-agents/commit/56b922486df71fc223fe887dc3d8c2b31242250f))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-702-fix-devloop-a-failed-approval-must-not-p ([e1863ce](https://github.com/mctlhq/mctl-agents/commit/e1863ce841f5d1a7445733dda0ab706ce797608c))
+* **agents:** issue-702-fix-devloop-a-failed-approval-must-not-p ([776050f](https://github.com/mctlhq/mctl-agents/commit/776050f49c587da604467dd2743ce35c3524f503))
+
 ## [1.85.0](https://github.com/mctlhq/mctl-agents/compare/1.84.0...1.85.0) (2026-10-18)
 
 
