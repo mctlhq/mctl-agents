@@ -49,11 +49,12 @@ VERBS = frozenset({"reinvestigate"})
 # `_run` in run_issue_investigator.py) running with a Vault-rotated GitHub
 # App installation token, and `.github/workflows/release-please.yml` /
 # `diagrams-refresh.yml` both document that token as coming from the
-# `mctl-agents` App (`secrets.AGENTS_APP_ID`) — "the backend-only automation
-# App", explicitly NOT the customer-facing "MCTL App" (`secrets.APP_ID`,
-# login `mctl-app`, no brackets). GitHub renders installation-token comments
-# as `<app-slug>[bot]`, i.e. `mctl-agents[bot]` — the same identity already
-# used everywhere else in this repo for the platform's own actor
+# `mctl-agents` App (`vars.AGENTS_APP_CLIENT_ID`) — "the backend-only
+# automation App", explicitly NOT the customer-facing "MCTL App"
+# (`vars.APP_CLIENT_ID`, login `mctl-app`, no brackets). GitHub renders
+# installation-token comments as `<app-slug>[bot]`, i.e. `mctl-agents[bot]`
+# — the same identity already used everywhere else in this repo for the
+# platform's own actor
 # (`orchestrator.proposal_state.actor`, `run_implementer.py`'s git identity,
 # `run_shepherd.py`, `run_issue_investigator.py`'s `updated_by`). `mctl-app`
 # is never the login this repo authenticates writes as, so keeping it here
