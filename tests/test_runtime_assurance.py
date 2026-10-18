@@ -843,3 +843,46 @@ def test_confirmed_validation_result_must_differ_from_origin_result():
     bad = dataclasses.replace(k["validation"], replay_result_id=k["origin_result_id"])
     with pytest.raises(ra.RuntimeAssuranceError, match="result"):
         ra.seal_finding(**{**k, "validation": bad})
+
+
+def test_confirmation_refuses_evidence_about_another_invariant():
+    # Owner review on 988dae0: the violated verdict cited `obs-2`, an
+    # observation about `policy-gate-hit`, and still confirmed a
+    # `no-secret-in-comment` finding that `check_result_against_run` rejects.
+    cand = parse("finding-candidate.json")
+    replay, rres = _replay_kwargs()
+    assert "no-secret-in-comment" not in {o.observation_id: o for o in replay.observations}["obs-2"].invariant_ids
+    wrong = ra.seal_result(
+        **{
+            **_result_kwargs(rres),
+            "invariant_verdicts": (
+                ra.InvariantVerdict("no-secret-in-comment", "violated", ("obs-2",)),
+                ra.InvariantVerdict("policy-gate-hit", "held", ("obs-2",)),
+            ),
+        }
+    )
+    for check in (
+        lambda: ra.check_finding_confirmation(cand, replay, wrong),
+        lambda: ra.transition_finding(cand, "confirmed", replay_run=replay, replay_result=wrong),
+    ):
+        with pytest.raises(ra.RuntimeAssuranceError, match="not about the invariant"):
+            check()
+    unknown = ra.seal_result(
+        **{
+            **_result_kwargs(rres),
+            "invariant_verdicts": (
+                ra.InvariantVerdict("no-secret-in-comment", "violated", ("obs-1", "obs-404")),
+                rres.invariant_verdicts[1],
+            ),
+        }
+    )
+    with pytest.raises(ra.RuntimeAssuranceError, match="not about the invariant"):
+        ra.check_finding_confirmation(cand, replay, unknown)
+
+
+def test_confirmation_refuses_replay_evidence_the_run_did_not_observe():
+    cand = parse("finding-candidate.json")
+    replay, rres = _replay_kwargs()
+    forged = ra.seal_result(**{**_result_kwargs(rres), "evidence_ids": (*rres.evidence_ids, "ev-ffffffffffffffff")})
+    with pytest.raises(ra.RuntimeAssuranceError, match="evidence"):
+        ra.check_finding_confirmation(cand, replay, forged)

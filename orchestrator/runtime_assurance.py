@@ -122,6 +122,7 @@ def is_read_only_tool(name: str) -> bool:
     bare = name.removeprefix("mcp__mctl__").removeprefix("mctl_")
     return bare.startswith(_pc._READ_VERBS) or bare in _pc._READ_TOOLS
 
+
 # ---------------------------------------------------------------------------
 # Bounds
 # ---------------------------------------------------------------------------
@@ -1545,11 +1546,21 @@ def check_finding_confirmation(
     verdict = next((v for v in replay_result.invariant_verdicts if v.invariant_id == finding.invariant_id), None)
     if replay_result.outcome != OUTCOME_VIOLATED or verdict is None or verdict.verdict != VERDICT_VIOLATED:
         raise _fail("finding: the replay did not violate the same invariant")
+    # The same run-consistency rule `check_result_against_run` applies: every
+    # observation the verdict cites exists in the replay run and is about the
+    # finding's invariant. Evidence about another invariant never confirms.
     by_id = {o.observation_id: o for o in replay_run.observations}
+    for oid in verdict.observation_ids:
+        obs = by_id.get(oid)
+        if obs is None or finding.invariant_id not in obs.invariant_ids:
+            raise _fail(f"finding: the replay verdict cites observation {oid!r}, which is not about the invariant")
+    known_evidence = {o.evidence_id for o in replay_run.observations if o.evidence_id}
+    if not set(replay_result.evidence_ids) <= known_evidence:
+        raise _fail("finding: the replay result cites evidence the replay run did not observe")
     backing = [
         by_id[i]
         for i in verdict.observation_ids
-        if i in by_id and by_id[i].status == OBS_OBSERVED and by_id[i].authority != "asserted"
+        if by_id[i].status == OBS_OBSERVED and by_id[i].authority != "asserted"
     ]
     if not backing:
         raise _fail("finding: the replay has no observed, non-asserted support")
