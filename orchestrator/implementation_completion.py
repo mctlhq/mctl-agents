@@ -725,15 +725,21 @@ class CompletionSummary:
     required_total: int
     optional_total: int
     relation: str | None = None
+    # The record's own `proposal.proposal_digest`: what the implementer
+    # recomputed, so the projection shows it next to `approval.content_digest`
+    # (mctl-agents#692). Optional only so a projection written before it
+    # existed still reads.
+    proposal_digest: str | None = None
 
     _KEYS = frozenset(
-        {"completion_id", "content_hash", "attempt_id", "step", "outcome", "stop_reason", "head_sha",
-         "verification", "relation"}
+        {"completion_id", "content_hash", "proposal_digest", "attempt_id", "step", "outcome", "stop_reason",
+         "head_sha", "verification", "relation"}
     )
 
     def __post_init__(self) -> None:
         _str(self.completion_id, where="summary.completion_id", max_chars=19, pattern=_COMPLETION_ID_RE)
         _str(self.content_hash, where="summary.content_hash", max_chars=71, pattern=_DIGEST_RE)
+        _opt_str(self.proposal_digest, where="summary.proposal_digest", max_chars=71, pattern=_DIGEST_RE)
         _str(self.attempt_id, where="summary.attempt_id", max_chars=MAX_ID_CHARS)
         _one_of(self.step, STEPS, where="summary.step")
         _one_of(self.outcome, OUTCOMES, where="summary.outcome")
@@ -750,6 +756,10 @@ class CompletionSummary:
         out: dict[str, Any] = {
             "completion_id": self.completion_id,
             "content_hash": self.content_hash,
+        }
+        if self.proposal_digest is not None:
+            out["proposal_digest"] = self.proposal_digest
+        out |= {
             "attempt_id": self.attempt_id,
             "step": self.step,
             "outcome": self.outcome,
@@ -785,6 +795,7 @@ class CompletionSummary:
             required_total=_g(v, "required_total"),
             optional_total=_g(v, "optional_total"),
             relation=_g(d, "relation"),
+            proposal_digest=_g(d, "proposal_digest"),
         )
 
     def with_relation(self, relation: str | None) -> CompletionSummary:
@@ -804,6 +815,7 @@ def summarize(completion: ImplementationCompletion) -> CompletionSummary:
         required_passed=sum(1 for v in required if v.result == "pass"),
         required_total=len(required),
         optional_total=len(completion.verification) - len(required),
+        proposal_digest=completion.proposal.proposal_digest,
     )
 
 

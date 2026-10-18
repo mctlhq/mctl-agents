@@ -16,10 +16,12 @@ import yaml
 
 from orchestrator import run_implementer
 from orchestrator.proposal_state import (
+    APPROVAL_DIGEST_MATCH,
     BLOCKED_APPROVAL_DIGEST_MISMATCH,
     BLOCKED_APPROVAL_DIGEST_MISSING,
     PROPOSAL_DIGEST_FILES,
     approval_digest_problem,
+    approval_digest_verdict,
     proposal_content_digest,
 )
 
@@ -278,3 +280,46 @@ def test_the_refusal_names_every_file_the_digest_covers(code: str) -> None:
         assert name in remedy
         if code == BLOCKED_APPROVAL_DIGEST_MISMATCH:
             assert name in message
+
+
+# --- the verdict is logged on every outcome (mctl-agents#692) -----------------
+
+def test_a_passing_gate_logs_both_digests(tmp_path: Path, capsys) -> None:
+    ref = _proposal(tmp_path, _approved(WITH_CONTENT_DIGEST), WITH_CONTENT)
+    result = run_implementer.implement_one(ref, dry_run=True)
+    assert result.blocked is None
+    out = capsys.readouterr().out
+    assert (
+        f"approval-digest: match service={ref.service} slug={ref.slug} "
+        f"recorded={WITH_CONTENT_DIGEST} current={WITH_CONTENT_DIGEST}"
+    ) in out
+
+
+def test_a_drifted_proposal_logs_the_mismatch(tmp_path: Path, capsys) -> None:
+    ref = _proposal(tmp_path, _approved(WITH_CONTENT_DIGEST), WITH_CONTENT)
+    (ref.proposal_dir / "tasks.md").write_bytes(b"- [ ] 1. something else\n")
+    current = proposal_content_digest(ref.proposal_dir)
+    result = run_implementer.implement_one(ref, dry_run=True)
+    assert result.blocked == BLOCKED_APPROVAL_DIGEST_MISMATCH
+    assert (
+        f"approval-digest: mismatch service={ref.service} slug={ref.slug} "
+        f"recorded={WITH_CONTENT_DIGEST} current={current}"
+    ) in capsys.readouterr().out
+
+
+def test_an_approval_without_a_digest_logs_missing(tmp_path: Path, capsys) -> None:
+    ref = _proposal(tmp_path, _approved(None))
+    result = run_implementer.implement_one(ref, dry_run=True)
+    assert result.blocked == BLOCKED_APPROVAL_DIGEST_MISSING
+    out = capsys.readouterr().out
+    assert f"approval-digest: missing service={ref.service} slug={ref.slug} recorded=- current=sha256:" in out
+
+
+def test_the_verdict_names_a_match_and_skips_a_record_without_approval(tmp_path: Path) -> None:
+    _write_triplet(tmp_path, WITH_CONTENT)
+    assert approval_digest_verdict(_approved(WITH_CONTENT_DIGEST), tmp_path) == (
+        APPROVAL_DIGEST_MATCH,
+        WITH_CONTENT_DIGEST,
+        WITH_CONTENT_DIGEST,
+    )
+    assert approval_digest_verdict({"status": "accepted"}, tmp_path) is None

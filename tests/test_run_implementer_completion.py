@@ -19,6 +19,7 @@ import yaml
 
 from orchestrator import implementation_completion as ic
 from orchestrator import run_implementer as ri
+from orchestrator.proposal_state import proposal_content_digest
 from orchestrator.rate_limit import RateLimitExhaustedError
 from orchestrator.source_issue import SourceIssueVerdict
 
@@ -223,7 +224,14 @@ _SCENARIOS: dict[str, tuple[Any, bool, tuple[str, str]]] = {
 
 
 def _run_step(
-    monkeypatch: Any, tmp_path: Path, *, label: str, scenario: str, fallback: bool, uid: str | None
+    monkeypatch: Any,
+    tmp_path: Path,
+    *,
+    label: str,
+    scenario: str,
+    fallback: bool,
+    uid: str | None,
+    status: dict[str, Any] | None = None,
 ) -> ri.ProposalRef:
     """One CWFT step: a FRESH gitops clone (the fallback cannot see the
     primary's writes), then `_implement_one` under that step's environment."""
@@ -237,6 +245,13 @@ def _run_step(
         monkeypatch.setenv("WORKFLOW_UID", uid)
     step_dir = tmp_path / label
     step_dir.mkdir()
+    if status is not None:
+        d = step_dir / "mctl-telegram" / "proposals" / "issue-510-x"
+        d.mkdir(parents=True)
+        (d / "requirements.md").write_text("r\n", encoding="utf-8")
+        status = dict(status)
+        status["approval"] = {**status.get("approval", {}), "content_digest": proposal_content_digest(d)}
+        (d / ".status.yaml").write_text(yaml.safe_dump(status), encoding="utf-8")
     ref = _ref(step_dir)
     _reach_the_sdk(monkeypatch, tmp_path, on_run=on_run, commits=commits, label=label)
     ri._implement_one(ref, dry_run=False)
@@ -271,9 +286,31 @@ def test_the_success_path_projects_a_bounded_completion(monkeypatch: Any, tmp_pa
     assert auth["verification"] == {"required_passed": 4, "required_total": 4, "optional_total": 1}
     # Bounded: no per-check details, no telemetry.
     assert set(auth) == {
-        "completion_id", "content_hash", "attempt_id", "step", "outcome", "stop_reason", "head_sha", "verification",
+        "completion_id", "content_hash", "proposal_digest", "attempt_id", "step", "outcome", "stop_reason",
+        "head_sha", "verification",
     }
+    assert auth["proposal_digest"] == proposal_content_digest(ref.proposal_dir)
     assert "other" not in block
+
+
+def test_an_approved_run_logs_and_projects_the_approved_digest(
+    monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    approved = {
+        "status": "accepted",
+        "control": {"requires_human_approval": True},
+        "approval": {"approved_by": "mashkovd", "approved_at": "2026-10-18T00:00:00Z"},
+    }
+    ref = _run_step(
+        monkeypatch, tmp_path, label="a", scenario="complete", fallback=False, uid=None, status=approved
+    )
+    status = _status(ref)
+    recorded = status["approval"]["content_digest"]
+    assert status["status"] == "implemented"
+    assert status["completion"]["authoritative"]["proposal_digest"] == recorded
+    assert (
+        f"approval-digest: match service={ref.service} slug={ref.slug} recorded={recorded} current={recorded}"
+    ) in capsys.readouterr().out
 
 
 def test_a_failed_attempt_projects_beside_its_existing_status(monkeypatch: Any, tmp_path: Path) -> None:

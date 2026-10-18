@@ -192,10 +192,12 @@ from orchestrator.options import (
 )
 from orchestrator.proc import describe_output, run_capturing
 from orchestrator.proposal_state import (
+    APPROVAL_DIGEST_MATCH,
     BLOCKED_APPROVAL_DIGEST_MISMATCH,
+    BLOCKED_APPROVAL_DIGEST_MISSING,
     BLOCKED_APPROVAL_MISSING,
     PROPOSAL_DIGEST_FILES,
-    approval_digest_problem,
+    approval_digest_verdict,
     human_approval_satisfied,
     load_status,
     now_iso,
@@ -3542,6 +3544,15 @@ def _issue_closing_line(ref: ProposalRef) -> str:
     return f"\n\nCloses {repo}#{issue}"
 
 
+def _approval_digest_label(verdict: str) -> str:
+    """The word the ``approval-digest:`` log line uses for a verdict."""
+    return {
+        APPROVAL_DIGEST_MATCH: "match",
+        BLOCKED_APPROVAL_DIGEST_MISMATCH: "mismatch",
+        BLOCKED_APPROVAL_DIGEST_MISSING: "missing",
+    }.get(verdict, verdict)
+
+
 def _approval_digest_message(code: str, recorded: str, current: str) -> tuple[str, str]:
     """Return ``(message, remedy)`` for a proposal whose approval does not
     cover its current content. Both are stable for unchanged content, so
@@ -4242,8 +4253,11 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     # recorded no digest, is content nobody approved. Same durable refusal as
     # the missing approval above. A proposal or status file that cannot be read
     # is this proposal's error, never a match, and never aborts the batch.
+    # Every verdict is logged, a pass included (mctl-agents#692), so the
+    # recomputed digest is readable evidence rather than an inference from
+    # the run not being blocked. Digests of proposal text, not secrets.
     try:
-        digest_problem = approval_digest_problem(_load_status(ref.status_path), ref.proposal_dir)
+        digest_verdict = approval_digest_verdict(_load_status(ref.status_path), ref.proposal_dir)
     except (OSError, ValueError, yaml.YAMLError) as exc:
         return ImplementResult(
             ref=ref,
@@ -4251,8 +4265,14 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             error=f"approval digest could not be checked: {exc}",
             counts_toward_limit=False,
         )
-    if digest_problem is not None:
-        digest_code, approved_digest, current_digest = digest_problem
+    if digest_verdict is not None:
+        digest_outcome, approved_digest, current_digest = digest_verdict
+        print(
+            f"approval-digest: {_approval_digest_label(digest_outcome)} service={ref.service} slug={ref.slug} "
+            f"recorded={approved_digest or '-'} current={current_digest}"
+        )
+    if digest_verdict is not None and digest_verdict[0] != APPROVAL_DIGEST_MATCH:
+        digest_code, approved_digest, current_digest = digest_verdict
         message, remedy = _approval_digest_message(digest_code, approved_digest, current_digest)
         blocked_is_new = False
         if not dry_run:
