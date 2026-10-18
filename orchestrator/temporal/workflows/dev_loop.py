@@ -23,6 +23,18 @@ manual approve never fails the loop. Histories recorded before this change
 replay the legacy signal-only branch via workflow.patched("atomic-approve");
 for those in-flight loops the manual gitops flip remains the affordance.
 
+Grant freshness (mctl-agents#701, #681, mctlhq/.github#182): a canonical
+loop's `aar_` is bound to the proposal content digest read when it was
+asked. `@MCTL reinvestigate` rewrites the proposal without signalling the
+loop, so under the `grant-freshness` patch the loop re-reads the digest
+(`check_grant_freshness`) every `GRANT_FRESHNESS_INTERVAL` while parked and
+once more immediately before `_delegated_approve`. On a mismatch it
+supersedes the grant (a `GRANT_SUPERSEDED` log naming both digests, an issue
+comment naming the fresh `aar_`), never adopts the old ref again, and asks a
+new grant on the same `we_` as a new attempt; an unreadable digest never
+counts as a match, and `MAX_GRANT_SUPERSEDES` bounds the cycle. Histories
+without the marker replay the previous commands unchanged.
+
 The implement step stays scoped to this issue's own repo AND its own
 proposal slug (see `_target_repo` and `find_proposal_slug` below), so even
 a mis-signalled approve can never implement a different repo's — or a
@@ -89,6 +101,9 @@ with workflow.unsafe.imports_passed_through():
         ApprovalRequestResult,
         DelegatedApproveInput,
         DelegatedApproveResult,
+        GrantFreshnessInput,
+        GrantFreshnessResult,
+        check_grant_freshness,
         request_devloop_approval,
         submit_delegated_approve,
     )
@@ -114,7 +129,7 @@ with workflow.unsafe.imports_passed_through():
         IncidentQueryResult,
         list_service_incidents,
     )
-    from orchestrator.temporal.activities.issue_state import IssueState, get_issue_state
+    from orchestrator.temporal.activities.issue_state import IssueState, get_issue_state, post_issue_comment
     from orchestrator.temporal.activities.lifecycle import (
         OwnershipRequest,
         OwnershipResult,
@@ -304,6 +319,22 @@ _APPROVAL_REF = re.compile(r"aar_[A-Za-z0-9_-]{1,124}")
 #: How many signalled refs a run remembers: enough for every attempt a loop
 #: plausibly makes, bounded so a signal flood cannot grow workflow state.
 _MAX_SIGNALLED_REFS = 16
+#: mctlhq/mctl-agents#701 (mctlhq/.github#182). A canonical loop proves its
+#: pending grant still describes the current proposal bytes before it
+#: presents or spends it, and supersedes it when a rewrite (for example
+#: `@MCTL reinvestigate`) changed them. Evaluated once when the canonical
+#: park begins; a history without the marker replays the old commands.
+GRANT_FRESHNESS_PATCH = "grant-freshness"
+#: How often a parked canonical loop re-reads the proposal digest. Budget: one
+#: hour over a ~7 day `CANONICAL_APPROVAL_WAIT` is at most ~168 ticks (about
+#: 1,700 history events, ~840 gitops API reads), well under Temporal's
+#: 10,240-event warn limit. A 15-minute cadence would be ~672 ticks and
+#: ~7,000 events, the same history-budget problem the merge watch hops around.
+GRANT_FRESHNESS_INTERVAL = timedelta(hours=1)
+#: Supersedes one loop tolerates before it ends rather than ask again.
+MAX_GRANT_SUPERSEDES = 8
+SUPERSEDE_REASON = "superseded: proposal rewritten"
+_MAX_SUPERSEDED_REFS = 16
 #: `request_devloop_approval`'s state for a grant a human already approved.
 APPROVAL_APPROVED = "approved"
 
@@ -1694,6 +1725,15 @@ class DevLoopWorkflow:
         #: `len(self._executions)` at the latest transition.
         self._transition_mark = 0
         self._approval_slug = ""
+        # #701: the digest/commit the current grant is bound to, the grants
+        # this loop superseded (never adopted again), and the audit note
+        # still to be posted once the fresh grant is known.
+        self._grant_freshness = False
+        self._approval_digest = ""
+        self._approval_commit = ""
+        self._superseded_refs: list[str] = []
+        self._supersede_count = 0
+        self._supersede_note: tuple[str, str, str, str] | None = None
         # Bumped by every surface/actor transition: the re-asked grant gets a
         # new idempotency key, so a decision made before the transition is
         # never found again as the fresh one the transition requires.
@@ -1905,7 +1945,11 @@ class DevLoopWorkflow:
                 # and neither is a ref this loop did not request for its
                 # current attempt (a stale or replayed decision).
                 approval_ref = arg.get("approval_ref")
-                if isinstance(approval_ref, str) and _APPROVAL_REF.fullmatch(approval_ref):
+                if (
+                    isinstance(approval_ref, str)
+                    and _APPROVAL_REF.fullmatch(approval_ref)
+                    and approval_ref not in self._superseded_refs
+                ):
                     if approval_ref not in self._signalled_refs:
                         self._signalled_refs = [*self._signalled_refs, approval_ref][-_MAX_SIGNALLED_REFS:]
                     if self._requested_ref and approval_ref == self._requested_ref:
@@ -2078,8 +2122,40 @@ class DevLoopWorkflow:
                 human_input=human_input,
                 ended="approval request refused: mctl-api answered no well-formed approval ref",
             )
+        if requested.approval_ref in self._superseded_refs:
+            # #701: a grant this loop superseded is never adopted again. A new
+            # digest is a new intent and key, so this is not expected; ask anew.
+            self._approval_attempt += 1
+            self._supersede_count += 1
+            self._grant_refresh = True
+            if self._supersede_count > MAX_GRANT_SUPERSEDES:
+                return DevLoopResult(
+                    investigate=investigate_result, implement=None, human_input=human_input,
+                    ended="approval superseded too many times",
+                )
+            return None
         self._approval_slug = slug
         self._requested_ref = requested.approval_ref
+        self._approval_digest = requested.content_digest
+        self._approval_commit = requested.content_commit
+        if self._supersede_note is not None:
+            old_ref, old_digest, new_digest, _ = self._supersede_note
+            self._supersede_note = None
+            parts = parse_issue_url(issue.issue_url)
+            body = (
+                f"Approval grant `{old_ref}` was superseded because the proposal was rewritten. "
+                f"It was bound to digest `{old_digest}`; the current digest is `{new_digest}`. "
+                f"Please decide the fresh grant `{requested.approval_ref}`."
+            )
+            try:
+                await workflow.execute_activity(
+                    post_issue_comment,
+                    args=[f"{parts.owner}/{parts.repo}", int(parts.number), body],
+                    start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                    retry_policy=RetryPolicy(maximum_attempts=2),
+                )
+            except ActivityError:
+                workflow.logger.warning("GRANT_SUPERSEDED comment on %s failed", issue.issue_url)
         if requested.state == APPROVAL_APPROVED and requested.approval_ref:
             # Found already decided (a new run of this loop re-finding the
             # grant a human approved for an earlier run): signals are per
@@ -2092,6 +2168,105 @@ class DevLoopWorkflow:
             self._approval_ref = requested.approval_ref
             self._approved = True
         return None
+
+    async def _supersede_grant_if_stale(self, target_repo: str, slug: str) -> str:
+        """Prove the pending grant still describes the current proposal
+        bytes (#701). Returns "fresh", "superseded" (the grant was dropped
+        and a fresh one must be asked), "unreadable" (the digest could not
+        be read: the grant must not be presented, retry later) or "capped"
+        (too many supersedes: the loop ends). An unreadable digest is never
+        a match."""
+        if not (self._requested_ref and self._approval_digest):
+            return "fresh"
+        attempt = self._approval_attempt
+        old_ref = self._approval_ref or self._requested_ref
+        try:
+            checked: GrantFreshnessResult = await workflow.execute_activity(
+                check_grant_freshness,
+                GrantFreshnessInput(service=target_repo, slug=slug, bound_digest=self._approval_digest),
+                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+            )
+        except ActivityError:
+            return "unreadable"
+        if attempt != self._approval_attempt:
+            # A transition already cleared this grant while the read ran.
+            return "superseded"
+        if checked.fresh:
+            return "fresh"
+        workflow.logger.warning(
+            "GRANT_SUPERSEDED aar=%s we=%s target=%s/%s old_digest=%s old_commit=%s "
+            "new_digest=%s new_commit=%s reason=%s",
+            old_ref, self._canonical_execution_id(), target_repo, slug,
+            self._approval_digest, self._approval_commit,
+            checked.current_digest, checked.current_commit, SUPERSEDE_REASON,
+        )
+        self._supersede_note = (old_ref, self._approval_digest, checked.current_digest, checked.current_commit)
+        self._superseded_refs = [*self._superseded_refs, old_ref][-_MAX_SUPERSEDED_REFS:]
+        self._approved = False
+        self._approver = None
+        self._approval_ref = ""
+        self._requested_ref = ""
+        self._signalled_refs = []
+        self._approval_digest = ""
+        self._approval_commit = ""
+        self._approval_attempt += 1
+        self._supersede_count += 1
+        self._grant_refresh = True
+        if self._supersede_count > MAX_GRANT_SUPERSEDES:
+            return "capped"
+        return "superseded"
+
+    async def _ensure_fresh_grant(
+        self,
+        issue: IssueRef,
+        target_repo: str,
+        slug: str,
+        investigate_result: WorkflowResult,
+        human_input: HumanInputOutcome | None,
+    ) -> DevLoopResult | None:
+        """Decision-time gate (#701): returns None only when the approved
+        grant is bound to the current proposal digest. A stale grant is
+        superseded and re-asked; an unreadable digest keeps the loop here
+        (bounded by one CANONICAL_APPROVAL_WAIT) rather than presenting it."""
+        deadline = workflow.now() + CANONICAL_APPROVAL_WAIT
+
+        def ended(reason: str) -> DevLoopResult:
+            return DevLoopResult(
+                investigate=investigate_result, implement=None, human_input=human_input, ended=reason
+            )
+
+        while True:
+            # A cleared grant (a resume landed while the digest was
+            # unreadable) is missing, not fresh: ask again.
+            # A stale-true `_grant_refresh` beside a decided grant is not
+            # missing: test the state, not the hint.
+            missing = not self._is_approved(needs_grant=True) and (
+                self._grant_refresh or not self._requested_ref
+            )
+            outcome = "superseded" if missing else await self._supersede_grant_if_stale(target_repo, slug)
+            if outcome == "fresh":
+                return None
+            if outcome == "capped":
+                return ended("approval superseded too many times")
+            if outcome == "superseded":
+                result = await self._await_canonical_reapproval(
+                    issue, target_repo, investigate_result, human_input=human_input
+                )
+                if result is not None:
+                    return result
+                continue
+            if workflow.now() >= deadline:
+                return ended("approval freshness unreadable")
+            try:
+                await workflow.wait_condition(
+                    lambda: self._abandoned or (self._grant_refresh and not self._is_approved(needs_grant=True)),
+                    timeout=GRANT_FRESHNESS_INTERVAL,
+                )
+            except TimeoutError:
+                pass
+            if self._abandoned:
+                return ended(f"{ABANDONED_ENDED_PREFIX}{self._abandon_reason}")
 
     async def _delegated_approve(self, target_repo: str, slug: str) -> tuple[WorkflowResult | None, str]:
         """Flip the proposal through mctl-api's delegated operation, under the
@@ -2229,13 +2404,14 @@ class DevLoopWorkflow:
         def opened() -> bool:
             return len(self._executions) > self._transition_mark
 
+        ticked = False
         while True:
             if self._abandoned:
                 return ended(f"{ABANDONED_ENDED_PREFIX}{self._abandon_reason}")
             remaining = deadline - workflow.now()
             if remaining <= timedelta(0) and not self._is_approved(needs_grant=True):
                 return ended("re-approval wait expired")
-            if not self._is_approved(needs_grant=True):
+            if not self._is_approved(needs_grant=True) and not (ticked and not self._grant_refresh):
                 if after_flip:
                     # The resume's `we_` is bound at its fulfil, after the
                     # transition; a grant asked before that would be asked
@@ -2255,10 +2431,28 @@ class DevLoopWorkflow:
                 )
                 if refused is not None:
                     return dataclasses.replace(refused, approve=approve)
+            ticked = False
+            wait = max(deadline - workflow.now(), timedelta(seconds=1))
+            tick = bool(self._grant_freshness and self._approval_slug and not after_flip)
+            if tick:
+                wait = min(wait, GRANT_FRESHNESS_INTERVAL)
             result = await self._await_reapproval(
                 investigate_result, approve=approve, human_input=human_input, needs_grant=True,
-                wait=max(deadline - workflow.now(), timedelta(seconds=1)),
+                wait=wait,
             )
+            if (
+                tick
+                and result is not None
+                and result.ended == "re-approval wait expired"
+                and workflow.now() < deadline
+                and not self._is_approved(needs_grant=True)
+            ):
+                # #701: re-check the pending grant's digest at a bounded
+                # interval, as the main approval park does.
+                ticked = True
+                if await self._supersede_grant_if_stale(target_repo, self._approval_slug) == "capped":
+                    return ended("approval superseded too many times")
+                continue
             if result is not None or self._is_approved(needs_grant=True):
                 return result
 
@@ -3514,6 +3708,8 @@ class DevLoopWorkflow:
         # park, which may last days with the loop RUNNING. Still best effort.
         dispatched_advance_pending = await self._land_pending_advance(dispatched_advance_pending, before="approval")
         if self._canonical:
+            self._grant_freshness = workflow.patched(GRANT_FRESHNESS_PATCH)
+        if self._canonical:
             # #636: the grant this park waits for exists before the wait
             # starts. It is bound to this loop's own `we_` and to exactly the
             # proposal that will be flipped, so mctl-api can tell the human
@@ -3528,6 +3724,8 @@ class DevLoopWorkflow:
         approval_ended: str | None = None
         if workflow.patched("approval-watch"):
             approval_deadline = workflow.now() + approval_wait
+            park_interval = GRANT_FRESHNESS_INTERVAL if self._grant_freshness else APPROVAL_POLL_INTERVAL
+            last_issue_read = workflow.now()
             while workflow.now() < approval_deadline:
                 try:
                     # wait_condition with a timeout raises asyncio.TimeoutError
@@ -3535,16 +3733,28 @@ class DevLoopWorkflow:
                     # returns a value at all (see its own signature).
                     await workflow.wait_condition(
                         lambda: self._is_approved() or self._abandoned or (self._canonical and self._grant_refresh),
-                        timeout=APPROVAL_POLL_INTERVAL,
+                        timeout=park_interval,
                     )
                 except TimeoutError:
-                    parked_state = await _read_issue_state(issue)
-                    if parked_state is not None and parked_state.state == "closed":
-                        approval_ended = (
-                            "source issue closed while parked "
-                            f"({parked_state.state_reason or 'completed'})"
-                        )
-                        break
+                    if not self._grant_freshness or workflow.now() - last_issue_read >= APPROVAL_POLL_INTERVAL:
+                        last_issue_read = workflow.now()
+                        parked_state = await _read_issue_state(issue)
+                        if parked_state is not None and parked_state.state == "closed":
+                            approval_ended = (
+                                "source issue closed while parked "
+                                f"({parked_state.state_reason or 'completed'})"
+                            )
+                            break
+                    if self._grant_freshness and self._approval_slug:
+                        # #701: a rewrite while parked supersedes the grant
+                        # before any decision arrives.
+                        fresh_outcome = await self._supersede_grant_if_stale(target_repo, self._approval_slug)
+                        if fresh_outcome == "capped":
+                            return DevLoopResult(
+                                investigate=investigate_result, implement=None,
+                                human_input=human_input_outcome,
+                                ended="approval superseded too many times",
+                            )
                     continue
                 if self._canonical and self._grant_refresh and not (self._is_approved() or self._abandoned):
                     # #636 (claude P2 on #651): a transition landed while
@@ -3714,6 +3924,14 @@ class DevLoopWorkflow:
                     # grant a human decided, with a run token for this `we_`.
                     # No branch below this one is a fallback: every refusal
                     # ends the loop, none reaches the legacy relay.
+                    if self._grant_freshness:
+                        # #701: never spend a grant bound to bytes that are
+                        # no longer the proposal's.
+                        stale = await self._ensure_fresh_grant(
+                            issue, target_repo, slug, investigate_result, human_input_outcome
+                        )
+                        if stale is not None:
+                            return stale
                     approve_result, refused = await self._delegated_approve(target_repo, slug)
                     if approve_result is None:
                         return DevLoopResult(

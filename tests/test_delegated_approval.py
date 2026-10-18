@@ -432,3 +432,36 @@ async def test_the_ttl_is_clamped_to_what_mctl_api_accepts(env, aar_api):
 
     expires = datetime.fromisoformat(aar_api.only()["expires_at"])
     assert (expires - datetime.now(UTC)).total_seconds() <= aa.MAX_TTL_S + 5
+
+
+# mctlhq/mctl-agents#701: the freshness check the DevLoop runs before it
+# presents or spends a grant.
+FRESH_INPUT = da.GrantFreshnessInput(service="mctl-telegram", slug="issue-7-title", bound_digest="sha256:v1")
+
+
+async def test_check_grant_freshness_is_fresh_for_an_equal_digest(env, monkeypatch):
+    async def read(service, slug):
+        return "sha256:v1", "c1"
+
+    monkeypatch.setattr(da, "read_proposal_content_digest", read)
+    result = await env.run(da.check_grant_freshness, FRESH_INPUT)
+    assert result == da.GrantFreshnessResult(fresh=True, current_digest="sha256:v1", current_commit="c1")
+
+
+async def test_check_grant_freshness_is_stale_for_a_different_digest(env, monkeypatch):
+    async def read(service, slug):
+        return "sha256:v2", "c2"
+
+    monkeypatch.setattr(da, "read_proposal_content_digest", read)
+    result = await env.run(da.check_grant_freshness, FRESH_INPUT)
+    assert result == da.GrantFreshnessResult(fresh=False, current_digest="sha256:v2", current_commit="c2")
+
+
+async def test_check_grant_freshness_raises_unavailable_when_unreadable(env, monkeypatch):
+    async def read(service, slug):
+        raise ProposalListingError("boom")
+
+    monkeypatch.setattr(da, "read_proposal_content_digest", read)
+    with pytest.raises(ApplicationError) as caught:
+        await env.run(da.check_grant_freshness, FRESH_INPUT)
+    assert caught.value.type == da.UNAVAILABLE_TYPE

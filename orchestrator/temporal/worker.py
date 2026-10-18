@@ -46,7 +46,11 @@ from orchestrator import tracing
 from orchestrator.temporal.activities.action_approval import read_action_approval
 from orchestrator.temporal.activities.argo import submit_and_wait
 from orchestrator.temporal.activities.canonical_execution import ensure_issue_execution
-from orchestrator.temporal.activities.delegated_approval import request_devloop_approval, submit_delegated_approve
+from orchestrator.temporal.activities.delegated_approval import (
+    check_grant_freshness,
+    request_devloop_approval,
+    submit_delegated_approve,
+)
 from orchestrator.temporal.activities.deploy_state import (
     get_deploy_status,
     get_release_after,
@@ -61,7 +65,7 @@ from orchestrator.temporal.activities.human_input import find_human_input_reques
 from orchestrator.temporal.activities.identity import mint_execution_context
 from orchestrator.temporal.activities.incidents import list_service_incidents
 from orchestrator.temporal.activities.issue_poll import directive_scan_activity, poll_issues_activity
-from orchestrator.temporal.activities.issue_state import get_issue_state
+from orchestrator.temporal.activities.issue_state import get_issue_state, post_issue_comment
 from orchestrator.temporal.activities.lifecycle import execution_claim, lifecycle_ownership
 from orchestrator.temporal.activities.lifecycle_reconcile import (
     reconcile_lifecycle_ownership,
@@ -714,6 +718,10 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         # mctl-api round trips, the same shape as the two above.
         ensure_issue_execution,
         request_devloop_approval,
+        # Read-only digest check and best-effort audit comment of a superseded
+        # grant (#701).
+        check_grant_freshness,
+        post_issue_comment,
         # The approval wait's read-only poll (#198, ADR-014 §7): one GET of
         # one ActionApprovalRequest, never a mutation.
         read_action_approval,
