@@ -178,6 +178,40 @@ async def request_devloop_approval(input: ApprovalRequestInput) -> ApprovalReque
 
 
 @dataclass(frozen=True)
+class GrantFreshnessInput:
+    service: str
+    slug: str
+    #: The proposal content digest the pending grant is bound to.
+    bound_digest: str
+
+
+@dataclass(frozen=True)
+class GrantFreshnessResult:
+    fresh: bool
+    current_digest: str
+    current_commit: str
+
+
+@activity.defn
+async def check_grant_freshness(input: GrantFreshnessInput) -> GrantFreshnessResult:
+    """Does the proposal still hash to the digest the grant is bound to
+    (mctl-agents#701)? Read-only, through the reader #681 binds with. A digest
+    that cannot be read is raised, never reported as fresh."""
+    try:
+        digest, commit = await read_proposal_content_digest(input.service, input.slug)
+    except ProposalListingError as exc:
+        raise ApplicationError(
+            f"proposal content of {approval_target(input.service, input.slug)} could not be read: {exc}",
+            type=UNAVAILABLE_TYPE,
+        ) from exc
+    return GrantFreshnessResult(
+        fresh=bool(input.bound_digest) and digest == input.bound_digest,
+        current_digest=digest,
+        current_commit=commit,
+    )
+
+
+@dataclass(frozen=True)
 class DelegatedApproveInput:
     #: The `we_` the grant and the run token are bound to.
     execution_id: str

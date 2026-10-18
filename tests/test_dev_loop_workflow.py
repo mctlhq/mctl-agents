@@ -45,6 +45,8 @@ from orchestrator.temporal.activities.delegated_approval import (
     ApprovalRequestResult,
     DelegatedApproveInput,
     DelegatedApproveResult,
+    GrantFreshnessInput,
+    GrantFreshnessResult,
 )
 from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTarget, ReleaseInfo
 from orchestrator.temporal.activities.execution_requests import AdvanceInput
@@ -66,6 +68,7 @@ from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.action_approval import ActionApprovalWaitWorkflow, ApprovalWaitResult
 from orchestrator.temporal.workflows.dev_loop import (
     FAST_ACTIVITY_TIMEOUT,
+    GRANT_FRESHNESS_INTERVAL,
     INCIDENT_WATCH_WINDOW,
     LIFECYCLE_HEARTBEAT_EVERY_POLLS,
     LIFECYCLE_REFUSAL_BACKOFF_POLLS,
@@ -73,6 +76,7 @@ from orchestrator.temporal.workflows.dev_loop import (
     LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT,
     LIFECYCLE_UNKNOWN_WRITE_LIMIT,
     LOOP_TERMINAL_PROPOSAL_STATUSES,
+    MAX_GRANT_SUPERSEDES,
     MERGE_GATE_OFF_CODES,
     MERGE_GATE_OFF_REPROBE_POLLS,
     MERGE_GATE_SETTLED_OUTCOMES,
@@ -235,6 +239,8 @@ def _canonical_activities(
     approval_requests: list[ApprovalRequestInput] | None = None,
     approval_result: ApprovalRequestResult | None = None,
     approval_hook: Any = None,
+    digest_state: dict | None = None,
+    comment_log: list[tuple] | None = None,
     delegated_log: list[DelegatedApproveInput] | None = None,
     delegated_result: DelegatedApproveResult | None = None,
     advance_log: list[AdvanceInput] | None = None,
@@ -265,7 +271,28 @@ def _canonical_activities(
         # Like mctl-api, a new attempt is a new idempotency key and so a new
         # `aar_`; asking again for the same attempt finds the same one.
         ref = "aar_test" if inp.attempt == 0 else f"aar_test_a{inp.attempt}"
+        if approval_result is None and digest_state is not None:
+            # #701: the grant is bound to the digest current when it is asked.
+            return ApprovalRequestResult(
+                ok=True, approval_ref=ref, state="pending",
+                content_digest=digest_state["current"], content_commit="c-" + digest_state["current"],
+            )
         return approval_result or ApprovalRequestResult(ok=True, approval_ref=ref, state="pending")
+
+    @activity.defn(name="check_grant_freshness")
+    async def fake_check_grant_freshness(inp: GrantFreshnessInput) -> GrantFreshnessResult:
+        if digest_state is None:
+            return GrantFreshnessResult(fresh=True, current_digest=inp.bound_digest, current_commit="c")
+        if digest_state.get("unreadable"):
+            raise ApplicationError("unreadable", type="DelegatedApprovalUnavailable")
+        cur = digest_state["current"]
+        return GrantFreshnessResult(fresh=cur == inp.bound_digest, current_digest=cur, current_commit="c-" + cur)
+
+    @activity.defn(name="post_issue_comment")
+    async def fake_post_issue_comment(repo: str, number: int, body: str) -> bool:
+        if comment_log is not None:
+            comment_log.append((repo, number, body))
+        return True
 
     @activity.defn(name="submit_delegated_approve")
     async def fake_submit_delegated_approve(inp: DelegatedApproveInput) -> DelegatedApproveResult:
@@ -290,6 +317,8 @@ def _canonical_activities(
         fake_request_devloop_approval,
         fake_submit_delegated_approve,
         fake_advance_dispatched_execution,
+        fake_check_grant_freshness,
+        fake_post_issue_comment,
     ]
 
 
@@ -377,6 +406,8 @@ def _fake_activities(
     approval_requests: list[ApprovalRequestInput] | None = None,
     approval_result: ApprovalRequestResult | None = None,
     approval_hook: Any = None,
+    digest_state: dict | None = None,
+    comment_log: list[tuple] | None = None,
     delegated_log: list[DelegatedApproveInput] | None = None,
     delegated_result: DelegatedApproveResult | None = None,
     advance_log: list[AdvanceInput] | None = None,
@@ -773,6 +804,8 @@ def _fake_activities(
             approval_requests=approval_requests,
             approval_result=approval_result,
             approval_hook=approval_hook,
+            digest_state=digest_state,
+            comment_log=comment_log,
             delegated_log=delegated_log,
             delegated_result=delegated_result,
             advance_log=advance_log,
@@ -8022,3 +8055,147 @@ class TestOwnerPrincipalOf:
     )
     def test_anything_else_names_no_principal(self, audience, refs):
         assert dev_loop._owner_principal_of(_sealed_request(actor_refs=refs, audience=audience)) == ""
+
+
+class TestGrantFreshness:
+    """mctlhq/mctl-agents#701 (mctlhq/.github#182): a rewritten proposal
+    supersedes the pending grant; a stale grant is never spent."""
+
+    URL = "https://github.com/mctlhq/mctl-telegram/issues/42"
+
+    async def _wait_for(self, predicate):
+        with anyio.fail_after(20):
+            while not predicate():  # noqa: ASYNC110 - polling a test fake
+                await anyio.sleep(0.05)
+
+    async def _start(self, env, **kwargs):
+        activities, _calls, investigate_ran, _ops = _fake_activities(released=True, **kwargs)
+        worker = Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities)
+        return worker, investigate_ran
+
+    async def test_t2_happy_path_asks_once_and_flips_once(self, env):
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        comments: list[tuple] = []
+        digest = {"current": "sha256:v1"}
+        worker, investigate_ran = await self._start(
+            env, approval_requests=requests, delegated_log=delegated, digest_state=digest, comment_log=comments
+        )
+        async with worker:
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run, IssueRef(issue_url=self.URL),
+                id=f"dev-loop-test-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            with anyio.fail_after(30):
+                await handle.result()
+        assert len(requests) == 1
+        assert [d.approval_ref for d in delegated] == ["aar_test"]
+        assert comments == []
+
+    async def test_t1_t3_rewrite_before_the_decision_supersedes_the_grant(self, env):
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        comments: list[tuple] = []
+        digest = {"current": "sha256:v1"}
+        worker, investigate_ran = await self._start(
+            env, approval_requests=requests, delegated_log=delegated, digest_state=digest, comment_log=comments
+        )
+        async with worker:
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run, IssueRef(issue_url=self.URL),
+                id=f"dev-loop-test-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await self._wait_for(lambda: len(requests) == 1)
+            digest["current"] = "sha256:v2"  # the reinvestigate rewrite
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await self._wait_for(lambda: len(requests) == 2)
+            assert delegated == [], "the stale grant must never be spent"
+            assert requests[1].attempt == requests[0].attempt + 1
+            assert (await handle.describe()).status.name == "RUNNING"
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test_a1"})
+            with anyio.fail_after(30):
+                await handle.result()
+        assert [d.approval_ref for d in delegated] == ["aar_test_a1"]
+        assert len(comments) == 1
+        body = comments[0][2]
+        assert "aar_test" in body and "sha256:v1" in body and "sha256:v2" in body and "aar_test_a1" in body
+
+    async def test_t4_a_rewrite_while_parked_supersedes_within_one_tick(self, env):
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        digest = {"current": "sha256:v1"}
+        worker, investigate_ran = await self._start(
+            env, approval_requests=requests, delegated_log=delegated, digest_state=digest
+        )
+        async with worker:
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run, IssueRef(issue_url=self.URL),
+                id=f"dev-loop-test-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await self._wait_for(lambda: len(requests) == 1)
+            digest["current"] = "sha256:v2"
+            await env.sleep(GRANT_FRESHNESS_INTERVAL + timedelta(minutes=1))
+            await self._wait_for(lambda: len(requests) == 2)
+            # A late decision on the superseded grant is ignored.
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await env.sleep(timedelta(minutes=1))
+            assert delegated == []
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test_a1"})
+            with anyio.fail_after(30):
+                await handle.result()
+        assert [d.approval_ref for d in delegated] == ["aar_test_a1"]
+
+    async def test_t5_an_unreadable_digest_is_never_a_match(self, env):
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        digest = {"current": "sha256:v1", "unreadable": True}
+        worker, investigate_ran = await self._start(
+            env, approval_requests=requests, delegated_log=delegated, digest_state=digest
+        )
+        async with worker:
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run, IssueRef(issue_url=self.URL),
+                id=f"dev-loop-test-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await self._wait_for(lambda: len(requests) == 1)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await env.sleep(timedelta(hours=1))
+            assert delegated == []
+            assert (await handle.describe()).status.name == "RUNNING"
+            digest["unreadable"] = False
+            with anyio.fail_after(60):
+                await handle.result()
+        assert [d.approval_ref for d in delegated] == ["aar_test"]
+
+    async def test_t6_too_many_supersedes_end_the_loop(self, env):
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        digest = {"current": "sha256:v0"}
+        worker, investigate_ran = await self._start(
+            env, approval_requests=requests, delegated_log=delegated, digest_state=digest
+        )
+        async with worker:
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run, IssueRef(issue_url=self.URL),
+                id=f"dev-loop-test-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            for i in range(MAX_GRANT_SUPERSEDES + 1):
+                await self._wait_for(lambda n=i + 1: len(requests) == n)
+                digest["current"] = f"sha256:v{i + 1}"
+                ref = "aar_test" if i == 0 else f"aar_test_a{i}"
+                await handle.signal(DevLoopWorkflow.approve, {"approval_ref": ref})
+            with anyio.fail_after(60):
+                result = await handle.result()
+        assert result.ended == "approval superseded too many times"
+        assert delegated == []

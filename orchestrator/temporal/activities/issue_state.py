@@ -108,3 +108,20 @@ async def get_issue_state(repo: str, issue_number: int) -> IssueState:
         repo, issue_number, result.state, result.state_reason,
     )
     return result
+
+
+@activity.defn
+async def post_issue_comment(repo: str, issue_number: int, body: str) -> bool:
+    """Best-effort comment on `repo#issue_number` (mctl-agents#701). Returns
+    whether it was posted; never raises, so an audit comment can never fail
+    or retry-storm the loop that asked for it."""
+    token = await asyncio.to_thread(_resolve_token)
+    if not token:
+        return False
+    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments"
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+            response = await client.post(url, headers=_headers(token), json={"body": body})
+    except httpx.RequestError:
+        return False
+    return response.status_code == 201
