@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.85.0](https://github.com/mctlhq/mctl-agents/compare/1.84.0...1.85.0) (2026-10-18)
+
+
+### Features
+
+* **agents:** issue-694-feat-runtime-assurance-define-assurance ([68f10af](https://github.com/mctlhq/mctl-agents/commit/68f10afcb8a96d7b1c54d5d56819d8e39979c275))
+* **agents:** issue-694-feat-runtime-assurance-define-assurance ([988dae0](https://github.com/mctlhq/mctl-agents/commit/988dae0d57a4e77b040073e55e4190f34e6557f7))
+* **agents:** issue-701-fix-devloop-reinvestigate-must-supersede ([1cfb381](https://github.com/mctlhq/mctl-agents/commit/1cfb3812c704fa14aad78e15357a8fc9107b3ea9))
+* **implementer:** record the approval digest verdict on every outcome ([cd068a8](https://github.com/mctlhq/mctl-agents/commit/cd068a8e2a2e45fd767bd4ac7989b037ab554f61))
+* **implementer:** record the approval digest verdict on every outcome ([d7a8fa0](https://github.com/mctlhq/mctl-agents/commit/d7a8fa04eb3f969663fac5cf8a61ac4f21a9262d))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-694-feat-runtime-assurance-define-assurance ([1a720af](https://github.com/mctlhq/mctl-agents/commit/1a720af696af1f6ac73a0ced1136b3f3724d7d1b))
+* **agents:** address P1/P2 codex findings on issue-694-feat-runtime-assurance-define-assurance ([87fec3c](https://github.com/mctlhq/mctl-agents/commit/87fec3ce6ba238a7a464518617762658084f1a74))
+* **agents:** address P1/P2 codex findings on issue-701-fix-devloop-reinvestigate-must-supersede ([3f01c7a](https://github.com/mctlhq/mctl-agents/commit/3f01c7a93732301d5f79c6b04eb40d87e51b0b88))
+* **agents:** address P1/P2 codex findings on issue-701-fix-devloop-reinvestigate-must-supersede ([15d45f0](https://github.com/mctlhq/mctl-agents/commit/15d45f0029464c13a157f98f2e00aa1ec401301e))
+* **agents:** address P1/P2 codex findings on issue-701-fix-devloop-reinvestigate-must-supersede ([e28a7af](https://github.com/mctlhq/mctl-agents/commit/e28a7af49916077baddcfcea4390795d18bf56b7))
+* **agents:** issue-701-fix-devloop-reinvestigate-must-supersede ([59c9208](https://github.com/mctlhq/mctl-agents/commit/59c92081c0eb730bfd6e6fe3b93988261c3e1417))
+* **agents:** scope finding confirmation to the finding's invariant ([554e8ac](https://github.com/mctlhq/mctl-agents/commit/554e8ac5e0a1f8ec1a14294d109fa19188e89242))
+
 ## [1.84.0](https://github.com/mctlhq/mctl-agents/compare/1.83.0...1.84.0) (2026-10-17)
 
 
