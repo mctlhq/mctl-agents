@@ -110,7 +110,8 @@ async def restart_if_restartable(issue_url: str, client: Client) -> WorkflowHand
     `start_dev_loop_workflow` refuses any COMPLETED run.
 
     The marker is the run's own result: every abandon path returns
-    ``ended`` starting with one of RESTARTABLE_ENDED_PREFIXES (abandoned, approval refused, approval failed). The runs this exists for
+    ``ended`` starting with one of RESTARTABLE_ENDED_PREFIXES (abandoned,
+    approval refused, approval failed). The runs this exists for
     were abandoned before any memo or search attribute could have been
     written. An abandon during implement or the merge watch leaves a PR
     behind, which a fresh investigate would not resume, so ``implement`` must

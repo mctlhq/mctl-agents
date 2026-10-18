@@ -1109,7 +1109,7 @@ RESTARTABLE_ENDED_PREFIXES = (
 APPROVAL_FAILURE_OUTCOME_PATCH = "approval-failure-outcome"
 #: A delegated refusal whose code contains one of these denotes a stale or
 #: drifted grant: re-ask a fresh grant instead of ending the loop.
-STALE_GRANT_REFUSAL_CODES = ("digest", "drift")
+STALE_GRANT_REFUSAL_CODES = ("digest", "drift", "stale-slug")
 
 
 @dataclass(frozen=True)
@@ -2293,8 +2293,10 @@ class DevLoopWorkflow:
         """Flip the proposal through mctl-api's delegated operation, under the
         signalled grant. Returns (result, "") or (None, why the loop ends)."""
         if slug != self._approval_slug:
+            self._approve_refusal_code = "stale-slug"
             return None, "approve flip refused: the proposal changed since the approval was requested"
         if not self._approval_ref:
+            self._approve_refusal_code = "missing-grant"
             return None, "approve flip refused: no approval grant was signalled"
         try:
             delegated: DelegatedApproveResult = await workflow.execute_activity(
@@ -4026,7 +4028,8 @@ class DevLoopWorkflow:
                                 human_input_outcome,
                             )
                         if approve_result is None:
-                            kind = "approval_failed" if refused.startswith("approve flip unavailable") else "approval_refused"
+                            unavailable = refused.startswith("approve flip unavailable")
+                            kind = "approval_failed" if unavailable else "approval_refused"
                             return self._approval_ended(
                                 kind, refused, investigate_result, None, human_input_outcome
                             )
