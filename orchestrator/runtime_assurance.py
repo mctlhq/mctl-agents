@@ -1564,7 +1564,16 @@ def check_finding_confirmation(
     ]
     if not backing:
         raise _fail("finding: the replay has no observed, non-asserted support")
-    return "observed" if any(o.authority == "observed" for o in backing) else "derived"
+    authority = "observed" if any(o.authority == "observed" for o in backing) else "derived"
+    if finding.state == STATE_REJECTED:
+        raise _fail("finding: a rejected finding is not confirmed by any replay")
+    if finding.validation is not None:
+        v = finding.validation
+        if (v.replay_run_id, v.replay_result_id) != (replay_run.run_id, replay_result.result_id):
+            raise _fail("finding: validation names a different replay run or result")
+        if v.authority != authority:
+            raise _fail(f"finding: validation claims authority {v.authority!r}, the replay supports {authority!r}")
+    return authority
 
 
 def check_finding_against_result(

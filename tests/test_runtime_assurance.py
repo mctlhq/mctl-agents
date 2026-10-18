@@ -819,6 +819,22 @@ def test_check_finding_confirmation_matches_transition():
         ra.check_finding_confirmation(cand, None, None)
 
 
+def test_check_finding_confirmation_binds_to_stored_validation():
+    conf = parse("finding-confirmed.json")
+    replay, rres = _replay_kwargs()
+    assert ra.check_finding_confirmation(conf, replay, rres) == conf.validation.authority
+    k = {
+        f.name: getattr(conf, f.name) for f in dataclasses.fields(conf) if f.name not in ("finding_id", "content_hash")
+    }
+    flipped = "derived" if conf.validation.authority == "observed" else "observed"
+    bad_authority = ra.seal_finding(**{**k, "validation": dataclasses.replace(conf.validation, authority=flipped)})
+    with pytest.raises(ra.RuntimeAssuranceError, match="authority"):
+        ra.check_finding_confirmation(bad_authority, replay, rres)
+    other = dataclasses.replace(conf.validation, replay_run_id="arn-" + "1" * 16)
+    with pytest.raises(ra.RuntimeAssuranceError):
+        ra.check_finding_confirmation(ra.seal_finding(**{**k, "validation": other}), replay, rres)
+
+
 def test_check_finding_against_result(result, shadow):
     cand = parse("finding-candidate.json")
     ra.check_finding_against_result(cand, result, shadow)
