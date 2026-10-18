@@ -18,7 +18,7 @@ from orchestrator.temporal.constants import TASK_QUEUE
 # callers can import it without the SDK; re-exported here because this
 # module is where every Temporal-side caller historically found it.
 from orchestrator.temporal.issue_ref import workflow_id_for
-from orchestrator.temporal.workflows.dev_loop import ABANDONED_ENDED_PREFIX, DevLoopWorkflow, IssueRef
+from orchestrator.temporal.workflows.dev_loop import RESTARTABLE_ENDED_PREFIXES, DevLoopWorkflow, IssueRef
 
 #: The one DevLoop per issue (mctlhq/mctl-agents#461 option A): every start,
 #: the intake poller's and the execution-request dispatcher's alike, names
@@ -41,7 +41,7 @@ DEV_LOOP_ID_REUSE_POLICY = WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY
 #: never ran it; a fulfilled request is closed for good.
 DISPATCH_ID_REUSE_POLICY = WorkflowIDReusePolicy.ALLOW_DUPLICATE
 #: The operator restart's reuse policy (mctl-api#640): a run that COMPLETED
-#: may be followed by a new one, but only after `restart_if_abandoned` has
+#: may be followed by a new one, but only after `restart_if_restartable` has
 #: read that the run was abandoned before implement. Temporal cannot make the
 #: reuse conditional on how the run ended, so the check is the caller's.
 RESTART_ID_REUSE_POLICY = WorkflowIDReusePolicy.ALLOW_DUPLICATE
@@ -98,7 +98,7 @@ async def start_dev_loop_workflow(issue_url: str, client: Client | None = None) 
     )
 
 
-async def restart_if_abandoned(issue_url: str, client: Client) -> WorkflowHandle | None:
+async def restart_if_restartable(issue_url: str, client: Client) -> WorkflowHandle | None:
     """Start a new DevLoopWorkflow for ``issue_url`` when its latest run was
     abandoned before the implement step, and return None for every other
     closed run (mctl-api#640).
@@ -110,7 +110,7 @@ async def restart_if_abandoned(issue_url: str, client: Client) -> WorkflowHandle
     `start_dev_loop_workflow` refuses any COMPLETED run.
 
     The marker is the run's own result: every abandon path returns
-    ``ended=f"{ABANDONED_ENDED_PREFIX}{reason}"``. The runs this exists for
+    ``ended`` starting with one of RESTARTABLE_ENDED_PREFIXES (abandoned, approval refused, approval failed). The runs this exists for
     were abandoned before any memo or search attribute could have been
     written. An abandon during implement or the merge watch leaves a PR
     behind, which a fresh investigate would not resume, so ``implement`` must
@@ -131,7 +131,7 @@ async def restart_if_abandoned(issue_url: str, client: Client) -> WorkflowHandle
     result = await client.get_workflow_handle_for(DevLoopWorkflow.run, workflow_id, run_id=desc.run_id).result()
     # `ended` is typed `str`, but a result payload carrying JSON null for it
     # would decode as None; that is "no abandon marker", not a crash.
-    if result.implement is not None or not (result.ended or "").startswith(ABANDONED_ENDED_PREFIX):
+    if result.implement is not None or not (result.ended or "").startswith(RESTARTABLE_ENDED_PREFIXES):
         return None
     return await client.start_workflow(
         DevLoopWorkflow.run,
@@ -141,6 +141,10 @@ async def restart_if_abandoned(issue_url: str, client: Client) -> WorkflowHandle
         id_reuse_policy=RESTART_ID_REUSE_POLICY,
         id_conflict_policy=DEV_LOOP_ID_CONFLICT_POLICY,
     )
+
+
+#: Old name, kept for callers.
+restart_if_abandoned = restart_if_restartable
 
 
 def dispatch_start_operation(issue: IssueRef) -> WithStartWorkflowOperation:
