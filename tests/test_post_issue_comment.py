@@ -11,7 +11,7 @@ from orchestrator.temporal.activities import issue_state
 from orchestrator.temporal.activities.issue_state import IssueStateError, post_issue_comment
 
 
-def _patch(monkeypatch, *, token="t", status=201, exc=None):
+def _patch(monkeypatch, *, token="t", status=201, exc=None):  # noqa: S107
     monkeypatch.setattr(issue_state, "_resolve_token", lambda: token)
 
     class _Client:

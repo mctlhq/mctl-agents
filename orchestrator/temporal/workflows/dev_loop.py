@@ -2237,7 +2237,9 @@ class DevLoopWorkflow:
             )
 
         while True:
-            outcome = await self._supersede_grant_if_stale(target_repo, slug)
+            # A cleared grant (a resume landed while the digest was
+            # unreadable) is missing, not fresh: ask again.
+            outcome = "superseded" if self._grant_refresh else await self._supersede_grant_if_stale(target_repo, slug)
             if outcome == "fresh":
                 return None
             if outcome == "capped":
@@ -2394,13 +2396,14 @@ class DevLoopWorkflow:
         def opened() -> bool:
             return len(self._executions) > self._transition_mark
 
+        ticked = False
         while True:
             if self._abandoned:
                 return ended(f"{ABANDONED_ENDED_PREFIX}{self._abandon_reason}")
             remaining = deadline - workflow.now()
             if remaining <= timedelta(0) and not self._is_approved(needs_grant=True):
                 return ended("re-approval wait expired")
-            if not self._is_approved(needs_grant=True):
+            if not self._is_approved(needs_grant=True) and not (ticked and not self._grant_refresh):
                 if after_flip:
                     # The resume's `we_` is bound at its fulfil, after the
                     # transition; a grant asked before that would be asked
@@ -2420,10 +2423,28 @@ class DevLoopWorkflow:
                 )
                 if refused is not None:
                     return dataclasses.replace(refused, approve=approve)
+            ticked = False
+            wait = max(deadline - workflow.now(), timedelta(seconds=1))
+            tick = bool(self._grant_freshness and self._approval_slug and not after_flip)
+            if tick:
+                wait = min(wait, GRANT_FRESHNESS_INTERVAL)
             result = await self._await_reapproval(
                 investigate_result, approve=approve, human_input=human_input, needs_grant=True,
-                wait=max(deadline - workflow.now(), timedelta(seconds=1)),
+                wait=wait,
             )
+            if (
+                tick
+                and result is not None
+                and result.ended == "re-approval wait expired"
+                and workflow.now() < deadline
+                and not self._is_approved(needs_grant=True)
+            ):
+                # #701: re-check the pending grant's digest at a bounded
+                # interval, as the main approval park does.
+                ticked = True
+                if await self._supersede_grant_if_stale(target_repo, self._approval_slug) == "capped":
+                    return ended("approval superseded too many times")
+                continue
             if result is not None or self._is_approved(needs_grant=True):
                 return result
 
