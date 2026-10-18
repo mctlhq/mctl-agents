@@ -196,14 +196,17 @@ def content_digest_of(files: Mapping[str, bytes | None]) -> str:
     return PROPOSAL_DIGEST_PREFIX + digest.hexdigest()
 
 
-def approval_digest_problem(data: dict[str, Any], proposal_dir: Path) -> tuple[str, str, str] | None:
-    """``(code, recorded, current)`` when the approved content is not the
-    content on disk, else ``None``.
+APPROVAL_DIGEST_MATCH = "match"
 
-    Only a proposal that requires a human approval is checked; one that never
-    asked for approval has nothing to bind. A missing or non-string digest is
-    ``BLOCKED_APPROVAL_DIGEST_MISSING`` and never counts as a match. Raises
-    ``OSError`` when one of the files cannot be read.
+
+def approval_digest_verdict(data: dict[str, Any], proposal_dir: Path) -> tuple[str, str, str] | None:
+    """``(verdict, recorded, current)`` for a proposal that requires a human
+    approval, else ``None``.
+
+    ``verdict`` is ``APPROVAL_DIGEST_MATCH`` only when the recorded digest
+    equals the content on disk; otherwise it is the blocking code. A missing
+    or non-string digest is ``BLOCKED_APPROVAL_DIGEST_MISSING`` and never
+    counts as a match. Raises ``OSError`` when one of the files cannot be read.
     """
     if not requires_human_approval(data):
         return None
@@ -214,7 +217,20 @@ def approval_digest_problem(data: dict[str, Any], proposal_dir: Path) -> tuple[s
         return BLOCKED_APPROVAL_DIGEST_MISSING, "", current
     if recorded.strip() != current:
         return BLOCKED_APPROVAL_DIGEST_MISMATCH, recorded.strip(), current
-    return None
+    return APPROVAL_DIGEST_MATCH, recorded.strip(), current
+
+
+def approval_digest_problem(data: dict[str, Any], proposal_dir: Path) -> tuple[str, str, str] | None:
+    """``(code, recorded, current)`` when the approved content is not the
+    content on disk, else ``None``.
+
+    Only a proposal that requires a human approval is checked; one that never
+    asked for approval has nothing to bind. See ``approval_digest_verdict``.
+    """
+    verdict = approval_digest_verdict(data, proposal_dir)
+    if verdict is None or verdict[0] == APPROVAL_DIGEST_MATCH:
+        return None
+    return verdict
 
 
 # Execution authorization (mctl-agents#412, the 2026-09-19 product decision).

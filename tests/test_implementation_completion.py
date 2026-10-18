@@ -321,3 +321,35 @@ def test_projection_round_trips_and_is_bounded() -> None:
     data["verification_details"] = []
     with pytest.raises(ic.ImplementationCompletionError, match="unknown key"):
         ic.CompletionProjection.from_dict(data)
+
+
+def test_the_summary_carries_the_records_proposal_digest() -> None:
+    record = _seal()
+    summary = ic.summarize(record)
+    assert summary.proposal_digest == record.proposal.proposal_digest
+    assert summary.to_dict()["proposal_digest"] == record.proposal.proposal_digest
+    assert ic.CompletionSummary.from_dict(summary.to_dict()) == summary
+
+
+def test_a_projection_written_before_the_proposal_digest_still_reads() -> None:
+    data = ic.project_primary(_seal()).to_dict()
+    del data["authoritative"]["proposal_digest"]
+    projection = ic.CompletionProjection.from_dict(data)
+    assert projection.authoritative.proposal_digest is None
+    assert "proposal_digest" not in projection.to_dict()["authoritative"]
+
+
+@pytest.mark.parametrize("value", ["", "sha256:short", "md5:" + "a" * 64, 7])
+def test_a_malformed_projected_proposal_digest_is_refused(value: object) -> None:
+    data = ic.project_primary(_seal()).to_dict()
+    data["authoritative"]["proposal_digest"] = value
+    with pytest.raises(ic.ImplementationCompletionError):
+        ic.CompletionProjection.from_dict(data)
+
+
+@pytest.mark.parametrize("key", ["approval", "content_digest", "approved_by"])
+def test_the_projection_still_rejects_approval_shaped_keys(key: str) -> None:
+    data = ic.project_primary(_seal()).to_dict()
+    data["authoritative"][key] = "sha256:" + "a" * 64
+    with pytest.raises(ic.ImplementationCompletionError, match="unknown key"):
+        ic.CompletionProjection.from_dict(data)
