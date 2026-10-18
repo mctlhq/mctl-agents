@@ -2239,7 +2239,12 @@ class DevLoopWorkflow:
         while True:
             # A cleared grant (a resume landed while the digest was
             # unreadable) is missing, not fresh: ask again.
-            outcome = "superseded" if self._grant_refresh else await self._supersede_grant_if_stale(target_repo, slug)
+            # A stale-true `_grant_refresh` beside a decided grant is not
+            # missing: test the state, not the hint.
+            missing = not self._is_approved(needs_grant=True) and (
+                self._grant_refresh or not self._requested_ref
+            )
+            outcome = "superseded" if missing else await self._supersede_grant_if_stale(target_repo, slug)
             if outcome == "fresh":
                 return None
             if outcome == "capped":
@@ -2254,7 +2259,10 @@ class DevLoopWorkflow:
             if workflow.now() >= deadline:
                 return ended("approval freshness unreadable")
             try:
-                await workflow.wait_condition(lambda: self._abandoned, timeout=GRANT_FRESHNESS_INTERVAL)
+                await workflow.wait_condition(
+                    lambda: self._abandoned or (self._grant_refresh and not self._is_approved(needs_grant=True)),
+                    timeout=GRANT_FRESHNESS_INTERVAL,
+                )
             except TimeoutError:
                 pass
             if self._abandoned:
