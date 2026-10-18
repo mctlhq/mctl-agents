@@ -8199,3 +8199,73 @@ class TestGrantFreshness:
                 result = await handle.result()
         assert result.ended == "approval superseded too many times"
         assert delegated == []
+
+    @staticmethod
+    def _ref_for(req: ApprovalRequestInput) -> str:
+        return "aar_test" if req.attempt == 0 else f"aar_test_a{req.attempt}"
+
+    async def test_a_resume_that_clears_the_grant_while_unreadable_re_parks(self, env):
+        # Owner review P2 on 59c9208: a resume landing during the
+        # unreadable-digest wait clears the grant; a missing grant must re-park,
+        # not count as "fresh" and end the loop on a refused flip.
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        digest = {"current": "sha256:v1", "unreadable": True}
+        worker, investigate_ran = await self._start(
+            env, approval_requests=requests, delegated_log=delegated, digest_state=digest
+        )
+        async with worker:
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run, IssueRef(issue_url=self.URL, work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await self._wait_for(lambda: len(requests) == 1)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await env.sleep(timedelta(minutes=5))  # parked on the unreadable digest
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {"work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                 "actor_kind": "human", "actor_id": "carol"},
+            )
+            digest["unreadable"] = False
+            await env.sleep(GRANT_FRESHNESS_INTERVAL + timedelta(minutes=1))
+            await self._wait_for(lambda: len(requests) >= 2)
+            assert delegated == []
+            assert (await handle.describe()).status.name == "RUNNING"
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": self._ref_for(requests[-1])})
+            with anyio.fail_after(60):
+                result = await handle.result()
+        assert [d.approval_ref for d in delegated] == [self._ref_for(requests[-1])]
+        assert result.ended is None or "refused" not in result.ended
+
+    async def test_the_re_approval_park_ticks_and_catches_a_second_rewrite(self, env):
+        # Owner review P2 on 59c9208: after a decision-time supersede the
+        # re-approval park must re-check the digest at a bounded interval, so
+        # a second rewrite is superseded without waiting for a decision.
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        digest = {"current": "sha256:v1"}
+        worker, investigate_ran = await self._start(
+            env, approval_requests=requests, delegated_log=delegated, digest_state=digest
+        )
+        async with worker:
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run, IssueRef(issue_url=self.URL),
+                id=f"dev-loop-test-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await self._wait_for(lambda: len(requests) == 1)
+            digest["current"] = "sha256:v2"
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await self._wait_for(lambda: len(requests) == 2)  # decision-time supersede
+            digest["current"] = "sha256:v3"  # a second rewrite while re-parked
+            await env.sleep(GRANT_FRESHNESS_INTERVAL + timedelta(minutes=1))
+            await self._wait_for(lambda: len(requests) == 3)
+            assert delegated == []
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": self._ref_for(requests[2])})
+            with anyio.fail_after(60):
+                await handle.result()
+        assert [d.approval_ref for d in delegated] == [self._ref_for(requests[2])]
