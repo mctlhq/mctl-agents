@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 import stat
 from collections.abc import Mapping
@@ -280,6 +281,13 @@ UNAUTHORIZED_LEGACY_AUTO_ACCEPTED = "legacy auto-accepted / unreviewed"
 #: not, because the fix is to re-approve with an identity, not to triage a
 #: stale proposal.
 UNAUTHORIZED_ANONYMOUS_APPROVER = "approved with no recorded approver identity"
+#: Stable reason for a record that names an approver but no mctl-api approval
+#: grant to verify it against: approved before grants were recorded, or by a
+#: path that does not record one. The remedy is to re-approve through the
+#: DevLoop.
+UNAUTHORIZED_NO_APPROVAL_GRANT = "approved with no verifiable approval grant"
+#: `approval_evidence.GRANT_REF_RE`, repeated so this module stays import-free.
+_GRANT_REF_RE = re.compile(r"aar_[A-Za-z0-9_-]{1,124}")
 
 
 def execution_authorization(data: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -298,7 +306,15 @@ def execution_authorization(data: dict[str, Any]) -> tuple[str | None, str | Non
             isinstance(approved_by, str)
             and approved_by.strip().lower() not in _ANONYMOUS_APPROVERS
         ):
-            return AUTHORIZATION_HUMAN_APPROVAL, None
+            # A named approver is a claim; the decision is the mctl-api grant
+            # the approve flip records (`orchestrator.approval_evidence`). A
+            # record without one cannot be verified, so it is not submitted.
+            # The implementer verifies the grant itself; this only keeps
+            # unverifiable records from being scheduled at all.
+            ref = approval.get("approval_ref")
+            if isinstance(ref, str) and _GRANT_REF_RE.fullmatch(ref.strip()):
+                return AUTHORIZATION_HUMAN_APPROVAL, None
+            return None, UNAUTHORIZED_NO_APPROVAL_GRANT
         # The presence of an `approval` block is what separates the two
         # reasons, not the readability of the identity inside it. `approval:
         # {}`, a missing key, an explicit null and a non-string are all the

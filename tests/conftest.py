@@ -41,6 +41,30 @@ def _no_live_refusal_replies(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _granted_approval(monkeypatch):
+    """Answer the implementer's approval-grant check as a spent human grant.
+
+    `_implement_one` verifies the mctl-api grant behind every accepted
+    proposal (`orchestrator.approval_evidence`) and marks it executed before
+    `gh pr create`. Dozens of implementer tests drive it past that point with
+    fixture proposals and no mctl-api, so both calls are stubbed for every
+    test. The gate's own tests (`test_run_implementer_approval_grant.py`)
+    hold references taken at import time, before this fixture runs, and
+    restore them.
+    """
+    from orchestrator import action_approvals as aa
+    from orchestrator import approval_evidence as ae
+
+    implementer = importlib.import_module("orchestrator.run_implementer")
+    monkeypatch.setattr(
+        implementer, "_verify_grant",
+        lambda *_a, **_kw: ae.GrantVerdict(ok=True, grant_id="aar_test", allow_new_run=True),
+    )
+    monkeypatch.setattr(implementer, "_execute_grant", lambda *_a, **_kw: aa.ApprovalAnswer(aa.EXECUTED_NOW))
+    yield
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     # Pins anyio's pytest plugin (auto-registered since anyio is already a

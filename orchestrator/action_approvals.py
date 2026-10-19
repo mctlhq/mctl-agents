@@ -42,6 +42,7 @@ ROUTES = {
     "create": "/api/v1/action-approvals",
     "get": "/api/v1/action-approvals/{id}",
     "consume": "/api/v1/action-approvals/{id}/consume",
+    "execute": "/api/v1/action-approvals/{id}/execute",
 }
 
 ID_PREFIX = "aar_"
@@ -64,12 +65,21 @@ CONSUMED = "consumed"
 #: This consume call spent the receipt. Distinct from CONSUMED (it was
 #: already spent), which is a refusal.
 SPENT = "spent"
+#: A spent receipt whose side effect has been started (`/execute`), once.
+EXECUTED = "executed"
+#: This execute call marked the receipt. Distinct from EXECUTED (it was
+#: already marked).
+EXECUTED_NOW = "executed_now"
+NOT_CONSUMED = "not_consumed"
 MISMATCH = "mismatch"
 NOT_FOUND = "not_found"
 REFUSED = "refused"
 UNKNOWN = "unknown"
 
-_STATES = {"pending": PENDING, "approved": APPROVED, "denied": DENIED, "expired": EXPIRED, "consumed": CONSUMED}
+_STATES = {
+    "pending": PENDING, "approved": APPROVED, "denied": DENIED, "expired": EXPIRED, "consumed": CONSUMED,
+    "executed": EXECUTED,
+}
 
 # mctl-api's typed refusal codes (internal/api/handlers_action_approvals.go).
 _CODES = {
@@ -79,6 +89,9 @@ _CODES = {
     "approval_intent_mismatch": MISMATCH,
     "approval_consumed": CONSUMED,
     "approval_not_found": NOT_FOUND,
+    "approval_not_consumed": NOT_CONSUMED,
+    "approval_executed": EXECUTED,
+    "approval_target_mismatch": MISMATCH,
 }
 
 #: 4xx statuses that mean "try later", not "no".
@@ -175,6 +188,9 @@ class ApprovalRecord:
     intent_hash: str
     expires_at: str
     decided_by: str = ""
+    action_kind: str = ""
+    target: str = ""
+    artifact_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -217,8 +233,14 @@ def _record_of(payload: dict[str, Any]) -> ApprovalRecord | None:
         return None
     if not isinstance(expires, str):
         return None
-    decided_by = raw.get("decided_by")
-    return ApprovalRecord(rid, state, digest, expires, decided_by if isinstance(decided_by, str) else "")
+    def text(name: str) -> str:
+        value = raw.get(name)
+        return value if isinstance(value, str) else ""
+
+    return ApprovalRecord(
+        rid, state, digest, expires, text("decided_by"),
+        action_kind=text("action_kind"), target=text("target"), artifact_hash=text("artifact_hash"),
+    )
 
 
 def _refusal(status: int, payload: dict[str, Any]) -> ApprovalAnswer:
@@ -322,6 +344,21 @@ class ActionApprovalClient:
             return ApprovalAnswer(UNKNOWN, record=rec, reason="consume answer does not describe this spend")
         return ApprovalAnswer(SPENT, record=rec)
 
+    def execute(self, approval_id: str, target: str, artifact_hash: str) -> ApprovalAnswer:
+        """Mark the spent `approval_id` executed for `target` and
+        `artifact_hash`, once. EXECUTED_NOW only when the store answers 200
+        with exactly that receipt, now executed, for exactly that target and
+        content; an already-marked receipt answers EXECUTED (409)."""
+        answer = self._read("POST", ROUTES["execute"].format(id=quote(approval_id, safe="")),
+                            {"target": target, "artifact_hash": artifact_hash}, ok=(200,))
+        rec = answer.record
+        if rec is None:
+            return answer
+        if (rec.id != approval_id or rec.state != "executed" or rec.target != target
+                or rec.artifact_hash != artifact_hash):
+            return ApprovalAnswer(UNKNOWN, record=rec, reason="execute answer does not describe this mark")
+        return ApprovalAnswer(EXECUTED_NOW, record=rec)
+
 
 # ---------------------------------------------------------------------------
 # The ApprovalLookup
@@ -332,6 +369,8 @@ _OUTCOMES = {
     DENIED: pc.APPROVAL_DENIED,
     EXPIRED: pc.APPROVAL_EXPIRED,
     CONSUMED: pc.APPROVAL_CONSUMED,
+    EXECUTED: pc.APPROVAL_CONSUMED,
+    NOT_CONSUMED: pc.APPROVAL_REFUSED,
     MISMATCH: pc.APPROVAL_MISMATCH,
     NOT_FOUND: pc.APPROVAL_REFUSED,
     REFUSED: pc.APPROVAL_REFUSED,
@@ -342,7 +381,7 @@ _OUTCOMES = {
 #: The store states a human's decision exists for; only these forward the
 #: record's `decided_by`, so `Decision.approver` is empty on `pending` (and
 #: every other undecided answer) by construction, not by the store's grace.
-_DECIDED = frozenset({APPROVED, DENIED, EXPIRED, CONSUMED})
+_DECIDED = frozenset({APPROVED, DENIED, EXPIRED, CONSUMED, EXECUTED})
 
 
 def _outcome(answer: ApprovalAnswer, ref: str = "") -> pc.ApprovalOutcome:

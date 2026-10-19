@@ -2166,7 +2166,7 @@ class TestReconcileReadsGitHub:
     # mctl-agents#413: the never-started signal on the GitHub path.
     NS_AUTHORIZED_OLD = (
         "status: accepted\n"
-        "approval:\n  approved_by: mashkovd\n  approved_at: '2026-10-01T10:00:00Z'\n"
+        "approval:\n  approved_by: mashkovd\n  approval_ref: aar_0123abcd\n  approved_at: '2026-10-01T10:00:00Z'\n"
     )
     NS_LEGACY = "status: accepted\n"
 

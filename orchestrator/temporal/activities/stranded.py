@@ -14,7 +14,8 @@ hold, checked in this order (design.md §1):
   3. it is unrunnable as written (`unrunnable_reason` / a `blocked` marker) —
      a submit here could only refuse (#349);
   4. it carries no execution authorization — `execution_authorization` finds
-     no non-anonymous `approval.approved_by`. An absent `control` block only
+     no non-anonymous `approval.approved_by`, or no `approval.approval_ref`
+     naming the mctl-api grant behind it. An absent `control` block only
      means "approval was never required" (a write-time default), not "someone
      authorized this to run", so it is never read as consent. Provenance of
      the WRITER is deliberately not part of this: a writer allowlist was tried

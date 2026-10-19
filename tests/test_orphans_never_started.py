@@ -185,7 +185,7 @@ def test_in_progress_is_classified_like_accepted():
 )
 def test_approved_at_round_trips_as_a_string(value):
     parsed = _parse_status_yaml(
-        f"status: accepted\napproval:\n  approved_by: mashkovd\n  approved_at: {value}\n"
+        f"status: accepted\napproval:\n  approved_by: mashkovd\n  approval_ref: aar_0123abcd\n  approved_at: {value}\n"
     )
     approved_at = parsed[-1]
     assert isinstance(approved_at, str)
@@ -247,7 +247,7 @@ def _write_state(root, service, slug, body):
 
 AUTHORIZED_OLD = (
     "status: accepted\n"
-    "approval:\n  approved_by: mashkovd\n  approved_at: '2026-10-01T10:00:00Z'\n"
+    "approval:\n  approved_by: mashkovd\n  approval_ref: aar_0123abcd\n  approved_at: '2026-10-01T10:00:00Z'\n"
 )
 LEGACY = "status: accepted\n"
 
