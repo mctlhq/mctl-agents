@@ -473,12 +473,16 @@ class FakeApprovals:
         self.by_id: dict[str, aa.ApprovalRecord] = {}
         self.consumes: list[str] = []
         self.lose_consume = 0
+        #: The decision context each create sent (mctl-api#700).
+        self.contexts: list[aa.DecisionContext | None] = []
 
     def _put(self, rec: aa.ApprovalRecord) -> aa.ApprovalRecord:
         self.by_id[rec.id] = rec
         return rec
 
-    def create(self, intent, *, key: str, expires_at: datetime) -> aa.ApprovalAnswer:
+    def create(self, intent, *, key: str, expires_at: datetime,
+               context: aa.DecisionContext | None = None) -> aa.ApprovalAnswer:
+        self.contexts.append(context)
         rec = self.by_key.get(key)
         if rec is None:
             rec = self._put(aa.ApprovalRecord(f"aar_{len(self.by_id) + 1}", "pending", aa.intent_hash(intent),

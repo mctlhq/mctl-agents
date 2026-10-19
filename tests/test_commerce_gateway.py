@@ -275,6 +275,19 @@ def test_approval_pending_holds_nothing_then_approve_and_retry_runs_once(world):
     assert len(world.executions) == 1 and world.ledger.budget["committed"] == 12
 
 
+def test_a_paid_approval_is_created_with_its_decision_context(world):
+    """mctl-api#700 refuses a create whose decision context is incomplete,
+    and a paid call's kind and rule are not registered there: the gateway
+    sends all of it."""
+    world.policy = APPROVE_PAID
+    run(_invoke(world))
+    assert world.approvals.contexts, "no approval was created"
+    ctx = world.approvals.contexts[-1]
+    assert ctx is not None
+    assert (ctx.risk_level, ctx.side_effect, ctx.policy_decision) == ("high", "external", "require_approval")
+    assert "commerce.paid" in ctx.policy_reasons and "policy.require-approval" in ctx.policy_reasons
+
+
 @pytest.mark.parametrize("state", ["denied", "expired"])
 def test_a_denied_or_expired_approval_refuses(world, state):
     world.policy = APPROVE_PAID
