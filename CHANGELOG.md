@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.86.1](https://github.com/mctlhq/mctl-agents/compare/1.86.0...1.86.1) (2026-10-19)
+
+
+### Bug Fixes
+
+* **commerce:** send decision context when creating action approvals ([6a86757](https://github.com/mctlhq/mctl-agents/commit/6a86757416816d49a4ce6c3df3f04907a479d963))
+* **commerce:** send decision context when creating action approvals ([8f0138d](https://github.com/mctlhq/mctl-agents/commit/8f0138d4b6f5f9d03c5b99b5d1f955df544f5d2b)), closes [#713](https://github.com/mctlhq/mctl-agents/issues/713)
+
 ## [1.86.0](https://github.com/mctlhq/mctl-agents/compare/1.85.0...1.86.0) (2026-10-18)
 
 
