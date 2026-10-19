@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import subprocess
 import sys
 import urllib.error
@@ -76,6 +77,8 @@ class FakeMctlApi:
         self.by_key: dict[str, str] = {}
         self.calls: list[tuple[str, str]] = []
         self.spent = 0
+        #: The decision context each stored create carried (mctl-api#700).
+        self.contexts: list[dict[str, Any]] = []
         #: route -> callable(req) raising or returning a response, to inject faults.
         self.override: dict[str, Any] = {}
         self.lazy_expiry = True
@@ -144,6 +147,25 @@ class FakeMctlApi:
         digest = _go_intent_hash(body)
         if body.get("intent_hash") and body["intent_hash"] != digest:
             return self._err(400, "intent_hash_mismatch")
+        # mctl-api#700: the decision context of an unregistered kind and rule
+        # (every checkpoint request) must be complete, or nothing is stored.
+        # The DevLoop grant's kind and rule are registered there, and the
+        # server fills their context itself.
+        registered = (body.get("action_kind"), body.get("policy_rule_id")) == (
+            "mctl-agents-approve", "dev-loop.human-approval")
+        missing = [] if registered else [f for f, ok in (
+            ("risk_level", body.get("risk_level") in ("low", "medium", "high")),
+            ("side_effect", body.get("side_effect") in ("none", "read", "write", "destructive", "external")),
+            ("policy.decision", bool(body.get("policy_decision"))),
+            ("policy.reasons", bool(body.get("policy_reasons")) and all(
+                re.fullmatch(r"[a-z0-9._:-]{1,128}", r) for r in body["policy_reasons"])),
+        ) if not ok]
+        if missing:
+            return FakeMctlApi._answer(422, {"code": "approval_context_incomplete",
+                                             "details": {"missing_fields": missing}})
+        if not registered:
+            self.contexts.append({k: body[k] for k in ("risk_level", "side_effect", "policy_decision",
+                                                       "policy_reasons")})
         key = body["idempotency_key"]
         if key in self.by_key:
             rec = self.records[self.by_key[key]]
@@ -270,6 +292,43 @@ def test_pending_is_not_permitted_and_names_a_reused_request(api, clock):
     rec = api.only()
     assert rec["idempotency_key"].startswith("mctl-agents/intent/")
     assert rec["action_kind"] == f"{pc.MCP_TOOL_CALL}:{DEPLOY}" and rec["policy_rule_id"] == "mctl-mcp-default-approval"
+
+
+def test_create_sends_the_decision_context(api, clock):
+    """mctl-api#700: a checkpoint kind and rule are never registered in
+    mctl-api, so the request carries its whole decision context; the fake
+    store refuses it otherwise, as mctl-api does."""
+    _deploy(_lookup(api, clock), ARGS)
+    assert api.contexts == [{
+        "risk_level": "high", "side_effect": "external", "policy_decision": "require_approval",
+        "policy_reasons": ["policy.require-approval", "policy.rule:mctl-mcp-default-approval"],
+    }]
+
+
+def test_an_incomplete_context_is_a_refusal_not_an_unknown(api, clock):
+    """422 approval_context_incomplete is the store's answer about this
+    request, not an outage: REFUSED, so nothing waits on it or retries it."""
+    client = _lookup(api, clock)._client
+    intent = aa.ActionIntent("ctx-1", "mcp.tool.call:x", "mctl", "sha256:args", "r", "p")
+    answer = client.create(intent, key="k", expires_at=clock() + timedelta(hours=1))
+    assert (answer.status, answer.code) == (aa.REFUSED, "approval_context_incomplete")
+    assert api.records == {}
+
+
+@pytest.mark.parametrize(("kind", "metadata", "rule", "want"), [
+    (pc.GITHUB_PR_MERGE, (), "github-pr-merge-approval",
+     ("high", "write", ("policy.require-approval", "policy.rule:github-pr-merge-approval"))),
+    (pc.MCP_TOOL_CALL, (("commerce", "paid"),), "paid",
+     ("high", "external", ("policy.require-approval", "policy.rule:paid", "commerce.paid"))),
+    # An unlisted class is shown at the most severe level; a rule id outside
+    # mctl-api's reason alphabet is left out rather than sent and refused.
+    ("some.new.kind", (), "Rule With Spaces", ("high", "external", ("policy.require-approval",))),
+])
+def test_context_for(kind, metadata, rule, want):
+    req = pc.ActionRequest(kind, "op", "t", "sha256:a", execution_id="e", metadata=metadata)
+    ctx = aa.context_for(req, rule_id=rule)
+    assert (ctx.risk_level, ctx.side_effect, ctx.policy_reasons) == want
+    assert ctx.policy_decision == "require_approval"
 
 
 def test_approved_and_matching_is_permitted_and_consumed_exactly_once(api, clock):
