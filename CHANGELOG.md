@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.87.0](https://github.com/mctlhq/mctl-agents/compare/1.86.3...1.87.0) (2026-10-20)
+
+
+### Features
+
+* **options:** pass the spent approval receipt to mctl-api ([a393d11](https://github.com/mctlhq/mctl-agents/commit/a393d11abe8022421fc0573df7de44e48af96026))
+* **options:** pass the spent approval receipt to mctl-api ([ad211ad](https://github.com/mctlhq/mctl-agents/commit/ad211addf862910dbf4932c54eb2d9af93ee65e7))
+
+
+### Bug Fixes
+
+* **options:** refuse a non-object tool input before the checkpoint ([fa292aa](https://github.com/mctlhq/mctl-agents/commit/fa292aaacd74683096ea542fa4d6b7697fd218fa))
+
 ## [1.86.3](https://github.com/mctlhq/mctl-agents/compare/1.86.2...1.86.3) (2026-10-20)
 
 
