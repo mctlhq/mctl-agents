@@ -4,6 +4,7 @@ import math
 import os
 import re
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -1077,19 +1078,42 @@ def _sibling_add_dirs(service_name: str) -> list[str | Path]:
     return dirs
 
 
+# The mctl-api bearer credential. This process reads it for the policy
+# checkpoint's approval store, the work-context client and the mctl MCP
+# headers built above; nothing the CLI child starts may hold it
+# (mctlhq/mctl-agents#717).
+MCTL_TOKEN_ENV = "MCTL_TOKEN"  # noqa: S105 — an env var name, not a credential
+
+
+def agent_env_without_mctl_token(env: Mapping[str, str]) -> dict[str, str]:
+    """`env` with the mctl-api token blanked, for an SDK session's env.
+
+    Without it a tool subprocess (the Bash tool and whatever it starts)
+    could call mctl-api with the pod's token directly, past the in-process
+    policy checkpoint. The mctl MCP server does not need it in the child's
+    env: `mctl_mcp_config()` puts the bearer header into the server config
+    itself.
+    """
+    return {**env, MCTL_TOKEN_ENV: ""}
+
+
 def _scrubbed(options: ClaudeAgentOptions) -> ClaudeAgentOptions:
     """Every SDK session's options in this module pass through here.
 
-    Blanks the usage-writer token (mctlhq/.github#50) and the evidence-writer
-    token (mctlhq/mctl-agents#544) in the session's env.
+    Blanks the usage-writer token (mctlhq/.github#50), the evidence-writer
+    token (mctlhq/mctl-agents#544) and the mctl-api token
+    (mctlhq/mctl-agents#717) in the session's env.
     The SDK layers `env` over the inherited environment, so a builder that
     passed none, or copied `os.environ`, would hand the tokens to the CLI
     child and to everything the model runs through Bash; they are for the
-    usage and evidence producers in this process only. A builder cannot opt out:
+    usage and evidence producers, the policy checkpoint and the work-context
+    client in this process only. A builder cannot opt out:
     tests/test_usage_ledger.py fails on any `ClaudeAgentOptions(...)` here
     that is not the direct argument of this function.
     """
-    options.env = agent_env_without_evidence_token(agent_env_without_writer_token(options.env or os.environ))
+    options.env = agent_env_without_mctl_token(
+        agent_env_without_evidence_token(agent_env_without_writer_token(options.env or os.environ))
+    )
     return options
 
 
