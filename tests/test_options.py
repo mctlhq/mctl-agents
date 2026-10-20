@@ -1716,3 +1716,116 @@ def test_gitops_context_dirs_are_read_only_for_edit_tools(tmp_path, monkeypatch)
     assert _call_hook(guard, "Write", {"file_path": str(proposal_dir / "design.md")}) == {}
     # A sibling whose name merely starts with a guarded dir is not inside it.
     assert _call_hook(guard, "Write", {"file_path": str(root / "services-notes.md")}) == {}
+
+
+# ---------------------------------------------------------------------------
+# Approval receipt for mctl-api's receipt gate (mctl-api#723)
+# ---------------------------------------------------------------------------
+def _decision(code, *, ref="", digest="sha256:" + "d" * 64):
+    from orchestrator import policy_checkpoint as pc
+
+    verdict = pc.ALLOW if code == pc.CODE_ALLOWED else pc.REQUIRE_APPROVAL
+    return pc.Decision(verdict, code, "test", "test-policy", "test-rule", digest, ref)
+
+
+def _hook_with(monkeypatch, decision, seen=None):
+    from orchestrator import policy_checkpoint as pc
+
+    def fake_checkpoint(*args, **kwargs):
+        if seen is not None:
+            seen.append(args)
+        return decision
+
+    monkeypatch.setattr(pc, "checkpoint", fake_checkpoint)
+    return options._PolicyCheckpointHook(("mcp__mctl__mctl_deploy_service",))
+
+
+def test_approved_mctl_call_carries_its_receipt(monkeypatch):
+    from orchestrator import policy_checkpoint as pc
+
+    digest = "sha256:" + "a" * 64
+    hook = _hook_with(monkeypatch, _decision(pc.CODE_APPROVED, ref="aar_" + "1" * 32, digest=digest))
+    out = _call_hook(hook, "mcp__mctl__mctl_deploy_service", {"service": "web", "tag": "1.2.3"})
+    spec = out["hookSpecificOutput"]
+    assert spec["permissionDecision"] == "allow"
+    assert spec["updatedInput"] == {
+        "service": "web",
+        "tag": "1.2.3",
+        "action_approval_ref": "aar_" + "1" * 32,
+        "action_approval_artifact_hash": digest,
+    }
+
+
+def test_receipt_hash_is_what_the_approval_stored(monkeypatch):
+    """The server compares the presented hash with the approval's
+    `artifact_hash`, which `intent_for` sets to the request's action digest.
+    The decision's digest must be that same value."""
+    from orchestrator import action_approvals as aa
+    from orchestrator import policy_checkpoint as pc
+
+    request = pc.ActionRequest(pc.MCP_TOOL_CALL, "mcp__mctl__mctl_deploy_service", "mctl",
+                               pc.args_digest_of({"service": "web"}), execution_id="e1", actor="agent:x")
+
+    class Granting:
+        def redeem(self, req, *, rule_id, policy_version, approval_ref=""):
+            return pc.ApprovalOutcome(pc.APPROVAL_GRANTED, "aar_" + "2" * 32)
+
+    decision = pc.decide(request, approvals=Granting(),
+                         policy=pc.Policy("v", (pc.Rule("r", pc.MCP_TOOL_CALL, "mcp__mctl__*", pc.REQUIRE_APPROVAL),)))
+    assert decision.code == pc.CODE_APPROVED
+    intent = aa.intent_for(request, rule_id="r", policy_version="v")
+    assert decision.action_digest == intent.artifact_hash
+
+
+def test_plain_allow_gets_no_receipt(monkeypatch):
+    from orchestrator import policy_checkpoint as pc
+
+    hook = _hook_with(monkeypatch, _decision(pc.CODE_ALLOWED))
+    assert _call_hook(hook, "mcp__mctl__mctl_get_service_status", {"service": "web"}) == {}
+
+
+def test_only_an_approved_decision_attaches_its_ref(monkeypatch):
+    """The code decides, not the presence of a ref: a ref on any other
+    decision was not spent for this call."""
+    from orchestrator import policy_checkpoint as pc
+
+    hook = _hook_with(monkeypatch, _decision(pc.CODE_ALLOWED, ref="aar_" + "7" * 32))
+    assert _call_hook(hook, "mcp__mctl__mctl_deploy_service", {"service": "web"}) == {}
+
+
+def test_approved_call_to_another_server_gets_no_receipt(monkeypatch):
+    """Only mctl-api strips the receipt arguments; another server would
+    receive them as tool input."""
+    from orchestrator import policy_checkpoint as pc
+
+    hook = _hook_with(monkeypatch, _decision(pc.CODE_APPROVED, ref="aar_" + "3" * 32))
+    assert _call_hook(hook, "mcp__github__create_issue", {"title": "x"}) == {}
+
+
+def test_approved_call_without_a_ref_gets_no_receipt(monkeypatch):
+    from orchestrator import policy_checkpoint as pc
+
+    hook = _hook_with(monkeypatch, _decision(pc.CODE_APPROVED, ref=""))
+    assert _call_hook(hook, "mcp__mctl__mctl_deploy_service", {}) == {}
+
+
+def test_approved_call_with_no_input_carries_only_the_receipt(monkeypatch):
+    from orchestrator import policy_checkpoint as pc
+
+    hook = _hook_with(monkeypatch, _decision(pc.CODE_APPROVED, ref="aar_" + "4" * 32))
+    out = _call_hook(hook, "mcp__mctl__mctl_sync_repos", None)
+    assert set(out["hookSpecificOutput"]["updatedInput"]) == options.RECEIPT_ARGS
+
+
+@pytest.mark.parametrize("key", sorted(options.RECEIPT_ARGS))
+def test_model_supplied_receipt_args_are_refused_before_the_checkpoint(monkeypatch, key):
+    """A receipt the model names was not spent for this call. Refused before
+    the checkpoint, so no approval is consumed for it either."""
+    from orchestrator import policy_checkpoint as pc
+
+    seen: list = []
+    hook = _hook_with(monkeypatch, _decision(pc.CODE_APPROVED, ref="aar_" + "5" * 32), seen)
+    out = _call_hook(hook, "mcp__mctl__mctl_deploy_service", {"service": "web", key: "aar_" + "6" * 32})
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert key in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert seen == []
