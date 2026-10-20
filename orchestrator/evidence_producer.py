@@ -987,15 +987,24 @@ def safely(action: Callable[..., None], *args: Any, **kwargs: Any) -> None:
         logger.warning("execution evidence: could not record the run's result (%s: %s)", type(exc).__name__, exc)
 
 
-def _credentials(env: Mapping[str, str]) -> tuple[str, str, str]:
-    """(token, ingest url, why off). A token is only ever sent over https."""
+def writer_credentials(env: Mapping[str, str]) -> tuple[str, str, str]:
+    """(token, mctl-api base url, why off) of the evidence-writer principal.
+    Also what `orchestrator.decision_records` writes with: mctl-api admits
+    this principal to the decision routes too. A token is only ever sent
+    over https."""
     token = env.get(TOKEN_ENV, "").strip()
     base_url = env.get(BASE_URL_ENV, "").strip() or DEFAULT_BASE_URL
     if not token:
         return "", "", f"{TOKEN_ENV} is not set"
     if not base_url.startswith("https://"):
         return "", "", f"{BASE_URL_ENV} is not https ({base_url!r})"
-    return token, base_url.rstrip("/") + INGEST_PATH, ""
+    return token, base_url.rstrip("/"), ""
+
+
+def _credentials(env: Mapping[str, str]) -> tuple[str, str, str]:
+    """(token, ingest url, why off)."""
+    token, base_url, why = writer_credentials(env)
+    return (token, base_url + INGEST_PATH, "") if token else ("", "", why)
 
 
 def _log_line(stage: str, result: str, evidence: ee.ExecutionEvidence | None, status: int, detail: str) -> None:

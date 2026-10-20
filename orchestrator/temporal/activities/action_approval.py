@@ -190,15 +190,20 @@ def run_gated(
     decision = pc.decide(request, policy=policy, approvals=lookup, approval_ref=inp.approval_ref)
     if not decision.permitted:
         return _result(decision)
+    # The durable attempt record (mctl-api#701): a no-op unless
+    # MCTL_DECISION_RECORDS is on, and it never raises.
+    attempt = pc.start_attempt(decision)
     try:
         result = side_effect()
     except Exception as exc:  # noqa: BLE001 — the receipt is spent: report, never retry on it
+        pc.end_attempt(attempt, exc)
         failed = _result(decision)
         return GatedActionResult(
             code=failed.code, verdict=failed.verdict, approval_ref=failed.approval_ref, ran=False,
             reason=failed.reason, effect_error=f"{type(exc).__name__}: {exc}",
             approver=failed.approver, decided_at=failed.decided_at,
         )
+    pc.end_attempt(attempt, None)
     return _result(decision, ran=True, result=result)
 
 
