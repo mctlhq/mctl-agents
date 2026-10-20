@@ -50,10 +50,11 @@ without `mcp.tool.call`, the only kind the harness performs),
 | `policy_refused` | `policy_refused` | `refused` |
 | `tool_calls_exhausted`, `wall_clock_exhausted`, `output_too_large` | `budget_exhausted` | `budget_exhausted` |
 | `probe_error` (any `BaseException` from the probe, `SystemExit` included) | `target_failure` | `inconclusive` |
+| `calls_outstanding` (the probe returned while a call it started was still in flight) | `out_of_envelope` | `inconclusive` |
 | `harness_error` (a detector raised or answered dishonestly) | `harness_failure` | `harness_failure` |
 | `completed` | `none` / `invariant_failure` / `target_failure` / `insufficient_observation` | `invariant_held` / `invariant_violated` / `inconclusive` |
 
-- `reserved_argument`: an argument key at any depth that names credential material or harness-owned scope. Credential keys match by substring (`redaction._TOKEN_KEY` plus authorization, cookie, api key, secret, password, credential, private/session key, bearer and an `auth` segment), so `auth_token` and `x-api-key` are refused. Scope keys (`target`, `target_ref`, `environment`, `tenant`) match exactly. `redaction._DENIED_KEY` is not reused whole because it also denies ordinary argument names such as `query` and `input`.
+- `reserved_argument`: an argument key at any depth that names credential material or harness-owned scope. Credential keys match by substring (`redaction.TOKEN_KEY` plus authorization, cookie, api key, secret, password, credential, private/session key, bearer and an `auth` segment), so `auth_token` and `x-api-key` are refused. Scope keys (`target`, `target_ref`, `environment`, `tenant`) match exactly. `redaction._DENIED_KEY` is not reused whole because it also denies ordinary argument names such as `query` and `input`.
 - `credential_in_request`: a credential-shaped value or key (`redaction.contains_credential`).
 - `mutation_not_permitted`: any non-read tool unless the scenario is `fixture_only` **and** the target is a fixture. So a sandbox is never mutated, and production mutation stays unrepresentable (ADR 022).
 
@@ -68,12 +69,19 @@ policy or transport are reached, so swallowing it changes nothing.
 If a run that already stopped then overruns its budget (a probe that swallows a
 refusal and hangs), the first stop stays the `stop_reason` and `failure_class`,
 and the outcome becomes `budget_exhausted`, the only outcome ADR 022 admits for
-consumption above the grant. The records are still emitted.
+consumption above the grant. The records are still emitted. This holds for a
+`harness_error` too: its class stays `harness_failure`, so callers that need to
+tell a harness fault from a budget problem read `failure_class`.
+
+A probe may use threads, but the run ends when the probe returns. The gate is
+then closed, so a thread it left behind cannot reach the target, and a call
+still in flight at that moment makes the run `calls_outstanding` instead of
+`completed`. Its output is withheld from the probe.
 
 ## Bounds
 
 - Tool calls are counted per request admitted to the policy checkpoint. The slot is claimed under the gate's lock, so concurrent probe threads get unique call indexes and can never exceed `max_tool_calls`.
-- A call handed to the transport is recorded at once as `abandoned`, and replaced when it returns. A call the watchdog leaves behind therefore counts as executed: it reached the target, so its effect is unknown, not absent.
+- A call handed to the transport is recorded at once as `abandoned`, in the same critical section as the post-decision stop check, and swapped for its final record in one critical section when it returns. A call the watchdog leaves behind therefore counts as executed: it reached the target, so its effect is unknown, not absent.
 - Wall clock uses the injected `Clock`, checked before and after every call. A call that overruns has its output withheld.
 - A real-time watchdog thread stops a probe or transport that never returns, after the granted wall clock plus 1 s. The thread cannot be killed: it is abandoned, and the gate refuses anything further from it.
 - Output is limited to 64 KiB per call by default, and requests to 16 KiB.

@@ -470,6 +470,65 @@ def test_a_refused_probe_that_then_overruns_keeps_its_refusal_and_records():
     assert_contract(report, sc)
 
 
+def test_a_probe_that_returns_with_a_call_in_flight_is_not_completed():
+    entered, release, answered = threading.Event(), threading.Event(), threading.Event()
+    got = []
+
+    def slow(args):
+        entered.set()
+        release.wait(5)
+        return "{}"
+
+    transport = FakeTransport({READ_TOOL: slow})
+
+    def leaves_a_call_behind(ctx):
+        def orphan():
+            try:
+                got.append(ctx.call_tool(READ_TOOL, {}))
+            except BaseException as exc:  # noqa: BLE001 — collected to check what the orphan was told
+                got.append(exc)
+            finally:
+                answered.set()
+
+        threading.Thread(target=orphan, daemon=True).start()
+        entered.wait(5)
+
+    sc = scenario()
+    report = ah.execute(sc, leaves_a_call_behind, config(transport), seed=0)
+    release.set()
+    assert answered.wait(5)
+    assert (report.stop_reason, report.failure_class, report.outcome) == (
+        ah.STOP_CALLS_OUTSTANDING, ah.FAILURE_OUT_OF_ENVELOPE, "inconclusive")
+    assert report.result.consumed.tool_calls == 1  # it reached the target, so it is counted
+    assert {v.verdict for v in report.result.invariant_verdicts} == {"unknown"}
+    assert isinstance(got[0], BaseException)  # the output arrived after the run ended: withheld
+    assert_contract(report, sc)
+
+
+def test_nothing_a_probe_leaves_behind_reaches_the_target_after_it_returns():
+    go, answered = threading.Event(), threading.Event()
+    got = []
+    transport = FakeTransport()
+
+    def leaves_a_thread_behind(ctx):
+        def later():
+            go.wait(5)
+            try:
+                ctx.call_tool(READ_TOOL, {})
+            except BaseException as exc:  # noqa: BLE001 — collected to check the call was refused
+                got.append(exc)
+            finally:
+                answered.set()
+
+        threading.Thread(target=later, daemon=True).start()
+
+    report = ah.execute(scenario(), leaves_a_thread_behind, config(transport), seed=0)
+    go.set()
+    assert answered.wait(5)
+    assert report.stop_reason == ah.STOP_COMPLETED and report.result.consumed.tool_calls == 0
+    assert transport.calls == [] and len(got) == 1
+
+
 def test_a_probe_that_swallows_the_stop_cannot_resume_the_run():
     transport = FakeTransport()
     attempts = []
@@ -781,6 +840,19 @@ def test_a_mutation_needing_approval_is_refused_without_one():
     assert_contract(report, _mutating_fixture())
 
 
+@pytest.mark.parametrize(
+    ("tool", "args", "decided"),
+    [(READ_TOOL, {"token": "x"}, False), (MUTATING_TOOL, {"replicas": 0}, True)],
+)
+def test_a_refused_call_stays_in_the_transcript_as_blocked(tool, args, decided):
+    spy = _Spy()
+    cfg = config(detectors={**DETECTORS, "policy-gate-hit": spy})
+    ah.execute(_mutating_fixture(), lambda ctx: ctx.call_tool(tool, args), cfg, seed=0)
+    (record,) = spy.seen
+    assert (record.index, record.tool, record.status, record.executed) == (0, tool, ah.CALL_BLOCKED, False)
+    assert (record.decision is not None) == decided
+
+
 def test_a_mutation_runs_only_after_the_approval_lookup_spends_a_receipt():
     transport = FakeTransport()
     approvals = GrantingApprovals()
@@ -986,14 +1058,33 @@ def test_a_dishonest_detector_is_a_harness_failure_not_a_verdict(detection):
     assert_contract(report, sc)
 
 
-def test_a_detector_that_raises_is_a_harness_failure():
-    class Raising(_LyingDetector):
-        def evaluate(self, calls):
-            raise RuntimeError("bug")
+class _Raising(_LyingDetector):
+    def evaluate(self, calls):
+        raise RuntimeError("bug")
 
-    report = ah.execute(scenario(), read_twice, config(detectors={**DETECTORS, "no-secret-in-output": Raising(None)}),
+
+def test_a_detector_that_raises_is_a_harness_failure():
+    report = ah.execute(scenario(), read_twice, config(detectors={**DETECTORS, "no-secret-in-output": _Raising(None)}),
                         seed=0)
-    assert report.failure_class == ah.FAILURE_HARNESS
+    assert (report.failure_class, report.outcome) == (ah.FAILURE_HARNESS, "harness_failure")
+
+
+def test_a_harness_failure_in_an_over_budget_run_keeps_its_class_under_the_budget_outcome():
+    # ADR 022 admits consumption above the grant only as budget_exhausted, so
+    # that is the outcome; the harness failure stays the class and the reason.
+    clock = ah.ManualClock()
+
+    def slow_after_reading(ctx):
+        read_twice(ctx)
+        clock.advance(120)
+
+    sc = scenario()
+    cfg = config(clock=clock, detectors={**DETECTORS, "no-secret-in-output": _Raising(None)})
+    report = ah.execute(sc, slow_after_reading, cfg, seed=0)
+    assert (report.stop_reason, report.failure_class, report.outcome) == (
+        ah.STOP_HARNESS_ERROR, ah.FAILURE_HARNESS, "budget_exhausted")
+    assert report.detail.startswith("detector failed: RuntimeError")
+    assert_contract(report, sc)
 
 
 @pytest.mark.parametrize(

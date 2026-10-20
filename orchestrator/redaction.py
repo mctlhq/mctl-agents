@@ -28,7 +28,10 @@ _DENIED_KEY = re.compile(
     r"|(?:^|[._])(?:prompts?|completions?|messages?|arguments?|args|argv|input|output|results?|body|content"
     r"|text|payload|stdout|stderr|command|cmd|diff|query|description|comment)$)"
 )
-_TOKEN_KEY = re.compile(r"(?i)token")
+#: Any key containing `token`. Public so other screens (the assurance harness
+#: argument screen) share the rule instead of copying it.
+TOKEN_KEY = re.compile(r"(?i)token")
+_TOKEN_KEY = TOKEN_KEY
 # Credential SHAPES, checked on every string value regardless of its key:
 # GitHub tokens, fine-grained PATs, sk- keys (Anthropic/OpenAI), Vault
 # tokens, JWTs, PEM private keys, bearer headers, basic-auth URLs.

@@ -59,7 +59,7 @@ from orchestrator import policy_checkpoint as pc
 from orchestrator import runtime_assurance as ra
 from orchestrator.context_snapshot import canonical_json, hash_bytes
 from orchestrator.execution_evidence import ArtifactRef, ExecutionJoin, PolicyDecisionRef, VersionPins
-from orchestrator.redaction import _TOKEN_KEY, contains_credential
+from orchestrator.redaction import TOKEN_KEY, contains_credential
 
 # ---------------------------------------------------------------------------
 # Failure classes and stop reasons (closed, machine-readable)
@@ -98,6 +98,7 @@ STOP_TOOL_CALLS_EXHAUSTED = "tool_calls_exhausted"
 STOP_WALL_CLOCK_EXHAUSTED = "wall_clock_exhausted"
 STOP_OUTPUT_TOO_LARGE = "output_too_large"
 STOP_PROBE_ERROR = "probe_error"
+STOP_CALLS_OUTSTANDING = "calls_outstanding"
 STOP_HARNESS_ERROR = "harness_error"
 
 #: stop reason -> (failure class, contract outcome; None = no records emitted).
@@ -119,12 +120,13 @@ _STOPS: Mapping[str, tuple[str, str | None]] = {
     STOP_WALL_CLOCK_EXHAUSTED: (FAILURE_BUDGET_EXHAUSTED, ra.OUTCOME_BUDGET_EXHAUSTED),
     STOP_OUTPUT_TOO_LARGE: (FAILURE_BUDGET_EXHAUSTED, ra.OUTCOME_BUDGET_EXHAUSTED),
     STOP_PROBE_ERROR: (FAILURE_TARGET, "inconclusive"),
+    STOP_CALLS_OUTSTANDING: (FAILURE_OUT_OF_ENVELOPE, "inconclusive"),
     STOP_HARNESS_ERROR: (FAILURE_HARNESS, "harness_failure"),
 }
 STOP_REASONS = frozenset({STOP_COMPLETED, *_STOPS})
 
 #: Argument keys a probe may never send, at any depth. Credential keys match
-#: by substring: `redaction._TOKEN_KEY` (any key containing `token`) plus the
+#: by substring: `redaction.TOKEN_KEY` (any key containing `token`) plus the
 #: credential half of `redaction._DENIED_KEY`. The rest of `_DENIED_KEY`
 #: (`query`, `input`, `args`, ...) names ordinary tool arguments, so it is not
 #: reused whole. Scope keys, which the target binding alone decides, match
@@ -138,7 +140,7 @@ SCOPE_ARGUMENT_KEYS = frozenset({"target", "target_ref", "environment", "tenant"
 
 def is_reserved_argument_key(key: str) -> bool:
     return bool(
-        _TOKEN_KEY.search(key)
+        TOKEN_KEY.search(key)
         or _CREDENTIAL_KEY.search(key)
         or key.lower().replace("-", "_") in SCOPE_ARGUMENT_KEYS
     )
@@ -396,6 +398,9 @@ class HarnessReport:
         }
 
 
+#: A probe drives one run through `ProbeContext.call_tool`. It may use threads,
+#: but the run ends when it returns: the gate is then closed, and a call still
+#: in flight makes the run `calls_outstanding`, never `completed`.
 Probe = Callable[["ProbeContext"], None]
 
 
@@ -430,6 +435,9 @@ class _Gate:
         self._inflight: dict[int, CallRecord] = {}
         self._decisions: list[PolicyDecisionRef] = []
         self._stop: tuple[str, str] | None = None
+        #: Set once the probe has returned: nothing it left behind may still
+        #: reach the target. Not a stop, so it never becomes the stop reason.
+        self._closed = False
         #: Request slots claimed so far. A slot is claimed under the lock, so
         #: concurrent callers never share an index or overrun the budget.
         self._issued = 0
@@ -443,6 +451,16 @@ class _Gate:
     def _stop_locked(self, reason: str, detail: str) -> None:
         if self._stop is None:  # the first stop wins
             self._stop = (reason, detail)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+    def _refuse_if_ended_locked(self) -> None:
+        if self._stop is not None:
+            raise _HarnessStop(self._stop[0])
+        if self._closed:
+            raise _HarnessStop(STOP_COMPLETED)
 
     def _claim_locked(self) -> int:
         index = self._issued
@@ -460,10 +478,13 @@ class _Gate:
             self._stop_locked(reason, detail)
         return _HarnessStop(reason)
 
-    def snapshot(self) -> tuple[tuple[CallRecord, ...], tuple[PolicyDecisionRef, ...], tuple[str, str] | None]:
+    def snapshot(
+        self,
+    ) -> tuple[tuple[CallRecord, ...], tuple[PolicyDecisionRef, ...], tuple[str, str] | None, int]:
+        """Calls, decisions, the stop, and how many calls are still in flight."""
         with self._lock:
             calls = sorted([*self._calls, *self._inflight.values()], key=lambda c: c.index)
-            return tuple(calls), tuple(self._decisions), self._stop
+            return tuple(calls), tuple(self._decisions), self._stop, len(self._inflight)
 
     def elapsed(self) -> float:
         return self._config.clock.monotonic() - self._start
@@ -471,8 +492,7 @@ class _Gate:
     # -- the only path from a probe to the target ---------------------------
     def call(self, tool: Any, args: Any) -> ToolOutput:
         with self._lock:
-            if self._stop is not None:
-                raise _HarnessStop(self._stop[0])
+            self._refuse_if_ended_locked()
         if not isinstance(tool, str) or tool not in self._scenario.permitted_tools:
             raise self._halt(STOP_TOOL_NOT_PERMITTED, f"tool {tool!r} is not permitted by the scenario")
         if args is not None and not isinstance(args, Mapping):
@@ -498,8 +518,7 @@ class _Gate:
                 STOP_MUTATION_NOT_PERMITTED, f"tool {tool!r} mutates and the target is not a fixture", blocked
             )
         with self._lock:
-            if self._stop is not None:
-                raise _HarnessStop(self._stop[0])
+            self._refuse_if_ended_locked()
             if self._issued >= self._granted.max_tool_calls:
                 self._stop_locked(STOP_TOOL_CALLS_EXHAUSTED, f"max_tool_calls {self._granted.max_tool_calls} reached")
                 raise _HarnessStop(STOP_TOOL_CALLS_EXHAUSTED)
@@ -527,8 +546,7 @@ class _Gate:
         )
         with self._lock:
             self._decisions.append(ref)  # the decision was made: it is recorded either way
-            if self._stop is not None:  # stopped while the decision was made, e.g. during approval
-                raise _HarnessStop(self._stop[0])
+            self._refuse_if_ended_locked()  # stopped while the decision was made, e.g. during approval
             if decision.permitted:  # in flight from here, so a call the watchdog abandons is still recorded
                 self._inflight[index] = CallRecord(index, tool, args_digest, CALL_ABANDONED, ref, error="abandoned")
         if not decision.permitted:
@@ -538,36 +556,37 @@ class _Gate:
                 replace(blocked, index=index, decision=ref),
             )
         remaining = max(self._granted.max_wall_clock_seconds - self.elapsed(), 0.0)
+        failure = ""
         try:
             raw: Any = self._binding.transport.call(
                 tool, clean, credential=self._binding.credential, timeout_seconds=remaining
             )
         except Exception as exc:  # noqa: BLE001 — a failing target is an observation failure, not a crash
             record = CallRecord(index, tool, args_digest, CALL_FAILED, ref, error=type(exc).__name__)
-            output = ToolOutput(ok=False, error=f"call failed: {type(exc).__name__}")
+            failure = f"call failed: {type(exc).__name__}"
         else:
             if not isinstance(raw, str):
                 record = CallRecord(index, tool, args_digest, CALL_FAILED, ref, error="malformed_output")
-                output = ToolOutput(ok=False, error="call failed: malformed output")
+                failure = "call failed: malformed output"
             elif len(raw.encode()) > self._config.max_output_bytes:
                 record = CallRecord(index, tool, args_digest, CALL_OVERSIZED, ref, error="output_too_large")
-                output = ToolOutput(ok=False, error="output_too_large")
             else:
                 record = CallRecord(
                     index, tool, args_digest, CALL_OK, ref, output=raw, output_hash=hash_bytes(raw.encode())
                 )
-                output = ToolOutput(ok=True, text=raw)
+        overran = self.elapsed() > self._granted.max_wall_clock_seconds
         with self._lock:
+            # One swap, so a snapshot sees the call either in flight or returned.
             self._inflight.pop(index, None)
-        if record.status == CALL_OVERSIZED:
-            raise self._halt(STOP_OUTPUT_TOO_LARGE, f"output exceeds {self._config.max_output_bytes} bytes", record)
-        if self.elapsed() > self._granted.max_wall_clock_seconds:
-            raise self._halt(STOP_WALL_CLOCK_EXHAUSTED, "wall clock budget exceeded during the call", record)
-        with self._lock:
             self._calls.append(record)
-            if self._stop is not None:  # stopped while the call ran: the output is withheld
-                raise _HarnessStop(self._stop[0])
-        return output
+            if record.status == CALL_OVERSIZED:
+                self._stop_locked(STOP_OUTPUT_TOO_LARGE, f"output exceeds {self._config.max_output_bytes} bytes")
+            elif overran:
+                self._stop_locked(STOP_WALL_CLOCK_EXHAUSTED, "wall clock budget exceeded during the call")
+            self._refuse_if_ended_locked()  # stopped or closed while the call ran: the output is withheld
+        if record.status == CALL_OK:
+            return ToolOutput(ok=True, text=raw)
+        return ToolOutput(ok=False, error=failure)
 
 
 def _keys(value: Any) -> list[str]:
@@ -749,6 +768,8 @@ def _run(
             pass
         except BaseException as exc:  # noqa: BLE001 — any probe crash, SystemExit included, is a run outcome
             gate.stop(STOP_PROBE_ERROR, f"probe raised {type(exc).__name__}")
+        finally:
+            gate.close()  # the probe is done: a thread it left behind may not reach the target
 
     watchdog = granted.max_wall_clock_seconds + WATCHDOG_GRACE_SECONDS
     if config.watchdog_seconds is not None:
@@ -759,7 +780,9 @@ def _run(
     watchdog_fired = worker.is_alive()
     if watchdog_fired:
         gate.stop(STOP_WALL_CLOCK_EXHAUSTED, "the probe did not return within the wall clock budget")
-    calls, decisions, stop = gate.snapshot()
+    calls, decisions, stop, outstanding = gate.snapshot()
+    if stop is None and outstanding:
+        stop = (STOP_CALLS_OUTSTANDING, f"the probe returned with {outstanding} call(s) still in flight")
     elapsed = gate.elapsed()
     ended_at = clock.utc_now()
     stop_reason, detail = stop or (STOP_COMPLETED, "the probe finished")
