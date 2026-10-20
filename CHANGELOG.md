@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.86.3](https://github.com/mctlhq/mctl-agents/compare/1.86.2...1.86.3) (2026-10-20)
+
+
+### Bug Fixes
+
+* **options:** keep MCTL_TOKEN out of agent tool subprocesses ([6ba11ce](https://github.com/mctlhq/mctl-agents/commit/6ba11ce41c029d693d6965e3c2e5634fb0ed1b28))
+* **options:** keep MCTL_TOKEN out of agent tool subprocesses ([5ef292e](https://github.com/mctlhq/mctl-agents/commit/5ef292e48076c9ae10d7313345cdd697d9f7b734)), closes [#717](https://github.com/mctlhq/mctl-agents/issues/717)
+
 ## [1.86.2](https://github.com/mctlhq/mctl-agents/compare/1.86.1...1.86.2) (2026-10-19)
 
 
