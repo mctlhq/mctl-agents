@@ -897,7 +897,7 @@ RECEIPT_ARGS = frozenset({RECEIPT_REF_ARG, RECEIPT_HASH_ARG})
 _RECEIPT_TOOL_PREFIX = "mcp__mctl__"
 
 
-def _with_approval_receipt(tool_name: str, tool_input: Any, decision: Any) -> dict[str, Any]:
+def _with_approval_receipt(tool_name: str, tool_input: dict[str, Any] | None, decision: Any) -> dict[str, Any]:
     """The hook's answer to a permitted call: `{}`, or for an mctl call that
     a human approval permitted, an `allow` whose `updatedInput` carries that
     approval's receipt.
@@ -918,12 +918,8 @@ def _with_approval_receipt(tool_name: str, tool_input: Any, decision: Any) -> di
         or not tool_name.startswith(_RECEIPT_TOOL_PREFIX)
     ):
         return {}
-    if tool_input is None:
-        tool_input = {}
-    if not isinstance(tool_input, dict):
-        # The arguments of an MCP call are an object; anything else cannot
-        # carry the receipt, and dropping it would leave the gate to refuse.
-        return _deny("policy checkpoint: tool input is not an object; the approval receipt cannot be attached")
+    # The hook refused any other shape before the checkpoint ran.
+    tool_input = tool_input or {}
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -975,6 +971,10 @@ class _PolicyCheckpointHook:
             if self.delegated_prefix and tool_name.startswith(self.delegated_prefix):
                 return {}
             tool_input = input_data.get("tool_input")
+            # Both refusals below come before the checkpoint, which spends a
+            # human approval: a call refused after it would burn one.
+            if tool_input is not None and not isinstance(tool_input, dict):
+                return _deny("policy checkpoint: tool input is not an object; the call was not made")
             if isinstance(tool_input, dict) and RECEIPT_ARGS & tool_input.keys():
                 # Only this hook writes these, from a receipt it just spent.
                 # One the model supplied would name a receipt nobody spent

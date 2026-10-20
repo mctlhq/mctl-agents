@@ -1829,3 +1829,16 @@ def test_model_supplied_receipt_args_are_refused_before_the_checkpoint(monkeypat
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert key in out["hookSpecificOutput"]["permissionDecisionReason"]
     assert seen == []
+
+
+@pytest.mark.parametrize("tool_input", [["a"], "text", 3])
+def test_non_object_input_is_refused_before_the_checkpoint(monkeypatch, tool_input):
+    """Refused before the checkpoint, so a human approval is never spent on
+    a call that is then refused (claude P2 on #722)."""
+    from orchestrator import policy_checkpoint as pc
+
+    seen: list = []
+    hook = _hook_with(monkeypatch, _decision(pc.CODE_APPROVED, ref="aar_" + "8" * 32), seen)
+    out = _call_hook(hook, "mcp__mctl__mctl_deploy_service", tool_input)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert seen == []
