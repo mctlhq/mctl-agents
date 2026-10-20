@@ -636,15 +636,12 @@ def start_attempt(decision: Decision) -> Any:
 
 
 def end_attempt(attempt: Any, exc: BaseException | None) -> None:
+    """Close the attempt `start_attempt` opened: succeeded, failed on an
+    `Exception`, and left open on any other `BaseException` (an interrupt or
+    cancellation does not tell whether the effect happened)."""
     try:
-        if attempt is None:
-            return
-        if exc is None:
-            attempt.succeeded()
-        else:
-            from orchestrator import decision_records
-
-            attempt.failed(decision_records.exception_code(exc))
+        if attempt is not None:
+            attempt.end(exc)
     except Exception:  # noqa: BLE001, S110 — a record never fails the action
         pass
 

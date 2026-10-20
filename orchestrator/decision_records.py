@@ -63,7 +63,8 @@ attempt event whose decision was not recorded, or a terminal event whose
 `started` was not, is dropped and counted (`dropped_decision_unrecorded`,
 `dropped_attempt_unopened`), never sent against a guessed id. A side effect
 whose end this process did not observe (a process killed mid-call, an
-interrupted tool call) gets no terminal event at all: mctl-api then reads
+interrupted tool call, a KeyboardInterrupt/SystemExit/cancellation out of
+the side effect) gets no terminal event at all: mctl-api then reads
 the attempt as `in_progress`, or `unknown` once a later attempt starts,
 never as `failed`.
 """
@@ -135,7 +136,6 @@ PHASE_PARTIAL = "partial"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _VERDICTS = {"ALLOW": "allow", "DENY": "deny", "REQUIRE_APPROVAL": "require_approval"}
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
-_CODE_RE = re.compile(r"[a-z0-9._:-]{1,64}")
 _CODE_INVALID = re.compile(r"[^a-z0-9._:-]+")
 _EVIDENCE_ID_RE = re.compile(r"ev-[0-9a-f]{16}")
 _RUNTIME_ID_RE = re.compile(r"ex-[0-9a-f]{16}")
@@ -239,11 +239,37 @@ class Attempt:
         return self
 
     def __exit__(self, exc_type: Any, exc: BaseException | None, tb: Any) -> Literal[False]:
-        if exc is not None:
-            self.failed(exception_code(exc))
-        else:
-            self.succeeded()
+        self.end(exc)
         return False
+
+    def end(self, exc: BaseException | None) -> None:
+        """Close this attempt from how the side effect ended: `succeeded`
+        on a normal return (unless the body already closed it, `partial`
+        say), `failed` on an `Exception`. A `BaseException` that is not an
+        `Exception` (SIGINT, SystemExit, a cancellation) says nothing about
+        whether the effect happened, so the attempt is left open."""
+        try:
+            with self._lock:
+                closed = self._closed
+            if closed:
+                return
+            if exc is None:
+                self.succeeded()
+            elif isinstance(exc, Exception):
+                self.failed(exception_code(exc))
+            else:
+                self.abandon()
+        except Exception as exc_:  # noqa: BLE001 — a record never fails the action it describes
+            logger.warning("decision records: could not record an attempt end (%s)", type(exc_).__name__)
+
+    def abandon(self) -> None:
+        """The end was not observed: send no terminal event."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        if self._recorder is not None and self._handle is not None:
+            self._recorder._report(LEFT_OPEN_INTERRUPTED, key=self._handle.key, phase="abandoned")
 
 
 #: What `start()` answers when nothing is recorded (off, untracked).
@@ -272,7 +298,11 @@ class DecisionRecorder:
         self._counts: collections.Counter[str] = collections.Counter()
         self._counts_lock = threading.Lock()
         self._handles: dict[int, _DecisionHandle] = {}
-        self._handles_lock = threading.Lock()
+        # Reentrant on purpose: `_forget` is a weakref.finalize callback, and
+        # a gc pass triggered by an allocation inside a block holding this
+        # lock can run it on the same thread. A plain Lock would deadlock
+        # that thread (the checkpoint's own) there.
+        self._handles_lock = threading.RLock()
         self._tool_uses: collections.OrderedDict[str, Attempt] = collections.OrderedDict()
         self._logged_once: set[str] = set()
         self._thread: threading.Thread | None = None
@@ -544,8 +574,13 @@ class DecisionRecorder:
 
     # -- MCP tool calls: PreToolUse opens, PostToolUse(Failure) closes ------
     def start_tool_use(self, tool_use_id: str, decision: Any) -> None:
+        if not tool_use_id:
+            # Without an id the PostToolUse hooks could never close it: open
+            # nothing rather than an attempt that reads in_progress forever.
+            self._report(DROPPED_UNTRACKED, phase=PHASE_STARTED, detail="no-tool-use-id", once=True)
+            return
         attempt = self.start(decision)
-        if not attempt.tracked or not tool_use_id:
+        if not attempt.tracked:
             return
         with self._handles_lock:
             self._tool_uses[tool_use_id] = attempt
@@ -570,7 +605,7 @@ class DecisionRecorder:
         with self._handles_lock:
             attempt = self._tool_uses.pop(tool_use_id, None) if tool_use_id else None
         if attempt is not None:
-            self._report(LEFT_OPEN_INTERRUPTED, key=attempt._handle.key if attempt._handle else "")
+            attempt.abandon()
 
 
 def decision_body(request: Any, decision: Any, *, key: str, decided_at: str) -> tuple[dict[str, Any] | None, str]:

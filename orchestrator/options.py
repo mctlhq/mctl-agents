@@ -994,7 +994,7 @@ class _PolicyCheckpointHook:
         except Exception as exc:  # noqa: BLE001 — fail closed
             return _deny(f"policy checkpoint failed ({type(exc).__name__}); the call was not made")
         if decision.permitted:
-            _open_decision_attempt(tool_use_id, decision)
+            _open_decision_attempt(tool_use_id or str(input_data.get("tool_use_id") or ""), decision)
             return _with_approval_receipt(tool_name, tool_input, decision)
         return _deny(
             f"policy {decision.verdict} ({decision.code}, rule {decision.rule_id or '-'}, "
@@ -1060,15 +1060,19 @@ def _policy_hooks(
 
     With `MCTL_DECISION_RECORDS` on, the PostToolUse pair that closes each
     permitted call's attempt record is added; off, the map is unchanged."""
-    from orchestrator import decision_records
-
     hook = _PolicyCheckpointHook(tuple(allowed_tools), delegated_prefix=delegated_prefix)
     hooks: dict[HookEventName, list[HookMatcher]] = {
         "PreToolUse": [
             HookMatcher(matcher="mcp__.*", hooks=[cast(Any, hook)]),
         ],
     }
-    if decision_records.enabled():
+    try:
+        from orchestrator import decision_records
+
+        recording = decision_records.enabled()
+    except Exception:  # noqa: BLE001 — a record never stops an agent from starting
+        recording = False
+    if recording:
         post_events: tuple[HookEventName, ...] = ("PostToolUse", "PostToolUseFailure")
         for event in post_events:
             hooks[event] = [HookMatcher(matcher="mcp__.*", hooks=[cast(Any, _DecisionAttemptHook(event))])]

@@ -272,7 +272,21 @@ def test_a_partial_inside_the_context_manager_is_not_overwritten_by_success(api)
     _drain(api)
     assert len(api.bodies("partial")) == 1
     assert not api.bodies("succeeded")
-    assert api.rec.stats()[dr.DUPLICATE_TERMINAL] == 1
+    # The documented pattern, not an anomaly: nothing counted as duplicate.
+    assert dr.DUPLICATE_TERMINAL not in api.rec.stats()
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit, asyncio.CancelledError])
+def test_an_interrupted_side_effect_is_left_open_never_failed(api, interrupt):
+    with pytest.raises(interrupt):
+        pc.enforce(_request(), lambda: (_ for _ in ()).throw(interrupt()))
+    with pytest.raises(interrupt):
+        with dr.start(pc.decide(_request())):
+            raise interrupt()
+    _drain(api)
+    assert len(api.bodies("started")) == 2
+    assert not api.bodies("failed") and not api.bodies("succeeded")
+    assert api.rec.stats()[dr.LEFT_OPEN_INTERRUPTED] == 2
 
 
 def test_a_second_terminal_call_is_ignored_and_counted(api):
@@ -440,6 +454,74 @@ def test_the_work_item_comes_from_the_run_and_only_when_canonical(api):
     assert "work_item_id" not in second
 
 
+class _Ctx:
+    def __init__(self, context_id: str, tenant: str) -> None:
+        self.context_id = context_id
+        self.scope = type("Scope", (), {"tenant": tenant})()
+
+
+def test_tenant_comes_from_the_context_only_when_it_names_this_execution(api, monkeypatch):
+    from orchestrator import execution_identity
+
+    loads: list[str] = []
+
+    def load(**_kw):
+        loads.append("x")
+        return _Ctx(EXECUTION_ID, "acme")
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", "/run/ctx.json")
+    monkeypatch.setattr(execution_identity, "load_from_environment", load)
+    pc.decide(_request())
+    pc.decide(_request())
+    other = "ex-fedcba9876543210"
+    pc.decide(_request(execution_id=other))
+    _drain(api)
+    first, second, third = api.bodies("decision")
+    assert first["tenant"] == "acme" and second["tenant"] == "acme"
+    # A context about another execution never stamps its tenant here.
+    assert "tenant" not in third
+    # Cached per (file, execution): one read for EXECUTION_ID, one for other.
+    assert len(loads) == 2
+
+
+def test_an_unreadable_context_leaves_the_tenant_out(api, monkeypatch):
+    from orchestrator import execution_identity
+
+    def broken(**_kw):
+        raise execution_identity.ExecutionIdentityError("tampered")
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", "/run/ctx.json")
+    monkeypatch.setattr(execution_identity, "load_from_environment", broken)
+    pc.enforce(_request(), lambda: None)
+    _drain(api)
+    assert "tenant" not in api.bodies("decision")[0]
+    assert api.bodies("succeeded")
+
+
+def test_terminal_references_are_sent_only_in_their_canonical_shape(api):
+    decision = pc.decide(_request())
+    dr.start(decision).succeeded(evidence_id="ev-0123456789abcdef", result_digest="sha256:" + "a" * 64,
+                                 commerce_invocation_id="inv_01JINV")
+    dr.start(decision).failed("x", evidence_id="ev-NOTHEX", commerce_invocation_id="bogus")
+    dr.start(decision).partial("y", evidence_id="ev-0123456789abcdef")
+    _drain(api)
+    ok = api.bodies("succeeded")[0]
+    assert (ok["evidence_id"], ok["result_digest"], ok["commerce_invocation_id"]) == (
+        "ev-0123456789abcdef", "sha256:" + "a" * 64, "inv_01JINV")
+    bad = api.bodies("failed")[0]
+    assert "evidence_id" not in bad and "commerce_invocation_id" not in bad
+    assert api.bodies("partial")[0]["evidence_id"] == "ev-0123456789abcdef"
+
+
+def test_open_tool_uses_are_bounded_oldest_evicted(api, monkeypatch):
+    monkeypatch.setattr(dr, "MAX_OPEN_TOOL_USES", 2)
+    for n in range(3):
+        dr.start_tool_use(f"toolu_{n}", pc.decide(_request()))
+    dr.finish_tool_use("toolu_0", dr.PHASE_SUCCEEDED)
+    dr.finish_tool_use("toolu_2", dr.PHASE_SUCCEEDED)
+    _drain(api)
+    assert len(api.bodies("started")) == 3
+    assert len(api.bodies("succeeded")) == 1
+
+
 def test_error_codes_are_codes_never_messages():
     assert dr.error_code("Connection reset by peer: https://x/y") == "connection-reset-by-peer:-https:-x-y"
     assert dr.error_code("") == "unspecified"
@@ -570,6 +652,44 @@ def test_mcp_error_result_and_failure_are_failed_interrupt_is_left_open(api, mon
     assert "boom" not in json.dumps([b for _u, b, _h in api.calls])
 
 
+def test_a_call_without_a_tool_use_id_opens_no_attempt(api, monkeypatch):
+    monkeypatch.setattr(pc, "current_identity", lambda: pc.ExecutionIdentity(EXECUTION_ID, "", ACTOR))
+    hook = options._PolicyCheckpointHook(("mcp__mctl__list_services",))
+    asyncio.run(hook({"tool_name": "mcp__mctl__list_services", "tool_input": {}}, None, None))
+    _drain(api)
+    assert len(api.bodies("decision")) == 1
+    assert not api.bodies("started")
+    assert api.rec.stats()[dr.DROPPED_UNTRACKED] == 1
+
+
+def test_the_pre_hook_takes_the_tool_use_id_from_the_payload_too(api, monkeypatch):
+    monkeypatch.setattr(pc, "current_identity", lambda: pc.ExecutionIdentity(EXECUTION_ID, "", ACTOR))
+    hook = options._PolicyCheckpointHook(("mcp__mctl__list_services",))
+    asyncio.run(hook({"tool_name": "mcp__mctl__list_services", "tool_input": {}, "tool_use_id": "toolu_9"},
+                     None, None))
+    asyncio.run(options._DecisionAttemptHook("PostToolUse")({"tool_use_id": "toolu_9"}, None, None))
+    _drain(api)
+    assert len(api.bodies("started")) == 1
+    assert api.bodies("succeeded")[0]["attempt_no"] == 1
+
+
+def test_the_finalizer_can_run_while_its_own_thread_holds_the_lock(api):
+    import threading
+
+    handle = dr._DecisionHandle(key="k", body={}, permitted=True)
+    api.rec._handles[1] = handle
+
+    def gc_inside_a_locked_block():
+        with api.rec._handles_lock:
+            api.rec._forget(1, handle)
+
+    worker = threading.Thread(target=gc_inside_a_locked_block, daemon=True)
+    worker.start()
+    worker.join(2.0)
+    assert not worker.is_alive(), "the finalizer deadlocked on the handles lock"
+    assert 1 not in api.rec._handles
+
+
 def test_post_hook_for_an_untracked_call_sends_nothing(api):
     asyncio.run(options._DecisionAttemptHook("PostToolUse")({}, "toolu_unknown", None))
     _drain(api)
@@ -590,6 +710,13 @@ def test_post_hooks_are_registered_only_when_on(monkeypatch):
     hooks = options._policy_hooks(["mcp__mctl__x"])
     assert set(hooks) == {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
     assert hooks == options._policy_hooks(["mcp__mctl__x"])
+
+
+def test_a_broken_flag_check_never_stops_an_agent_from_starting(monkeypatch):
+    def broken() -> bool:
+        raise RuntimeError("boom")
+    monkeypatch.setattr(dr, "enabled", broken)
+    assert set(options._policy_hooks(["mcp__mctl__x"])) == {"PreToolUse"}
 
 
 def test_gated_activity_records_its_attempt(api):
