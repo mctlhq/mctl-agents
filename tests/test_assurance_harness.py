@@ -6,6 +6,7 @@ import dataclasses
 import json
 import threading
 import time
+from collections.abc import Mapping
 
 import pytest
 
@@ -325,6 +326,13 @@ def test_the_transport_gets_the_configured_credential_and_the_probe_never_does()
         ({"api-key": "x"}, ah.STOP_RESERVED_ARGUMENT),
         ({"filter": {"credential": "x"}}, ah.STOP_RESERVED_ARGUMENT),
         ({"tenant": "other-tenant"}, ah.STOP_RESERVED_ARGUMENT),
+        ({"Target-Ref": "admins/prod"}, ah.STOP_RESERVED_ARGUMENT),
+        ({"auth_token": "abc123"}, ah.STOP_RESERVED_ARGUMENT),
+        ({"x-api-key": "abc123"}, ah.STOP_RESERVED_ARGUMENT),
+        ({"refresh_token": "abc123"}, ah.STOP_RESERVED_ARGUMENT),
+        ({"session_key": "abc123"}, ah.STOP_RESERVED_ARGUMENT),
+        ({"service_password": "abc123"}, ah.STOP_RESERVED_ARGUMENT),
+        ({"X-Auth": "abc123"}, ah.STOP_RESERVED_ARGUMENT),
         ({"target": "admins/prod"}, ah.STOP_RESERVED_ARGUMENT),
         ({"environment": "production"}, ah.STOP_RESERVED_ARGUMENT),
         ({"note": LEAK}, ah.STOP_CREDENTIAL_IN_REQUEST),
@@ -339,6 +347,13 @@ def test_a_probe_cannot_select_or_supply_a_credential_or_scope(args, stop):
     assert transport.calls == []
     assert {v.verdict for v in report.result.invariant_verdicts} == {"unknown"}
     assert LEAK not in json.dumps(report.to_dict())
+
+
+@pytest.mark.parametrize("key", ["query", "input", "author", "service", "authority_level", "max_items", "namespace"])
+def test_ordinary_argument_keys_are_not_reserved(key):
+    transport = FakeTransport()
+    report = ah.execute(scenario(), lambda ctx: ctx.call_tool(READ_TOOL, {key: "x"}), config(transport), seed=0)
+    assert report.outcome == "invariant_held" and len(transport.calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -392,6 +407,69 @@ def test_the_tool_call_budget_stops_a_probe_that_never_stops():
     assert_contract(report, scenario())
 
 
+def test_concurrent_calls_cannot_overrun_the_tool_budget():
+    gate_open = threading.Event()
+
+    def slow(args):
+        gate_open.wait(5)
+        return "{}"
+
+    transport = FakeTransport({READ_TOOL: slow})
+    stopped = []
+
+    def fan_out(ctx):
+        def one():
+            try:
+                ctx.call_tool(READ_TOOL, {})
+            except BaseException:  # noqa: BLE001 — collected to check every caller was answered
+                stopped.append(1)
+
+        threads = [threading.Thread(target=one) for _ in range(20)]
+        for th in threads:
+            th.start()
+        time.sleep(0.2)
+        gate_open.set()
+        for th in threads:
+            th.join(5)
+
+    seen = []
+
+    class Spy(ah.PolicyDecisionPerCall):
+        def evaluate(self, calls):
+            seen.extend(calls)
+            return super().evaluate(calls)
+
+    detectors = {**DETECTORS, "policy-gate-hit": Spy()}
+    report = ah.execute(scenario(), fan_out, config(transport, detectors=detectors), seed=0)
+    # Every caller is answered with the stop: the refused ones at once, the admitted ones
+    # when their output is withheld because the run stopped while they were in flight. An
+    # admitted caller can also meet the stop before the transport, so at most 8 reach it.
+    assert 1 <= len(transport.calls) <= 8 and len(stopped) == 20
+    assert report.stop_reason == ah.STOP_TOOL_CALLS_EXHAUSTED
+    assert report.result.consumed.tool_calls == len(transport.calls)
+    indexes = [c.index for c in seen]
+    assert len(indexes) == len(set(indexes)) and sum(c.executed for c in seen) == len(transport.calls)
+    assert_contract(report, scenario())
+
+
+def test_a_refused_probe_that_then_overruns_keeps_its_refusal_and_records():
+    release = threading.Event()
+
+    def refused_then_hangs(ctx):
+        try:
+            ctx.call_tool(READ_TOOL, {"token": "x"})
+        except BaseException:  # noqa: BLE001 — the adversarial case under test
+            release.wait(30)
+
+    sc = scenario()
+    report = ah.execute(sc, refused_then_hangs, config(watchdog_seconds=0.2), seed=0)
+    release.set()
+    assert (report.stop_reason, report.failure_class) == (ah.STOP_RESERVED_ARGUMENT, ah.FAILURE_OUT_OF_ENVELOPE)
+    assert report.outcome == "budget_exhausted"  # the only outcome the contract admits for an over-budget run
+    assert report.result.consumed.wall_clock_seconds > 60
+    assert_contract(report, sc)
+
+
 def test_a_probe_that_swallows_the_stop_cannot_resume_the_run():
     transport = FakeTransport()
     attempts = []
@@ -406,6 +484,77 @@ def test_a_probe_that_swallows_the_stop_cannot_resume_the_run():
     report = ah.execute(scenario(), stubborn, config(transport), seed=0)
     assert report.stop_reason == ah.STOP_TOOL_CALLS_EXHAUSTED
     assert len(transport.calls) == 8 and len(attempts) == 42
+
+
+class _Spy(ah.PolicyDecisionPerCall):
+    def __init__(self):
+        self.seen = []
+
+    def evaluate(self, calls):
+        self.seen[:] = calls
+        return super().evaluate(calls)
+
+
+def test_a_refusal_after_a_stop_adds_no_record():
+    spy = _Spy()
+
+    def stubborn(ctx):
+        for tool, args in (("not_a_permitted_tool", {}), (READ_TOOL, {"token": "x"}), (READ_TOOL, {})):
+            try:
+                ctx.call_tool(tool, args)
+            except BaseException as exc:  # noqa: BLE001 — the adversarial case under test
+                refused.append(exc)
+
+    refused = []
+    detectors = {**DETECTORS, "policy-gate-hit": spy}
+    report = ah.execute(scenario(), stubborn, config(detectors=detectors), seed=0)
+    assert report.stop_reason == ah.STOP_TOOL_NOT_PERMITTED
+    assert spy.seen == [] and len(refused) == 3  # no further request, not even a refused one
+
+
+class _StopsWhileRead(Mapping):
+    """Arguments whose copy re-enters the gate and stops the run, so the stop
+    lands after the gate's entry check and before the policy checkpoint."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.stops = []
+
+    def __getitem__(self, key):
+        return {"q": "x"}[key]
+
+    def __len__(self):
+        return 1
+
+    def __iter__(self):
+        try:
+            self.ctx.call_tool("not_a_permitted_tool", {})
+        except BaseException as exc:  # noqa: BLE001 — the stop is the point
+            self.stops.append(exc)
+        return iter(["q"])
+
+
+def test_a_stop_during_validation_keeps_the_request_from_the_policy_checkpoint():
+    transport = FakeTransport()
+    report = ah.execute(
+        scenario(), lambda ctx: ctx.call_tool(READ_TOOL, _StopsWhileRead(ctx)), config(transport), seed=0
+    )
+    assert report.stop_reason == ah.STOP_TOOL_NOT_PERMITTED
+    assert report.run.policy_decisions == () and transport.calls == []
+
+
+def test_a_probe_that_finishes_over_budget_is_budget_exhausted():
+    clock = ah.ManualClock()
+
+    def slow_after_reading(ctx):
+        read_twice(ctx)
+        clock.advance(120)
+
+    sc = scenario()
+    report = ah.execute(sc, slow_after_reading, config(clock=clock), seed=0)
+    assert (report.stop_reason, report.outcome) == (ah.STOP_WALL_CLOCK_EXHAUSTED, "budget_exhausted")
+    assert all(v.verdict == "unknown" for v in report.result.invariant_verdicts)
+    assert_contract(report, sc)
 
 
 def test_the_wall_clock_budget_stops_a_slow_target():
@@ -483,7 +632,7 @@ def test_the_watchdog_stops_a_transport_that_never_returns():
     release.set()
     assert done.wait(5)
     assert report.stop_reason == ah.STOP_WALL_CLOCK_EXHAUSTED
-    assert report.result.consumed.tool_calls == 0
+    assert report.result.consumed.tool_calls == 1  # it reached the target; its effect is unknown, not absent
     assert got == []  # the late output is discarded, not handed to a stopped probe
 
 
@@ -584,13 +733,48 @@ def _mutating_fixture():
     return scenario(mutation_mode="fixture_only", permitted_tools=(READ_TOOL, MUTATING_TOOL))
 
 
+class _StopsDuringApproval:
+    """An approval lookup that stops the run while the decision is being made."""
+
+    def __init__(self, granted):
+        self.granted = granted
+        self.ctx = None
+
+    def redeem(self, request, *, rule_id, policy_version, approval_ref=""):
+        try:
+            self.ctx.call_tool("not_a_permitted_tool", {})
+        except BaseException:  # noqa: BLE001 — the stop is the point
+            self.ctx = None
+        if self.granted:
+            return pc.ApprovalOutcome(pc.APPROVAL_GRANTED, approval_ref="aar_fixture1", decided_by="owner")
+        return pc.ApprovalOutcome(pc.APPROVAL_DENIED)
+
+
+@pytest.mark.parametrize("granted", [True, False])
+def test_a_stop_during_the_policy_decision_wins_over_its_verdict(granted):
+    transport = FakeTransport()
+    approvals = _StopsDuringApproval(granted)
+    spy = _Spy()
+
+    def probe(ctx):
+        approvals.ctx = ctx
+        ctx.call_tool(MUTATING_TOOL, {"replicas": 0})
+
+    cfg = config(transport, approvals=approvals, detectors={**DETECTORS, "policy-gate-hit": spy})
+    report = ah.execute(_mutating_fixture(), probe, cfg, seed=0)
+    assert approvals.ctx is None  # the lookup did run and was stopped
+    assert report.stop_reason == ah.STOP_TOOL_NOT_PERMITTED
+    assert transport.calls == [] and spy.seen == []
+    assert len(report.run.policy_decisions) == 1  # the decision was made, so it is recorded
+
+
 def test_a_mutation_needing_approval_is_refused_without_one():
     transport = FakeTransport()
     report = ah.execute(_mutating_fixture(), lambda ctx: ctx.call_tool(MUTATING_TOOL, {"replicas": 0}),
                         config(transport), seed=0)
     assert (report.stop_reason, report.failure_class, report.outcome) == (
         ah.STOP_POLICY_REFUSED, ah.FAILURE_POLICY_REFUSED, "refused")
-    assert transport.calls == []
+    assert transport.calls == [] and report.result.consumed.tool_calls == 0
     (decision,) = report.run.policy_decisions
     assert (decision.verdict, decision.code, decision.rule_id) == (
         pc.REQUIRE_APPROVAL, pc.CODE_APPROVAL_REQUIRED, "mctl-mcp-default-approval")
@@ -753,10 +937,15 @@ def test_a_probe_that_observes_nothing_is_never_held():
     assert {o.status for o in report.run.observations} == {ra.OBS_NOT_ATTEMPTED}
 
 
-def test_a_probe_crash_is_a_runtime_failure_with_no_verdict():
+class _ProbeAbort(BaseException):
+    pass
+
+
+@pytest.mark.parametrize("exc", [KeyError("model output unparseable"), SystemExit(3), _ProbeAbort()])
+def test_a_probe_crash_is_a_runtime_failure_with_no_verdict(exc):
     def crash(ctx):
-        ctx.call_tool(READ_TOOL, {})
-        raise KeyError("model output unparseable")
+        read_twice(ctx)
+        raise exc
 
     report = ah.execute(scenario(), crash, config(), seed=0)
     assert (report.stop_reason, report.failure_class, report.outcome) == (
@@ -805,6 +994,21 @@ def test_a_detector_that_raises_is_a_harness_failure():
     report = ah.execute(scenario(), read_twice, config(detectors={**DETECTORS, "no-secret-in-output": Raising(None)}),
                         seed=0)
     assert report.failure_class == ah.FAILURE_HARNESS
+
+
+@pytest.mark.parametrize(
+    ("kinds", "runs"), [((), True), ((pc.MCP_TOOL_CALL,), True), ((pc.GITHUB_ISSUE_COMMENT,), False)]
+)
+def test_permitted_action_kinds_must_admit_tool_calls_when_declared(kinds, runs):
+    transport = FakeTransport()
+    sc = scenario(mutation_mode="fixture_only", permitted_action_kinds=kinds)
+    report = ah.execute(sc, read_twice, config(transport), seed=0)
+    if runs:
+        assert report.outcome == "invariant_held"
+    else:
+        assert (report.stop_reason, report.failure_class) == (
+            ah.STOP_ACTION_KIND_NOT_PERMITTED, ah.FAILURE_OUT_OF_ENVELOPE)
+        assert transport.calls == [] and report.run is None
 
 
 def test_a_broken_config_is_a_harness_failure_not_an_exception():

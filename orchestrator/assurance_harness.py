@@ -47,6 +47,7 @@ and attempt. `started_at` / `ended_at` are outside the content hash.
 from __future__ import annotations
 
 import math
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -58,7 +59,7 @@ from orchestrator import policy_checkpoint as pc
 from orchestrator import runtime_assurance as ra
 from orchestrator.context_snapshot import canonical_json, hash_bytes
 from orchestrator.execution_evidence import ArtifactRef, ExecutionJoin, PolicyDecisionRef, VersionPins
-from orchestrator.redaction import contains_credential
+from orchestrator.redaction import _TOKEN_KEY, contains_credential
 
 # ---------------------------------------------------------------------------
 # Failure classes and stop reasons (closed, machine-readable)
@@ -85,6 +86,7 @@ STOP_TARGET_NOT_ALLOWLISTED = "target_not_allowlisted"
 STOP_TARGET_NOT_CONFIGURED = "target_not_configured"
 STOP_DETECTOR_MISSING = "detector_missing"
 STOP_ATTEMPTS_EXHAUSTED = "attempts_exhausted"
+STOP_ACTION_KIND_NOT_PERMITTED = "action_kind_not_permitted"
 # During the run (a run and result are emitted).
 STOP_TOOL_NOT_PERMITTED = "tool_not_permitted"
 STOP_REQUEST_INVALID = "request_invalid"
@@ -106,6 +108,7 @@ _STOPS: Mapping[str, tuple[str, str | None]] = {
     STOP_TARGET_NOT_CONFIGURED: (FAILURE_OUT_OF_ENVELOPE, None),
     STOP_DETECTOR_MISSING: (FAILURE_HARNESS, None),
     STOP_ATTEMPTS_EXHAUSTED: (FAILURE_BUDGET_EXHAUSTED, None),
+    STOP_ACTION_KIND_NOT_PERMITTED: (FAILURE_OUT_OF_ENVELOPE, None),
     STOP_TOOL_NOT_PERMITTED: (FAILURE_OUT_OF_ENVELOPE, "refused"),
     STOP_REQUEST_INVALID: (FAILURE_OUT_OF_ENVELOPE, "refused"),
     STOP_RESERVED_ARGUMENT: (FAILURE_OUT_OF_ENVELOPE, "refused"),
@@ -120,14 +123,26 @@ _STOPS: Mapping[str, tuple[str, str | None]] = {
 }
 STOP_REASONS = frozenset({STOP_COMPLETED, *_STOPS})
 
-#: Argument keys a probe may never send: credential material, or scope the
-#: harness alone owns (the target binding decides target, environment and
-#: tenant). Compared case-insensitively with `-` folded to `_`.
-RESERVED_ARGUMENT_KEYS = frozenset({
-    "credential", "credentials", "token", "access_token", "secret", "password", "authorization", "auth",
-    "api_key", "apikey", "bearer", "cookie", "private_key",
-    "target", "target_ref", "environment", "tenant",
-})
+#: Argument keys a probe may never send, at any depth. Credential keys match
+#: by substring: `redaction._TOKEN_KEY` (any key containing `token`) plus the
+#: credential half of `redaction._DENIED_KEY`. The rest of `_DENIED_KEY`
+#: (`query`, `input`, `args`, ...) names ordinary tool arguments, so it is not
+#: reused whole. Scope keys, which the target binding alone decides, match
+#: exactly (case-insensitive, `-` folded to `_`).
+_CREDENTIAL_KEY = re.compile(
+    r"(?i)authorization|cookie|api[-_]?key|secret|passw(?:or)?d|credential|private[-_]?key|session[-_]?key"
+    r"|bearer|(?:^|[-_])auth(?:$|[-_])"
+)
+SCOPE_ARGUMENT_KEYS = frozenset({"target", "target_ref", "environment", "tenant"})
+
+
+def is_reserved_argument_key(key: str) -> bool:
+    return bool(
+        _TOKEN_KEY.search(key)
+        or _CREDENTIAL_KEY.search(key)
+        or key.lower().replace("-", "_") in SCOPE_ARGUMENT_KEYS
+    )
+
 
 DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 MAX_REQUEST_BYTES = 16 * 1024
@@ -136,6 +151,9 @@ MAX_SEED = 2**63 - 1
 #: a probe that has not returned.
 WATCHDOG_GRACE_SECONDS = 1.0
 CALL_OK, CALL_FAILED, CALL_OVERSIZED, CALL_BLOCKED = "ok", "failed", "oversized", "blocked"
+#: Reached the target, but the run stopped before the call returned: its
+#: effect is unknown, and it still counts as executed.
+CALL_ABANDONED = "abandoned"
 TRANSCRIPT_ARTIFACT_KIND = "assurance-transcript"
 HARNESS_ACTOR = "runtime-assurance-harness"
 _MAX_DETAIL_CHARS = 300
@@ -408,8 +426,13 @@ class _Gate:
         self._runtime_execution_id = runtime_execution_id
         self._lock = threading.Lock()
         self._calls: list[CallRecord] = []
+        #: Calls handed to the transport that have not returned yet.
+        self._inflight: dict[int, CallRecord] = {}
         self._decisions: list[PolicyDecisionRef] = []
         self._stop: tuple[str, str] | None = None
+        #: Request slots claimed so far. A slot is claimed under the lock, so
+        #: concurrent callers never share an index or overrun the budget.
+        self._issued = 0
         self._start = config.clock.monotonic()
 
     # -- state, always under the lock -------------------------------------
@@ -421,16 +444,26 @@ class _Gate:
         if self._stop is None:  # the first stop wins
             self._stop = (reason, detail)
 
+    def _claim_locked(self) -> int:
+        index = self._issued
+        self._issued += 1
+        return index
+
     def _halt(self, reason: str, detail: str, record: CallRecord | None = None) -> _HarnessStop:
+        """Stop the run. A `record` is appended whatever the stop state: it
+        is what happened. An unclaimed record (`index < 0`) claims a slot."""
         with self._lock:
-            if record is not None and self._stop is None:
+            if record is not None:
+                if record.index < 0:
+                    record = replace(record, index=self._claim_locked())
                 self._calls.append(record)
             self._stop_locked(reason, detail)
         return _HarnessStop(reason)
 
     def snapshot(self) -> tuple[tuple[CallRecord, ...], tuple[PolicyDecisionRef, ...], tuple[str, str] | None]:
         with self._lock:
-            return tuple(self._calls), tuple(self._decisions), self._stop
+            calls = sorted([*self._calls, *self._inflight.values()], key=lambda c: c.index)
+            return tuple(calls), tuple(self._decisions), self._stop
 
     def elapsed(self) -> float:
         return self._config.clock.monotonic() - self._start
@@ -440,7 +473,6 @@ class _Gate:
         with self._lock:
             if self._stop is not None:
                 raise _HarnessStop(self._stop[0])
-            index = len(self._calls)
         if not isinstance(tool, str) or tool not in self._scenario.permitted_tools:
             raise self._halt(STOP_TOOL_NOT_PERMITTED, f"tool {tool!r} is not permitted by the scenario")
         if args is not None and not isinstance(args, Mapping):
@@ -453,8 +485,8 @@ class _Gate:
         if len(payload) > MAX_REQUEST_BYTES:
             raise self._halt(STOP_REQUEST_INVALID, "arguments exceed the request size bound")
         args_digest = pc.args_digest_of(clean)
-        blocked = CallRecord(index, tool, args_digest, CALL_BLOCKED)
-        reserved = sorted(k for k in _keys(clean) if k.lower().replace("-", "_") in RESERVED_ARGUMENT_KEYS)
+        blocked = CallRecord(-1, tool, args_digest, CALL_BLOCKED)
+        reserved = sorted(k for k in _keys(clean) if is_reserved_argument_key(k))
         if reserved:
             raise self._halt(STOP_RESERVED_ARGUMENT, f"request names harness-owned key(s) {reserved!r}", blocked)
         if any(contains_credential(s) for s in _strings(clean)):
@@ -465,10 +497,16 @@ class _Gate:
             raise self._halt(
                 STOP_MUTATION_NOT_PERMITTED, f"tool {tool!r} mutates and the target is not a fixture", blocked
             )
-        if index >= self._granted.max_tool_calls:
-            raise self._halt(STOP_TOOL_CALLS_EXHAUSTED, f"max_tool_calls {self._granted.max_tool_calls} reached")
-        if self.elapsed() >= self._granted.max_wall_clock_seconds:
-            raise self._halt(STOP_WALL_CLOCK_EXHAUSTED, "wall clock budget reached before the call")
+        with self._lock:
+            if self._stop is not None:
+                raise _HarnessStop(self._stop[0])
+            if self._issued >= self._granted.max_tool_calls:
+                self._stop_locked(STOP_TOOL_CALLS_EXHAUSTED, f"max_tool_calls {self._granted.max_tool_calls} reached")
+                raise _HarnessStop(STOP_TOOL_CALLS_EXHAUSTED)
+            if self.elapsed() >= self._granted.max_wall_clock_seconds:
+                self._stop_locked(STOP_WALL_CLOCK_EXHAUSTED, "wall clock budget reached before the call")
+                raise _HarnessStop(STOP_WALL_CLOCK_EXHAUSTED)
+            index = self._claim_locked()
         request = pc.ActionRequest(
             action_kind=pc.MCP_TOOL_CALL,
             operation=tool if tool.startswith("mcp__") else f"mcp__mctl__{tool}",
@@ -488,12 +526,16 @@ class _Gate:
             approval_ref=decision.approval_ref,
         )
         with self._lock:
-            if self._stop is not None:
+            self._decisions.append(ref)  # the decision was made: it is recorded either way
+            if self._stop is not None:  # stopped while the decision was made, e.g. during approval
                 raise _HarnessStop(self._stop[0])
-            self._decisions.append(ref)
+            if decision.permitted:  # in flight from here, so a call the watchdog abandons is still recorded
+                self._inflight[index] = CallRecord(index, tool, args_digest, CALL_ABANDONED, ref, error="abandoned")
         if not decision.permitted:
             raise self._halt(
-                STOP_POLICY_REFUSED, f"policy {decision.verdict} ({decision.code})", replace(blocked, decision=ref)
+                STOP_POLICY_REFUSED,
+                f"policy {decision.verdict} ({decision.code})",
+                replace(blocked, index=index, decision=ref),
             )
         remaining = max(self._granted.max_wall_clock_seconds - self.elapsed(), 0.0)
         try:
@@ -509,20 +551,22 @@ class _Gate:
                 output = ToolOutput(ok=False, error="call failed: malformed output")
             elif len(raw.encode()) > self._config.max_output_bytes:
                 record = CallRecord(index, tool, args_digest, CALL_OVERSIZED, ref, error="output_too_large")
-                raise self._halt(
-                    STOP_OUTPUT_TOO_LARGE, f"output exceeds {self._config.max_output_bytes} bytes", record
-                )
+                output = ToolOutput(ok=False, error="output_too_large")
             else:
                 record = CallRecord(
                     index, tool, args_digest, CALL_OK, ref, output=raw, output_hash=hash_bytes(raw.encode())
                 )
                 output = ToolOutput(ok=True, text=raw)
+        with self._lock:
+            self._inflight.pop(index, None)
+        if record.status == CALL_OVERSIZED:
+            raise self._halt(STOP_OUTPUT_TOO_LARGE, f"output exceeds {self._config.max_output_bytes} bytes", record)
         if self.elapsed() > self._granted.max_wall_clock_seconds:
             raise self._halt(STOP_WALL_CLOCK_EXHAUSTED, "wall clock budget exceeded during the call", record)
         with self._lock:
-            if self._stop is not None:  # the watchdog fired while the call ran
-                raise _HarnessStop(self._stop[0])
             self._calls.append(record)
+            if self._stop is not None:  # stopped while the call ran: the output is withheld
+                raise _HarnessStop(self._stop[0])
         return output
 
 
@@ -626,6 +670,8 @@ def _admit(
             ra.check_target_allowlisted(parsed, config.allowlist)
         except ra.RuntimeAssuranceError as exc:
             return _report(STOP_TARGET_NOT_ALLOWLISTED, str(exc))
+    if parsed.permitted_action_kinds and pc.MCP_TOOL_CALL not in parsed.permitted_action_kinds:
+        return _report(STOP_ACTION_KIND_NOT_PERMITTED, f"the harness performs {pc.MCP_TOOL_CALL}, not permitted here")
     binding = config.target((target.kind, target.ref, target.environment))
     if binding is None:
         return _report(STOP_TARGET_NOT_CONFIGURED, f"no target binding for {target.kind}:{target.ref}")
@@ -695,15 +741,13 @@ def _run(
         scenario=scenario, binding=binding, config=config, granted=granted, runtime_execution_id=exec_id
     )
     ctx = ProbeContext(gate_call=gate.call, scenario=scenario, seed=seed)
-    probe_error: list[str] = []
 
     def drive() -> None:
         try:
             probe(ctx)
         except _HarnessStop:
             pass
-        except Exception as exc:  # noqa: BLE001 — a probe crash is a run outcome, not a harness crash
-            probe_error.append(type(exc).__name__)
+        except BaseException as exc:  # noqa: BLE001 — any probe crash, SystemExit included, is a run outcome
             gate.stop(STOP_PROBE_ERROR, f"probe raised {type(exc).__name__}")
 
     watchdog = granted.max_wall_clock_seconds + WATCHDOG_GRACE_SECONDS
@@ -728,7 +772,8 @@ def _run(
         wall_clock_seconds=min(wall, ra.MAX_WALL_CLOCK_CAP * 100),
         followups=0,
     )
-    if stop_reason == STOP_COMPLETED and not consumed.within(granted):
+    overrun = not consumed.within(granted)
+    if stop_reason == STOP_COMPLETED and overrun:
         stop_reason, detail = STOP_WALL_CLOCK_EXHAUSTED, "consumed exceeds the granted budget"
 
     try:
@@ -749,6 +794,11 @@ def _run(
     else:
         failure, stop_outcome = _STOPS[stop_reason]
         outcome = stop_outcome or "harness_failure"
+        if overrun and outcome != ra.OUTCOME_BUDGET_EXHAUSTED:
+            # The contract admits an over-budget run only as budget_exhausted.
+            # The first stop stays the stop reason and failure class.
+            outcome = ra.OUTCOME_BUDGET_EXHAUSTED
+            detail = f"{detail}; the run then overran its granted budget"
 
     try:
         run = ra.seal_run(
