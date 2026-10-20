@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.86.2](https://github.com/mctlhq/mctl-agents/compare/1.86.1...1.86.2) (2026-10-19)
+
+
+### Bug Fixes
+
+* **investigator:** direct approve instructions omitted the content digest ([4f13ad3](https://github.com/mctlhq/mctl-agents/commit/4f13ad398af435c6c5defa9ce7a353ee6b8a956f))
+
 ## [1.86.1](https://github.com/mctlhq/mctl-agents/compare/1.86.0...1.86.1) (2026-10-19)
 
 
