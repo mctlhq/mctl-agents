@@ -885,6 +885,54 @@ def _deadline_guard_hooks(
     }
 
 
+#: The tool arguments that carry an approval receipt to mctl-api's receipt
+#: gate (mctl-api#723, `internal/mcp/agent_receipt_gate.go`). mctl-api strips
+#: both from every call before any handler sees them, so they never reach a
+#: tool as input.
+RECEIPT_REF_ARG = "action_approval_ref"
+RECEIPT_HASH_ARG = "action_approval_artifact_hash"
+RECEIPT_ARGS = frozenset({RECEIPT_REF_ARG, RECEIPT_HASH_ARG})
+#: Only mctl-api runs the receipt gate, so only its tools get the receipt.
+#: Another server would receive the two arguments as tool input.
+_RECEIPT_TOOL_PREFIX = "mcp__mctl__"
+
+
+def _with_approval_receipt(tool_name: str, tool_input: dict[str, Any] | None, decision: Any) -> dict[str, Any]:
+    """The hook's answer to a permitted call: `{}`, or for an mctl call that
+    a human approval permitted, an `allow` whose `updatedInput` carries that
+    approval's receipt.
+
+    The checkpoint has just consumed the receipt for exactly this call, so
+    mctl-api can check that its own caller consumed it for this tool, and
+    spend it. The artifact hash is the checkpoint's action digest, the value
+    `action_approvals.intent_for` stored as the approval's `artifact_hash`.
+
+    What the server can verify with it is principal + tool + one use, not
+    these exact arguments (mctl-api#723 v1): it does not recompute the
+    digest."""
+    from orchestrator import policy_checkpoint
+
+    if (
+        decision.code != policy_checkpoint.CODE_APPROVED
+        or not decision.approval_ref
+        or not tool_name.startswith(_RECEIPT_TOOL_PREFIX)
+    ):
+        return {}
+    # The hook refused any other shape before the checkpoint ran.
+    tool_input = tool_input or {}
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": {
+                **tool_input,
+                RECEIPT_REF_ARG: decision.approval_ref,
+                RECEIPT_HASH_ARG: decision.action_digest,
+            },
+        }
+    }
+
+
 @dataclass(frozen=True)
 class _PolicyCheckpointHook:
     """PreToolUse hook that puts every MCP tool call through the runtime
@@ -923,6 +971,18 @@ class _PolicyCheckpointHook:
             if self.delegated_prefix and tool_name.startswith(self.delegated_prefix):
                 return {}
             tool_input = input_data.get("tool_input")
+            # Both refusals below come before the checkpoint, which spends a
+            # human approval: a call refused after it would burn one.
+            if tool_input is not None and not isinstance(tool_input, dict):
+                return _deny("policy checkpoint: tool input is not an object; the call was not made")
+            if isinstance(tool_input, dict) and RECEIPT_ARGS & tool_input.keys():
+                # Only this hook writes these, from a receipt it just spent.
+                # One the model supplied would name a receipt nobody spent
+                # for this call.
+                return _deny(
+                    f"policy checkpoint: {', '.join(sorted(RECEIPT_ARGS & tool_input.keys()))} "
+                    "is reserved for the approval receipt; the call was not made"
+                )
             decision = await anyio.to_thread.run_sync(functools.partial(
                 policy_checkpoint.checkpoint,
                 policy_checkpoint.MCP_TOOL_CALL,
@@ -934,7 +994,7 @@ class _PolicyCheckpointHook:
         except Exception as exc:  # noqa: BLE001 — fail closed
             return _deny(f"policy checkpoint failed ({type(exc).__name__}); the call was not made")
         if decision.permitted:
-            return {}
+            return _with_approval_receipt(tool_name, tool_input, decision)
         return _deny(
             f"policy {decision.verdict} ({decision.code}, rule {decision.rule_id or '-'}, "
             f"policy {decision.policy_version}): {decision.reason}"
