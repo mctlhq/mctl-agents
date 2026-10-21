@@ -1,0 +1,41 @@
+{
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "budgets": {
+    "max_attempts": 1,
+    "max_followups": 0,
+    "max_tool_calls": 16,
+    "max_wall_clock_seconds": 60
+  },
+  "content_hash": "sha256:a47604c6ecff35e74dccc1bdc98f3217976a1c446135e669cc09af7622e56561",
+  "description": "Reinvestigate supersedes a pending approval grant (mctlhq/mctl-agents#701).",
+  "execution_mode": "deterministic",
+  "followup_templates": [],
+  "inputs": [],
+  "invariants": [
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "guarantee-holds",
+      "statement": "A grant pending when a reinvestigation starts is superseded and cannot be approved; a grant asked afterwards can."
+    }
+  ],
+  "kind": "AssuranceScenario",
+  "mutation_mode": "fixture_only",
+  "name": "governance-reinvestigate-supersedes",
+  "permitted_action_kinds": [
+    "mcp.tool.call"
+  ],
+  "permitted_tools": [
+    "mctl_approve_grant",
+    "mctl_get_grant",
+    "mctl_reinvestigate_issue",
+    "mctl_request_approval"
+  ],
+  "scenario_id": "asc-a47604c6ecff35e7",
+  "setup": [],
+  "target": {
+    "environment": "fixture",
+    "kind": "fixture",
+    "ref": "fixtures/governance/reinvestigate-supersedes"
+  },
+  "version": "1.0.0"
+}

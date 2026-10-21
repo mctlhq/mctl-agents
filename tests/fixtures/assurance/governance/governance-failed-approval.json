@@ -1,0 +1,39 @@
+{
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "budgets": {
+    "max_attempts": 1,
+    "max_followups": 0,
+    "max_tool_calls": 16,
+    "max_wall_clock_seconds": 60
+  },
+  "content_hash": "sha256:1b3e573571aed0b72ab6006049f421d10510380f260a7be17e7bc8e793689c1c",
+  "description": "A failed approval never projects success (mctlhq/mctl-agents#702).",
+  "execution_mode": "deterministic",
+  "followup_templates": [],
+  "inputs": [],
+  "invariants": [
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "guarantee-holds",
+      "statement": "After an approval fails, the work item never reads as approved or succeeded; a successful approval does project."
+    }
+  ],
+  "kind": "AssuranceScenario",
+  "mutation_mode": "fixture_only",
+  "name": "governance-failed-approval",
+  "permitted_action_kinds": [
+    "mcp.tool.call"
+  ],
+  "permitted_tools": [
+    "mctl_approve_work_item",
+    "mctl_get_work_item"
+  ],
+  "scenario_id": "asc-1b3e573571aed0b7",
+  "setup": [],
+  "target": {
+    "environment": "fixture",
+    "kind": "fixture",
+    "ref": "fixtures/governance/failed-approval"
+  },
+  "version": "1.0.0"
+}

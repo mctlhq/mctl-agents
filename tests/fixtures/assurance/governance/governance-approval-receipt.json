@@ -1,0 +1,43 @@
+{
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "budgets": {
+    "max_attempts": 1,
+    "max_followups": 0,
+    "max_tool_calls": 16,
+    "max_wall_clock_seconds": 60
+  },
+  "content_hash": "sha256:ff498ef1c82ce24bb214157d2b527cca4f88ba923f9cf5006063bd07c22f32bc",
+  "description": "Every governed call gets a policy decision; an approval receipt is principal + tool + single use (mctl-api#723, v1 semantics; arguments are not bound).",
+  "execution_mode": "deterministic",
+  "followup_templates": [],
+  "inputs": [],
+  "invariants": [
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "guarantee-holds",
+      "statement": "A receipt executes the governed tool only for the principal and tool it was issued to, and only once."
+    },
+    {
+      "check_kind": "policy_decision_expected",
+      "invariant_id": "policy-gate-hit",
+      "statement": "Every call that reached the target carries a permitting policy decision."
+    }
+  ],
+  "kind": "AssuranceScenario",
+  "mutation_mode": "fixture_only",
+  "name": "governance-approval-receipt",
+  "permitted_action_kinds": [
+    "mcp.tool.call"
+  ],
+  "permitted_tools": [
+    "mctl_deploy_service"
+  ],
+  "scenario_id": "asc-ff498ef1c82ce24b",
+  "setup": [],
+  "target": {
+    "environment": "fixture",
+    "kind": "fixture",
+    "ref": "fixtures/governance/approval-receipt"
+  },
+  "version": "1.0.0"
+}

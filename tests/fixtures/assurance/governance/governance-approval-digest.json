@@ -1,0 +1,39 @@
+{
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "budgets": {
+    "max_attempts": 1,
+    "max_followups": 0,
+    "max_tool_calls": 16,
+    "max_wall_clock_seconds": 60
+  },
+  "content_hash": "sha256:055876b407df33657e5eee25f58760cfe7ba905160463fab9d0804d918d14b1a",
+  "description": "An approval decision binds the reviewed content digest (mctl-gitops#1979, mctl-api#722).",
+  "execution_mode": "deterministic",
+  "followup_templates": [],
+  "inputs": [],
+  "invariants": [
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "guarantee-holds",
+      "statement": "An approve without the reviewed content digest, or with another digest, is refused; the reviewed digest is accepted."
+    }
+  ],
+  "kind": "AssuranceScenario",
+  "mutation_mode": "fixture_only",
+  "name": "governance-approval-digest",
+  "permitted_action_kinds": [
+    "mcp.tool.call"
+  ],
+  "permitted_tools": [
+    "mctl_approve_proposal",
+    "mctl_get_proposal"
+  ],
+  "scenario_id": "asc-055876b407df3365",
+  "setup": [],
+  "target": {
+    "environment": "fixture",
+    "kind": "fixture",
+    "ref": "fixtures/governance/approval-digest"
+  },
+  "version": "1.0.0"
+}
