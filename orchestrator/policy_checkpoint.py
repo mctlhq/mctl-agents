@@ -48,6 +48,8 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -774,16 +776,92 @@ class ExecutionIdentity:
     trace_id: str = ""
     actor: str = ""
     metadata: Mapping[str, str] = field(default_factory=dict)
+    #: Set only on a store-bound identity (`bind_store_execution`): the work
+    #: item's tenant and its owner's canonical `prn_`, as mctl-api reported them.
+    tenant: str = ""
+    principal_id: str = ""
+
+
+#: A work-item store execution id as mctl-api issues it (`we_` + uuid).
+_STORE_EXECUTION_RE = re.compile(r"we_[A-Za-z0-9][A-Za-z0-9-]{0,127}")
+#: A principal as mctl-api records it (`service:mctl-agent`, `human:...`),
+#: within the charset mctl-api's decision store accepts for `actor`.
+_STORE_ACTOR_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}:[A-Za-z0-9._@+-][A-Za-z0-9._:/@+-]{0,200}")
+_PRINCIPAL_ID_RE = re.compile(r"prn_[0-9A-Z]{26}")
+
+_store_identity: ExecutionIdentity | None = None
+_store_lock = threading.Lock()
+
+
+def bind_store_execution(
+    execution_id: str, actor: str, *, tenant: str = "", principal_id: str = "", trace_id: str = "",
+) -> bool:
+    """Bind this process's policy identity to a work-item store execution
+    that mctl-api has just confirmed (mctl-api#701).
+
+    The caller must have READ `execution_id` from mctl-api for this run:
+    either in the work item's own execution ledger, or as the answer to
+    this run's attach. `actor` is the work item's owner principal as
+    mctl-api recorded it. Neither may come from a flag, a parameter or a
+    prompt: this is the one identity source besides the sealed ADR 011
+    context, and it is only as good as that read.
+
+    It never outranks the sealed context: with `MCTL_EXECUTION_CONTEXT_FILE`
+    set, the file is the identity (or, broken, no identity at all), and in
+    require mode (`MCTL_REQUIRE_EXECUTION_CONTEXT`) a missing file still
+    refuses every action. A binding is single-execution: rebinding to a
+    different execution before `unbind_store_execution` is refused, so one
+    run's decisions can never be split across two ids. Returns whether the
+    binding holds; a malformed value binds nothing."""
+    global _store_identity
+    if not (
+        isinstance(execution_id, str) and _STORE_EXECUTION_RE.fullmatch(execution_id)
+        and isinstance(actor, str) and _STORE_ACTOR_RE.fullmatch(actor)
+    ):
+        return False
+    identity = ExecutionIdentity(
+        execution_id=execution_id,
+        trace_id=trace_id if isinstance(trace_id, str) and re.fullmatch(r"[0-9a-f]{32}", trace_id) else "",
+        actor=actor,
+        tenant=tenant if isinstance(tenant, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}", tenant) else "",
+        principal_id=principal_id if isinstance(principal_id, str) and _PRINCIPAL_ID_RE.fullmatch(principal_id) else "",
+    )
+    with _store_lock:
+        if _store_identity is not None:
+            return (_store_identity.execution_id, _store_identity.actor) == (execution_id, actor)
+        _store_identity = identity
+    return True
+
+
+def unbind_store_execution() -> None:
+    """End the store binding (the run that bound it is over)."""
+    global _store_identity
+    with _store_lock:
+        _store_identity = None
+
+
+def store_identity() -> ExecutionIdentity | None:
+    """The store-bound identity, when one is bound and no sealed context
+    file is configured — i.e. exactly when `current_identity()` returns it."""
+    if os.environ.get("MCTL_EXECUTION_CONTEXT_FILE", "").strip():
+        return None
+    if os.environ.get("MCTL_REQUIRE_EXECUTION_CONTEXT", "").strip():
+        return None
+    return _store_identity
 
 
 def current_identity() -> ExecutionIdentity:
-    """The sealed execution context the CWFT wrote, if any.
+    """The sealed execution context the CWFT wrote, if any; else the
+    work-item store execution this run bound (`bind_store_execution`).
 
-    Only a context read from `MCTL_EXECUTION_CONTEXT_FILE` counts: a
-    locally-minted fallback gets a fresh id per call, which would make the
-    action digest unstable. Absent file -> empty identity. In require mode
+    Only a context read from `MCTL_EXECUTION_CONTEXT_FILE` counts as
+    sealed: a locally-minted fallback gets a fresh id per call, which would
+    make the action digest unstable, and it asserts nothing. Absent file ->
+    the store-bound identity, or an empty one. A present but broken file is
+    an empty identity, never a fall back to the store. In require mode
     (`MCTL_REQUIRE_EXECUTION_CONTEXT`) a missing or broken context raises,
-    and callers must turn that into a DENY (see `identity_or_refusal`)."""
+    whatever is bound, and callers must turn that into a DENY (see
+    `identity_or_refusal`)."""
     from orchestrator.execution_identity import (
         MCTL_EXECUTION_CONTEXT_FILE_ENV,
         MCTL_REQUIRE_EXECUTION_CONTEXT_ENV,
@@ -794,7 +872,7 @@ def current_identity() -> ExecutionIdentity:
     if not os.environ.get(MCTL_EXECUTION_CONTEXT_FILE_ENV, "").strip():
         if os.environ.get(MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, "").strip():
             load_from_environment(executor_type="system")  # raises ExecutionContextRequiredError
-        return ExecutionIdentity()
+        return _store_identity or ExecutionIdentity()
     try:
         ctx = load_from_environment(executor_type="system")
     except ExecutionIdentityError:

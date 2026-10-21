@@ -605,3 +605,78 @@ def test_a_refused_marker_or_ambiguous_ack_raises_the_refusal_not_an_attribute_e
         asyncio.run(run_issue_directive_poller._handle_directive(
             directive, issue_url=ISSUE, ref=ref, all_refs=[ref], dry_run=False, prior_failures=0))
     assert "FAIL:" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Store-bound identity (mctl-api#701): the work-item store execution a run
+# resolved from mctl-api, when no sealed ADR 011 context is configured.
+# ---------------------------------------------------------------------------
+STORE_ID = "we_11430e2c-d486-48b3-95ed-50106add0aa6"
+STORE_ACTOR = "service:mctl-agent"
+STORE_PRN = "prn_01M39HRKDM8WJXDX9F0B3HP46F"
+_IDENTITY_FIXTURE = str(Path(__file__).parent / "fixtures" / "identity" / "investigator-context.json")
+
+
+@pytest.fixture
+def store_bound(monkeypatch):
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    assert pc.bind_store_execution(STORE_ID, STORE_ACTOR, tenant="mctl", principal_id=STORE_PRN)
+    yield
+    pc.unbind_store_execution()
+
+
+def test_store_bound_identity_stamps_every_request(store_bound):
+    ident = pc.current_identity()
+    assert (ident.execution_id, ident.actor, ident.tenant, ident.principal_id) == (
+        STORE_ID, STORE_ACTOR, "mctl", STORE_PRN,
+    )
+    request = pc.request_for(pc.MCP_TOOL_CALL, READ, "mctl", {}, grants=GRANTS)
+    assert (request.execution_id, request.actor) == (STORE_ID, STORE_ACTOR)
+    pc.unbind_store_execution()
+    assert pc.current_identity() == pc.ExecutionIdentity()
+
+
+def test_a_sealed_context_outranks_the_store_binding(store_bound, monkeypatch):
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", _IDENTITY_FIXTURE)
+    ident = pc.current_identity()
+    assert ident.execution_id.startswith("ex-") and ident.execution_id != STORE_ID
+    assert pc.store_identity() is None
+
+
+def test_a_broken_context_file_never_falls_back_to_the_store(store_bound, monkeypatch, tmp_path):
+    broken = tmp_path / "ctx.json"
+    broken.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", str(broken))
+    assert pc.current_identity() == pc.ExecutionIdentity()
+
+
+def test_require_mode_is_not_satisfied_by_a_store_binding(store_bound, monkeypatch):
+    monkeypatch.setenv("MCTL_REQUIRE_EXECUTION_CONTEXT", "1")
+    d = _mcp(READ, {})
+    assert (d.verdict, d.code, d.permitted) == (pc.DENY, pc.CODE_IDENTITY_UNAVAILABLE, False)
+    assert pc.store_identity() is None
+
+
+def test_a_binding_holds_one_execution_until_unbound(store_bound):
+    assert pc.bind_store_execution(STORE_ID, STORE_ACTOR)  # the same binding again is idempotent
+    assert not pc.bind_store_execution("we_54ec0985-6860-48ef-ab01-d6e9c28cbbfe", STORE_ACTOR)
+    assert not pc.bind_store_execution(STORE_ID, "human:mallory")
+    assert pc.current_identity().execution_id == STORE_ID
+
+
+@pytest.mark.parametrize("execution_id, actor", [
+    ("", STORE_ACTOR),
+    ("ex-43964106f95834ad", STORE_ACTOR),  # a runtime context id is not a store execution
+    ("e2", STORE_ACTOR),
+    (STORE_ID, ""),
+    (STORE_ID, "mctl-agent"),  # no kind
+    (STORE_ID, "service:"),
+    (STORE_ID, "service:mctl agent"),
+    (None, STORE_ACTOR),
+])
+def test_a_malformed_store_identity_binds_nothing(monkeypatch, execution_id, actor):
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    assert not pc.bind_store_execution(execution_id, actor)
+    assert pc.current_identity() == pc.ExecutionIdentity()

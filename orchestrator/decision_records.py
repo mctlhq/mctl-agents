@@ -27,7 +27,10 @@ What is sent. Canonical ids and digests only, never a payload:
 - `approval_id` (the `aar_`) on `approved` and on the `approval_*` refusals
   that name one; actor (`type:id` of the sealed execution context), tenant
   (its scope) and trace id; the run's `wi_` work item when the evidence
-  producer knows one. No `prn_`: the execution context does not carry one;
+  producer knows one. Without a sealed context, the work-item store
+  execution the run bound (`policy_checkpoint.bind_store_execution`) is the
+  identity: its `we_`, the work item owner as actor, its tenant and the
+  owner's `prn_`. The sealed context carries no `prn_`;
 - on attempts, the runtime execution (`ex-`), an `ev-` evidence id or `inv_`
   commerce invocation when the call site has one, and an error *code*
   (`exception:calledprocesserror`), never a message.
@@ -650,12 +653,27 @@ def decision_body(request: Any, decision: Any, *, key: str, decided_at: str) -> 
     if trace_id:
         body["trace_id"] = trace_id
     tenant = _tenant_of(execution_id)
+    store = _store_identity_of(execution_id)
+    if store is not None:
+        # A store-bound identity (policy_checkpoint.bind_store_execution):
+        # mctl-api's own work item names the tenant and the owner's prn_.
+        tenant = tenant or store.tenant
+        if store.principal_id:
+            body["principal_id"] = store.principal_id
     if tenant:
         body["tenant"] = tenant
     work_item_id = _work_item_of_current_run()
     if work_item_id:
         body["work_item_id"] = work_item_id
     return body, ""
+
+
+def _store_identity_of(execution_id: str) -> Any:
+    """The store-bound identity, when it is the one `execution_id` names."""
+    from orchestrator import policy_checkpoint
+
+    store = policy_checkpoint.store_identity()
+    return store if store is not None and store.execution_id == execution_id else None
 
 
 def _runtime_id_of(handle: _DecisionHandle) -> str:

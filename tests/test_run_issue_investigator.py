@@ -25,7 +25,7 @@ import pytest
 import yaml
 from claude_agent_sdk import TaskUpdatedMessage
 
-from orchestrator import run_issue_investigator
+from orchestrator import policy_checkpoint, run_issue_investigator
 from orchestrator.proposal_state import unrunnable_reason
 from orchestrator.run_implementer import (
     ProposalRef,
@@ -4756,6 +4756,97 @@ def test_seal_side_wiring_carries_work_context_end_to_end(tmp_path, monkeypatch)
     assert wc.actor_id == "carol"
     # The store's id for this engine run, as the help text promises.
     assert wc.execution_id == "we_e2e"
+
+
+def test_store_execution_is_the_policy_identity_of_the_run(tmp_path, monkeypatch):
+    """mctl-api#701: no CWFT writes the sealed ADR 011 context, so in an Argo
+    run every policy decision carried an empty execution id and actor, and
+    no decision record could be written (`skipped_no_execution`). The `we_`
+    the store confirmed for this run, with the work item's owner as actor,
+    is now the identity of the decisions the run makes, and only while the
+    run lasts."""
+    from orchestrator import decision_records
+    from orchestrator.work_context.contract import WORK_ITEM_FOUND, ExecutionRef, WorkItem, WorkItemAnswer
+
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.OBSERVE)
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_MODE", "shadow")
+    _stub_attach(monkeypatch, "we_e2e", attempt=2)
+    item = WorkItem(
+        work_item_id="wi-1", revision="r7", state="in-progress", service="mctl-telegram",
+        slug="issue-104-identity", executions=(ExecutionRef(execution_id="e1", sequence=1),),
+        tenant="mctl", owner_principal="service:mctl-agent", owner_principal_id="prn_01M39HRKDM8WJXDX9F0B3HP46F",
+    )
+    monkeypatch.setattr(
+        "orchestrator.work_context.client.WorkItemClient.get",
+        lambda self, work_item_id: WorkItemAnswer(verdict=WORK_ITEM_FOUND, item=item),
+    )
+    monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "a" * 40)
+    seen: list[tuple[object, object]] = []
+
+    def record(request, decision):
+        # The body is built here, synchronously, as the real recorder does.
+        seen.append((request, decision_records.decision_body(request, decision, key="k", decided_at="t")))
+
+    monkeypatch.setattr(decision_records, "record_decision", record)
+    during: list[policy_checkpoint.ExecutionIdentity] = []
+
+    def agent(repo_dir, prompt, proposal_dir):
+        during.append(policy_checkpoint.current_identity())
+        # A governed action the run takes, as the SDK hooks would check it.
+        policy_checkpoint.checkpoint(policy_checkpoint.MCP_TOOL_CALL, "mcp__mctl__mctl_get_status", "mctl", {})
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"x {name}")
+
+    _investigate_harness(tmp_path, monkeypatch, number=104, title="Identity", agent=agent)
+    result = investigate(
+        "https://github.com/mctlhq/mctl-telegram/issues/104", state_dir=tmp_path, work_item_id="wi-1",
+    )
+    assert result.error is None
+
+    assert [(i.execution_id, i.actor, i.tenant, i.principal_id) for i in during] == [
+        ("we_e2e", "service:mctl-agent", "mctl", "prn_01M39HRKDM8WJXDX9F0B3HP46F"),
+    ]
+    governed = [(r, built) for r, built in seen if getattr(r, "operation", "") == "mcp__mctl__mctl_get_status"]
+    assert governed and all((r.execution_id, r.actor) == ("we_e2e", "service:mctl-agent") for r, _ in governed)
+    # ...which is what the decision record producer needs to write a row.
+    body, skip = governed[0][1]
+    assert skip == "" and body is not None
+    assert (body["execution_id"], body["actor"], body["tenant"], body["principal_id"]) == (
+        "we_e2e", "service:mctl-agent", "mctl", "prn_01M39HRKDM8WJXDX9F0B3HP46F",
+    )
+    # The binding ends with the run: a later run in this process starts empty.
+    assert policy_checkpoint.current_identity() == policy_checkpoint.ExecutionIdentity()
+
+
+def test_store_identity_is_not_bound_without_an_owner_principal(tmp_path, monkeypatch):
+    """No usable owner principal means no attributable actor: nothing is
+    bound, and decisions stay without an identity rather than with a guessed one."""
+    from orchestrator.work_context.contract import WORK_ITEM_FOUND, WorkItem, WorkItemAnswer
+
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.OBSERVE)
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_MODE", "shadow")
+    _stub_attach(monkeypatch, "we_e2e", attempt=1)
+    item = WorkItem(work_item_id="wi-1", revision="r1", state="in-progress", service="mctl-telegram",
+                    slug="issue-105-identity")
+    monkeypatch.setattr(
+        "orchestrator.work_context.client.WorkItemClient.get",
+        lambda self, work_item_id: WorkItemAnswer(verdict=WORK_ITEM_FOUND, item=item),
+    )
+    monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "a" * 40)
+    during: list[policy_checkpoint.ExecutionIdentity] = []
+
+    def agent(repo_dir, prompt, proposal_dir):
+        during.append(policy_checkpoint.current_identity())
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"x {name}")
+
+    _investigate_harness(tmp_path, monkeypatch, number=105, title="Identity", agent=agent)
+    assert investigate("https://github.com/mctlhq/mctl-telegram/issues/105", state_dir=tmp_path,
+                       work_item_id="wi-1").error is None
+    assert during == [policy_checkpoint.ExecutionIdentity()]
 
 
 def test_mismatched_work_item_warns_at_observe_and_refuses_at_enforce(tmp_path, monkeypatch, capsys):
