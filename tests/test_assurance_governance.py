@@ -229,7 +229,7 @@ def test_a_stored_write_the_producer_cannot_address_keeps_the_guarantee():
     class UnreadableId(gov._Sink):
         def __call__(self, url, body, headers):
             resp = super().__call__(url, body, headers)
-            if url.endswith(dr.DECISIONS_PATH) and self.decisions == 1:
+            if url.endswith(dr.DECISIONS_PATH) and resp.status_code in (200, 201) and self.decisions == 1:
                 return httpx.Response(201, json={"decision": {"id": "not-an-id"}}, request=resp.request)
             return resp
 
@@ -239,7 +239,9 @@ def test_a_stored_write_the_producer_cannot_address_keeps_the_guarantee():
     assert report.outcome == ra.OUTCOME_HELD, report.detail
     recorded = sum(n for k, n in target.recorder.stats().items() if k in dr.RECORDED)
     assert recorded < target.sink.stored
+    # One stored write with an unreadable id, one persistent 503.
     assert target.recorder.stats()[dr.UNOBSERVABLE] == 2
+    assert target.sink.stored == 2
 
 
 def test_decision_record_mutant_claims_writes_that_did_not_land():
