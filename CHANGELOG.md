@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.89.0](https://github.com/mctlhq/mctl-agents/compare/1.88.4...1.89.0) (2026-10-21)
+
+
+### Features
+
+* **agents:** issue-735-fix-evidence-never-bind-a-pr-subject-to ([925669e](https://github.com/mctlhq/mctl-agents/commit/925669e758352c978ad9e1564e4e1a5994069d0f))
+* **agents:** register mctl-alice as an issue-driven service ([04fd60f](https://github.com/mctlhq/mctl-agents/commit/04fd60fcc43128f5b0969e90a0ef69930d486085))
+
 ## [1.88.4](https://github.com/mctlhq/mctl-agents/compare/1.88.3...1.88.4) (2026-10-21)
 
 
