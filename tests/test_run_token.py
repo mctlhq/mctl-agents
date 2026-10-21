@@ -134,3 +134,33 @@ def test_revoke_never_raises():
         raise httpx.ConnectError("down")
 
     run_token.revoke(run_token.RunToken(RUN, "art_1", "investigate", "we_1", ""), post=boom)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        httpx.Response(201, content=b"not json"),
+        httpx.Response(201, json=["art_x"]),
+        httpx.Response(201, json={"token": None}),
+    ],
+)
+def test_a_malformed_success_body_is_a_failed_exchange(monkeypatch, answer):
+    monkeypatch.setenv(run_token.MODE_ENV, "observe")
+    run_token.setup("investigate", post=FakeAPI(answer))  # observe: never raises
+    assert _mcp_headers()[run_token.SHADOW_HEADER] == "investigate"
+    monkeypatch.setenv(run_token.MODE_ENV, "enforce")
+    with pytest.raises(run_token.RunTokenError):
+        run_token.setup("investigate", post=FakeAPI(answer))
+
+
+def test_a_null_scope_falls_back_to_the_named_one(monkeypatch):
+    monkeypatch.setenv(run_token.MODE_ENV, "observe")
+    answer = httpx.Response(201, json={"token": RUN, "token_id": "art_1", "scope": None})
+    run_token.setup("investigate", post=FakeAPI(answer))
+    assert _mcp_headers()[run_token.SHADOW_HEADER] == "investigate"
+
+
+def test_enforce_without_setup_fails_closed(monkeypatch):
+    monkeypatch.setenv(run_token.MODE_ENV, "enforce")
+    with pytest.raises(run_token.RunTokenError, match=r"call run_token.setup\(\) first"):
+        options.mctl_mcp_config()

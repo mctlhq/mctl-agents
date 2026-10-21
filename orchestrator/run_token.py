@@ -110,16 +110,28 @@ def exchange(sa_token_file: str | None = None, post=_post) -> RunToken:
         except ValueError:
             pass
         raise RunTokenError(f"run token exchange refused: HTTP {resp.status_code} {code}".rstrip())
-    body = resp.json()
-    token = str(body.get("token", ""))
+    # A malformed success body is a failed exchange like any other, so it
+    # stays inside RunTokenError and observe mode's catch.
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise RunTokenError(f"run token exchange answered with invalid JSON: {exc}") from exc
+    if not isinstance(body, dict):
+        raise RunTokenError("run token exchange answered with a non-object body")
+
+    def field(name: str) -> str:
+        value = body.get(name)
+        return value if isinstance(value, str) else ""
+
+    token = field("token")
     if not token.startswith("art_"):
         raise RunTokenError("run token exchange answered without a run token")
     return RunToken(
         token=token,
-        token_id=str(body.get("token_id", "")),
-        scope=str(body.get("scope", "")),
-        execution_id=str(body.get("execution_id", "")),
-        expires_at=str(body.get("expires_at", "")),
+        token_id=field("token_id"),
+        scope=field("scope"),
+        execution_id=field("execution_id"),
+        expires_at=field("expires_at"),
     )
 
 
@@ -163,7 +175,10 @@ def mcp_auth(static_token: str) -> tuple[str, dict[str, str]]:
     """The bearer and extra headers for the mctl MCP connection: the run
     token in enforce mode, otherwise the static token, plus the shadow scope
     header in observe mode."""
-    if _state.mode == MODE_ENFORCE:
+    # The environment decides enforce, not only setup(): a run configured
+    # for enforce that never called setup() must not connect with the static
+    # token.
+    if _state.mode == MODE_ENFORCE or mode() == MODE_ENFORCE:
         if _state.token is None:
             raise RunTokenError("enforce mode without a run token: call run_token.setup() first")
         return _state.token.token, {}
