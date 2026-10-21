@@ -1426,7 +1426,14 @@ def post_proposal_comment(
         "and the implementer refuses a proposal whose "
         "`control.requires_human_approval` carries no named approver — so "
         "prefer the mctl-api endpoint, which takes the approver from the "
-        "authenticated caller rather than from what the caller types."
+        "authenticated caller rather than from what the caller types.\n\n"
+        "To approve with amendments, edit `requirements.md`, `design.md` or "
+        "`tasks.md` on mctl-gitops main through a PR first. The edit "
+        "supersedes the pending grant, and the loop asks for a decision on "
+        "the new one: approve that, and the implementer works from the "
+        "amended files. The approve `reason` is recorded for audit only and "
+        "never reaches the implementer, and `@MCTL reinvestigate` carries no "
+        "text, so neither can carry amendments."
     )
     # The policy checkpoint (#197): on refusal PolicyRefused is raised and
     # `gh` never runs. The body is recorded only as a digest.

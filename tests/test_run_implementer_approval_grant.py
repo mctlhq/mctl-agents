@@ -185,6 +185,44 @@ def test_content_edited_after_the_decision_never_runs(tmp_path, gate) -> None:
     assert gate.calls["preflight"] == [] and gate.calls["model"] == []
 
 
+def test_owner_amendments_reach_the_implementer_through_a_new_grant(tmp_path, gate) -> None:
+    """The supported way to approve with amendments (mctl-agents#729): edit
+    the proposal files, then approve the grant for the edited content. The
+    grant for the reviewed-but-unamended content no longer authorizes
+    anything, and the run on the new grant reads the amended files."""
+    old_grant, new_grant = GRANT, "aar_fedcba9876543210"
+    ref = _proposal(tmp_path, control={"requires_human_approval": True}, approval=APPROVED)
+    gate.store[old_grant] = _grant_for(ref, id=old_grant)
+    reviewed_digest = proposal_content_digest(ref.proposal_dir)
+
+    # The owner amends requirements.md on gitops main; the approve flip of the
+    # new grant records the new digest and the new grant id.
+    amendment = "- Owner amendment: no client-side revoke promise.\n"
+    req = ref.proposal_dir / "requirements.md"
+    req.write_text(req.read_text(encoding="utf-8") + amendment, encoding="utf-8")
+    amended_digest = proposal_content_digest(ref.proposal_dir)
+    assert amended_digest != reviewed_digest
+    status = load_status(ref.status_path)
+    status["approval"]["content_digest"] = amended_digest
+    ref.status_path.write_text(yaml.safe_dump(status), encoding="utf-8")
+
+    # Still pointing at the grant decided before the amendment: refused.
+    result = _run(ref)
+    assert result is not None and result.blocked == ae.GRANT_CONTENT_MISMATCH
+    assert gate.calls["model"] == []
+
+    # The owner approves the superseding grant for the amended content.
+    status = load_status(ref.status_path)
+    status["approval"]["approval_ref"] = new_grant
+    ref.status_path.write_text(yaml.safe_dump(status), encoding="utf-8")
+    gate.store[new_grant] = _grant_for(ref, id=new_grant)
+    assert _run(ref) is None  # reached the model tripwire
+    assert gate.calls["model"] == [True]
+    assert ref.grant_id == new_grant and ref.grant_digest == amended_digest
+    # The implementer reads its spec from ref.proposal_dir ($PROPOSAL_DIR).
+    assert amendment in (ref.proposal_dir / "requirements.md").read_text(encoding="utf-8")
+
+
 def test_an_unreadable_store_defers_without_a_marker(tmp_path, gate) -> None:
     ref = _proposal(tmp_path, control={"requires_human_approval": True}, approval=APPROVED)
     gate.store[GRANT] = aa.ApprovalAnswer(aa.UNKNOWN, reason="HTTP 503")
