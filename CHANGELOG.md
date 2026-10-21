@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.88.0](https://github.com/mctlhq/mctl-agents/compare/1.87.0...1.88.0) (2026-10-21)
+
+
+### Features
+
+* **decision-records:** write durable decision and attempt records to mctl-api ([d56fd26](https://github.com/mctlhq/mctl-agents/commit/d56fd266db7945cab5d2d04c719a08befb71a0a6))
+* **decision-records:** write durable decision and attempt records to mctl-api ([5e2fc25](https://github.com/mctlhq/mctl-agents/commit/5e2fc25e12d44db795a9995aef87f679e5d3aee1))
+* **runtime-assurance:** add a deterministic bounded probe harness ([7a6aae4](https://github.com/mctlhq/mctl-agents/commit/7a6aae4a8e1b001eb9f08ecced511170fb9a475a))
+* **runtime-assurance:** add a deterministic bounded probe harness ([73203f4](https://github.com/mctlhq/mctl-agents/commit/73203f41007c20ddd270e0ecdf61057b4195abf8))
+
+
+### Bug Fixes
+
+* **decision-records:** never record an unobserved end, and never deadlock on cleanup ([efec666](https://github.com/mctlhq/mctl-agents/commit/efec666767502d96b3c5a7d8e06c9849333f2081))
+* **deps:** bump certifi to 2026.10.19 ([ff5b321](https://github.com/mctlhq/mctl-agents/commit/ff5b321123b019d3bd0a497e11edba93472a38ee))
+* **deps:** bump certifi to 2026.10.19 ([28f8fa0](https://github.com/mctlhq/mctl-agents/commit/28f8fa03e3839b8aff41e91f668aad97d845d7a8))
+* **runtime-assurance:** close the harness gate's concurrency and accounting gaps ([06feb0d](https://github.com/mctlhq/mctl-agents/commit/06feb0d348e01d05dc783cfb09b801576573f53f))
+* **runtime-assurance:** end the run when the probe returns ([ca4e67b](https://github.com/mctlhq/mctl-agents/commit/ca4e67be9bd3945e481ab91da060b9ffbd858db5))
+* **runtime-assurance:** send the target the arguments that were screened ([c0da70b](https://github.com/mctlhq/mctl-agents/commit/c0da70b7e44d04b549dbd6bf06b5caafa7c6c584))
+
 ## [1.87.0](https://github.com/mctlhq/mctl-agents/compare/1.86.3...1.87.0) (2026-10-20)
 
 
