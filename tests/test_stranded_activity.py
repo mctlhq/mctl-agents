@@ -454,12 +454,12 @@ class TestExecutionAuthorizationPredicate:
     def test_waiving_the_approval_gate_grants_no_authority(self, control):
         """`requires_human_approval: false` waives a gate; it does not grant
         permission to execute. This is the split from
-        `human_approval_satisfied`, which answers True for every one of these.
+        `approval_requirement_met`, which answers True for every one of these.
         """
-        from orchestrator.proposal_state import human_approval_satisfied
+        from orchestrator.proposal_state import approval_requirement_met
 
         data = {"control": control}
-        assert human_approval_satisfied(data) is True
+        assert approval_requirement_met(data) is True
         assert execution_authorization(data) == (None, UNAUTHORIZED_LEGACY_AUTO_ACCEPTED)
 
     def test_an_approval_survives_a_waived_gate(self):

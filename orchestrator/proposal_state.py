@@ -64,8 +64,13 @@ _FALSEY = {"false", "no", "0", "off", ""}
 BLOCKED_APPROVAL_MISSING = "approval-missing"
 
 
-def human_approval_satisfied(data: dict[str, Any]) -> bool:
+def approval_requirement_met(data: dict[str, Any]) -> bool:
     """Whether a proposal's recorded approval meets its own requirement.
+
+    Named ``human_approval_satisfied`` before mctl-agents#703. It answers
+    True for a record that never asked for approval, so the old name read as
+    "a human approved this" when no human was involved. It is a write-time
+    check only; execution is authorized by ``execution_authorization``.
 
     ``control.requires_human_approval`` was written by the investigator,
     self-checked once at publish time, and then read by nothing: the
@@ -103,7 +108,7 @@ def human_approval_satisfied(data: dict[str, Any]) -> bool:
 def requires_human_approval(data: dict[str, Any]) -> bool:
     """Whether a proposal's own ``control`` block asks for a human approval.
 
-    The requirement half of ``human_approval_satisfied``: absent ``control``
+    The requirement half of ``approval_requirement_met``: absent ``control``
     means never asked; a ``control`` that is not a mapping is corrupt and
     counts as asking.
     """
@@ -236,7 +241,7 @@ def approval_digest_problem(data: dict[str, Any], proposal_dir: Path) -> tuple[s
 
 # Execution authorization (mctl-agents#412, the 2026-09-19 product decision).
 #
-# `human_approval_satisfied` above answers a WRITE-TIME question: "does this
+# `approval_requirement_met` above answers a WRITE-TIME question: "does this
 # record meet its own declared approval requirement?" An absent `control` block
 # answers it True, because the record never asked for approval — which is the
 # right default for a writer checking its own write.
@@ -286,6 +291,10 @@ UNAUTHORIZED_ANONYMOUS_APPROVER = "approved with no recorded approver identity"
 #: path that does not record one. The remedy is to re-approve through the
 #: DevLoop.
 UNAUTHORIZED_NO_APPROVAL_GRANT = "approved with no verifiable approval grant"
+#: Durable ``blocked`` code the implementer writes when
+#: ``execution_authorization`` refuses a proposal at the execution boundary
+#: (mctl-agents#703). The marker's message carries the reason above.
+BLOCKED_EXECUTION_UNAUTHORIZED = "execution-unauthorized"
 #: `approval_evidence.GRANT_REF_RE`, repeated so this module stays import-free.
 _GRANT_REF_RE = re.compile(r"aar_[A-Za-z0-9_-]{1,124}")
 
@@ -297,7 +306,18 @@ def execution_authorization(data: dict[str, Any]) -> tuple[str | None, str | Non
     does not positively identify an authorization returns ``(None, <reason>)``,
     and the reason distinguishes the two unauthorized shapes because they have
     opposite remedies. See the block comment above for why this is not
-    `human_approval_satisfied`.
+    `approval_requirement_met`.
+
+    This is the one execution-authorization contract (mctl-agents#703). The
+    implement sweep schedules only what it authorizes, and the implementer
+    applies it again at the execution boundary, so every entry point (sweep,
+    DevLoop, manual trigger) gets the same answer with the same reason. In
+    the vocabulary of #703: "approval satisfied" is
+    ``AUTHORIZATION_HUMAN_APPROVAL``; "authorized by policy" is
+    ``AUTHORIZATION_AUTONOMY_POLICY``, reserved and never returned until an
+    autonomy policy is defined; "approval not required" (no ``control``, or a
+    waived gate) is a statement about the record, not an authorization, and
+    reads as unauthorized here.
     """
     approval = data.get("approval")
     if isinstance(approval, dict):
@@ -340,7 +360,7 @@ def unrunnable_reason(data: dict[str, Any]) -> str | None:
     """
     if data.get("status") != "accepted":
         return None
-    return None if human_approval_satisfied(data) else BLOCKED_APPROVAL_MISSING
+    return None if approval_requirement_met(data) else BLOCKED_APPROVAL_MISSING
 
 
 class UnrunnableProposalError(RuntimeError):
@@ -406,7 +426,7 @@ def _write_status_atomic(path: Path, payload: dict[str, Any]) -> None:
     new content is written, and that window is not merely lost work here.
     A `.status.yaml` left empty or half-written makes `load_status` return
     `{}` or raise, and an empty mapping has no `control` block — which
-    `human_approval_satisfied` reads as "this proposal never asked for
+    `approval_requirement_met` reads as "this proposal never asked for
     approval" and waives the gate. So the one failure mode that erases the
     requirement is the same one that lets it be skipped (agy P1 on
     gitops#986).

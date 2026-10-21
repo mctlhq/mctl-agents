@@ -65,6 +65,25 @@ def _granted_approval(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _authorized_execution(monkeypatch):
+    """Answer the implementer's execution-authorization gate as a human approval.
+
+    `_implement_one` applies `proposal_state.execution_authorization` to every
+    accepted proposal before it runs (mctl-agents#703), the same contract the
+    implement sweep schedules by. The implementer tests that drive it further
+    use fixture status files with no approval block, so the gate is answered
+    for every test, exactly like the grant check above. The contract's own
+    tests (`test_execution_authorization_contract.py`) hold the real function,
+    taken at import time, and restore it.
+    """
+    from orchestrator.proposal_state import AUTHORIZATION_HUMAN_APPROVAL
+
+    implementer = importlib.import_module("orchestrator.run_implementer")
+    monkeypatch.setattr(implementer, "_execution_authorization", lambda _ref: (AUTHORIZATION_HUMAN_APPROVAL, None))
+    yield
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     # Pins anyio's pytest plugin (auto-registered since anyio is already a

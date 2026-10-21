@@ -22,7 +22,7 @@ import yaml
 from orchestrator import run_implementer
 from orchestrator.proposal_state import (
     UnrunnableProposalError,
-    human_approval_satisfied,
+    approval_requirement_met,
     load_status,
     unrunnable_reason,
     update_status_file,
@@ -42,7 +42,7 @@ REQUIRES = {"status": "accepted", "control": {"requires_human_approval": True}}
 # --- the predicate, called directly rather than through the implementer -----
 
 def test_requirement_without_an_approval_is_not_satisfied() -> None:
-    assert human_approval_satisfied(REQUIRES) is False
+    assert approval_requirement_met(REQUIRES) is False
 
 
 def test_an_approval_naming_nobody_is_not_satisfied() -> None:
@@ -52,25 +52,25 @@ def test_an_approval_naming_nobody_is_not_satisfied() -> None:
     # exactly the paths that record nothing.
     for anonymous in ("unknown", "UNKNOWN", "  unknown  ", "", "none"):
         data = {**REQUIRES, "approval": {"approved_by": anonymous}}
-        assert human_approval_satisfied(data) is False, anonymous
+        assert approval_requirement_met(data) is False, anonymous
 
 
 def test_a_named_approver_satisfies_the_requirement() -> None:
     data = {**REQUIRES, "approval": {"approved_by": "mashkovd"}}
-    assert human_approval_satisfied(data) is True
+    assert approval_requirement_met(data) is True
 
 
 def test_a_proposal_with_no_control_block_does_not_require_approval() -> None:
     # The incident-responder writes `status: accepted` with no control block
     # at all. Defaulting to deny would strand that entire path.
-    assert human_approval_satisfied({"status": "accepted"}) is True
-    assert human_approval_satisfied({"status": "accepted", "control": {}}) is True
+    assert approval_requirement_met({"status": "accepted"}) is True
+    assert approval_requirement_met({"status": "accepted", "control": {}}) is True
 
 
 def test_a_malformed_approval_block_does_not_satisfy() -> None:
     for approval in ("mashkovd", ["mashkovd"], {"approved_by": None}, {}):
         data = {**REQUIRES, "approval": approval}
-        assert human_approval_satisfied(data) is False, approval
+        assert approval_requirement_met(data) is False, approval
 
 
 def test_a_string_true_still_requires_approval() -> None:
@@ -82,13 +82,13 @@ def test_a_string_true_still_requires_approval() -> None:
     # ones that will not.
     for truthy in ("true", "True", "TRUE", " yes ", "1"):
         data = {"status": "accepted", "control": {"requires_human_approval": truthy}}
-        assert human_approval_satisfied(data) is False, truthy
+        assert approval_requirement_met(data) is False, truthy
 
 
 def test_a_falsey_string_does_not_require_approval() -> None:
     for falsey in (False, "false", "no", "0", None):
         data = {"status": "accepted", "control": {"requires_human_approval": falsey}}
-        assert human_approval_satisfied(data) is True, falsey
+        assert approval_requirement_met(data) is True, falsey
 
 
 def test_an_unrecognised_requirement_value_fails_closed() -> None:
@@ -98,7 +98,7 @@ def test_an_unrecognised_requirement_value_fails_closed() -> None:
     # require approval.
     for weird in (["true"], {"v": True}, "required", "yep", 42, object()):
         data = {"status": "accepted", "control": {"requires_human_approval": weird}}
-        assert human_approval_satisfied(data) is False, weird
+        assert approval_requirement_met(data) is False, weird
 
 
 def test_a_malformed_control_block_fails_closed() -> None:
@@ -106,7 +106,7 @@ def test_a_malformed_control_block_fails_closed() -> None:
     # but not a mapping asked for something unreadable, which is not the same
     # thing and must not be read as consent (agy P2).
     for malformed in ("requires_human_approval: true", ["requires_human_approval"], 42):
-        assert human_approval_satisfied({"control": malformed}) is False, malformed
+        assert approval_requirement_met({"control": malformed}) is False, malformed
 
 
 def test_a_hand_built_ref_is_not_assumed_approved() -> None:
@@ -371,7 +371,7 @@ def test_a_failed_dump_leaves_the_previous_status_intact(tmp_path: Path) -> None
     # The file the implementer will read next must still carry the gate.
     survived = load_status(path)
     assert survived["control"] == {"requires_human_approval": True}
-    assert human_approval_satisfied(survived) is False
+    assert approval_requirement_met(survived) is False
 
 
 def test_the_target_is_never_opened_for_writing(tmp_path: Path) -> None:

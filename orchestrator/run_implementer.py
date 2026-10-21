@@ -197,9 +197,12 @@ from orchestrator.proposal_state import (
     BLOCKED_APPROVAL_DIGEST_MISMATCH,
     BLOCKED_APPROVAL_DIGEST_MISSING,
     BLOCKED_APPROVAL_MISSING,
+    BLOCKED_EXECUTION_UNAUTHORIZED,
     PROPOSAL_DIGEST_FILES,
+    UNAUTHORIZED_LEGACY_AUTO_ACCEPTED,
     approval_digest_verdict,
-    human_approval_satisfied,
+    approval_requirement_met,
+    execution_authorization,
     load_status,
     now_iso,
     proposal_content_digest,
@@ -1636,7 +1639,7 @@ def find_accepted_proposals(
                         slug=slug,
                         proposal_dir=proposal_dir,
                         status=status,
-                        approval_ok=human_approval_satisfied(data),
+                        approval_ok=approval_requirement_met(data),
                     )
                 )
     return refs
@@ -4271,6 +4274,22 @@ _GRANT_REMEDY = (
 )
 
 
+#: Remedy per `execution_authorization` refusal. A record that never went
+#: through a human belongs in triage; one whose approval cannot be verified is
+#: re-approved through its DevLoop.
+_UNAUTHORIZED_REMEDY = {
+    UNAUTHORIZED_LEGACY_AUTO_ACCEPTED: (
+        "This record was never reviewed by a human. Triage it: re-publish it in 'proposed' status and "
+        "approve it through its DevLoop, or close it."
+    ),
+}
+
+
+def _execution_authorization(ref: ProposalRef) -> tuple[str | None, str | None]:
+    """`proposal_state.execution_authorization` for the status file on disk now."""
+    return execution_authorization(_load_status(ref.status_path))
+
+
 def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     """Implement a single accepted proposal. Returns ImplementResult."""
     if ref.status != "accepted":
@@ -4301,6 +4320,45 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             ref=ref,
             pr_url=None,
             blocked=BLOCKED_APPROVAL_MISSING,
+            blocked_is_new=blocked_is_new,
+            skipped_reason=message,
+            counts_toward_limit=False,
+        )
+
+    # One execution-authorization contract at the execution boundary
+    # (mctl-agents#703). The implement sweep submits only what
+    # `execution_authorization` authorizes; this is the same predicate here,
+    # so a run that arrives any other way (a manual trigger, a direct
+    # workflow submit) gets the same answer, with the same reason, as the
+    # sweep would have given. An auto-accept, a waived gate and missing
+    # metadata authorize nothing. The grant check below then verifies the
+    # human decision this names. A status file that cannot be read is this
+    # proposal's error, never an authorization.
+    try:
+        authorization, unauthorized = _execution_authorization(ref)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=f"execution authorization could not be checked: {exc}",
+            counts_toward_limit=False,
+        )
+    print(
+        f"execution-authorization: {authorization or 'refused'} service={ref.service} slug={ref.slug}"
+        + (f" reason={unauthorized!r}" if unauthorized else "")
+    )
+    if authorization is None:
+        message = f"execution not authorized: {unauthorized}"
+        remedy = _UNAUTHORIZED_REMEDY.get(unauthorized or "", _GRANT_REMEDY)
+        blocked_is_new = False
+        if not dry_run:
+            blocked_is_new = _mark_blocked(
+                ref, code=BLOCKED_EXECUTION_UNAUTHORIZED, message=message, remedy=remedy,
+            )
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            blocked=BLOCKED_EXECUTION_UNAUTHORIZED,
             blocked_is_new=blocked_is_new,
             skipped_reason=message,
             counts_toward_limit=False,
