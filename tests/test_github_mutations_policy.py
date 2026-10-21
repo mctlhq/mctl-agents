@@ -86,6 +86,7 @@ def _proc(stdout: str = "") -> subprocess.CompletedProcess[str]:
 
 REF = run_implementer.ProposalRef(
     service="mctl-web", slug="slug", proposal_dir=Path("/tmp/proposal"), status="accepted",
+    grant_id="aar_test", grant_digest="sha256:" + "0" * 64,
 )
 LEASE = "a" * 40
 

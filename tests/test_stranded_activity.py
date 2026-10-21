@@ -16,6 +16,7 @@ from orchestrator.proposal_state import (
     AUTHORIZATION_HUMAN_APPROVAL,
     UNAUTHORIZED_ANONYMOUS_APPROVER,
     UNAUTHORIZED_LEGACY_AUTO_ACCEPTED,
+    UNAUTHORIZED_NO_APPROVAL_GRANT,
     execution_authorization,
 )
 from orchestrator.temporal.activities import stranded as act
@@ -375,9 +376,24 @@ class TestExecutionAuthorizationPredicate:
     """
 
     def test_a_named_human_approver_authorizes(self):
-        assert execution_authorization({"approval": {"approved_by": "mashkovd"}}) == (
-            AUTHORIZATION_HUMAN_APPROVAL,
+        assert execution_authorization(
+            {"approval": {"approved_by": "mashkovd", "approval_ref": "aar_0123abcd"}}
+        ) == (AUTHORIZATION_HUMAN_APPROVAL, None)
+
+    @pytest.mark.parametrize(
+        "ref",
+        [None, "", "  ", "aar_", "grant-1", "aar_bad ref", "aar_" + "x" * 125, 42],
+        ids=["absent", "empty", "blank", "bare-prefix", "not-aar", "space", "too-long", "non-string"],
+    )
+    def test_a_named_approver_without_a_grant_ref_does_not_authorize(self, ref):
+        """A name in the file is a claim; without the mctl-api grant it names
+        there is nothing to verify it against, so the sweep must not submit."""
+        approval = {"approved_by": "mashkovd"}
+        if ref is not None:
+            approval["approval_ref"] = ref
+        assert execution_authorization({"approval": approval}) == (
             None,
+            UNAUTHORIZED_NO_APPROVAL_GRANT,
         )
 
     def test_nothing_at_all_is_legacy_auto_accepted(self):
@@ -450,5 +466,5 @@ class TestExecutionAuthorizationPredicate:
         """Authorization is read off the approval, not off the gate."""
         assert execution_authorization({
             "control": {"requires_human_approval": False},
-            "approval": {"approved_by": "mashkovd"},
+            "approval": {"approved_by": "mashkovd", "approval_ref": "aar_0123abcd"},
         }) == (AUTHORIZATION_HUMAN_APPROVAL, None)

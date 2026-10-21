@@ -150,7 +150,8 @@ from config.settings import (
     SERVICE_AGENT_MODEL,
     SERVICES,
 )
-from orchestrator import evidence_producer, policy_checkpoint, tracing, usage_ledger
+from orchestrator import action_approvals, evidence_producer, policy_checkpoint, tracing, usage_ledger
+from orchestrator import approval_evidence as ae
 from orchestrator import implementation_completion as ic
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.context_snapshot import canonical_json as _canonical_json
@@ -787,6 +788,14 @@ class ProposalRef:
     # make "forgot to pass it" indistinguishable from "a human approved it"
     # (agy P2). find_accepted_proposals always computes it.
     approval_ok: bool = False
+    # The human decision `_implement_one` verified in mctl-api for this
+    # attempt (`approval_evidence`), and the content digest it was decided
+    # for. Empty until then: `_open_pr_for_branch` refuses without it.
+    grant_id: str = ""
+    grant_digest: str = ""
+    # False when the grant was already marked executed: this attempt may only
+    # finish that execution, never run the model again.
+    grant_allows_new_run: bool = False
     status_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
@@ -3660,6 +3669,44 @@ def _result_branch_is_missing(detail: str) -> bool:
     )
 
 
+def _lookup_grant(grant_id: str) -> action_approvals.ApprovalAnswer:
+    return action_approvals.ActionApprovalClient().get(grant_id)
+
+
+def _execute_grant(grant_id: str, target: str, artifact_hash: str) -> action_approvals.ApprovalAnswer:
+    return action_approvals.ActionApprovalClient().execute(grant_id, target, artifact_hash)
+
+
+def _verify_grant(ref: ProposalRef, data: dict[str, Any], current_digest: str) -> ae.GrantVerdict:
+    return ae.verify_execution_grant(
+        data, service=ref.service, slug=ref.slug, current_digest=current_digest, lookup=_lookup_grant,
+    )
+
+
+def _grant_refused(reason: str) -> policy_checkpoint.PolicyRefused:
+    return policy_checkpoint.PolicyRefused(policy_checkpoint.Decision(
+        verdict=policy_checkpoint.DENY,
+        code=policy_checkpoint.CODE_APPROVAL_LOOKUP_ERROR,
+        reason=reason,
+        policy_version="",
+        rule_id="",
+        action_digest="",
+    ))
+
+
+def _mark_grant_executed(ref: ProposalRef) -> None:
+    if not ref.grant_id or not ref.grant_digest:
+        raise _grant_refused("no verified approval grant for this attempt")
+    try:
+        ae.mark_executed(
+            ref.grant_id, service=ref.service, slug=ref.slug,
+            artifact_hash=ref.grant_digest, mark=_execute_grant,
+        )
+    except ae.GrantMarkError as exc:
+        raise _grant_refused(str(exc)) from exc
+    print(f"approval-grant: executed grant={ref.grant_id} service={ref.service} slug={ref.slug}")
+
+
 def _open_pr_for_branch(ref: ProposalRef, branch: str) -> str:
     title, body = _pr_title_and_body(ref)
     # Pin the base repo with --repo: on a fork `gh pr create` otherwise defaults
@@ -3676,6 +3723,11 @@ def _open_pr_for_branch(ref: ProposalRef, branch: str) -> str:
         {"title": title, "body": body, "head": branch, "base": "main"},
         metadata={"repo": repo, "head": branch, "base": "main"},
     ))
+    # One human decision, one execution: the grant is marked executed in
+    # mctl-api before the PR exists, so a second attempt on it can only finish
+    # this one. Any failure is undecided, never a PR: the branch stays pushed
+    # and the next tick's preflight opens the PR once the mark succeeds.
+    _mark_grant_executed(ref)
     proc = _run(
         ["gh", "pr", "create", "--repo", repo,
          "--title", title, "--body", body, "--head", branch, "--base", "main"],
@@ -4213,6 +4265,12 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         return result
 
 
+_GRANT_REMEDY = (
+    "Approve the proposal through its DevLoop (mctl-api POST /api/v1/agents/dev-loop/<workflow>/approve), "
+    "which records a human decision bound to this proposal's current content."
+)
+
+
 def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     """Implement a single accepted proposal. Returns ImplementResult."""
     if ref.status != "accepted":
@@ -4289,6 +4347,51 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     if dry_run:
         print(f"[dry-run] would preflight then implement {ref.service}/{ref.slug}")
         return ImplementResult(ref=ref, pr_url=None, skipped_reason="dry-run")
+
+    # The status file is a claim; the decision is in mctl-api
+    # (`approval_evidence`). Whatever the record says, nothing runs unless the
+    # grant it names was decided by a human for this proposal and for the
+    # content on disk now, and was spent by the approve flip. A store that
+    # cannot answer defers the proposal; it never authorizes and never blocks.
+    try:
+        current_digest = proposal_content_digest(ref.proposal_dir)
+        grant = _verify_grant(ref, _load_status(ref.status_path), current_digest)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=f"approval grant could not be checked: {exc}",
+            counts_toward_limit=False,
+        )
+    print(
+        f"approval-grant: {'ok' if grant.ok else ('unknown' if grant.transient else grant.code)} "
+        f"service={ref.service} slug={ref.slug} grant={grant.grant_id or '-'}"
+    )
+    if grant.transient:
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            skipped_reason=f"approval grant unreadable; deferring: {grant.detail}",
+            counts_toward_limit=False,
+        )
+    if not grant.ok:
+        blocked_is_new = _mark_blocked(
+            ref,
+            code=grant.code,
+            message=grant.detail,
+            remedy=_GRANT_REMEDY,
+        )
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            blocked=grant.code,
+            blocked_is_new=blocked_is_new,
+            skipped_reason=grant.detail,
+            counts_toward_limit=False,
+        )
+    ref.grant_id = grant.grant_id
+    ref.grant_digest = current_digest
+    ref.grant_allows_new_run = grant.allow_new_run
 
     # Loaded once per proposal attempt (mctlhq/mctl-agents#196, ADR 011) and
     # reused wherever this run's identity is recorded, so the log line, the
@@ -4379,6 +4482,25 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             ref=ref,
             pr_url=existing.pr_url,
             error=existing.reason or "existing result needs triage",
+        )
+
+    # Nothing on GitHub to finish, and the grant already started an execution:
+    # running the model again would be a second execution of one decision.
+    if not ref.grant_allows_new_run:
+        message = (
+            f"approval grant {ref.grant_id} was already executed and no result exists to finish; "
+            "a new run needs a new approval"
+        )
+        blocked_is_new = _mark_blocked(
+            ref, code=ae.GRANT_ALREADY_EXECUTED, message=message, remedy=_GRANT_REMEDY,
+        )
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            blocked=ae.GRANT_ALREADY_EXECUTED,
+            blocked_is_new=blocked_is_new,
+            skipped_reason=message,
+            counts_toward_limit=False,
         )
 
     # Admission gate (mctl-agents#410): only reachable on `existing.action
