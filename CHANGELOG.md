@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.88.4](https://github.com/mctlhq/mctl-agents/compare/1.88.3...1.88.4) (2026-10-21)
+
+
+### Bug Fixes
+
+* **policy:** bind investigate decisions to the store execution ([a711447](https://github.com/mctlhq/mctl-agents/commit/a711447dc833e1f684535cd4cf1949565adab5bc))
+* **policy:** bind investigate decisions to the store execution ([7e93b9d](https://github.com/mctlhq/mctl-agents/commit/7e93b9dfa9eb780c0f20244cc1a4ab19e625b442))
+
 ## [1.88.3](https://github.com/mctlhq/mctl-agents/compare/1.88.2...1.88.3) (2026-10-21)
 
 
