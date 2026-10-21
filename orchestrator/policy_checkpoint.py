@@ -21,6 +21,9 @@ Rules:
   `orchestrator/lifecycle/claim.py`'s `_emit`), shaped to be carried over
   unchanged into the execution trace of #195. Arguments are only ever
   recorded as a digest: no raw payload and no secret reaches the record.
+  With `MCTL_DECISION_RECORDS` on, each decision is also written to
+  mctl-api as a durable decision record, and `enforce` records its side
+  effect's attempt under it (mctl-api#701, `orchestrator/decision_records.py`).
 
 The durable approval store is NOT part of this module: `ApprovalLookup` is
 the seam. mctl-api is the approval authority (mctl-api#366); the lookup
@@ -608,13 +611,39 @@ def enforce[T](
     decision = decide(request, policy=policy, approvals=approvals, approval_ref=approval_ref)
     if not decision.permitted:
         raise PolicyRefused(decision)
+    attempt = start_attempt(decision)
     try:
         result = side_effect()
-    except BaseException:
+    except BaseException as exc:
         _record_tool_result(decision.action_digest, succeeded=False)
+        end_attempt(attempt, exc)
         raise
     _record_tool_result(decision.action_digest, succeeded=True)
+    end_attempt(attempt, None)
     return result
+
+
+def start_attempt(decision: Decision) -> Any:
+    """Open the durable attempt record of `decision`'s side effect
+    (mctl-api#701, `orchestrator/decision_records.py`). Imported lazily;
+    a no-op unless the producer is on, and it never raises."""
+    try:
+        from orchestrator import decision_records
+
+        return decision_records.start(decision)
+    except Exception:  # noqa: BLE001 — a record never fails the action
+        return None
+
+
+def end_attempt(attempt: Any, exc: BaseException | None) -> None:
+    """Close the attempt `start_attempt` opened: succeeded, failed on an
+    `Exception`, and left open on any other `BaseException` (an interrupt or
+    cancellation does not tell whether the effect happened)."""
+    try:
+        if attempt is not None:
+            attempt.end(exc)
+    except Exception:  # noqa: BLE001, S110 — a record never fails the action
+        pass
 
 
 def _record_tool_result(action_digest: str, *, succeeded: bool) -> None:
@@ -700,6 +729,14 @@ def emit(request: ActionRequest, decision: Decision) -> None:
 
         evidence_producer.record_decision(request, decision)
     except Exception:  # noqa: BLE001, S110 — same rule: evidence never fails the action
+        pass
+    try:
+        # The durable decision record (mctl-api#701): off unless
+        # MCTL_DECISION_RECORDS is on; the write itself is asynchronous.
+        from orchestrator import decision_records
+
+        decision_records.record_decision(request, decision)
+    except Exception:  # noqa: BLE001, S110 — same rule: a record never fails the action
         pass
 
 

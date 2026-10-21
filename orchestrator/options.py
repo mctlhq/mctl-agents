@@ -961,7 +961,7 @@ class _PolicyCheckpointHook:
     # set holds anything consequential. Empty for every other builder.
     delegated_prefix: str = ""
 
-    async def __call__(self, input_data: Any, _tool_use_id: str | None, _context: Any) -> dict[str, Any]:
+    async def __call__(self, input_data: Any, tool_use_id: str | None, _context: Any) -> dict[str, Any]:
         from orchestrator import policy_checkpoint
 
         try:
@@ -994,6 +994,7 @@ class _PolicyCheckpointHook:
         except Exception as exc:  # noqa: BLE001 — fail closed
             return _deny(f"policy checkpoint failed ({type(exc).__name__}); the call was not made")
         if decision.permitted:
+            _open_decision_attempt(tool_use_id or str(input_data.get("tool_use_id") or ""), decision)
             return _with_approval_receipt(tool_name, tool_input, decision)
         return _deny(
             f"policy {decision.verdict} ({decision.code}, rule {decision.rule_id or '-'}, "
@@ -1001,18 +1002,81 @@ class _PolicyCheckpointHook:
         )
 
 
+def _open_decision_attempt(tool_use_id: str | None, decision: Any) -> None:
+    """The permitted call runs next: open its durable attempt record
+    (mctl-api#701, `orchestrator/decision_records.py`). A no-op unless the
+    producer is on; never raises, and never changes the hook's answer."""
+    try:
+        from orchestrator import decision_records
+
+        decision_records.start_tool_use(tool_use_id, decision)
+    except Exception:  # noqa: BLE001, S110 — a record never fails the call
+        pass
+
+
+@dataclass(frozen=True)
+class _DecisionAttemptHook:
+    """PostToolUse / PostToolUseFailure hook that closes the attempt
+    `_PolicyCheckpointHook` opened for the same `tool_use_id`. Observes
+    only, answers `{}` always.
+
+    - PostToolUse: `succeeded`, unless the tool answered an MCP error
+      result (`isError`), which is `failed` with code `tool_error`.
+    - PostToolUseFailure: `failed` with code `tool_failure`. An interrupted
+      call is left open: whether its effect happened was not observed, so
+      mctl-api reads it `in_progress` (or `unknown`), never `failed`.
+
+    The tool's input, output and error text are never recorded."""
+
+    event: str
+
+    async def __call__(self, input_data: Any, tool_use_id: str | None, _context: Any) -> dict[str, Any]:
+        try:
+            from orchestrator import decision_records
+
+            data = input_data if isinstance(input_data, dict) else {}
+            tool_use_id = tool_use_id or str(data.get("tool_use_id") or "")
+            if self.event == "PostToolUse":
+                response = data.get("tool_response")
+                if isinstance(response, dict) and (response.get("isError") is True or response.get("is_error") is True):
+                    decision_records.finish_tool_use(tool_use_id, decision_records.PHASE_FAILED, "tool_error")
+                else:
+                    decision_records.finish_tool_use(tool_use_id, decision_records.PHASE_SUCCEEDED)
+            elif data.get("is_interrupt") is True:
+                decision_records.abandon_tool_use(tool_use_id)
+            else:
+                decision_records.finish_tool_use(tool_use_id, decision_records.PHASE_FAILED, "tool_failure")
+        except Exception:  # noqa: BLE001, S110 — observation only
+            pass
+        return {}
+
+
 def _policy_hooks(
     allowed_tools: list[str], *, delegated_prefix: str = "",
 ) -> dict[HookEventName, list[HookMatcher]]:
     """Every MCP tool call, whatever the server, meets the checkpoint; the
     builder's own allow-list is the grant set it evaluates against.
-    `delegated_prefix` is the one exception, see `_PolicyCheckpointHook`."""
+    `delegated_prefix` is the one exception, see `_PolicyCheckpointHook`.
+
+    With `MCTL_DECISION_RECORDS` on, the PostToolUse pair that closes each
+    permitted call's attempt record is added; off, the map is unchanged."""
     hook = _PolicyCheckpointHook(tuple(allowed_tools), delegated_prefix=delegated_prefix)
-    return {
+    hooks: dict[HookEventName, list[HookMatcher]] = {
         "PreToolUse": [
             HookMatcher(matcher="mcp__.*", hooks=[cast(Any, hook)]),
         ],
     }
+    try:
+        from orchestrator import decision_records
+
+        recording = decision_records.enabled()
+    except Exception:  # noqa: BLE001 — a record never stops an agent from starting
+        recording = False
+    if recording:
+        post_events: tuple[HookEventName, ...] = ("PostToolUse", "PostToolUseFailure")
+        for event in post_events:
+            hooks[event] = [HookMatcher(matcher="mcp__.*", hooks=[cast(Any, _DecisionAttemptHook(event))])]
+    return hooks
 
 
 def _compose_hooks(
