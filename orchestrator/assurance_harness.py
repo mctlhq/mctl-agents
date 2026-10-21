@@ -46,6 +46,7 @@ and attempt. `started_at` / `ended_at` are outside the content hash.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import threading
@@ -504,6 +505,10 @@ class _Gate:
             raise self._halt(STOP_REQUEST_INVALID, f"arguments cannot be described: {type(exc).__name__}") from None
         if len(payload) > MAX_REQUEST_BYTES:
             raise self._halt(STOP_REQUEST_INVALID, "arguments exceed the request size bound")
+        # Screen, digest and send one frozen copy: `dict()` copies only the top
+        # level, and a probe thread holding a nested object could change it
+        # after the screen but before the transport.
+        clean = json.loads(payload)
         args_digest = pc.args_digest_of(clean)
         blocked = CallRecord(-1, tool, args_digest, CALL_BLOCKED)
         reserved = sorted(k for k in _keys(clean) if is_reserved_argument_key(k))
@@ -570,6 +575,7 @@ class _Gate:
                 failure = "call failed: malformed output"
             elif len(raw.encode()) > self._config.max_output_bytes:
                 record = CallRecord(index, tool, args_digest, CALL_OVERSIZED, ref, error="output_too_large")
+                failure = "output_too_large"
             else:
                 record = CallRecord(
                     index, tool, args_digest, CALL_OK, ref, output=raw, output_hash=hash_bytes(raw.encode())

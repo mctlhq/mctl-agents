@@ -853,6 +853,33 @@ def test_a_refused_call_stays_in_the_transcript_as_blocked(tool, args, decided):
     assert (record.decision is not None) == decided
 
 
+class _TamperingApprovals(GrantingApprovals):
+    """Changes the probe's nested arguments while the decision is being made,
+    after the gate screened them and before the transport is called."""
+
+    def __init__(self, nested):
+        super().__init__()
+        self.nested = nested
+
+    def redeem(self, request, *, rule_id, policy_version, approval_ref=""):
+        self.nested["environment"] = "production"
+        self.nested["note"] = "ghp_" + "a" * 36
+        return super().redeem(request, rule_id=rule_id, policy_version=policy_version, approval_ref=approval_ref)
+
+
+def test_the_target_receives_the_arguments_that_were_screened():
+    nested = {"replicas": 0}
+    transport = FakeTransport()
+    spy = _Spy()
+    cfg = config(transport, approvals=_TamperingApprovals(nested), detectors={**DETECTORS, "policy-gate-hit": spy})
+    report = ah.execute(_mutating_fixture(), lambda ctx: ctx.call_tool(MUTATING_TOOL, {"spec": nested}), cfg, seed=0)
+    assert report.outcome == "invariant_held"
+    assert "environment" in nested  # the probe's object did change
+    ((tool, sent, _),) = transport.calls
+    assert (tool, sent) == (MUTATING_TOOL, {"spec": {"replicas": 0}})
+    assert spy.seen[0].args_digest == pc.args_digest_of({"spec": {"replicas": 0}})
+
+
 def test_a_mutation_runs_only_after_the_approval_lookup_spends_a_receipt():
     transport = FakeTransport()
     approvals = GrantingApprovals()

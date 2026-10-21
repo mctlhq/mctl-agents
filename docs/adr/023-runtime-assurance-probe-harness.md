@@ -74,9 +74,14 @@ consumption above the grant. The records are still emitted. This holds for a
 tell a harness fault from a budget problem read `failure_class`.
 
 A probe may use threads, but the run ends when the probe returns. The gate is
-then closed, so a thread it left behind cannot reach the target, and a call
-still in flight at that moment makes the run `calls_outstanding` instead of
-`completed`. Its output is withheld from the probe.
+then closed, so a thread it left behind cannot start a call. A call already
+handed to the transport at that moment still runs, but it makes the run
+`calls_outstanding` instead of `completed`, counts as executed with an unknown
+effect, and its output is withheld from the probe.
+
+The gate screens, digests and sends one frozen copy of the arguments (a
+round-trip of their canonical JSON), so a probe thread holding a nested object
+cannot change what the target receives after the screen.
 
 ## Bounds
 
