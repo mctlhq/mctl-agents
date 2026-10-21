@@ -80,7 +80,6 @@ import logging
 import math
 import os
 import re
-import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -109,9 +108,8 @@ INGEST_PATH = "/api/v1/evidence/records"
 #   dead store;
 # - the investigator's `xr_` read, when it was given one: one read bounded
 #   by READ_TIMEOUT_SECONDS;
-# - the PR head read at seal time, Amendment 2 only and only when the run
-#   neither read nor pushed a head itself: READ_TIMEOUT_SECONDS.
-# So a run's tail grows by at most ~30 s, and only when stores are down.
+# No PR head is read at seal time: a head the run did not observe is a gap.
+# So a run's tail grows by at most ~25 s, and only when stores are down.
 REQUEST_TIMEOUT_SECONDS = 5.0
 ATTEMPTS = 3
 RETRY_DELAYS_SECONDS = (1.0, 2.0)
@@ -173,7 +171,6 @@ _APPROVAL_UNKNOWN_CODES = frozenset({"approval_lookup_error"})
 MAX_POLICY_DECISIONS = 256
 
 Post = Callable[[str, dict[str, Any], dict[str, str]], httpx.Response]
-PrHeadReader = Callable[[str, int], str]
 RequestReader = Callable[[str, str], Any]
 
 
@@ -254,8 +251,8 @@ class RunEvidence:
         self.versions: ee.VersionPins | None = None
         self.subject: ee.SubjectRef | None = None
         self.subject_observed_at = ""
-        # (repository, number) of a PR whose head the producer reads itself
-        # at seal time (Amendment 2 only).
+        # (repository, number) of a PR named without an observed head; sealed
+        # as a required `subject` gap (Amendment 2 only).
         self.pending_pr: tuple[str, int] | None = None
         # The commit this run itself pushed, when it pushed one: the
         # revision its evidence is about.
@@ -476,12 +473,19 @@ class RunEvidence:
     def note_pushed_head(self, sha: str) -> None:
         if isinstance(sha, str) and _GIT_SHA_RE.fullmatch(sha):
             self.pushed_head_sha = sha
+            if self.pending_pr is not None:
+                repository, number = self.pending_pr
+                self.subject = ee.SubjectRef(
+                    kind="pull_request", repository=repository, ref=str(number), revision=sha
+                )
+                self.subject_observed_at = _utc_now_iso()
+                self.pending_pr = None
 
     def note_subject_pr(self, repository: str, number: Any, head_sha: str | None = None) -> None:
         """The PR this run acted on, at `head_sha` (the revision this run
-        itself read), else at the commit this run pushed. Only with neither
-        does the producer read the head at seal time, which can be a later
-        revision than the one the run worked on."""
+        itself read), else at the commit this run pushed. With neither the
+        subject stays unbound and is sealed as a required gap: the head is
+        never read at seal time."""
         if not (isinstance(repository, str) and _REPO_RE.fullmatch(repository)):
             return
         if not str(number).isdigit() or int(number) <= 0:
@@ -494,13 +498,21 @@ class RunEvidence:
             self.subject_observed_at = _utc_now_iso()
             self.pending_pr = None
             return
+        current = self.subject
+        if (
+            current is not None
+            and current.kind == "pull_request"
+            and current.repository == repository
+            and current.ref == str(int(number))
+        ):
+            return  # already bound to an observed head: keep it
         self.subject = None
         self.pending_pr = (repository, int(number))
 
-    def note_subject_pr_url(self, url: str | None) -> None:
+    def note_subject_pr_url(self, url: str | None, head_sha: str | None = None) -> None:
         match = _PR_URL_RE.fullmatch((url or "").strip())
         if match:
-            self.note_subject_pr(match.group(1), match.group(2))
+            self.note_subject_pr(match.group(1), match.group(2), head_sha)
 
 
 # ---------------------------------------------------------------------------
@@ -620,22 +632,6 @@ def _snapshot_ref_ok(snapshot_id: Any, content_hash: Any) -> bool:
     )
 
 
-def read_pr_head_sha(repository: str, number: int) -> str:
-    """The PR's current head SHA, read from GitHub by the producer itself.
-    Raises on any failure: the caller turns that into an unknown."""
-    proc = subprocess.run(  # noqa: S603 — fixed argv, validated repository and number
-        ["gh", "api", f"repos/{repository}/pulls/{int(number)}", "--jq", ".head.sha"],  # noqa: S607
-        capture_output=True,
-        text=True,
-        timeout=READ_TIMEOUT_SECONDS,
-        check=False,
-    )
-    sha = proc.stdout.strip()
-    if proc.returncode != 0 or not _GIT_SHA_RE.fullmatch(sha):
-        raise RuntimeError(f"gh api pulls/{number} answered rc={proc.returncode}")
-    return sha
-
-
 def read_execution_request(work_item_id: str, request_id: str) -> Any:
     """One read of the `xr_` request from the work-item store."""
     from orchestrator.work_context.client import WorkItemClient
@@ -728,7 +724,6 @@ def build(
     *,
     amendment_2: bool,
     created_at: str | None = None,
-    read_pr_head: PrHeadReader | None = None,
     read_request: RequestReader | None = None,
 ) -> ee.ExecutionEvidence:
     """Seal `evidence`. Raises `ExecutionEvidenceError` only when not even
@@ -802,15 +797,11 @@ def build(
         if subject is None and evidence.pending_pr is not None:
             repository, number = evidence.pending_pr
             flags["subject"] = True
-            try:
-                # A head pushed after the PR was named still wins over a read.
-                sha = evidence.pushed_head_sha or (read_pr_head or read_pr_head_sha)(repository, number)
-                if not _GIT_SHA_RE.fullmatch(sha):
-                    raise ValueError("not a full git SHA")
-                subject = ee.SubjectRef(kind="pull_request", repository=repository, ref=str(number), revision=sha)
-                observed_at = _utc_now_iso()
-            except Exception as exc:  # noqa: BLE001 — could not observe the revision: an unknown
-                logger.warning("execution evidence: could not read the head of %s#%s (%s)", repository, number, exc)
+            if evidence.pushed_head_sha:  # defensive: note_* already folds it in
+                subject = ee.SubjectRef(
+                    kind="pull_request", repository=repository, ref=str(number), revision=evidence.pushed_head_sha
+                )
+            else:
                 gaps.append(ee.Gap(block="subject", code="observation_failed", required=True))
         if subject is not None:
             provenance = ee.Provenance(authority="observed", observed_at=observed_at or created_at)
@@ -1024,7 +1015,6 @@ def produce(
     environ: Mapping[str, str] | None = None,
     post: Post | None = None,
     sleep: Callable[[float], None] = time.sleep,
-    read_pr_head: PrHeadReader | None = None,
     read_request: RequestReader | None = None,
     created_at: str | None = None,
 ) -> str:
@@ -1047,7 +1037,6 @@ def produce(
             evidence,
             amendment_2=amendment_2_enabled(env),
             created_at=created_at,
-            read_pr_head=read_pr_head,
             read_request=read_request,
         )
         result, status, detail = deliver(envelope_bytes(sealed), url=url, token=token, post=post, sleep=sleep)
