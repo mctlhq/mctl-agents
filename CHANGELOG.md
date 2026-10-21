@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.88.2](https://github.com/mctlhq/mctl-agents/compare/1.88.1...1.88.2) (2026-10-21)
+
+
+### Bug Fixes
+
+* **implementer:** one execution-authorization contract at every entry ([e13e92f](https://github.com/mctlhq/mctl-agents/commit/e13e92f84f89408c05ccab556e486200c676fd11))
+* **implementer:** one execution-authorization contract at every entry ([d9f397c](https://github.com/mctlhq/mctl-agents/commit/d9f397c40b43bef6554212174724740257647791))
+
 ## [1.88.1](https://github.com/mctlhq/mctl-agents/compare/1.88.0...1.88.1) (2026-10-21)
 
 
