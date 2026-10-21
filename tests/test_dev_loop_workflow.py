@@ -242,7 +242,8 @@ def _canonical_activities(
     digest_state: dict | None = None,
     comment_log: list[tuple] | None = None,
     delegated_log: list[DelegatedApproveInput] | None = None,
-    delegated_result: DelegatedApproveResult | None = None,
+    # A list answers the flips in order, repeating its last entry (#702 T5/T6).
+    delegated_result: DelegatedApproveResult | list[DelegatedApproveResult] | None = None,
     advance_log: list[AdvanceInput] | None = None,
     seen_queues: dict[str, list[str]] | None = None,
 ) -> list:
@@ -302,6 +303,12 @@ def _canonical_activities(
             delegated_log.append(inp)
         if seen_queues is not None:
             seen_queues.setdefault("delegated-approve", []).append(activity.info().task_queue)
+        if digest_state is not None and "after_flip" in digest_state:
+            # #702 T5: the proposal is rewritten while the flip runs, so the
+            # post-failure freshness check sees a new digest.
+            digest_state["current"] = digest_state.pop("after_flip")
+        if isinstance(delegated_result, list):
+            return delegated_result.pop(0) if len(delegated_result) > 1 else delegated_result[0]
         return delegated_result or DelegatedApproveResult(
             result=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Succeeded"),
         )
@@ -409,7 +416,8 @@ def _fake_activities(
     digest_state: dict | None = None,
     comment_log: list[tuple] | None = None,
     delegated_log: list[DelegatedApproveInput] | None = None,
-    delegated_result: DelegatedApproveResult | None = None,
+    # A list answers the flips in order, repeating its last entry (#702 T5/T6).
+    delegated_result: DelegatedApproveResult | list[DelegatedApproveResult] | None = None,
     advance_log: list[AdvanceInput] | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
@@ -1898,6 +1906,7 @@ class TestDevLoopWorkflow:
         accepted."""
         calls: list[str] = []
         resolved_agents: list[str] = []
+        advances: list[AdvanceInput] = []
         investigate_ran = anyio.Event()
 
         @activity.defn(name="resolve_agent_release")
@@ -1931,6 +1940,7 @@ class TestDevLoopWorkflow:
                     delegated_result=DelegatedApproveResult(
                         result=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Failed"),
                     ),
+                    advance_log=advances,
                 ),
                 fake_resolve_agent_release,
                 failing_approve_submit_and_wait,
@@ -1956,6 +1966,8 @@ class TestDevLoopWorkflow:
         assert result.implement is None
         assert result.outcome == "approval_failed"
         assert result.ended.startswith("approval failed")
+        # #702 T1: the `we_` advances once, Failed (pre-#702 it read Succeeded).
+        assert [a.phase for a in advances] == ["Failed"]
         assert calls == ["mctl-agents-investigate", "delegated-approve"]
         # The implementer registry lookup must be skipped entirely on a
         # failed flip — the resolve happens only after approval is durable
@@ -8269,6 +8281,91 @@ class TestGrantFreshness:
                 result = await handle.result()
         assert [d.approval_ref for d in delegated] == [self._ref_for(requests[-1])]
         assert result.ended is None or "refused" not in result.ended
+
+    async def test_702_t5_a_failed_flip_on_a_rewritten_proposal_is_reasked_on_the_same_execution(self, env):
+        # #702 T5: the first flip ends Failed and the proposal was rewritten
+        # meanwhile, so the grant is stale rather than the loop failed: the
+        # loop supersedes it, asks a fresh decision on the same `we_`, and the
+        # second flip under that decision proceeds to the implementer.
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        comments: list[tuple] = []
+        advances: list[AdvanceInput] = []
+        digest = {"current": "sha256:v1", "after_flip": "sha256:v2"}
+        worker, investigate_ran = await self._start(
+            env,
+            approval_requests=requests,
+            delegated_log=delegated,
+            digest_state=digest,
+            comment_log=comments,
+            advance_log=advances,
+            delegated_result=[
+                DelegatedApproveResult(result=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Failed")),
+                DelegatedApproveResult(
+                    result=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Succeeded")
+                ),
+            ],
+        )
+        async with worker:
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run, IssueRef(issue_url=self.URL),
+                id=f"dev-loop-test-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await self._wait_for(lambda: len(requests) == 1)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await self._wait_for(lambda: len(requests) == 2)
+            assert (await handle.describe()).status.name == "RUNNING"
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test_a1"})
+            with anyio.fail_after(60):
+                result = await handle.result()
+        assert [d.approval_ref for d in delegated] == ["aar_test", "aar_test_a1"]
+        assert requests[-1].execution_id == requests[0].execution_id == "we_test_own"
+        assert requests[-1].attempt == requests[0].attempt + 1
+        assert result.outcome == ""
+        assert result.implement is not None
+        assert [a.phase for a in advances] == ["Succeeded"]
+        assert len(comments) == 1
+        assert "sha256:v1" in comments[0][2] and "sha256:v2" in comments[0][2]
+
+    async def test_702_t6_repeated_stale_flip_failures_end_typed_approval_refused(self, env):
+        # #702 T6: every flip fails on a freshly rewritten proposal, so each
+        # one supersedes the grant; past MAX_GRANT_SUPERSEDES the loop ends
+        # Failed as `approval_refused` without reaching the implementer.
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        advances: list[AdvanceInput] = []
+        digest = {"current": "sha256:v0"}
+        worker, investigate_ran = await self._start(
+            env,
+            approval_requests=requests,
+            delegated_log=delegated,
+            digest_state=digest,
+            advance_log=advances,
+            delegated_result=[
+                DelegatedApproveResult(result=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Failed"))
+            ],
+        )
+        async with worker:
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run, IssueRef(issue_url=self.URL),
+                id=f"dev-loop-test-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            for i in range(MAX_GRANT_SUPERSEDES + 1):
+                await self._wait_for(lambda n=i + 1: len(requests) == n)
+                digest["after_flip"] = f"sha256:v{i + 1}"
+                ref = "aar_test" if i == 0 else f"aar_test_a{i}"
+                await handle.signal(DevLoopWorkflow.approve, {"approval_ref": ref})
+            with anyio.fail_after(60):
+                result = await handle.result()
+        assert result.outcome == "approval_refused"
+        assert result.ended == "approval refused: approval superseded too many times"
+        assert result.implement is None
+        assert len(delegated) == MAX_GRANT_SUPERSEDES + 1
+        assert [a.phase for a in advances] == ["Failed"]
 
     async def test_the_re_approval_park_ticks_and_catches_a_second_rewrite(self, env):
         # Owner review P2 on 59c9208: after a decision-time supersede the

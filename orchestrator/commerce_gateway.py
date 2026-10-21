@@ -323,6 +323,12 @@ class PaidInvocation:
         return aa.intent_for(self._request, rule_id=self._decision.rule_id,
                              policy_version=self._decision.policy_version)
 
+    def _context(self) -> aa.DecisionContext:
+        """What mctl-api shows the human deciding this call (mctl-api#700)."""
+        if not (self._request is not None and self._decision is not None):
+            raise RuntimeError("the policy request was not built")
+        return aa.context_for(self._request, rule_id=self._decision.rule_id)
+
     # -- entry -----------------------------------------------------------------
 
     async def run(self) -> PaidResult:
@@ -559,6 +565,7 @@ class PaidInvocation:
         answer = await asyncio.to_thread(
             store.create, intent, key=aa.idempotency_key(intent, 0),
             expires_at=self.runtime.now() + timedelta(seconds=aa.ttl_s()),
+            context=self._context(),
         )
         rec = answer.record
         if rec is None:

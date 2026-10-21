@@ -1,5 +1,61 @@
 # Changelog
 
+## [1.88.0](https://github.com/mctlhq/mctl-agents/compare/1.87.0...1.88.0) (2026-10-21)
+
+
+### Features
+
+* **decision-records:** write durable decision and attempt records to mctl-api ([d56fd26](https://github.com/mctlhq/mctl-agents/commit/d56fd266db7945cab5d2d04c719a08befb71a0a6))
+* **decision-records:** write durable decision and attempt records to mctl-api ([5e2fc25](https://github.com/mctlhq/mctl-agents/commit/5e2fc25e12d44db795a9995aef87f679e5d3aee1))
+* **runtime-assurance:** add a deterministic bounded probe harness ([7a6aae4](https://github.com/mctlhq/mctl-agents/commit/7a6aae4a8e1b001eb9f08ecced511170fb9a475a))
+* **runtime-assurance:** add a deterministic bounded probe harness ([73203f4](https://github.com/mctlhq/mctl-agents/commit/73203f41007c20ddd270e0ecdf61057b4195abf8))
+
+
+### Bug Fixes
+
+* **decision-records:** never record an unobserved end, and never deadlock on cleanup ([efec666](https://github.com/mctlhq/mctl-agents/commit/efec666767502d96b3c5a7d8e06c9849333f2081))
+* **deps:** bump certifi to 2026.10.19 ([ff5b321](https://github.com/mctlhq/mctl-agents/commit/ff5b321123b019d3bd0a497e11edba93472a38ee))
+* **deps:** bump certifi to 2026.10.19 ([28f8fa0](https://github.com/mctlhq/mctl-agents/commit/28f8fa03e3839b8aff41e91f668aad97d845d7a8))
+* **runtime-assurance:** close the harness gate's concurrency and accounting gaps ([06feb0d](https://github.com/mctlhq/mctl-agents/commit/06feb0d348e01d05dc783cfb09b801576573f53f))
+* **runtime-assurance:** end the run when the probe returns ([ca4e67b](https://github.com/mctlhq/mctl-agents/commit/ca4e67be9bd3945e481ab91da060b9ffbd858db5))
+* **runtime-assurance:** send the target the arguments that were screened ([c0da70b](https://github.com/mctlhq/mctl-agents/commit/c0da70b7e44d04b549dbd6bf06b5caafa7c6c584))
+
+## [1.87.0](https://github.com/mctlhq/mctl-agents/compare/1.86.3...1.87.0) (2026-10-20)
+
+
+### Features
+
+* **options:** pass the spent approval receipt to mctl-api ([a393d11](https://github.com/mctlhq/mctl-agents/commit/a393d11abe8022421fc0573df7de44e48af96026))
+* **options:** pass the spent approval receipt to mctl-api ([ad211ad](https://github.com/mctlhq/mctl-agents/commit/ad211addf862910dbf4932c54eb2d9af93ee65e7))
+
+
+### Bug Fixes
+
+* **options:** refuse a non-object tool input before the checkpoint ([fa292aa](https://github.com/mctlhq/mctl-agents/commit/fa292aaacd74683096ea542fa4d6b7697fd218fa))
+
+## [1.86.3](https://github.com/mctlhq/mctl-agents/compare/1.86.2...1.86.3) (2026-10-20)
+
+
+### Bug Fixes
+
+* **options:** keep MCTL_TOKEN out of agent tool subprocesses ([6ba11ce](https://github.com/mctlhq/mctl-agents/commit/6ba11ce41c029d693d6965e3c2e5634fb0ed1b28))
+* **options:** keep MCTL_TOKEN out of agent tool subprocesses ([5ef292e](https://github.com/mctlhq/mctl-agents/commit/5ef292e48076c9ae10d7313345cdd697d9f7b734)), closes [#717](https://github.com/mctlhq/mctl-agents/issues/717)
+
+## [1.86.2](https://github.com/mctlhq/mctl-agents/compare/1.86.1...1.86.2) (2026-10-19)
+
+
+### Bug Fixes
+
+* **investigator:** direct approve instructions omitted the content digest ([4f13ad3](https://github.com/mctlhq/mctl-agents/commit/4f13ad398af435c6c5defa9ce7a353ee6b8a956f))
+
+## [1.86.1](https://github.com/mctlhq/mctl-agents/compare/1.86.0...1.86.1) (2026-10-19)
+
+
+### Bug Fixes
+
+* **commerce:** send decision context when creating action approvals ([6a86757](https://github.com/mctlhq/mctl-agents/commit/6a86757416816d49a4ce6c3df3f04907a479d963))
+* **commerce:** send decision context when creating action approvals ([8f0138d](https://github.com/mctlhq/mctl-agents/commit/8f0138d4b6f5f9d03c5b99b5d1f955df544f5d2b)), closes [#713](https://github.com/mctlhq/mctl-agents/issues/713)
+
 ## [1.86.0](https://github.com/mctlhq/mctl-agents/compare/1.85.0...1.86.0) (2026-10-18)
 
 

@@ -38,8 +38,8 @@ from orchestrator import tracing
 from orchestrator.redaction import (  # noqa: F401 — MAX_ATTRIBUTE_CHARS re-exported for compatibility
     _CREDENTIAL_VALUE,
     _DENIED_KEY,
-    _TOKEN_KEY,
     MAX_ATTRIBUTE_CHARS,
+    TOKEN_KEY,
     _scalar_allowed,
     value_allowed,
 )
@@ -87,7 +87,7 @@ _USAGE_TOKEN_KEYS = frozenset(
         "gen_ai.usage.cache_creation.input_tokens",
     }
 )
-# `_CREDENTIAL_VALUE`, `_DENIED_KEY`, `_TOKEN_KEY` and `MAX_ATTRIBUTE_CHARS`
+# `_CREDENTIAL_VALUE`, `_DENIED_KEY`, `TOKEN_KEY` and `MAX_ATTRIBUTE_CHARS`
 # now live in `orchestrator/redaction.py` (mctl-agents#520) so they can be
 # shared with the stdlib-only evidence module; imported above unchanged.
 
@@ -101,7 +101,7 @@ def key_allowed(key: str, *, error_detail: bool = False) -> bool:
         # Checked before the denylist, which would refuse `.message`; the
         # VALUE still goes through the credential and length checks.
         return True
-    if _TOKEN_KEY.search(key) or _DENIED_KEY.search(key):
+    if TOKEN_KEY.search(key) or _DENIED_KEY.search(key):
         return False
     return bool(_ALLOWED_KEY.match(key))
 

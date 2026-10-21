@@ -4,6 +4,7 @@ import math
 import os
 import re
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -884,6 +885,54 @@ def _deadline_guard_hooks(
     }
 
 
+#: The tool arguments that carry an approval receipt to mctl-api's receipt
+#: gate (mctl-api#723, `internal/mcp/agent_receipt_gate.go`). mctl-api strips
+#: both from every call before any handler sees them, so they never reach a
+#: tool as input.
+RECEIPT_REF_ARG = "action_approval_ref"
+RECEIPT_HASH_ARG = "action_approval_artifact_hash"
+RECEIPT_ARGS = frozenset({RECEIPT_REF_ARG, RECEIPT_HASH_ARG})
+#: Only mctl-api runs the receipt gate, so only its tools get the receipt.
+#: Another server would receive the two arguments as tool input.
+_RECEIPT_TOOL_PREFIX = "mcp__mctl__"
+
+
+def _with_approval_receipt(tool_name: str, tool_input: dict[str, Any] | None, decision: Any) -> dict[str, Any]:
+    """The hook's answer to a permitted call: `{}`, or for an mctl call that
+    a human approval permitted, an `allow` whose `updatedInput` carries that
+    approval's receipt.
+
+    The checkpoint has just consumed the receipt for exactly this call, so
+    mctl-api can check that its own caller consumed it for this tool, and
+    spend it. The artifact hash is the checkpoint's action digest, the value
+    `action_approvals.intent_for` stored as the approval's `artifact_hash`.
+
+    What the server can verify with it is principal + tool + one use, not
+    these exact arguments (mctl-api#723 v1): it does not recompute the
+    digest."""
+    from orchestrator import policy_checkpoint
+
+    if (
+        decision.code != policy_checkpoint.CODE_APPROVED
+        or not decision.approval_ref
+        or not tool_name.startswith(_RECEIPT_TOOL_PREFIX)
+    ):
+        return {}
+    # The hook refused any other shape before the checkpoint ran.
+    tool_input = tool_input or {}
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": {
+                **tool_input,
+                RECEIPT_REF_ARG: decision.approval_ref,
+                RECEIPT_HASH_ARG: decision.action_digest,
+            },
+        }
+    }
+
+
 @dataclass(frozen=True)
 class _PolicyCheckpointHook:
     """PreToolUse hook that puts every MCP tool call through the runtime
@@ -912,7 +961,7 @@ class _PolicyCheckpointHook:
     # set holds anything consequential. Empty for every other builder.
     delegated_prefix: str = ""
 
-    async def __call__(self, input_data: Any, _tool_use_id: str | None, _context: Any) -> dict[str, Any]:
+    async def __call__(self, input_data: Any, tool_use_id: str | None, _context: Any) -> dict[str, Any]:
         from orchestrator import policy_checkpoint
 
         try:
@@ -922,6 +971,18 @@ class _PolicyCheckpointHook:
             if self.delegated_prefix and tool_name.startswith(self.delegated_prefix):
                 return {}
             tool_input = input_data.get("tool_input")
+            # Both refusals below come before the checkpoint, which spends a
+            # human approval: a call refused after it would burn one.
+            if tool_input is not None and not isinstance(tool_input, dict):
+                return _deny("policy checkpoint: tool input is not an object; the call was not made")
+            if isinstance(tool_input, dict) and RECEIPT_ARGS & tool_input.keys():
+                # Only this hook writes these, from a receipt it just spent.
+                # One the model supplied would name a receipt nobody spent
+                # for this call.
+                return _deny(
+                    f"policy checkpoint: {', '.join(sorted(RECEIPT_ARGS & tool_input.keys()))} "
+                    "is reserved for the approval receipt; the call was not made"
+                )
             decision = await anyio.to_thread.run_sync(functools.partial(
                 policy_checkpoint.checkpoint,
                 policy_checkpoint.MCP_TOOL_CALL,
@@ -933,11 +994,61 @@ class _PolicyCheckpointHook:
         except Exception as exc:  # noqa: BLE001 — fail closed
             return _deny(f"policy checkpoint failed ({type(exc).__name__}); the call was not made")
         if decision.permitted:
-            return {}
+            _open_decision_attempt(tool_use_id or str(input_data.get("tool_use_id") or ""), decision)
+            return _with_approval_receipt(tool_name, tool_input, decision)
         return _deny(
             f"policy {decision.verdict} ({decision.code}, rule {decision.rule_id or '-'}, "
             f"policy {decision.policy_version}): {decision.reason}"
         )
+
+
+def _open_decision_attempt(tool_use_id: str | None, decision: Any) -> None:
+    """The permitted call runs next: open its durable attempt record
+    (mctl-api#701, `orchestrator/decision_records.py`). A no-op unless the
+    producer is on; never raises, and never changes the hook's answer."""
+    try:
+        from orchestrator import decision_records
+
+        decision_records.start_tool_use(tool_use_id, decision)
+    except Exception:  # noqa: BLE001, S110 — a record never fails the call
+        pass
+
+
+@dataclass(frozen=True)
+class _DecisionAttemptHook:
+    """PostToolUse / PostToolUseFailure hook that closes the attempt
+    `_PolicyCheckpointHook` opened for the same `tool_use_id`. Observes
+    only, answers `{}` always.
+
+    - PostToolUse: `succeeded`, unless the tool answered an MCP error
+      result (`isError`), which is `failed` with code `tool_error`.
+    - PostToolUseFailure: `failed` with code `tool_failure`. An interrupted
+      call is left open: whether its effect happened was not observed, so
+      mctl-api reads it `in_progress` (or `unknown`), never `failed`.
+
+    The tool's input, output and error text are never recorded."""
+
+    event: str
+
+    async def __call__(self, input_data: Any, tool_use_id: str | None, _context: Any) -> dict[str, Any]:
+        try:
+            from orchestrator import decision_records
+
+            data = input_data if isinstance(input_data, dict) else {}
+            tool_use_id = tool_use_id or str(data.get("tool_use_id") or "")
+            if self.event == "PostToolUse":
+                response = data.get("tool_response")
+                if isinstance(response, dict) and (response.get("isError") is True or response.get("is_error") is True):
+                    decision_records.finish_tool_use(tool_use_id, decision_records.PHASE_FAILED, "tool_error")
+                else:
+                    decision_records.finish_tool_use(tool_use_id, decision_records.PHASE_SUCCEEDED)
+            elif data.get("is_interrupt") is True:
+                decision_records.abandon_tool_use(tool_use_id)
+            else:
+                decision_records.finish_tool_use(tool_use_id, decision_records.PHASE_FAILED, "tool_failure")
+        except Exception:  # noqa: BLE001, S110 — observation only
+            pass
+        return {}
 
 
 def _policy_hooks(
@@ -945,13 +1056,27 @@ def _policy_hooks(
 ) -> dict[HookEventName, list[HookMatcher]]:
     """Every MCP tool call, whatever the server, meets the checkpoint; the
     builder's own allow-list is the grant set it evaluates against.
-    `delegated_prefix` is the one exception, see `_PolicyCheckpointHook`."""
+    `delegated_prefix` is the one exception, see `_PolicyCheckpointHook`.
+
+    With `MCTL_DECISION_RECORDS` on, the PostToolUse pair that closes each
+    permitted call's attempt record is added; off, the map is unchanged."""
     hook = _PolicyCheckpointHook(tuple(allowed_tools), delegated_prefix=delegated_prefix)
-    return {
+    hooks: dict[HookEventName, list[HookMatcher]] = {
         "PreToolUse": [
             HookMatcher(matcher="mcp__.*", hooks=[cast(Any, hook)]),
         ],
     }
+    try:
+        from orchestrator import decision_records
+
+        recording = decision_records.enabled()
+    except Exception:  # noqa: BLE001 — a record never stops an agent from starting
+        recording = False
+    if recording:
+        post_events: tuple[HookEventName, ...] = ("PostToolUse", "PostToolUseFailure")
+        for event in post_events:
+            hooks[event] = [HookMatcher(matcher="mcp__.*", hooks=[cast(Any, _DecisionAttemptHook(event))])]
+    return hooks
 
 
 def _compose_hooks(
@@ -1077,19 +1202,42 @@ def _sibling_add_dirs(service_name: str) -> list[str | Path]:
     return dirs
 
 
+# The mctl-api bearer credential. This process reads it for the policy
+# checkpoint's approval store, the work-context client and the mctl MCP
+# headers built above; nothing the CLI child starts may hold it
+# (mctlhq/mctl-agents#717).
+MCTL_TOKEN_ENV = "MCTL_TOKEN"  # noqa: S105 — an env var name, not a credential
+
+
+def agent_env_without_mctl_token(env: Mapping[str, str]) -> dict[str, str]:
+    """`env` with the mctl-api token blanked, for an SDK session's env.
+
+    Without it a tool subprocess (the Bash tool and whatever it starts)
+    could call mctl-api with the pod's token directly, past the in-process
+    policy checkpoint. The mctl MCP server does not need it in the child's
+    env: `mctl_mcp_config()` puts the bearer header into the server config
+    itself.
+    """
+    return {**env, MCTL_TOKEN_ENV: ""}
+
+
 def _scrubbed(options: ClaudeAgentOptions) -> ClaudeAgentOptions:
     """Every SDK session's options in this module pass through here.
 
-    Blanks the usage-writer token (mctlhq/.github#50) and the evidence-writer
-    token (mctlhq/mctl-agents#544) in the session's env.
+    Blanks the usage-writer token (mctlhq/.github#50), the evidence-writer
+    token (mctlhq/mctl-agents#544) and the mctl-api token
+    (mctlhq/mctl-agents#717) in the session's env.
     The SDK layers `env` over the inherited environment, so a builder that
     passed none, or copied `os.environ`, would hand the tokens to the CLI
     child and to everything the model runs through Bash; they are for the
-    usage and evidence producers in this process only. A builder cannot opt out:
+    usage and evidence producers, the policy checkpoint and the work-context
+    client in this process only. A builder cannot opt out:
     tests/test_usage_ledger.py fails on any `ClaudeAgentOptions(...)` here
     that is not the direct argument of this function.
     """
-    options.env = agent_env_without_evidence_token(agent_env_without_writer_token(options.env or os.environ))
+    options.env = agent_env_without_mctl_token(
+        agent_env_without_evidence_token(agent_env_without_writer_token(options.env or os.environ))
+    )
     return options
 
 

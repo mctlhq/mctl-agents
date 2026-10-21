@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -159,6 +160,61 @@ def intent_for(request: pc.ActionRequest, *, rule_id: str, policy_version: str) 
         policy_version=policy_version,
         artifact_hash=request.action_digest(),
     )
+
+
+@dataclass(frozen=True)
+class DecisionContext:
+    """What mctl-api shows the human deciding a request and binds the
+    decision to (mctl-api#700, docs/decision-context-contract.md there).
+
+    mctl-api fills these only for a registered operation and a registered
+    policy rule, and refuses a create that is still incomplete (422
+    `approval_context_incomplete`). The checkpoint's action kinds
+    (`<kind>:<operation>`) and rules are never registered there, so a
+    checkpoint or commerce request sends all four. They are not part of the
+    intent hash."""
+
+    risk_level: str
+    side_effect: str
+    policy_decision: str
+    policy_reasons: tuple[str, ...]
+
+    def fields(self) -> dict[str, Any]:
+        return {
+            "risk_level": self.risk_level,
+            "side_effect": self.side_effect,
+            "policy_decision": self.policy_decision,
+            "policy_reasons": list(self.policy_reasons),
+        }
+
+
+#: Risk and side effect per checkpoint action class. A REQUIRE_APPROVAL
+#: action of a class not listed here is shown as the most severe class
+#: that still describes it: a human sees "high", never a guess that
+#: understates it.
+_CONTEXT_BY_KIND: dict[str, tuple[str, str]] = {
+    pc.GITHUB_PR_MERGE: ("high", "write"),
+    pc.MCP_TOOL_CALL: ("high", "external"),
+}
+_DEFAULT_CONTEXT = ("high", "external")
+
+#: mctl-api's reason-code alphabet and limits (`policy_reasons`).
+_REASON_RE = re.compile(r"^[a-z0-9._:-]{1,128}$")
+_POLICY_DECISION = "require_approval"
+
+
+def context_for(request: pc.ActionRequest, *, rule_id: str) -> DecisionContext:
+    """The decision context of one REQUIRE_APPROVAL checkpoint request: the
+    class's risk and side effect, the policy's decision, and reason codes
+    naming the rule (and a paid call, when it is one)."""
+    risk, side_effect = _CONTEXT_BY_KIND.get(request.action_kind, _DEFAULT_CONTEXT)
+    reasons = ["policy.require-approval"]
+    rule_reason = f"policy.rule:{rule_id}"
+    if _REASON_RE.match(rule_reason):
+        reasons.append(rule_reason)
+    if dict(request.metadata).get("commerce") == "paid":
+        reasons.append("commerce.paid")
+    return DecisionContext(risk, side_effect, _POLICY_DECISION, tuple(reasons))
 
 
 def idempotency_key(intent: ActionIntent, attempt: int = 0) -> str:
@@ -312,10 +368,17 @@ class ActionApprovalClient:
             return ApprovalAnswer(UNKNOWN, reason=f"HTTP {status} does not describe an action approval")
         return ApprovalAnswer(_STATES[record.state], record=record)
 
-    def create(self, intent: ActionIntent, *, key: str, expires_at: datetime) -> ApprovalAnswer:
+    def create(
+        self, intent: ActionIntent, *, key: str, expires_at: datetime, context: DecisionContext | None = None,
+    ) -> ApprovalAnswer:
         """Create, or find by `key`, the request for `intent`. Sends the
         locally computed intent_hash, so mctl-api refuses (400
-        `intent_hash_mismatch`) if the two encodings ever disagree."""
+        `intent_hash_mismatch`) if the two encodings ever disagree.
+
+        `context` is the decision context; without it mctl-api fills what its
+        registry and policy set know and refuses the rest (422
+        `approval_context_incomplete`, a REFUSED answer: the same request
+        gets the same answer, so it is not retried)."""
         optional = ("artifact_hash", "work_item_id")
         body: dict[str, Any] = {name: value for name, value in intent.fields() if value or name not in optional}
         body.update({
@@ -323,6 +386,8 @@ class ActionApprovalClient:
             "expires_at": expires_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "intent_hash": intent_hash(intent),
         })
+        if context is not None:
+            body.update(context.fields())
         return self._read("POST", ROUTES["create"], body, ok=(200, 201))
 
     def get(self, approval_id: str) -> ApprovalAnswer:
@@ -464,6 +529,7 @@ class MctlApiApprovals:
             answer = self._client.create(
                 intent, key=idempotency_key(intent, self._attempt),
                 expires_at=self._now() + timedelta(seconds=ttl_s()),
+                context=context_for(request, rule_id=rule_id),
             )
         rec = answer.record
         if rec is None:
