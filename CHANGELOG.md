@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.88.3](https://github.com/mctlhq/mctl-agents/compare/1.88.2...1.88.3) (2026-10-21)
+
+
+### Bug Fixes
+
+* **policy:** bind incident mutations to the incident responder ([5a02e32](https://github.com/mctlhq/mctl-agents/commit/5a02e32906ea58406f7780772eac05573e95cee6))
+* **policy:** bind incident mutations to the incident responder ([548d89f](https://github.com/mctlhq/mctl-agents/commit/548d89fa10356beeaceceb97c6561a4e1b80936b))
+
 ## [1.88.2](https://github.com/mctlhq/mctl-agents/compare/1.88.1...1.88.2) (2026-10-21)
 
 
