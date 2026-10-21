@@ -77,6 +77,12 @@ AGENTS_DIR = REPO_ROOT / "agents"
 # `agents/mctl-claude-remote/` scaffold, so it must NOT enter
 # ROTATING_SERVICES; the generic implementer sub-agent covers it and its PRs
 # stay shepherd-owned (no SHEPHERD_SKIP_SERVICES entry).
+#
+# `mctl-alice` (public Yandex smart-home MCP server, deployed in tenant
+# `labs`) is issue-driven only, registered for its public-launch hardening
+# issues. Same shape as `mctl-claude-remote`: no `agents/mctl-alice/`
+# scaffold, so it must NOT enter ROTATING_SERVICES; the generic implementer
+# covers it and its PRs stay shepherd-owned.
 SERVICES = [
     "mctl-web",
     "mctl-docs",
@@ -94,6 +100,7 @@ SERVICES = [
     ".github",
     "newton-mcp-gateway",
     "mctl-claude-remote",
+    "mctl-alice",
     # "upwork-mcp",
 ]
 
@@ -126,6 +133,7 @@ SERVICE_TENANTS = {
     ".github": PLATFORM_TENANT,
     "newton-mcp-gateway": PLATFORM_TENANT,
     "mctl-claude-remote": PLATFORM_TENANT,
+    "mctl-alice": PLATFORM_TENANT,
 }
 
 
@@ -147,6 +155,7 @@ NON_ROTATING_SERVICES = {
     ".github",
     "newton-mcp-gateway",
     "mctl-claude-remote",
+    "mctl-alice",
 }
 
 # Subset of SERVICES that the proactive R&D rotation analyzes via
