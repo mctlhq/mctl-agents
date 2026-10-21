@@ -1,0 +1,39 @@
+{
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "budgets": {
+    "max_attempts": 1,
+    "max_followups": 0,
+    "max_tool_calls": 16,
+    "max_wall_clock_seconds": 60
+  },
+  "content_hash": "sha256:58de2791b08183751ef43aaf9151194f75d24ab26f7130bc8cb4ae33358ac26d",
+  "description": "A decision or attempt record that did not land is counted as dropped, never as recorded (mctl-api#701 producer contract).",
+  "execution_mode": "deterministic",
+  "followup_templates": [],
+  "inputs": [],
+  "invariants": [
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "guarantee-holds",
+      "statement": "Every decision and attempt write is counted under exactly one result, and as recorded only when the sink stored it."
+    }
+  ],
+  "kind": "AssuranceScenario",
+  "mutation_mode": "fixture_only",
+  "name": "governance-decision-records",
+  "permitted_action_kinds": [
+    "mcp.tool.call"
+  ],
+  "permitted_tools": [
+    "mctl_get_record_audit",
+    "mctl_record_governed_action"
+  ],
+  "scenario_id": "asc-58de2791b0818375",
+  "setup": [],
+  "target": {
+    "environment": "fixture",
+    "kind": "fixture",
+    "ref": "fixtures/governance/decision-records"
+  },
+  "version": "1.0.0"
+}
