@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.88.1](https://github.com/mctlhq/mctl-agents/compare/1.88.0...1.88.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* **implementer:** execute only on a verified approval grant ([ffd02b1](https://github.com/mctlhq/mctl-agents/commit/ffd02b191eb88740cbc54ef1b906b2f9f336679b))
+* **runtime-assurance:** specify the transport timeout and harness counters ([b3955d9](https://github.com/mctlhq/mctl-agents/commit/b3955d965e69e20bba294fd29da8c3358ae6ad01))
+* **runtime-assurance:** specify the transport timeout and harness counters ([dc5c7ff](https://github.com/mctlhq/mctl-agents/commit/dc5c7ff692c0af3ccdf830f0395f13185de27e2a))
+
 ## [1.88.0](https://github.com/mctlhq/mctl-agents/compare/1.87.0...1.88.0) (2026-10-21)
 
 
