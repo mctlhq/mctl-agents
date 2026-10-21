@@ -292,6 +292,17 @@ it), but the sealed document never reaches the agent container, so
 `mcp__mctl__*` calls and `.status.yaml` carry a locally-minted, explicitly
 `unverified` identity rather than the control-plane-asserted one.
 
+As of 2026-10-21 neither prerequisite has landed, so no Argo run has a
+sealed context and every policy decision carried an empty execution id and
+actor (mctl-api#701: no decision record could be written). Until they land,
+the investigator binds the policy identity to the work-item store execution
+it resolved from mctl-api (`policy_checkpoint.bind_store_execution`): the
+`we_` id the store confirmed for this run, with the work item's owner
+principal as actor. The local mint is never that identity. A sealed context
+file, when configured, still wins; a broken one is no identity, never a
+fall back to the store; and `MCTL_REQUIRE_EXECUTION_CONTEXT` is not
+satisfied by a store binding.
+
 ## Implementation map
 
 This proposal changes:

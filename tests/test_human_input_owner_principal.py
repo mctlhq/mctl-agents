@@ -52,6 +52,13 @@ class TestWorkItemOwnerPrincipal:
         assert item is not None and item.work_item_id == WID
         assert item.owner_principal_id == ""
 
+    def test_the_owner_principal_is_read_as_recorded(self):
+        # mctl-api#701: the actor of a store-bound policy identity.
+        item = WorkItem.from_payload(_item(owner_principal="service:mctl-agent"))
+        assert item.owner_principal == "service:mctl-agent"
+        assert WorkItem.from_payload(_item()).owner_principal == ""
+        assert WorkItem.from_payload(_item(owner_principal=7)).owner_principal == ""
+
 
 class TestSealedActorRefs:
     def test_a_principal_is_named_after_the_login(self, tmp_path):

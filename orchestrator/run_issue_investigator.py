@@ -3289,7 +3289,43 @@ def _investigate_and_finish(
         _trace_published(result)
         return result
     finally:
-        own_execution.finish(result)
+        try:
+            own_execution.finish(result)
+        finally:
+            policy_checkpoint.unbind_store_execution()
+
+
+def _bind_policy_identity(execution_id: str, item: Any) -> None:
+    """Make the store execution this run just resolved from mctl-api the
+    identity of its policy decisions (mctl-api#701): `execution_id` is the
+    `we_` the store confirmed (in the item's ledger, or answered to this
+    run's attach), the actor is the work item's owner as mctl-api records
+    it. Without it every decision of an Argo run carries no identity — no
+    CWFT writes the sealed ADR 011 context — and no decision record can be
+    written. A sealed context, when one is configured, still wins
+    (`policy_checkpoint.current_identity`)."""
+    trace_id = ""
+    try:
+        ids = tracing.current_trace_ids()
+        if ids and isinstance(ids[0], str):
+            trace_id = ids[0]
+    except Exception:  # noqa: BLE001 — the trace id is enrichment only
+        trace_id = ""
+    actor = getattr(item, "owner_principal", "")
+    bound = policy_checkpoint.bind_store_execution(
+        execution_id,
+        actor,
+        tenant=getattr(item, "tenant", ""),
+        principal_id=getattr(item, "owner_principal_id", ""),
+        trace_id=trace_id,
+    )
+    if bound:
+        print(f"info: policy identity execution_id={execution_id} actor={actor} (work-item store)")
+    else:
+        print(
+            f"warn: policy identity not bound to {execution_id}: owner principal {actor!r} is not usable "
+            "or another execution is bound; decisions carry no execution identity"
+        )
 
 
 def _trace_published(result: InvestigateResult) -> None:
@@ -3579,6 +3615,7 @@ def _investigate(
                         evidence_producer.note(
                             "note_work_execution", work_context_ref.execution_id, work_context_ref.work_item_id,
                         )
+                        _bind_policy_identity(work_context_ref.execution_id, answer.item)
             elif _work_context_rollout.blocks_on_unknown():
                 reason = f"work item {work_item_id!r} could not be resolved: {answer.reason}"
                 print(f"warn: {reason}")

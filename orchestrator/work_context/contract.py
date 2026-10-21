@@ -299,6 +299,11 @@ class WorkItem:
     #: an unreadable value reads as no principal: that names fewer
     #: respondents, never a guessed one.
     owner_principal_id: str = ""
+    #: mctl-api's `owner_principal` (`service:mctl-agent`, `human:...`): the
+    #: principal the item belongs to, as the store authorizes it. "" when
+    #: absent or not a string. Read as the actor of a store-bound policy
+    #: identity (`policy_checkpoint.bind_store_execution`), which validates it.
+    owner_principal: str = ""
 
     @staticmethod
     def from_payload(data: Any) -> WorkItem | None:
@@ -337,6 +342,7 @@ class WorkItem:
             external_key=external_key,
             tenant=_str(data.get("tenant")),
             owner_principal_id=_principal_id(data.get("owner_principal_id")),
+            owner_principal=_str(data.get("owner_principal")),
         )
 
 
