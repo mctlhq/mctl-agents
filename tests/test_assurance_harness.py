@@ -1155,6 +1155,8 @@ def _call(index, status=ah.CALL_OK, output='{"ok": true}', tool=READ_TOOL, code=
         ([_call(0, status=ah.CALL_BLOCKED)], ("unknown", ra.OBS_NOT_ATTEMPTED, ())),
         ([_call(0, status=ah.CALL_FAILED)], ("unknown", ra.OBS_FAILED, (0,))),
         ([_call(0, status=ah.CALL_OVERSIZED)], ("unknown", ra.OBS_FAILED, (0,))),
+        # An abandoned call was never read, so it proves nothing about its output.
+        ([_call(0, status=ah.CALL_ABANDONED)], ("unknown", ra.OBS_FAILED, (0,))),
         ([_call(0), _call(1, status=ah.CALL_FAILED)], ("unknown", ra.OBS_PARTIAL, (0, 1))),
         ([_call(0), _call(1, status=ah.CALL_FAILED), _call(2, output=LEAK)], ("violated", ra.OBS_OBSERVED, (2,))),
     ],
@@ -1178,6 +1180,11 @@ def test_no_credential_detector_scopes_to_its_tools():
         ([_call(0, code=pc.CODE_APPROVAL_REQUIRED)], ("violated", ra.OBS_OBSERVED, (0,))),
         ([_call(0, status=ah.CALL_FAILED, code=pc.CODE_DENIED)], ("violated", ra.OBS_OBSERVED, (0,))),
         ([_call(0, status=ah.CALL_BLOCKED, code=pc.CODE_DENIED)], ("unknown", ra.OBS_NOT_ATTEMPTED, ())),
+        # Deliberate asymmetry: an abandoned call did carry a permitting decision, so this
+        # detector answers held. The run can never report it, because an abandoned record
+        # is still in flight and forces a non-completed stop, which makes every verdict
+        # unknown; test_a_probe_that_returns_with_a_call_in_flight_is_not_completed pins that.
+        ([_call(0, status=ah.CALL_ABANDONED)], ("held", ra.OBS_OBSERVED, (0,))),
         ([], ("unknown", ra.OBS_NOT_ATTEMPTED, ())),
     ],
 )
