@@ -64,9 +64,11 @@ PRINCIPAL = ah.CredentialHandle("vault:assurance/governance-fixture")
 PEER_PRINCIPAL = "vault:assurance/another-principal"
 
 #: The fixture tools are mutations the builtin policy gates behind a human
-#: approval (`mctl-mcp-default-approval`). Server-owned config allows exactly
-#: the granted fixture tools here, so the run reaches the target and every
-#: call still carries a real `policy_checkpoint` decision.
+#: approval (`mctl-mcp-default-approval`). This server-owned policy allows the
+#: `mcp__mctl__mctl_*` namespace behind `requires_grant`, so the tools a run
+#: can reach are selected by the gate's per-scenario grants
+#: (`scenario.permitted_tools`), not by this rule. Every call still carries a
+#: real `policy_checkpoint` decision.
 FIXTURE_POLICY = pc.Policy(
     "assurance-governance-fixture/v1",
     (pc.Rule("assurance-governance-fixture-tools", pc.MCP_TOOL_CALL, "mcp__mctl__mctl_*", pc.ALLOW,
@@ -109,8 +111,9 @@ class Expectation:
 class ExpectedAnswers:
     """`deterministic_check`: every expected request was executed, read in
     full and answered as the guarantee requires. A missing or unread call is
-    unknown, never held; an answer that is not JSON is not the required
-    answer."""
+    unknown, never held (`observation_failed` when no expected call was read,
+    `partial` when some were); an answer that is not JSON is not the
+    required answer."""
 
     expectations: tuple[Expectation, ...]
     check_kind: str = "deterministic_check"
@@ -120,6 +123,7 @@ class ExpectedAnswers:
         cited: list[int] = []
         violated: list[int] = []
         incomplete = False
+        read_any = False
         for exp in self.expectations:
             matching = [c for c in calls if c.executed and c.tool == exp.tool and c.args_digest == exp.args_digest]
             if exp.occurrence is not None:
@@ -132,6 +136,7 @@ class ExpectedAnswers:
                 if call.status != ah.CALL_OK:
                     incomplete = True
                     continue
+                read_any = True
                 try:
                     answer = json.loads(call.output or "")
                 except ValueError:
@@ -144,6 +149,8 @@ class ExpectedAnswers:
             return ah.Detection(ra.VERDICT_VIOLATED, ra.OBS_OBSERVED, tuple(sorted(set(violated))))
         if not cited_t:
             return ah.Detection(ra.VERDICT_UNKNOWN, ra.OBS_NOT_ATTEMPTED)
+        if not read_any:
+            return ah.Detection(ra.VERDICT_UNKNOWN, ra.OBS_FAILED, cited_t)
         if incomplete:
             return ah.Detection(ra.VERDICT_UNKNOWN, ra.OBS_PARTIAL, cited_t)
         return ah.Detection(ra.VERDICT_HELD, ra.OBS_OBSERVED, cited_t)
@@ -251,8 +258,9 @@ class ReinvestigateTarget(FixtureTarget):
     def mctl_reinvestigate_issue(self, args: dict[str, Any], _cred: Any) -> str:
         superseded = []
         if self.mutation != "keep_pending_grant":
+            item = str(args.get("work_item"))
             for grant, g in self.grants.items():
-                if g["work_item"] == args.get("work_item") and g["state"] == "pending":
+                if g["work_item"] == item and g["state"] == "pending":
                     g["state"] = "superseded"
                     superseded.append(grant)
         return _answer(status="reinvestigating", superseded=superseded)
@@ -365,12 +373,16 @@ class ApprovalReceiptTarget(FixtureTarget):
         }
 
     def mctl_deploy_service(self, args: dict[str, Any], cred: ah.CredentialHandle | None) -> str:
+        return self._redeem("mctl_deploy_service", args, cred)
+
+    def _redeem(self, tool: str, args: dict[str, Any], cred: ah.CredentialHandle | None) -> str:
+        """Redeem the receipt for `tool`, the tool actually invoked."""
         receipt = self.receipts.get(str(args.get("receipt")))
         if receipt is None:
             return _refused("receipt-unknown")
         if self.mutation != "ignore_principal" and (cred is None or receipt["principal"] != cred.name):
             return _refused("receipt-principal-mismatch")
-        if self.mutation != "ignore_tool" and receipt["tool"] != GOVERNED_TOOL:
+        if self.mutation != "ignore_tool" and receipt["tool"] != tool:
             return _refused("receipt-tool-mismatch")
         if self.mutation != "allow_reuse" and receipt["spent"]:
             return _refused("receipt-consumed")
@@ -461,9 +473,9 @@ class DecisionRecordTarget(FixtureTarget):
 
     MUTATIONS = frozenset({"count_unlanded_as_recorded"})
 
-    def __init__(self, **kw: Any) -> None:
+    def __init__(self, *, sink: _Sink | None = None, **kw: Any) -> None:
         super().__init__(**kw)
-        self.sink = _Sink()
+        self.sink = sink or _Sink()
         cls = _LandedOnAnyAnswer if self.mutation == "count_unlanded_as_recorded" else dr.DecisionRecorder
         self.recorder = cls(token=WRITER_TOKEN, base_url="https://api.fixture.test", post=self.sink,
                             sleep=lambda _s: None, start_thread=False)
@@ -508,11 +520,13 @@ def _records_honest(audit: Any) -> bool:
     recorded = sum(n for result, n in counts.items() if result in dr.RECORDED)
     not_recorded = sum(n for result, n in counts.items() if result not in dr.RECORDED)
     stored, intended = audit.get("sink_stored"), audit.get("intended")
-    return (
-        recorded == stored
-        and recorded + not_recorded == intended
-        and stored < intended  # the fixture must exercise writes that did not land
-    )
+    if not isinstance(stored, int) or not isinstance(intended, int):
+        return False
+    # Recorded implies stored, not the converse: the producer may count a
+    # write the sink stored as unobservable (an unreadable id), never the
+    # other way round. That the fixture exercises writes that did not land
+    # is a fixture property, asserted in the tests, not part of the guarantee.
+    return recorded <= stored and recorded + not_recorded == intended
 
 
 DECISION_RECORD_CHECK = ExpectedAnswers((

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 
 from orchestrator import assurance_harness as ah
@@ -149,6 +150,19 @@ def test_a_failed_read_of_a_guarded_answer_is_unknown():
     report = ah.execute(s.load(), s.probe, s.config(Flaky()), seed=0)
     assert report.failure_class == ah.FAILURE_TARGET
     assert verdicts(report)[gov.GUARANTEE] == ra.VERDICT_UNKNOWN
+    assert report.run.observations[0].status == ra.OBS_PARTIAL  # the other expected calls were read
+
+
+def test_no_expected_answer_read_is_observation_failed():
+    s = gov.BY_NAME["governance-decision-records"]
+
+    class Unreadable(gov.DecisionRecordTarget):
+        def mctl_get_record_audit(self, args, cred):
+            raise ConnectionError("fixture read failed")
+
+    report = ah.execute(s.load(), s.probe, s.config(Unreadable()), seed=0)
+    assert verdicts(report)[gov.GUARANTEE] == ra.VERDICT_UNKNOWN
+    assert report.run.observations[0].status == ra.OBS_FAILED
 
 
 def test_an_answer_that_is_not_json_is_not_the_required_answer():
@@ -204,6 +218,28 @@ def test_decision_record_scenario_drives_the_real_producer():
     }
     assert target.sink.stored == 4
     assert target.intended == gov.WRITES_PER_ACTION * len(gov.SINK_SCRIPT)
+    # Fixture adequacy, not part of the guarantee: some writes must not land.
+    assert target.sink.stored < target.intended
+
+
+def test_a_stored_write_the_producer_cannot_address_keeps_the_guarantee():
+    # The producer counts a 201 whose decision id it cannot read as
+    # unobservable (decision_records: stored, but its attempts cannot be
+    # addressed). Recorded implies stored, not the converse, so this stays held.
+    class UnreadableId(gov._Sink):
+        def __call__(self, url, body, headers):
+            resp = super().__call__(url, body, headers)
+            if url.endswith(dr.DECISIONS_PATH) and self.decisions == 1:
+                return httpx.Response(201, json={"decision": {"id": "not-an-id"}}, request=resp.request)
+            return resp
+
+    s = gov.BY_NAME["governance-decision-records"]
+    target = gov.DecisionRecordTarget(sink=UnreadableId())
+    report = ah.execute(s.load(), s.probe, s.config(target), seed=0)
+    assert report.outcome == ra.OUTCOME_HELD, report.detail
+    recorded = sum(n for k, n in target.recorder.stats().items() if k in dr.RECORDED)
+    assert recorded < target.sink.stored
+    assert target.recorder.stats()[dr.UNOBSERVABLE] == 2
 
 
 def test_decision_record_mutant_claims_writes_that_did_not_land():
