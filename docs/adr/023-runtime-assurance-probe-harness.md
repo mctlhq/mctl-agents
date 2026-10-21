@@ -85,7 +85,8 @@ cannot change what the target receives after the screen.
 
 ## Bounds
 
-- Tool calls are counted per request admitted to the policy checkpoint. The slot is claimed under the gate's lock, so concurrent probe threads get unique call indexes and can never exceed `max_tool_calls`.
+- A slot is claimed under the gate's lock for every request the gate accepts for screening, so concurrent probe threads get unique call indexes and can never exceed `max_tool_calls`. `consumed.tool_calls` counts only requests that reached the transport: one refused by the screen or by the policy is recorded as `blocked` and is not consumption.
+- The transport receives the remaining wall-clock budget as `timeout_seconds`. `0.0` means the budget is already spent, and the call must not block.
 - A call handed to the transport is recorded at once as `abandoned`, in the same critical section as the post-decision stop check, and swapped for its final record in one critical section when it returns. A call the watchdog leaves behind therefore counts as executed: it reached the target, so its effect is unknown, not absent.
 - Wall clock uses the injected `Clock`, checked before and after every call. A call that overruns has its output withheld.
 - A real-time watchdog thread stops a probe or transport that never returns, after the granted wall clock plus 1 s. The thread cannot be killed: it is abandoned, and the gate refuses anything further from it.
