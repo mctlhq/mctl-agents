@@ -8,7 +8,7 @@ drops a valid implementer target — these tests catch that drift.
 """
 from __future__ import annotations
 
-from config.settings import NON_ROTATING_SERVICES, ROTATING_SERVICES, SERVICES
+from config.settings import NON_ROTATING_SERVICES, PLATFORM_TENANT, ROTATING_SERVICES, SERVICES, tenant_for_service
 
 
 def test_portfolio_is_a_registered_service():
@@ -66,6 +66,14 @@ def test_mctl_claude_remote_is_a_registered_service():
 def test_mctl_claude_remote_is_non_rotating():
     assert "mctl-claude-remote" in NON_ROTATING_SERVICES
     assert "mctl-claude-remote" not in ROTATING_SERVICES
+
+
+def test_mctl_alice_is_an_issue_driven_service():
+    """Registered for DevLoop issues; no scaffold, so never in the rotation."""
+    assert "mctl-alice" in SERVICES
+    assert tenant_for_service("mctl-alice") == PLATFORM_TENANT
+    assert "mctl-alice" in NON_ROTATING_SERVICES
+    assert "mctl-alice" not in ROTATING_SERVICES
 
 
 def test_no_service_name_is_shell_glob_hostile_beyond_a_leading_dot():
