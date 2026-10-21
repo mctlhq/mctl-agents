@@ -811,6 +811,9 @@ class ImplementResult:
     pr_url: str | None
     error: str | None = None
     skipped_reason: str | None = None
+    # The PR head the GitHub preflight read (execution-evidence subject
+    # revision); None when the run observed no head.
+    pr_head_sha: str | None = None
     # Stable code (e.g. BLOCKED_APPROVAL_MISSING) when the proposal was
     # never attempted because it is permanently unrunnable as written --
     # distinct from both `error` (an attempt ran and failed) and a plain
@@ -2858,7 +2861,7 @@ def _note_implement_evidence(
     evidence: evidence_producer.RunEvidence, result: ImplementResult, *, success_reason: str
 ) -> None:
     """Map an `ImplementResult` onto ADR 018's closed outcome vocabulary,
-    and name the PR it acted on (its head is read at seal time)."""
+    and name the PR it acted on (at the head the run observed, if any)."""
     error = result.error or ""
     if result.rate_limited:
         evidence.set_outcome("failed", "rate-limited")
@@ -2887,7 +2890,7 @@ def _note_implement_evidence(
     else:
         evidence.set_outcome("failed", "no-pr")
     if result.pr_url:
-        evidence.note_subject_pr_url(result.pr_url)
+        evidence.note_subject_pr_url(result.pr_url, result.pr_head_sha)
     evidence.note_proposal_status(result.ref.service, result.ref.slug, result.ref.status_path)
 
 
@@ -4497,7 +4500,7 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             attempt=None,
             rate_limited=None,
         )
-        return ImplementResult(ref=ref, pr_url=existing.pr_url)
+        return ImplementResult(ref=ref, pr_url=existing.pr_url, pr_head_sha=existing.head_sha)
     if existing.action == "merged":
         update_status_yaml(
             ref,
@@ -4511,7 +4514,7 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             attempt=None,
             rate_limited=None,
         )
-        return ImplementResult(ref=ref, pr_url=existing.pr_url)
+        return ImplementResult(ref=ref, pr_url=existing.pr_url, pr_head_sha=existing.head_sha)
     if existing.action == "closed":
         update_status_yaml(
             ref,
@@ -4526,6 +4529,7 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         return ImplementResult(
             ref=ref,
             pr_url=existing.pr_url,
+            pr_head_sha=existing.head_sha,
             skipped_reason="existing PR is closed without merge",
         )
     if existing.action == "needs-triage":
@@ -4539,6 +4543,7 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         return ImplementResult(
             ref=ref,
             pr_url=existing.pr_url,
+            pr_head_sha=existing.head_sha,
             error=existing.reason or "existing result needs triage",
         )
 

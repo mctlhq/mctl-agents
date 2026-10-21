@@ -446,26 +446,37 @@ def test_flag_on_posts_subject_provenance_and_tool_calls():
     assert ee.recompute_content_hash(parsed) == parsed.content_hash
 
 
-def test_flag_on_a_pr_head_that_cannot_be_read_is_a_subject_gap():
+def test_a_pr_named_without_a_head_is_a_required_subject_gap(monkeypatch):
+    def forbidden(*_a, **_k):
+        raise AssertionError("no gh call may be made while sealing")
+
+    monkeypatch.setattr(__import__("subprocess"), "run", forbidden)
     evidence = _run()
     evidence.note_subject_pr_url("https://github.com/mctlhq/mctl-agents/pull/7")
     evidence.set_outcome("succeeded", "pr-opened")
-
-    def unreadable(_repo, _number):
-        raise RuntimeError("gh failed")
-
-    sealed = ep.build(evidence, amendment_2=True, created_at=CREATED_AT, read_pr_head=unreadable)
+    sealed = ep.build(evidence, amendment_2=True, created_at=CREATED_AT)
     assert sealed.subject is None and sealed.provenance is None
     assert ("subject", "observation_failed", True) in _gaps(sealed)
     assert sealed.completeness == ee.INCOMPLETE
 
 
-def test_flag_on_a_pr_head_read_at_seal_time_binds_the_subject():
+def test_a_pr_named_again_without_a_head_keeps_the_bound_subject():
     evidence = _run()
+    evidence.note_subject_pr_url("https://github.com/mctlhq/mctl-agents/pull/7", SHA)
     evidence.note_subject_pr_url("https://github.com/mctlhq/mctl-agents/pull/7")
-    evidence.set_outcome("succeeded", "pr-opened")
-    sealed = ep.build(evidence, amendment_2=True, created_at=CREATED_AT, read_pr_head=lambda *_: SHA)
-    assert sealed.subject == ee.SubjectRef("pull_request", "mctlhq/mctl-agents", "7", SHA)
+    assert evidence.subject == ee.SubjectRef("pull_request", "mctlhq/mctl-agents", "7", SHA)
+
+
+def test_the_implementer_binds_the_preflight_head(monkeypatch, tmp_path):
+    from orchestrator import run_implementer as ri
+
+    ref = SimpleNamespace(service="mctl-agents", slug="s", status_path=tmp_path / ".status.yaml")
+    result = ri.ImplementResult(
+        ref=ref, pr_url="https://github.com/mctlhq/mctl-agents/pull/7", pr_head_sha=SHA
+    )
+    evidence = _run()
+    ri._note_implement_evidence(evidence, result, success_reason="pr-opened")
+    assert evidence.subject == ee.SubjectRef("pull_request", "mctlhq/mctl-agents", "7", SHA)
 
 
 def test_flag_on_versions_come_from_the_snapshot_correlation():
@@ -731,11 +742,7 @@ def test_the_implementer_subject_is_the_commit_it_pushed_not_the_head_at_seal_ti
     evidence.note_pushed_head(SHA)
     evidence.note_subject_pr_url("https://github.com/mctlhq/mctl-agents/pull/7")
     evidence.set_outcome("succeeded", "pr-opened")
-
-    def moved_head(_repo, _number):
-        raise AssertionError("the head must not be re-read when the run pushed one")
-
-    sealed = ep.build(evidence, amendment_2=True, created_at=CREATED_AT, read_pr_head=moved_head)
+    sealed = ep.build(evidence, amendment_2=True, created_at=CREATED_AT)
     assert sealed.subject == ee.SubjectRef("pull_request", "mctlhq/mctl-agents", "7", SHA)
 
 
@@ -839,11 +846,7 @@ def test_a_head_pushed_after_the_pr_was_named_still_wins_over_a_read():
     evidence.note_subject_pr_url("https://github.com/mctlhq/mctl-agents/pull/7")
     evidence.note_pushed_head(SHA)
     evidence.set_outcome("succeeded", "pr-opened")
-
-    def unexpected(_repo, _number):
-        raise AssertionError("must not read the head")
-
-    sealed = ep.build(evidence, amendment_2=True, created_at=CREATED_AT, read_pr_head=unexpected)
+    sealed = ep.build(evidence, amendment_2=True, created_at=CREATED_AT)
     assert sealed.subject == ee.SubjectRef("pull_request", "mctlhq/mctl-agents", "7", SHA)
 
 
@@ -864,6 +867,30 @@ def test_shepherd_process_one_binds_the_subject_to_the_head_it_read(monkeypatch,
         result = rs.process_one(ref, state_dir=tmp_path)
     assert result.decision == "wait"
     assert evidence.subject == ee.SubjectRef("pull_request", "mctlhq/mctl-agents", "9", SHA)
+
+
+def test_shepherd_process_one_with_an_empty_head_makes_no_gh_call(monkeypatch, tmp_path):
+    from orchestrator import run_shepherd as rs
+
+    ref = rs.ProposalRef(service="mctl-agents", slug="issue-1", proposal_dir=tmp_path, status="in-progress")
+    snapshot = rs.PRSnapshot(
+        number=9, repo="mctlhq/mctl-agents", state="OPEN", merged=False, closed_unmerged=False,
+        merge_commit=None, close_comment_or_default="", head_sha="", head_pushed_at=None,
+        merge_state_status="CLEAN", checks_green=True, is_draft=False,
+    )
+    monkeypatch.setattr(rs, "find_pr_for_proposal", lambda *a, **k: snapshot)
+    monkeypatch.setattr(rs, "_attempt_is_fresh", lambda *_a: True)
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("no gh call")
+
+    monkeypatch.setattr(__import__("subprocess"), "run", forbidden)
+    with ep.run(ep.STAGE_SHEPHERD, environ={}) as evidence:
+        rs.process_one(ref, state_dir=tmp_path)
+    assert evidence.subject is None
+    assert evidence.pending_pr == ("mctlhq/mctl-agents", 9)
+    sealed = ep.build(evidence, amendment_2=True, created_at=CREATED_AT)
+    assert ("subject", "observation_failed", True) in _gaps(sealed)
 
 
 def test_one_digest_that_failed_then_succeeded_is_unknown_not_succeeded():
