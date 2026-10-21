@@ -98,9 +98,42 @@ def test_every_mctl_tool_that_is_not_a_known_read_or_agent_mutation_needs_an_app
                  "mctl_trigger_issue", "trigger_issue"):
         assert _mcp(f"mcp__mctl__{tool}", {}).code == pc.CODE_APPROVAL_REQUIRED, tool
     for tool in ("mctl_list_services", "mctl_get_dev_loop", "mctl_whoami", "mctl_get_service_status",
-                 "get_service_status", "mctl_incident_summary", "mctl_resolve_incident",
-                 "mctl_acknowledge_incident"):
+                 "get_service_status", "mctl_incident_summary"):
         assert _mcp(f"mcp__mctl__{tool}", {}).code == pc.CODE_ALLOWED, tool
+
+
+#: The incident responder's grants: the mctl server plus the two incident
+#: mutations by name (`options.build_incident_responder_options`).
+RESPONDER_GRANTS = (*GRANTS, *pc.AGENT_MUTATION_TOOLS)
+MUTATIONS = ("mctl_resolve_incident", "resolve_incident", "mctl_acknowledge_incident", "acknowledge_incident")
+
+
+def test_agent_incident_mutations_need_an_explicit_grant():
+    """Holding the mctl server (`mcp__mctl__*`) is not enough to resolve or
+    acknowledge an incident: every agent that reads untrusted text holds it.
+    Only an execution that grants the tool by name may make the call."""
+    assert set(pc.AGENT_MUTATION_TOOLS) == {f"mcp__mctl__{t}" for t in MUTATIONS}
+    for tool in MUTATIONS:
+        op = f"mcp__mctl__{tool}"
+        for grants in (GRANTS, ("mcp__mctl__*resolve_incident", "mcp__mctl__*acknowledge_incident"),
+                       ("mcp__mctl__mctl_?esolve_incident", "mcp__mctl__[mr]*"), ("*",), ()):
+            d = _mcp(op, {}, grants=grants)
+            assert (d.verdict, d.code, d.permitted) == (pc.DENY, pc.CODE_GRANT_MISSING, False), (tool, grants)
+            assert d.rule_id == "mctl-mcp-agent-mutation", (tool, grants)
+        d = _mcp(op, {}, grants=RESPONDER_GRANTS)
+        assert (d.verdict, d.code, d.permitted) == (pc.ALLOW, pc.CODE_ALLOWED, True), tool
+        # One spelling granted by name does not grant the other.
+        other = {"mctl_resolve_incident": "resolve_incident", "resolve_incident": "mctl_resolve_incident",
+                 "mctl_acknowledge_incident": "acknowledge_incident",
+                 "acknowledge_incident": "mctl_acknowledge_incident"}[tool]
+        assert not _mcp(op, {}, grants=(*GRANTS, f"mcp__mctl__{other}")).permitted, tool
+
+
+def test_explicit_grant_is_scoped_to_the_mutation_rule():
+    """Only the mutation rule ignores wildcard grants: reads and gated tools
+    still match `mcp__mctl__*` exactly as before."""
+    explicit = {r.rule_id for r in pc.BUILTIN_POLICY.rules if r.explicit_grant}
+    assert explicit == {"mctl-mcp-agent-mutation"}
 
 
 
@@ -113,15 +146,22 @@ def test_the_rule_table_classifies_the_recorded_mctl_tool_inventory():
     facts = yaml.safe_load((Path(__file__).parents[1] / "docs/diagrams/archify/facts.yaml").read_text(encoding="utf-8"))
     tools = facts["mcp_tools"]
     assert len(tools) == facts["mcp_tool_count"]
-    allowed = set()
-    for tool in tools:
-        code = _mcp(f"mcp__mctl__{tool}", {}).code
-        assert code in (pc.CODE_ALLOWED, pc.CODE_APPROVAL_REQUIRED), tool
-        if code == pc.CODE_ALLOWED:
-            allowed.add(tool)
     reads = {t for t in tools if t.removeprefix("mctl_").startswith(("get_", "list_", "read_", "search_", "describe_"))
              or t.removeprefix("mctl_") in ("whoami", "incident_summary", "resolve_agent")}
-    assert allowed == reads | {"mctl_resolve_incident", "mctl_acknowledge_incident"}
+    mutations = {"mctl_resolve_incident", "mctl_acknowledge_incident"}
+    # Any agent holding the mctl server: reads only. The incident responder,
+    # which also grants the two mutations by name: reads plus those two.
+    for grants, expected in ((GRANTS, reads), (RESPONDER_GRANTS, reads | mutations)):
+        allowed = set()
+        for tool in tools:
+            code = _mcp(f"mcp__mctl__{tool}", {}, grants=grants).code
+            if tool in mutations and grants is GRANTS:
+                assert code == pc.CODE_GRANT_MISSING, tool
+                continue
+            assert code in (pc.CODE_ALLOWED, pc.CODE_APPROVAL_REQUIRED), tool
+            if code == pc.CODE_ALLOWED:
+                allowed.add(tool)
+        assert allowed == expected
 
 def test_an_approval_binds_to_the_exact_action_only():
     request = pc.ActionRequest(pc.MCP_TOOL_CALL, DEPLOY, "mctl", pc.args_digest_of({"service": "x", "tag": "1.2.0"}),
@@ -412,7 +452,10 @@ def test_every_builder_with_mcp_installs_the_hook_on_every_mcp_call(tmp_path, mo
         matchers = [m for m in (opts.hooks or {}).get("PreToolUse", []) if m.matcher == "mcp__.*"]
         hooks = [h for m in matchers for h in m.hooks if isinstance(h, options._PolicyCheckpointHook)]
         assert len(hooks) == 1, opts
-        assert hooks[0].grants == tuple(opts.allowed_tools)
+        # The allow-list is the grant set; the incident responder alone adds
+        # the explicit grants for its two incident mutations.
+        extra = pc.AGENT_MUTATION_TOOLS if opts is built[2] else ()
+        assert hooks[0].grants == (*opts.allowed_tools, *extra)
 
 
 # ---------------------------------------------------------------------------

@@ -142,6 +142,16 @@ def _mctl_tool_globs() -> list[str]:
     return ["mcp__mctl__*"] if mctl_mcp_config() else []
 
 
+def _mctl_agent_mutation_tools() -> list[str]:
+    """The incident mutations an agent may make on its own, by exact tool
+    name, when MCP is configured; empty otherwise. The policy checkpoint
+    allows them only on an explicit grant (`Rule.explicit_grant`), so only
+    a builder that lists these grants them: `mcp__mctl__*` does not."""
+    from orchestrator.policy_checkpoint import AGENT_MUTATION_TOOLS
+
+    return list(AGENT_MUTATION_TOOLS) if mctl_mcp_config() else []
+
+
 # The durable human-clarification primitive (mctlhq/mctl-agents#333, ADR 013).
 # A capability entry in `ExecutionPlan.tools`, not an SDK tool name — a model
 # cannot "call" it, so it must never leak into `allowed_tools` (the CLI would
@@ -1052,15 +1062,18 @@ class _DecisionAttemptHook:
 
 
 def _policy_hooks(
-    allowed_tools: list[str], *, delegated_prefix: str = "",
+    allowed_tools: list[str], *, delegated_prefix: str = "", extra_grants: list[str] | None = None,
 ) -> dict[HookEventName, list[HookMatcher]]:
     """Every MCP tool call, whatever the server, meets the checkpoint; the
     builder's own allow-list is the grant set it evaluates against.
     `delegated_prefix` is the one exception, see `_PolicyCheckpointHook`.
+    `extra_grants` adds checkpoint grants that are not SDK tool names, such
+    as the explicit grant a rule with `explicit_grant` needs: the tool itself
+    is already allowed through the allow-list's `mcp__mctl__*`.
 
     With `MCTL_DECISION_RECORDS` on, the PostToolUse pair that closes each
     permitted call's attempt record is added; off, the map is unchanged."""
-    hook = _PolicyCheckpointHook(tuple(allowed_tools), delegated_prefix=delegated_prefix)
+    hook = _PolicyCheckpointHook((*allowed_tools, *(extra_grants or ())), delegated_prefix=delegated_prefix)
     hooks: dict[HookEventName, list[HookMatcher]] = {
         "PreToolUse": [
             HookMatcher(matcher="mcp__.*", hooks=[cast(Any, hook)]),
@@ -1342,6 +1355,10 @@ def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
         model=model,
         # Write/Edit: writes only into _mentor/digest/
         allowed_tools=["Read", "Glob", "Grep", "Write", "Edit", *_mctl_tool_globs()],
+        # With no checkpoint to refuse them, the incident mutations are
+        # removed from the session outright: the mentor reads, it does not
+        # resolve or acknowledge anything.
+        disallowed_tools=_mctl_agent_mutation_tools(),
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=MENTOR_BUDGET_USD,
@@ -1401,7 +1418,13 @@ def build_incident_responder_options(
         permission_mode="acceptEdits",
         max_budget_usd=INCIDENT_RESPONDER_BUDGET_USD,
         env=env,
-        hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
+        # The responder is the one agent that resolves and acknowledges
+        # incidents on its own (profile scope `incident-resolve`), so it is
+        # the one builder whose checkpoint grants those tools by name.
+        hooks=_compose_hooks(
+            _command_audit_hooks(),
+            _policy_hooks(allowed_tools, extra_grants=_mctl_agent_mutation_tools()),
+        ),
     ))
 
 

@@ -166,13 +166,16 @@ class ActionRequest:
 class Rule:
     """First matching rule wins. `operation` is an fnmatch pattern over
     `ActionRequest.operation`. With `requires_grant`, the operation must
-    also match one of the request's grants, or the decision is DENY."""
+    also match one of the request's grants, or the decision is DENY. With
+    `explicit_grant` as well, only a grant with no wildcard counts: a
+    blanket grant such as `mcp__mctl__*` does not cover the operation."""
 
     rule_id: str
     action_kind: str
     operation: str
     verdict: str
     requires_grant: bool = False
+    explicit_grant: bool = False
 
 
 @dataclass(frozen=True)
@@ -327,12 +330,23 @@ _READ_TOOLS = ("whoami", "incident_summary", "resolve_agent")
 #: approves or starts a run: `trigger_issue` starts a paid investigator
 #: run (and could fan out recursively), so like every other trigger it is
 #: gated.
+#:
+#: Allowed for the agent that declares them, not for every agent that holds
+#: the mctl server: the rule needs an explicit grant (`Rule.explicit_grant`),
+#: which only `options.build_incident_responder_options` gives its
+#: checkpoint (`AGENT_MUTATION_TOOLS`). `mcp__mctl__*` alone does not reach them.
 _ALLOWED_MUTATIONS = ("resolve_incident", "acknowledge_incident")
 
 
 def _mctl_tool_patterns(names: tuple[str, ...], *, prefix: bool) -> tuple[str, ...]:
     tail = "*" if prefix else ""
     return tuple(f"mcp__mctl__{p}{n}{tail}" for n in names for p in ("mctl_", ""))
+
+
+#: The SDK tool names of `_ALLOWED_MUTATIONS`, both spellings: the explicit
+#: grants the incident responder carries, and what an agent without hooks
+#: (the mentor) has disallowed outright.
+AGENT_MUTATION_TOOLS = _mctl_tool_patterns(_ALLOWED_MUTATIONS, prefix=False)
 
 
 #: The two operations of `GITHUB_PR_MERGE`. Every merge path picks one from
@@ -403,8 +417,9 @@ BUILTIN_POLICY = Policy(
                             *_mctl_tool_patterns(_READ_TOOLS, prefix=False))
         ),
         *(
-            Rule("mctl-mcp-agent-mutation", MCP_TOOL_CALL, pattern, ALLOW, requires_grant=True)
-            for pattern in _mctl_tool_patterns(_ALLOWED_MUTATIONS, prefix=False)
+            Rule("mctl-mcp-agent-mutation", MCP_TOOL_CALL, pattern, ALLOW, requires_grant=True,
+                 explicit_grant=True)
+            for pattern in AGENT_MUTATION_TOOLS
         ),
         Rule("mctl-mcp-default-approval", MCP_TOOL_CALL, "mcp__mctl__*", REQUIRE_APPROVAL, requires_grant=True),
     ),
@@ -460,6 +475,10 @@ def configured_policy() -> Policy:
     )
 
 
+def _is_wildcard(grant: str) -> bool:
+    return any(c in grant for c in "*?[")
+
+
 def evaluate(policy: Policy, request: ActionRequest) -> tuple[Rule | None, str, str]:
     """(matching rule, code, reason) for request under policy. Pure; raises
     only on a malformed policy, which `decide` turns into a DENY."""
@@ -468,7 +487,16 @@ def evaluate(policy: Policy, request: ActionRequest) -> tuple[Rule | None, str, 
             raise ValueError(f"rule {rule.rule_id!r} has unknown verdict {rule.verdict!r}")
         if rule.action_kind != request.action_kind or not fnmatch.fnmatchcase(request.operation, rule.operation):
             continue
-        if rule.requires_grant and not any(fnmatch.fnmatchcase(request.operation, g) for g in request.grants):
+        if rule.requires_grant and not any(
+            fnmatch.fnmatchcase(request.operation, g)
+            for g in request.grants
+            if not (rule.explicit_grant and _is_wildcard(g))
+        ):
+            if rule.explicit_grant:
+                return rule, CODE_GRANT_MISSING, (
+                    f"{request.operation} is not explicitly granted to this execution; "
+                    "a wildcard grant does not cover it"
+                )
             return rule, CODE_GRANT_MISSING, f"{request.operation} is not granted to this execution"
         code = {ALLOW: CODE_ALLOWED, DENY: CODE_DENIED, REQUIRE_APPROVAL: CODE_APPROVAL_REQUIRED}[rule.verdict]
         return rule, code, f"rule {rule.rule_id}"
