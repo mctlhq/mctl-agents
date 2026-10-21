@@ -218,7 +218,11 @@ class Transport(Protocol):
         self, tool: str, args: Mapping[str, Any], *, credential: CredentialHandle | None, timeout_seconds: float
     ) -> str:
         """Perform one tool call against the bound target and return its raw
-        output text. Raising means the call failed."""
+        output text. Raising means the call failed.
+
+        `timeout_seconds` is the remaining wall-clock budget. `0.0` means the
+        budget is already spent: the call must fail at once rather than block,
+        and never read `0` as "no timeout"."""
         ...
 
 
