@@ -218,6 +218,7 @@ def test_enforce_stops_a_run_whose_token_is_not_scoped(monkeypatch, probe):
         # A refusal from something in front of mctl-api, not the scope.
         httpx.Response(403, content=b"<html>blocked</html>"),
         httpx.Response(429, json=["slow down"]),
+        httpx.Response(429, json={"code": "rate_limited"}),
     ],
 )
 def test_an_unobservable_probe_is_unverified_not_enforced(monkeypatch, capsys, probe):

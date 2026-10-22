@@ -103,7 +103,7 @@ def probe_scope(token: RunToken, get=None) -> bool:
     """Ask for a work item outside the run's scope and check it is refused.
 
     True: refused with agent_scope_denied, so the scope is enforced. False:
-    the probe could not be observed (network error, 5xx, a refusal without
+    the probe could not be observed (network error, 5xx, 429, a refusal without
     mctl-api's error body) -- unknown, never reported as enforced. Raises RunTokenError when
     the call was admitted: the token is not scoped as it must be."""
     get = get or _get
@@ -112,7 +112,9 @@ def probe_scope(token: RunToken, get=None) -> bool:
     except httpx.HTTPError as exc:
         print(f"warn: run token scope probe could not be observed: {exc}")
         return False
-    if resp.status_code >= 500:
+    # A rate limit answers before the scope gate, whoever sets it, so it
+    # says nothing about the scope.
+    if resp.status_code >= 500 or resp.status_code == 429:
         print(f"warn: run token scope probe could not be observed: HTTP {resp.status_code}")
         return False
     if resp.is_success:
