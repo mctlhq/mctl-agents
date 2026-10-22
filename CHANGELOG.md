@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.91.0](https://github.com/mctlhq/mctl-agents/compare/1.90.0...1.91.0) (2026-10-22)
+
+
+### Features
+
+* **investigator:** prove the run token's scope on every enforced run ([7c9b3d6](https://github.com/mctlhq/mctl-agents/commit/7c9b3d6a8a0d8c91a9d9744ecd67ef2f0b0bd630))
+* **investigator:** prove the run token's scope on every enforced run ([7317cbd](https://github.com/mctlhq/mctl-agents/commit/7317cbd1ceb2a4bd65f75c7e7c9f0e4bb2200cf7))
+
+
+### Bug Fixes
+
+* **run-token:** treat a rate-limited scope probe as unverified ([254c33c](https://github.com/mctlhq/mctl-agents/commit/254c33cf8cc1137ab1808fe67305555a1e546d09))
+* **run-token:** treat a refusal without an error body as unverified ([ec4d666](https://github.com/mctlhq/mctl-agents/commit/ec4d6669838ac49d18f077e965b3a0d8988e6528))
+
 ## [1.90.0](https://github.com/mctlhq/mctl-agents/compare/1.89.1...1.90.0) (2026-10-22)
 
 
