@@ -193,6 +193,7 @@ def test_enforce_without_setup_fails_closed(monkeypatch):
     [
         httpx.Response(404, json={"code": "work_item_not_found"}),
         httpx.Response(200, json={"id": "wi_x"}),
+        httpx.Response(200, content=b"<html>ok</html>"),
         httpx.Response(403, json={"code": "forbidden"}),
         httpx.Response(401, json={}),
     ],
@@ -210,7 +211,14 @@ def test_enforce_stops_a_run_whose_token_is_not_scoped(monkeypatch, probe):
 
 @pytest.mark.parametrize(
     "probe",
-    [httpx.ConnectError("down"), httpx.Response(503, json={}), httpx.Response(502, content=b"<html>")],
+    [
+        httpx.ConnectError("down"),
+        httpx.Response(503, json={}),
+        httpx.Response(502, content=b"<html>"),
+        # A refusal from something in front of mctl-api, not the scope.
+        httpx.Response(403, content=b"<html>blocked</html>"),
+        httpx.Response(429, json=["slow down"]),
+    ],
 )
 def test_an_unobservable_probe_is_unverified_not_enforced(monkeypatch, capsys, probe):
     monkeypatch.setenv(run_token.MODE_ENV, "enforce")

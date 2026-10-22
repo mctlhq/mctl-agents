@@ -103,8 +103,8 @@ def probe_scope(token: RunToken, get=None) -> bool:
     """Ask for a work item outside the run's scope and check it is refused.
 
     True: refused with agent_scope_denied, so the scope is enforced. False:
-    the probe could not be observed (network error, 5xx, an unreadable
-    body) -- unknown, never reported as enforced. Raises RunTokenError when
+    the probe could not be observed (network error, 5xx, a refusal without
+    mctl-api's error body) -- unknown, never reported as enforced. Raises RunTokenError when
     the call was admitted: the token is not scoped as it must be."""
     get = get or _get
     try:
@@ -115,13 +115,19 @@ def probe_scope(token: RunToken, get=None) -> bool:
     if resp.status_code >= 500:
         print(f"warn: run token scope probe could not be observed: HTTP {resp.status_code}")
         return False
-    code = ""
+    if resp.is_success:
+        # Answered, whatever the body says: the scope admitted the call.
+        raise RunTokenError(f"scope probe was not refused: HTTP {resp.status_code}")
     try:
         body = resp.json()
     except ValueError:
         body = None
-    if isinstance(body, dict) and isinstance(body.get("code"), str):
-        code = body["code"]
+    if not isinstance(body, dict):
+        # Not mctl-api's error shape (an ingress or WAF page, say): who
+        # answered, and why, is unknown.
+        print(f"warn: run token scope probe could not be observed: HTTP {resp.status_code} without an error body")
+        return False
+    code = body.get("code") if isinstance(body.get("code"), str) else ""
     if resp.status_code == 403 and code == SCOPE_DENIED_CODE:
         return True
     raise RunTokenError(f"scope probe was not refused: HTTP {resp.status_code} {code}".rstrip())
