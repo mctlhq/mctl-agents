@@ -803,6 +803,40 @@ def test_a_failing_result_mapper_never_reaches_the_run(monkeypatch, tmp_path, li
     assert live_post.envelope()["outcome"] == {"code": "failed", "reason_code": "no-outcome-recorded"}
 
 
+def test_a_pr_named_early_survives_a_failed_run(monkeypatch, tmp_path, live_post):
+    """mctlhq/mctl-agents#744: a PR opened before the run errored is the
+    subject (or a required gap), never `not_applicable`."""
+    from orchestrator import run_implementer as ri
+
+    monkeypatch.setenv(ep.AMENDMENT_2_ENV, "true")
+
+    def failing(ref_, dry_run=False):
+        ep.note("note_pushed_head", SHA)
+        ri._note_subject_pr("https://github.com/mctlhq/mctl-agents/pull/7")
+        return ri.ImplementResult(ref=ref_, pr_url=None, error="gitops write conflict")
+
+    monkeypatch.setattr(ri, "_implement_one", failing)
+    ri.implement_one(_implementer_ref(tmp_path))
+    envelope = live_post.envelope()
+    assert envelope["outcome"]["code"] == "failed"
+    assert envelope["subject"] == {"kind": "pull_request", "repository": "mctlhq/mctl-agents", "ref": "7",
+                                   "revision": SHA}
+
+
+def test_a_run_that_names_no_pr_still_seals_subject_not_applicable(monkeypatch, tmp_path, live_post):
+    from orchestrator import run_implementer as ri
+
+    monkeypatch.setenv(ep.AMENDMENT_2_ENV, "true")
+    ri._note_subject_pr(None)
+    monkeypatch.setattr(
+        ri, "_implement_one", lambda ref_, dry_run=False: ri.ImplementResult(ref=ref_, pr_url=None, error="x")
+    )
+    ri.implement_one(_implementer_ref(tmp_path))
+    envelope = live_post.envelope()
+    assert "subject" not in envelope or envelope["subject"] is None
+    assert any(g["block"] == "subject" and g["code"] == "not_applicable" for g in envelope["gaps"])
+
+
 def test_two_proposals_in_one_implementer_batch_post_two_distinct_evidence_ids(monkeypatch, tmp_path, live_post):
     """Claude P3 on #577: an implementer batch shares one ex- id too, so the
     proposal-status record must tell its envelopes apart."""
