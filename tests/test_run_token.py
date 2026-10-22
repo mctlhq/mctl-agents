@@ -23,12 +23,22 @@ def _clean(monkeypatch, tmp_path):
     sa.write_text("k8s-sa-jwt\n")
     monkeypatch.setenv(run_token.SA_TOKEN_FILE_ENV, str(sa))
     monkeypatch.setattr(run_token.atexit, "register", lambda *a, **k: None)
+
+    def no_network(url, bearer):
+        raise AssertionError(f"unexpected real GET {url}")
+
+    monkeypatch.setattr(run_token, "_get", no_network)
     yield
     run_token._reset_for_tests()
 
 
 class FakeAPI:
-    def __init__(self, exchange: httpx.Response | Exception | None = None):
+    def __init__(
+        self,
+        exchange: httpx.Response | Exception | None = None,
+        probe: httpx.Response | Exception | None = None,
+    ):
+        self.probe = probe or httpx.Response(403, json={"code": run_token.SCOPE_DENIED_CODE})
         self.exchange = exchange or httpx.Response(
             201,
             json={
@@ -45,6 +55,10 @@ class FakeAPI:
         self.calls.append((url, bearer))
         if url.endswith(run_token.REVOKE_PATH):
             return httpx.Response(204)
+        if run_token.PROBE_PATH_PREFIX in url:
+            if isinstance(self.probe, Exception):
+                raise self.probe
+            return self.probe
         if isinstance(self.exchange, Exception):
             raise self.exchange
         return self.exchange
@@ -56,7 +70,7 @@ def _mcp_headers() -> dict[str, str]:
 
 def test_off_is_unchanged():
     api = FakeAPI()
-    run_token.setup("investigate", post=api)
+    run_token.setup("investigate", post=api, get=api)
     assert api.calls == []
     headers = _mcp_headers()
     assert headers["Authorization"] == f"Bearer {STATIC}"
@@ -72,9 +86,12 @@ def test_unknown_mode_is_an_error_not_off(monkeypatch):
 def test_enforce_connects_with_the_run_token(monkeypatch):
     monkeypatch.setenv(run_token.MODE_ENV, "enforce")
     api = FakeAPI()
-    run_token.setup("investigate", post=api)
-    # Only the Kubernetes token is sent; mctl-api decides the rest.
-    assert api.calls == [("https://api.mctl.ai" + run_token.EXCHANGE_PATH, "k8s-sa-jwt")]
+    run_token.setup("investigate", post=api, get=api)
+    # Only the Kubernetes token is sent; mctl-api decides the rest. Then the
+    # run token itself proves it is refused outside its scope.
+    assert api.calls[0] == ("https://api.mctl.ai" + run_token.EXCHANGE_PATH, "k8s-sa-jwt")
+    assert len(api.calls) == 2
+    assert run_token.PROBE_PATH_PREFIX in api.calls[1][0] and api.calls[1][1] == RUN
     headers = _mcp_headers()
     assert headers["Authorization"] == f"Bearer {RUN}"
     assert STATIC not in str(options.mctl_mcp_config())
@@ -84,7 +101,8 @@ def test_enforce_connects_with_the_run_token(monkeypatch):
 def test_enforce_without_a_static_token_still_connects(monkeypatch):
     monkeypatch.setenv(run_token.MODE_ENV, "enforce")
     monkeypatch.delenv("MCTL_TOKEN")
-    run_token.setup("investigate", post=FakeAPI())
+    api = FakeAPI()
+    run_token.setup("investigate", post=api, get=api)
     assert _mcp_headers()["Authorization"] == f"Bearer {RUN}"
 
 
@@ -113,7 +131,7 @@ def test_enforce_without_a_projected_token_fails_closed(monkeypatch, tmp_path):
 def test_observe_proves_the_exchange_then_shadows_on_the_static_token(monkeypatch):
     monkeypatch.setenv(run_token.MODE_ENV, "observe")
     api = FakeAPI()
-    run_token.setup("investigate", post=api)
+    run_token.setup("investigate", post=api, get=api)
     # The exchanged token is revoked at once, with itself.
     assert api.calls[-1] == ("https://api.mctl.ai" + run_token.REVOKE_PATH, RUN)
     headers = _mcp_headers()
@@ -168,3 +186,43 @@ def test_enforce_without_setup_fails_closed(monkeypatch):
     monkeypatch.setenv(run_token.MODE_ENV, "enforce")
     with pytest.raises(run_token.RunTokenError, match=r"call run_token.setup\(\) first"):
         options.mctl_mcp_config()
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        httpx.Response(404, json={"code": "work_item_not_found"}),
+        httpx.Response(200, json={"id": "wi_x"}),
+        httpx.Response(403, json={"code": "forbidden"}),
+        httpx.Response(401, json={}),
+    ],
+)
+def test_enforce_stops_a_run_whose_token_is_not_scoped(monkeypatch, probe):
+    monkeypatch.setenv(run_token.MODE_ENV, "enforce")
+    api = FakeAPI(probe=probe)
+    with pytest.raises(run_token.RunTokenError, match="scope probe was not refused"):
+        run_token.setup("investigate", post=api, get=api)
+    # The admitted token is revoked, and nothing connects with it.
+    assert api.calls[-1] == ("https://api.mctl.ai" + run_token.REVOKE_PATH, RUN)
+    with pytest.raises(run_token.RunTokenError):
+        options.mctl_mcp_config()
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [httpx.ConnectError("down"), httpx.Response(503, json={}), httpx.Response(502, content=b"<html>")],
+)
+def test_an_unobservable_probe_is_unverified_not_enforced(monkeypatch, capsys, probe):
+    monkeypatch.setenv(run_token.MODE_ENV, "enforce")
+    api = FakeAPI(probe=probe)
+    run_token.setup("investigate", post=api, get=api)
+    out = capsys.readouterr().out
+    assert "out-of-scope probe unverified" in out and "refused as expected" not in out
+    assert _mcp_headers()["Authorization"] == f"Bearer {RUN}"
+
+
+def test_enforce_logs_a_refused_probe(monkeypatch, capsys):
+    monkeypatch.setenv(run_token.MODE_ENV, "enforce")
+    api = FakeAPI()
+    run_token.setup("investigate", post=api, get=api)
+    assert "out-of-scope probe refused as expected" in capsys.readouterr().out
