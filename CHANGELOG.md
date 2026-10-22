@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.90.0](https://github.com/mctlhq/mctl-agents/compare/1.89.1...1.90.0) (2026-10-22)
+
+
+### Features
+
+* **agents:** issue-744-fix-evidence-pr-opened-then-run-errors-r ([b376886](https://github.com/mctlhq/mctl-agents/commit/b376886bb42479ad4d80cb068c49185d93aa38c8))
+* **investigator:** scoped run token for the MCP connection ([7812265](https://github.com/mctlhq/mctl-agents/commit/781226591e3e618207e97a2e72e551aa7185d9a1))
+
+
+### Bug Fixes
+
+* **agents:** issue-744-fix-evidence-pr-opened-then-run-errors-r ([d3883c2](https://github.com/mctlhq/mctl-agents/commit/d3883c24c8a3d8ad2217cda4b22e7075f47c7a0f))
+
 ## [1.89.1](https://github.com/mctlhq/mctl-agents/compare/1.89.0...1.89.1) (2026-10-22)
 
 
