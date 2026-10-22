@@ -123,14 +123,19 @@ def mctl_mcp_config(*, always_load: bool = False) -> dict:
     # early-return, so require mode fails closed even with no MCTL_TOKEN
     # (the hook-time raise below stays as backstop).
     identity_headers = _execution_context_headers()
-    token = os.environ.get("MCTL_TOKEN", "").strip()
+    # A run that set up a scoped run token (orchestrator.run_token,
+    # mctlhq/mctl-agents#737) connects with it, or shadows its scope on the
+    # static token; any other run is unchanged.
+    from orchestrator import run_token
+
+    token, scope_headers = run_token.mcp_auth(os.environ.get("MCTL_TOKEN", "").strip())
     if not token:
         print("warn: MCTL_TOKEN is not set — agent will run without mctl MCP tools.")
         return {}
     server_config: dict[str, Any] = {
         "type": "http",
         "url": MCTL_MCP_URL,
-        "headers": {"Authorization": f"Bearer {token}", **identity_headers},
+        "headers": {"Authorization": f"Bearer {token}", **identity_headers, **scope_headers},
     }
     if always_load:
         server_config["alwaysLoad"] = True

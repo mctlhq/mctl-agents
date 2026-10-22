@@ -4659,6 +4659,11 @@ def main() -> None:
         from orchestrator.auth import ensure_auth_for_sdk  # deferred — see the import note at the top
 
         ensure_auth_for_sdk()
+        # Before any options are built: the MCP connection takes its
+        # credential from here (mctlhq/mctl-agents#737).
+        from orchestrator import run_token  # deferred — see the import note at the top
+
+        run_token.setup(shadow_scope="investigate")
 
     try:
         result = investigate(
