@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.89.1](https://github.com/mctlhq/mctl-agents/compare/1.89.0...1.89.1) (2026-10-22)
+
+
+### Bug Fixes
+
+* **investigator:** name the channel for approving with amendments ([7a0a49f](https://github.com/mctlhq/mctl-agents/commit/7a0a49f837b7df78aab8a07bc05c6d9a7d6e6bbb))
+* **investigator:** name the channel for approving with amendments ([72c9e7d](https://github.com/mctlhq/mctl-agents/commit/72c9e7d85130001673b51c78c6a0a3e18dcb2cdf)), closes [#729](https://github.com/mctlhq/mctl-agents/issues/729)
+
 ## [1.89.0](https://github.com/mctlhq/mctl-agents/compare/1.88.4...1.89.0) (2026-10-21)
 
 
