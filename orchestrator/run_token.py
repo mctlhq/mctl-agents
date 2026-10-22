@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,6 +48,10 @@ MODES = (MODE_OFF, MODE_OBSERVE, MODE_ENFORCE)
 
 EXCHANGE_PATH = "/api/v1/agent-run-tokens/exchange"
 REVOKE_PATH = "/api/v1/agent-run-tokens/self/revoke"
+# A work item no run is bound to: the scope must refuse it. A read of an id
+# that does not exist is harmless even if it were admitted.
+PROBE_PATH_PREFIX = "/api/v1/work-items/wi_scope_probe_"
+SCOPE_DENIED_CODE = "agent_scope_denied"
 REQUEST_TIMEOUT_SECONDS = 15.0
 
 
@@ -88,6 +93,46 @@ def _api_base() -> str:
 
 def _post(url: str, bearer: str) -> httpx.Response:
     return httpx.post(url, headers={"Authorization": f"Bearer {bearer}"}, timeout=REQUEST_TIMEOUT_SECONDS)
+
+
+def _get(url: str, bearer: str) -> httpx.Response:
+    return httpx.get(url, headers={"Authorization": f"Bearer {bearer}"}, timeout=REQUEST_TIMEOUT_SECONDS)
+
+
+def probe_scope(token: RunToken, get=None) -> bool:
+    """Ask for a work item outside the run's scope and check it is refused.
+
+    True: refused with agent_scope_denied, so the scope is enforced. False:
+    the probe could not be observed (network error, 5xx, 429, a refusal without
+    mctl-api's error body) -- unknown, never reported as enforced. Raises RunTokenError when
+    the call was admitted: the token is not scoped as it must be."""
+    get = get or _get
+    try:
+        resp = get(_api_base() + PROBE_PATH_PREFIX + uuid.uuid4().hex, token.token)
+    except httpx.HTTPError as exc:
+        print(f"warn: run token scope probe could not be observed: {exc}")
+        return False
+    # A rate limit answers before the scope gate, whoever sets it, so it
+    # says nothing about the scope.
+    if resp.status_code >= 500 or resp.status_code == 429:
+        print(f"warn: run token scope probe could not be observed: HTTP {resp.status_code}")
+        return False
+    if resp.is_success:
+        # Answered, whatever the body says: the scope admitted the call.
+        raise RunTokenError(f"scope probe was not refused: HTTP {resp.status_code}")
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        # Not mctl-api's error shape (an ingress or WAF page, say): who
+        # answered, and why, is unknown.
+        print(f"warn: run token scope probe could not be observed: HTTP {resp.status_code} without an error body")
+        return False
+    code = body.get("code") if isinstance(body.get("code"), str) else ""
+    if resp.status_code == 403 and code == SCOPE_DENIED_CODE:
+        return True
+    raise RunTokenError(f"scope probe was not refused: HTTP {resp.status_code} {code}".rstrip())
 
 
 def exchange(sa_token_file: str | None = None, post=_post) -> RunToken:
@@ -149,7 +194,7 @@ def revoke(token: RunToken, post=_post) -> None:
         print(f"warn: run token {token.token_id} revoke failed: {exc}")
 
 
-def setup(shadow_scope: str, post=_post) -> None:
+def setup(shadow_scope: str, post=_post, get=None) -> None:
     """Acquire this run's token per MCTL_RUN_TOKEN_MODE. Call once, before the
     agent's options are built. shadow_scope is the scope observe mode names
     when the exchange itself failed; otherwise mctl-api's answer is used."""
@@ -159,9 +204,20 @@ def setup(shadow_scope: str, post=_post) -> None:
         return
     if m == MODE_ENFORCE:
         tok = exchange(post=post)
+        # Prove the scope before the agent relies on it: a token that is
+        # not refused outside its scope is revoked and the run stops.
+        try:
+            enforced = probe_scope(tok, get=get)
+        except RunTokenError:
+            revoke(tok, post)
+            raise
         _state.token, _state.scope = tok, tok.scope
         atexit.register(revoke, tok, post)
-        print(f"run token: enforce, scope={tok.scope} token_id={tok.token_id} expires_at={tok.expires_at}")
+        probe = "refused as expected" if enforced else "unverified"
+        print(
+            f"run token: enforce, scope={tok.scope} token_id={tok.token_id} "
+            f"expires_at={tok.expires_at}; out-of-scope probe {probe}"
+        )
         return
     try:
         tok = exchange(post=post)
