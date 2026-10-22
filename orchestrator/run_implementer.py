@@ -3192,6 +3192,7 @@ def _review_feedback_attempt(
         # check could not (store unreachable, rollout below `enforce`).
         _push_followup(target, branch, old_head, claim_context=claim_ctx, repo=f"mctlhq/{ref.service}")
         _note_pushed_head(target)
+        _note_subject_pr(str(pre_status.get("pr") or ""))
         _note_pushed(target, obs)
 
         # 8. Read the existing PR URL from `.status.yaml` for the result
@@ -3361,6 +3362,14 @@ def _note_pushed_head(repo_dir: Path) -> None:
     except Exception:  # noqa: BLE001 — evidence bookkeeping must never fail the run
         return
     evidence_producer.note("note_pushed_head", sha)
+
+
+def _note_subject_pr(pr_url: str | None, head_sha: str | None = None) -> None:
+    """Name the PR this run acted on to its evidence as soon as it is known,
+    so a later failure seals a bound subject or a required gap, never
+    `not_applicable` (mctlhq/mctl-agents#744). Never fatal."""
+    if pr_url:
+        evidence_producer.note("note_subject_pr_url", pr_url, head_sha)
 
 
 def _capture_head_sha(repo_dir: Path, *, timeout: float | None = None) -> str:
@@ -4488,6 +4497,8 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             counts_toward_limit=False,
         )
 
+    if existing.action in ("open", "merged", "closed", "needs-triage"):
+        _note_subject_pr(existing.pr_url, existing.head_sha)
     if existing.action == "open":
         update_status_yaml(
             ref,
@@ -4947,6 +4958,7 @@ def _implement_attempt(
         # 7. Push + PR.
         pr_url = _push_and_open_pr(target, ref, claim_context=claim_ctx)
         _note_pushed_head(target)
+        _note_subject_pr(pr_url)
         _note_pushed(target, obs)
 
         # 8. Mark implemented.
