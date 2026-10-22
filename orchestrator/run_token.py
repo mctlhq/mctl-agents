@@ -106,9 +106,12 @@ def exchange(sa_token_file: str | None = None, post=_post) -> RunToken:
     if resp.status_code != 201:
         code = ""
         try:
-            code = str(resp.json().get("code", ""))
+            err = resp.json()
         except ValueError:
-            pass
+            err = None
+        # Whatever answered (a proxy, a gateway) may send any JSON or none.
+        if isinstance(err, dict) and isinstance(err.get("code"), str):
+            code = err["code"]
         raise RunTokenError(f"run token exchange refused: HTTP {resp.status_code} {code}".rstrip())
     # A malformed success body is a failed exchange like any other, so it
     # stays inside RunTokenError and observe mode's catch.

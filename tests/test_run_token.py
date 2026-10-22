@@ -142,6 +142,10 @@ def test_revoke_never_raises():
         httpx.Response(201, content=b"not json"),
         httpx.Response(201, json=["art_x"]),
         httpx.Response(201, json={"token": None}),
+        httpx.Response(502, json=["bad gateway"]),
+        httpx.Response(503, json="unavailable"),
+        httpx.Response(403, json=None),
+        httpx.Response(500, content=b"<html>oops</html>"),
     ],
 )
 def test_a_malformed_success_body_is_a_failed_exchange(monkeypatch, answer):
