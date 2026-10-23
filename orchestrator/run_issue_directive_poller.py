@@ -42,7 +42,9 @@ report is blind to the same issue too. This is a scope decision, not an
 oversight: a directive on a fully closed-out issue has nothing left to
 reopen through this path (claude P3 on head `f7a42ab`).
 
-This module never starts or signals a DevLoopWorkflow, and never touches
+This module reads (describe + `work_context` query, via
+`orchestrator.directive_execution`) the issue's DevLoopWorkflow to borrow its
+execution identity, but never starts, signals or updates one, and never touches
 the `agents:intake` label: the comment path and the label path are
 independent by construction (see tests/test_run_issue_directive_poller.py's
 acceptance test).
@@ -67,6 +69,12 @@ from dataclasses import dataclass
 import httpx
 
 from orchestrator import policy_checkpoint
+from orchestrator.directive_execution import (
+    ExecutionLookupUnavailable,
+    LoopExecution,
+    NoExecution,
+    resolve_loop_execution,
+)
 from orchestrator.directives import (
     VERBS,
     Directive,
@@ -90,6 +98,7 @@ from orchestrator.run_issue_investigator import (
 )
 from orchestrator.temporal.activities.gitops_state import ProposalStateRef, list_proposal_refs
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
+from orchestrator.work_context.snapshots import is_store_execution
 
 # A tick dispatches at most this many directives. Unlike run_issue_poller's
 # --max-issues (starting a workflow is cheap), a directive dispatch starts a
@@ -258,7 +267,9 @@ def read_issue_comments(issue_url: str) -> list[RawComment]:
     return comments
 
 
-async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> str:
+async def submit_investigate(
+    issue_url: str, slug: str, requested_by: str, execution: LoopExecution
+) -> str:
     """POST the `mctl-agents-investigate` operation and return the Argo
     workflow name mctl-api hands back.
 
@@ -267,6 +278,13 @@ async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> st
     runs synchronously inside a 15-minute tick and only needs the name to
     reply with — the investigation itself runs independently in Argo, the
     same as every other consumer of this operation.
+
+    `execution` is the owning DevLoop's identity (mctl-agents#758): mctl-api's
+    run-token binder refuses a Workflow with no `execution_id`, so
+    `work_item_id`, `execution_id`, `temporal_workflow_id` and
+    `temporal_run_id` are forwarded exactly as the loop forwards them for its
+    own investigate step. A non-`we_` execution id raises `ValueError` before
+    the policy checkpoint or any request.
 
     `slug` and `requested_by` are both accepted for the caller's own
     logging/reply purposes only and are NOT sent as CWFT parameters (codex
@@ -308,7 +326,18 @@ async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> st
     `httpx.HTTPStatusError` — mctl-api affirmatively rejected the request,
     so nothing could have started and the caller's normal retry is safe.
     """
-    params = {"issue_url": issue_url}
+    if not is_store_execution(execution.execution_id):
+        raise ValueError(
+            f"refusing to submit {INVESTIGATE_OPERATION} without a store execution id "
+            f"(got {execution.execution_id!r})"
+        )
+    params = {
+        "issue_url": issue_url,
+        "work_item_id": execution.work_item_id,
+        "execution_id": execution.execution_id,
+        "temporal_workflow_id": execution.workflow_id,
+        "temporal_run_id": execution.run_id,
+    }
     # The policy checkpoint (#197) sits immediately before the POST: a
     # refusal raises PolicyRefused before any request leaves this process.
     policy_checkpoint.require(policy_checkpoint.checkpoint(
@@ -316,7 +345,7 @@ async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> st
         f"execute:{INVESTIGATE_OPERATION}",
         INVESTIGATE_OPERATION,
         params,
-        metadata={"issue_url": issue_url},
+        metadata={"issue_url": issue_url, "execution_id": execution.execution_id},
     ))
     async with httpx.AsyncClient(base_url=MCTL_API_BASE_URL, timeout=_SUBMIT_TIMEOUT_SECONDS) as client:
         try:
@@ -472,10 +501,23 @@ def _reply_not_overwritable(author: str, comment_id: str, status: str) -> str:
     )
 
 
-def _reply_dispatched(author: str, comment_id: str, workflow_name: str, service: str, slug: str) -> str:
+def _reply_no_execution(author: str, comment_id: str, reason: str) -> str:
+    return _with_ack(
+        f"@{author} cannot re-investigate this issue ({reason}): investigate runs need the "
+        "execution identity of a live DevLoop. Start or resume the loop (apply the "
+        "`agents:intake` label, or `mctl_trigger_issue` with `use_temporal=true`), then "
+        "comment `@MCTL reinvestigate` again.",
+        comment_id,
+    )
+
+
+def _reply_dispatched(
+    author: str, comment_id: str, workflow_name: str, service: str, slug: str, execution_id: str = ""
+) -> str:
+    bound = f" bound to the DevLoop execution `{execution_id}`" if execution_id else ""
     return _with_ack(
         f"@{author} re-investigation started: Argo workflow `{workflow_name}` "
-        f"({service}/{slug}).",
+        f"({service}/{slug}){bound}.",
         comment_id,
     )
 
@@ -592,6 +634,74 @@ class PolicyCheckpointUndecided(RuntimeError):
         self.decision = decision
 
 
+async def _record_dispatch_failure(
+    directive: Directive, issue_url: str, e: Exception, prior_failures: int
+) -> str:
+    """Shared retry/give-up accounting for a failed (or unattempted) dispatch."""
+    attempt = prior_failures + 1
+    _log_dispatch_error(
+        f"dispatch attempt {attempt}/{MAX_DISPATCH_ATTEMPTS} failed for directive comment "
+        f"{directive.comment_id} ({issue_url})",
+        e,
+    )
+    if attempt >= MAX_DISPATCH_ATTEMPTS:
+        # Visible in the poller's own log stream, not only in the
+        # buried GitHub comment: this is the permanent give-up path
+        # (the reply below carries the ack trailer, so no later tick
+        # retries this comment id) — an operator monitoring the
+        # poller's logs must be able to see it happened without
+        # having to notice the GitHub comment (codex review on #417).
+        print(
+            f"FAIL: giving up on directive comment {directive.comment_id} "
+            f"({issue_url}) after {attempt} dispatch attempts — "
+            "acking; an operator must resubmit manually."
+        )
+        await asyncio.to_thread(
+            _post_reply,
+            issue_url,
+            _with_ack(_reply_dispatch_gave_up(directive.author, e, attempt), directive.comment_id),
+        )
+    else:
+        try:
+            await asyncio.to_thread(
+                _post_reply_with_retries,
+                issue_url,
+                f"{_reply_dispatch_failed(directive.author, e, attempt)}\n\n"
+                f"{fail_trailer(directive.comment_id)}",
+            )
+        except (subprocess.CalledProcessError, policy_checkpoint.PolicyRefused) as post_e:
+            # Even after MARKER_POST_ATTEMPTS in-process retries, the
+            # retry-marker write itself failed — `prior_failures` is
+            # only ever recomputed from `fail_trailer` markers
+            # already posted (there is no other durable store; see
+            # the module docstring), so letting this exception
+            # propagate would leave `attempt` unchanged on the next
+            # tick and retry forever without ever recording progress
+            # toward the give-up bound. This is a distinct failure
+            # from ordinary dispatch exhaustion — a GitHub write
+            # failure, not `MAX_DISPATCH_ATTEMPTS` genuinely being
+            # reached (claude P3 on #421: the previous reply here
+            # reused `_reply_dispatch_gave_up`, whose wording claims
+            # the dispatch itself failed `attempt` times, which
+            # is not what happened). Escalate straight to give-up
+            # for this attempt instead of silently looping, but say
+            # why with `_reply_dispatch_marker_write_failed`.
+            print(
+                f"FAIL: could not post retry marker for directive comment "
+                f"{directive.comment_id} ({issue_url}) after dispatch attempt "
+                f"{attempt} ({post_e}) — escalating straight to give-up since "
+                "progress cannot be recorded without a working GitHub write."
+            )
+            await asyncio.to_thread(
+                _post_reply,
+                issue_url,
+                _with_ack(
+                    _reply_dispatch_marker_write_failed(directive.author, e), directive.comment_id
+                ),
+            )
+    return "dispatch-failed"
+
+
 async def _handle_directive(
     directive: Directive,
     *,
@@ -604,7 +714,7 @@ async def _handle_directive(
     """Run the decision table for one unacked directive. Returns one of:
     "unauthorized", "unrecognised", "no-proposal", "ambiguous",
     "not-overwritable", "dispatched", "dispatch-failed",
-    "dispatch-ambiguous", "policy-refused", or "dry-run".
+    "dispatch-ambiguous", "policy-refused", "no-execution", or "dry-run".
 
     `prior_failures` is the number of previously recorded dispatch-failure
     attempts for this exact comment id (`orchestrator.directives.
@@ -671,14 +781,35 @@ async def _handle_directive(
         else:
             outcome, body = "dispatch", ""
 
+    execution: LoopExecution | None = None
+    if outcome == "dispatch":
+        # Resolved before the dry-run branch, the policy checkpoint and the
+        # POST. ExecutionLookupUnavailable is deliberately NOT caught here
+        # beyond the retry accounting below: it shares the generic
+        # dispatch-failure policy (unacked, MAX_DISPATCH_ATTEMPTS).
+        try:
+            execution = await resolve_loop_execution(issue_url)
+        except NoExecution as e:
+            outcome, body = "no-execution", _reply_no_execution(directive.author, directive.comment_id, str(e))
+        except ExecutionLookupUnavailable as e:
+            if dry_run:
+                print(f"[dry-run] {issue_url} comment {directive.comment_id}: execution lookup unavailable: {e}")
+                return "dry-run"
+            return await _record_dispatch_failure(directive, issue_url, e, prior_failures)
+
     if dry_run:
+        if execution is not None:
+            print(
+                f"[dry-run] {issue_url} comment {directive.comment_id}: would forward "
+                f"work_item_id={execution.work_item_id} execution_id={execution.execution_id}"
+            )
         print(f"[dry-run] {issue_url} comment {directive.comment_id}: would reply/act as '{outcome}'")
         return "dry-run"
 
     if outcome == "dispatch":
         try:
             try:
-                workflow_name = await submit_investigate(issue_url, ref.slug, directive.author)
+                workflow_name = await submit_investigate(issue_url, ref.slug, directive.author, execution)
             except policy_checkpoint.PolicyRefused as e:
                 if e.decision.undecided:
                     # The checkpoint could not decide (evaluator, identity
@@ -734,68 +865,7 @@ async def _handle_directive(
                 raise
             return "dispatch-ambiguous"
         except Exception as e:  # noqa: BLE001 — surfaced as a per-directive failure, comment kept unacked for retry
-            attempt = prior_failures + 1
-            _log_dispatch_error(
-                f"dispatch attempt {attempt}/{MAX_DISPATCH_ATTEMPTS} failed for directive comment "
-                f"{directive.comment_id} ({issue_url})",
-                e,
-            )
-            if attempt >= MAX_DISPATCH_ATTEMPTS:
-                # Visible in the poller's own log stream, not only in the
-                # buried GitHub comment: this is the permanent give-up path
-                # (the reply below carries the ack trailer, so no later tick
-                # retries this comment id) — an operator monitoring the
-                # poller's logs must be able to see it happened without
-                # having to notice the GitHub comment (codex review on #417).
-                print(
-                    f"FAIL: giving up on directive comment {directive.comment_id} "
-                    f"({issue_url}) after {attempt} dispatch attempts — "
-                    "acking; an operator must resubmit manually."
-                )
-                await asyncio.to_thread(
-                    _post_reply,
-                    issue_url,
-                    _with_ack(_reply_dispatch_gave_up(directive.author, e, attempt), directive.comment_id),
-                )
-            else:
-                try:
-                    await asyncio.to_thread(
-                        _post_reply_with_retries,
-                        issue_url,
-                        f"{_reply_dispatch_failed(directive.author, e, attempt)}\n\n"
-                        f"{fail_trailer(directive.comment_id)}",
-                    )
-                except (subprocess.CalledProcessError, policy_checkpoint.PolicyRefused) as post_e:
-                    # Even after MARKER_POST_ATTEMPTS in-process retries, the
-                    # retry-marker write itself failed — `prior_failures` is
-                    # only ever recomputed from `fail_trailer` markers
-                    # already posted (there is no other durable store; see
-                    # the module docstring), so letting this exception
-                    # propagate would leave `attempt` unchanged on the next
-                    # tick and retry forever without ever recording progress
-                    # toward the give-up bound. This is a distinct failure
-                    # from ordinary dispatch exhaustion — a GitHub write
-                    # failure, not `MAX_DISPATCH_ATTEMPTS` genuinely being
-                    # reached (claude P3 on #421: the previous reply here
-                    # reused `_reply_dispatch_gave_up`, whose wording claims
-                    # the dispatch itself failed `attempt` times, which
-                    # is not what happened). Escalate straight to give-up
-                    # for this attempt instead of silently looping, but say
-                    # why with `_reply_dispatch_marker_write_failed`.
-                    print(
-                        f"FAIL: could not post retry marker for directive comment "
-                        f"{directive.comment_id} ({issue_url}) after dispatch attempt "
-                        f"{attempt} ({post_e}) — escalating straight to give-up since "
-                        "progress cannot be recorded without a working GitHub write."
-                    )
-                    await asyncio.to_thread(
-                        _post_reply,
-                        issue_url,
-                        _with_ack(
-                            _reply_dispatch_marker_write_failed(directive.author, e), directive.comment_id
-                        ),
-                    )
-            return "dispatch-failed"
+            return await _record_dispatch_failure(directive, issue_url, e, prior_failures)
         try:
             # `_post_reply_with_retries`, not bare `_post_reply` (agy P2 on
             # #421): the ack trailer this reply carries is the ONLY record
@@ -807,7 +877,10 @@ async def _handle_directive(
             await asyncio.to_thread(
                 _post_reply_with_retries,
                 issue_url,
-                _reply_dispatched(directive.author, directive.comment_id, workflow_name, ref.service, ref.slug),
+                _reply_dispatched(
+                    directive.author, directive.comment_id, workflow_name, ref.service, ref.slug,
+                    execution.execution_id,
+                ),
             )
         except (subprocess.CalledProcessError, policy_checkpoint.PolicyRefused) as post_e:
             # Even MARKER_POST_ATTEMPTS in-process retries could not write
@@ -825,6 +898,11 @@ async def _handle_directive(
             )
             raise
         return "dispatched"
+
+    if outcome == "no-execution":
+        # A definite answer: acked at once (the body carries the trailer).
+        await asyncio.to_thread(_post_reply_with_retries, issue_url, body)
+        return outcome
 
     await asyncio.to_thread(_post_reply, issue_url, body)
     return outcome

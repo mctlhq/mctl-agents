@@ -18,6 +18,7 @@ import httpx
 import pytest
 
 from orchestrator import run_issue_directive_poller
+from orchestrator.directive_execution import ExecutionLookupUnavailable, LoopExecution, NoExecution
 from orchestrator.directives import BOT_LOGINS, Directive, ack_trailer, acked_comment_ids
 from orchestrator.run_issue_directive_poller import (
     DirectiveScanResult,
@@ -27,6 +28,21 @@ from orchestrator.run_issue_directive_poller import (
     submit_investigate,
 )
 from orchestrator.temporal.activities.gitops_state import ProposalStateRef
+
+
+EXECUTION = LoopExecution(
+    work_item_id="wi_x", execution_id="we_y",
+    workflow_id="dev-loop-mctlhq-mctl-web-9", run_id="run-1",
+)
+
+
+@pytest.fixture(autouse=True)
+def _live_loop(monkeypatch):
+    """Default: the issue has a live canonical DevLoop (mctl-agents#758)."""
+    async def _resolve(issue_url):
+        return EXECUTION
+
+    monkeypatch.setattr(run_issue_directive_poller, "resolve_loop_execution", _resolve)
 
 
 def _mock_async_client(monkeypatch, handler):
@@ -133,7 +149,7 @@ def _refs_stub(refs: list[ProposalStateRef]):
 
 
 def _recording_submit(calls: list):
-    async def _inner(issue_url, slug, requested_by):
+    async def _inner(issue_url, slug, requested_by, execution=None):
         calls.append((issue_url, slug, requested_by))
         return f"wf-{len(calls)}"
     return _inner
@@ -775,7 +791,7 @@ def test_issue_url_for_a_non_issue_slug_is_none():
 def _submit(monkeypatch, handler):
     monkeypatch.setenv("MCTL_TOKEN", "test-token")
     _mock_async_client(monkeypatch, handler)
-    return asyncio.run(submit_investigate("https://github.com/mctlhq/mctl-web/issues/9", "issue-9-fix", "octocat"))
+    return asyncio.run(submit_investigate("https://github.com/mctlhq/mctl-web/issues/9", "issue-9-fix", "octocat", EXECUTION))
 
 
 def test_submit_investigate_on_a_definite_rejection_raises_http_status_error_not_ambiguous(monkeypatch):
@@ -794,7 +810,8 @@ def test_submit_investigate_on_a_clean_success_returns_the_workflow_name(monkeyp
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["authorization"] == "Bearer test-token"
         body = json.loads(request.content)
-        assert body == {"issue_url": "https://github.com/mctlhq/mctl-web/issues/9"}
+        assert body["issue_url"] == "https://github.com/mctlhq/mctl-web/issues/9"
+        assert body["execution_id"] == "we_y"
         return httpx.Response(200, json={"workflow": {"workflowName": "wf-abc123"}})
 
     assert _submit(monkeypatch, handler) == "wf-abc123"
@@ -1145,3 +1162,105 @@ def test_read_issue_comments_rejects_a_url_it_cannot_turn_into_a_rest_path(monke
                 "https://github.com/someone-else/mctl-agents/issues/395"):
         with pytest.raises(ValueError):
             run_issue_directive_poller.read_issue_comments(bad)
+
+
+# ---------------------------------------------------------------------------
+# mctl-agents#758 — the run carries the owning DevLoop's execution identity
+# ---------------------------------------------------------------------------
+def _one_directive(monkeypatch, gh=None):
+    gh = gh or FakeGitHub()
+    ref = _ref()
+    issue_url = run_issue_directive_poller.issue_url_for(ref.service, ref.slug)
+    gh.add_comment(issue_url)
+    monkeypatch.setattr(run_issue_directive_poller, "_run", gh.run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref]))
+    return gh, issue_url
+
+
+def test_submit_forwards_the_loop_execution_identity(monkeypatch):
+    posted: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        return httpx.Response(200, json={"workflow": {"workflowName": "wf-1"}})
+
+    assert _submit(monkeypatch, handler) == "wf-1"
+    assert posted == [{
+        "issue_url": "https://github.com/mctlhq/mctl-web/issues/9",
+        "work_item_id": "wi_x",
+        "execution_id": "we_y",
+        "temporal_workflow_id": "dev-loop-mctlhq-mctl-web-9",
+        "temporal_run_id": "run-1",
+    }]
+
+
+def test_submit_with_a_non_store_execution_raises_before_checkpoint_or_post(monkeypatch):
+    def boom(*_a, **_k):
+        raise AssertionError("no checkpoint or POST may happen")
+
+    monkeypatch.setattr(run_issue_directive_poller.policy_checkpoint, "require", boom)
+    _mock_async_client(monkeypatch, boom)
+    bad = replace(EXECUTION, execution_id="deadbeef")
+    with pytest.raises(ValueError):
+        asyncio.run(submit_investigate("https://github.com/mctlhq/mctl-web/issues/9", "s", "o", bad))
+
+
+@pytest.mark.parametrize("reason", ["no-live-loop", "loop-not-canonical", "no-work-item"])
+def test_no_execution_replies_once_acked_and_never_submits(monkeypatch, reason):
+    gh, issue_url = _one_directive(monkeypatch)
+
+    async def _resolve(_url):
+        raise NoExecution(reason)
+
+    monkeypatch.setattr(run_issue_directive_poller, "resolve_loop_execution", _resolve)
+    submits: list = []
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _recording_submit(submits))
+    required: list = []
+    monkeypatch.setattr(
+        run_issue_directive_poller.policy_checkpoint, "require",
+        lambda decision: required.append(decision),
+    )
+
+    result = _run_scan(max_directives=10)
+    assert submits == []
+    assert result.dispatched == 0 and result.replied == 1
+    replies = [c for c in gh.comments[issue_url] if c["user"]["login"] == "mctl-agents[bot]"]
+    assert len(replies) == 1
+    assert reason in replies[0]["body"]
+    assert "c1" in acked_comment_ids([
+        run_issue_directive_poller.RawComment(
+            id=str(c["node_id"]), author=c["user"]["login"], body=c["body"],
+            created_at=c["created_at"], author_association=c["author_association"],
+        ) for c in gh.comments[issue_url]
+    ])
+    assert all("mctl-agents-investigate" not in str(d) for d in required)
+
+
+def test_lookup_unavailable_leaves_comment_unacked_and_gives_up_at_max(monkeypatch):
+    gh, issue_url = _one_directive(monkeypatch)
+
+    async def _resolve(_url):
+        raise ExecutionLookupUnavailable("temporal down")
+
+    monkeypatch.setattr(run_issue_directive_poller, "resolve_loop_execution", _resolve)
+    submits: list = []
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _recording_submit(submits))
+
+    for _ in range(run_issue_directive_poller.MAX_DISPATCH_ATTEMPTS):
+        result = _run_scan(max_directives=10)
+        assert result.failed == 1
+    assert submits == []
+    bodies = [c["body"] for c in gh.comments[issue_url] if c["user"]["login"] == "mctl-agents[bot]"]
+    assert sum("mctl-directive-fail" in b for b in bodies) == run_issue_directive_poller.MAX_DISPATCH_ATTEMPTS - 1
+    assert ack_trailer("c1") in bodies[-1]
+    assert _run_scan(max_directives=10) == DirectiveScanResult()
+
+
+def test_dry_run_resolves_but_neither_posts_nor_replies(monkeypatch, capsys):
+    gh, issue_url = _one_directive(monkeypatch)
+    submits: list = []
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _recording_submit(submits))
+    _run_scan(dry_run=True, max_directives=10)
+    assert submits == []
+    assert "execution_id=we_y" in capsys.readouterr().out
+    assert [c for c in gh.comments[issue_url] if c["user"]["login"] == "mctl-agents[bot]"] == []
