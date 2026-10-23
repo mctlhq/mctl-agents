@@ -104,9 +104,19 @@ if [ -f "$BIN" ]; then
   if [ "$(uname -s)" = Darwin ]; then
     deps=$(otool -L "$BIN" | tail -n +2 | wc -l | tr -d ' ')
   else
-    deps=$(ldd "$BIN" 2>&1 | wc -l | tr -d ' ')
+    if ldd_out=$(ldd "$BIN" 2>&1); then
+      deps=$(wc -l <<<"$ldd_out" | tr -d ' ')
+    elif grep -qiE 'not a dynamic executable|statically linked' <<<"$ldd_out"; then
+      deps=0   # measured: a static binary has no dynamic dependencies
+    else
+      deps=""
+    fi
   fi
-  rec rust-proxy dependency_lines "$deps" lines measured "$(file -b "$BIN" | cut -c1-200)" "$NOTE"
+  if [ -n "$deps" ]; then
+    rec rust-proxy dependency_lines "$deps" lines measured "$(file -b "$BIN" | cut -c1-200)" "$NOTE"
+  else
+    rec rust-proxy dependency_lines "" lines failed "ldd failed: $(head -c 200 <<<"$ldd_out")" "$NOTE"
+  fi
 else
   rec rust-proxy binary_size "" bytes failed "release binary missing" "$NOTE"
   rec rust-proxy dependency_lines "" lines failed "release binary missing" "$NOTE"
@@ -125,8 +135,11 @@ else
 fi
 
 # ---- startup, latency, RSS -------------------------------------------------
-if [ -x "$FAKE" ] && [ -x "$DRIVER" ]; then
-  start_fake
+if [ -x "$FAKE" ] && [ -x "$DRIVER" ] && ! start_fake; then
+  for subject in rust-proxy python-baseline python-uv-run; do
+    rec "$subject" driver_run "" "" failed "fake upstream did not print a URL within 10 s"
+  done
+elif [ -x "$FAKE" ] && [ -x "$DRIVER" ]; then
   rust_cmd=("$BIN" proxy --upstream "$URL" --allowlist "$ALLOW")
   py_cmd=("$VENV/bin/python" -I baseline/thin_adapter.py --upstream "$URL" --allowlist "$ALLOW")
   uv_cmd=(uv run --locked --project "$ROOT" python -I "$HERE/baseline/thin_adapter.py" --upstream "$URL" --allowlist "$HERE/$ALLOW")

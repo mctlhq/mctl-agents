@@ -85,9 +85,14 @@ struct Ctx {
 
 impl Ctx {
     fn record(&self, subject: &str, metric: &str, value: Option<f64>, unit: &str, reason: &str) {
-        let (num, status) = match value {
-            Some(v) => (Value::Num(format!("{v:.3}")), "measured"),
-            None => (Value::Null, "failed"),
+        let status = if value.is_some() { "measured" } else { "failed" };
+        self.record_status(subject, metric, value, unit, status, reason);
+    }
+
+    fn record_status(&self, subject: &str, metric: &str, value: Option<f64>, unit: &str, status: &str, reason: &str) {
+        let num = match value {
+            Some(v) => Value::Num(format!("{v:.3}")),
+            None => Value::Null,
         };
         let mut pairs = vec![
             ("subject", Value::text(subject)),
@@ -361,7 +366,7 @@ fn mode_rss(ctx: &Ctx, o: &Opts) -> Result<(), String> {
     ctx.record(&ctx.subject, "rss_peak_call_kb", Some(peak as f64), "kB", "max of 20 ms samples during slow_tool");
     match hwm {
         Some(h) => ctx.record(&ctx.subject, "rss_hwm_kb", Some(h as f64), "kB", "VmHWM after slow_tool"),
-        None => ctx.record(&ctx.subject, "rss_hwm_kb", None, "kB", "high-water mark not available on this OS"),
+        None => ctx.record_status(&ctx.subject, "rss_hwm_kb", None, "kB", "unmeasured", "high-water mark not available on this OS"),
     }
     Ok(())
 }

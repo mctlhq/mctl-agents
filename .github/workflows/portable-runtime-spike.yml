@@ -40,7 +40,7 @@ jobs:
           count=$(grep -c . <<<"$files" || true)
           # Here-strings, not pipes: under pipefail, `grep -q` closing a pipe
           # early would SIGPIPE the writer and read as "no match".
-          if [ "$count" -ge 3000 ] || grep -qE '^(experiments/portable-runtime-rs/|\.github/workflows/portable-runtime-spike\.yml$)' <<<"$files"; then
+          if [ "$count" -ge 3000 ] || grep -qE '^(experiments/portable-runtime-rs/|docs/spikes/746|\.github/workflows/portable-runtime-spike\.yml$)' <<<"$files"; then
             echo "spike=true" >> "$GITHUB_OUTPUT"
           else
             echo "spike=false" >> "$GITHUB_OUTPUT"
@@ -101,9 +101,17 @@ jobs:
           cargo build --locked
           cargo build --locked --examples
       - name: T11 baseline parity
+        env:
+          OUT: ${{ runner.temp }}/parity
         run: experiments/portable-runtime-rs/bench/parity.sh
       - name: T12 report shape
         run: experiments/portable-runtime-rs/bench/check_report.sh docs/spikes/746-portable-runtime.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: portable-runtime-parity
+          path: ${{ runner.temp }}/parity
+          if-no-files-found: warn
 
   # Informational: timing is noisy and must not block unrelated work.
   bench:
