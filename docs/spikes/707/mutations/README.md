@@ -7,13 +7,13 @@ it in a `finally` block. Each is a one-to-three line change on real code.
 
 | Patch | Defect class | Source pattern (file, function) |
 | --- | --- | --- |
-| 01-optional-to-nonoptional | `str \| caught (`bad-argument-type`, `missing-attribute`) | caught |
-| 02-incompatible-assignment | `str` assigned to an `int`-annotated name | caught (`bad-assignment`) | caught 
-| 03-wrong-argument-type | `int` passed where `str` is declared | caught (`bad-argument-type`) | caught 
-| 04-wrong-return-type | `int` returned from a `-> str` function | caught (`bad-return`) | caught 
-| 05-attribute-on-optional | attribute access on `str \| caught (`missing-attribute`) | caught |
-| 06-unawaited-coroutine | coroutine created and dropped | caught (`unused-coroutine`) | caught 
-| 07-await-non-awaitable | `await` on a `list` | caught (`not-async`) | caught 
+| 01-optional-to-nonoptional | `str \| None` flows into a `str` parameter | `ci_checks.fetch_failure_logs`: drops the `if raw is None` guard before `_bound_log(raw, ...)` |
+| 02-incompatible-assignment | `str` assigned to an `int`-annotated name | `ci_checks._classify`: `c: int = (conclusion or "").upper()` |
+| 03-wrong-argument-type | `int` passed where `str` is declared | `ci_checks._build_excerpt`: `_bound_excerpt(len(text))` |
+| 04-wrong-return-type | `int` returned from a `-> str` function | `ci_checks._bound_excerpt` |
+| 05-attribute-on-optional | attribute access on `str \| None` | `ci_checks._status_state_to_conclusion`: `state.upper()` |
+| 06-unawaited-coroutine | coroutine created and dropped | `temporal/worker._ensure_schedule`: `client.create_schedule(...)` without `await` |
+| 07-await-non-awaitable | `await` on a `list` | `temporal/worker._action_fingerprint_desired` |
 | 08-any-boundary | wrong type across an unannotated parameter (expected to be missed by both: soft-mode `Any` boundary) | `ci_checks._fetch_one_log`: `cwd=42` into `proc.run_capturing(cwd=None)` |
 
 ## Detection table

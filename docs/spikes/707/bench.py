@@ -257,11 +257,14 @@ def run_edit(target: Path):
             clear_mypy_cache(target)
             sh(MYPY, target)  # prime the incremental cache once
         for i in range(EDIT_ITERATIONS):
-            with Patched(target, patches[i % len(patches)]):
-                rc, dt, _ = sh(cmd, target)
+            patch = patches[i % len(patches)]
+            with Patched(target, patch):
+                _, dt, text = sh(cmd, target)
             samples.append(dt)
-            caught += rc != 0
-        res[name] = {**stats(samples), "iterations_nonzero_exit": caught}
+            # Exit status is useless here: Pyrefly already exits 1 on the clean
+            # baseline. Count iterations with an error on the mutated file.
+            caught += any(patch_file(patch) in ln and "error" in ln.lower() for ln in text.splitlines())
+        res[name] = {**stats(samples), "iterations_caught": caught}
     return res
 
 
@@ -289,10 +292,13 @@ def run_loop(target: Path):
         f = patch_file(patch)
         test = LOOP_TESTS.get(f)
         res[stem] = {}
-        with Patched(target, patch):
-            for name, cmd in cmds.items():
-                if name == "mypy":
-                    sh(MYPY, target)  # warm incremental cache, as in an agent session
+        for name, cmd in cmds.items():
+            if name == "mypy":
+                # Warm on the clean tree, as in an agent session, so the timed
+                # run below re-checks the edited module instead of hitting a
+                # cache built from the already-mutated tree.
+                sh(MYPY, target)
+            with Patched(target, patch):
                 _, t_check, _ = sh(cmd, target)
                 _, t_ruff, _ = sh(["uv", "run", "--locked", "--no-sync", "ruff", "check", f], target)
                 entry = {
