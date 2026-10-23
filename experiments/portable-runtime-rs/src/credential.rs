@@ -35,6 +35,7 @@ pub enum CredentialError {
     InsecureMode { path: PathBuf, mode: u32 },
     Unreadable(PathBuf, io::Error),
     Empty(PathBuf),
+    InvalidToken,
 }
 
 impl fmt::Display for CredentialError {
@@ -52,6 +53,9 @@ impl fmt::Display for CredentialError {
                 write!(f, "token file {} is unreadable: {e}", path.display())
             }
             CredentialError::Empty(path) => write!(f, "token file {} is empty", path.display()),
+            CredentialError::InvalidToken => {
+                write!(f, "token contains characters outside visible ASCII (0x21..0x7e)")
+            }
         }
     }
 }
@@ -94,6 +98,7 @@ fn read_checked(path: &Path) -> Result<Secret, CredentialError> {
     if trimmed.is_empty() {
         return Err(CredentialError::Empty(path.to_path_buf()));
     }
+    check_header_safe(trimmed)?;
     Ok(Secret::new(trimmed.to_string()))
 }
 
@@ -102,6 +107,16 @@ fn read_checked(_path: &Path) -> Result<Secret, CredentialError> {
     Err(CredentialError::Unsupported(
         "token file permission check requires a unix host",
     ))
+}
+
+/// A token is interpolated into an HTTP header: only visible ASCII is allowed,
+/// which rules out CR/LF header injection.
+fn check_header_safe(token: &str) -> Result<(), CredentialError> {
+    if token.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        Ok(())
+    } else {
+        Err(CredentialError::InvalidToken)
+    }
 }
 
 /// Permission bits of a file (unix only).
@@ -150,6 +165,7 @@ impl CredentialSource for EnvVar {
         if self.0.is_empty() {
             Err(CredentialError::Absent)
         } else {
+            check_header_safe(&self.0)?;
             Ok(Secret::new(self.0.clone()))
         }
     }
@@ -310,5 +326,21 @@ mod tests {
             assert!(matches!(src.load(), Err(CredentialError::Empty(_))));
             std::fs::remove_file(path).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod header_safety_tests {
+    use super::*;
+
+    #[test]
+    fn env_token_with_newline_is_rejected() {
+        let e = EnvVar::new("abc\r\nX-Foo: bar".to_string());
+        assert!(matches!(e.load(), Err(CredentialError::InvalidToken)));
+    }
+
+    #[test]
+    fn plain_token_is_accepted() {
+        assert!(EnvVar::new("abc.DEF-123".to_string()).load().is_ok());
     }
 }

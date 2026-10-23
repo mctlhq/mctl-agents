@@ -161,8 +161,8 @@ impl Upstream {
         invocation_id: &str,
     ) -> Result<Reply, UpstreamError> {
         let deadline = Instant::now() + self.timeout;
-        self.ensure_session(deadline)?;
         self.last_request_id = None;
+        self.ensure_session(deadline)?;
         let params = Value::obj(vec![
             ("name", Value::text(name)),
             ("arguments", arguments.clone()),

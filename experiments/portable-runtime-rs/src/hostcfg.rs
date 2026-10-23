@@ -34,8 +34,18 @@ impl Host {
 }
 
 /// Render the host config. Never resolves a credential value.
-pub fn render(host: Host, exe: &str, upstream: Option<&str>, token_file: Option<&str>) -> String {
-    let mut args = vec![Value::text("proxy")];
+pub fn render(
+    host: Host,
+    exe: &str,
+    upstream: Option<&str>,
+    token_file: Option<&str>,
+    allowlist: &str,
+) -> String {
+    let mut args = vec![
+        Value::text("proxy"),
+        Value::text("--allowlist"),
+        Value::text(allowlist),
+    ];
     if let Some(u) = upstream {
         args.push(Value::text("--upstream"));
         args.push(Value::text(u));
@@ -224,12 +234,12 @@ mod tests {
 
     #[test]
     fn render_shapes() {
-        let c = render(Host::ClaudeCode, "/bin/mctl-runtime", None, Some("/tmp/t"));
+        let c = render(Host::ClaudeCode, "/bin/mctl-runtime", None, Some("/tmp/t"), "/a/allow.toml");
         assert_eq!(
             c,
             "{\"mcpServers\":{\"mctl\":{\"command\":\"/bin/mctl-runtime\",\"args\":[\"proxy\"],\"env\":{\"MCTL_RUNTIME_TOKEN_FILE\":\"/tmp/t\"}}}}\n"
         );
-        let f = render(Host::Fixture, "/bin/x", Some("http://h/mcp"), None);
+        let f = render(Host::Fixture, "/bin/x", Some("http://h/mcp"), None, "/a/allow.toml");
         assert!(f.starts_with("{\"servers\":[{\"name\":\"mctl\""));
         assert!(f.contains("MCTL_TOKEN"));
         assert!(f.contains("--upstream"));

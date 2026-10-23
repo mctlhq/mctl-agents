@@ -181,7 +181,9 @@ fn handle_call(cfg: &Config, upstream: &mut Upstream, id: Value, params: Option<
     let args = params.and_then(|p| p.get("arguments")).unwrap_or(&empty);
     let invocation_id = uuid::v4();
 
+    let mut refused = false;
     let (resp, outcome, is_error) = if !is_allowed(cfg, name) {
+        refused = true;
         // Fail closed: no upstream I/O at all, not even a lazy initialize.
         (
             ok_response(
@@ -215,8 +217,14 @@ fn handle_call(cfg: &Config, upstream: &mut Upstream, id: Value, params: Option<
         host_request_id: id,
         tool: name.to_string(),
         args_sha256: correlation::args_sha256(args),
-        upstream_session_id: upstream.session_id().map(str::to_string),
-        upstream_request_id: upstream.last_request_id().map(str::to_string),
+        upstream_session_id: upstream
+            .session_id()
+            .filter(|_| !refused)
+            .map(str::to_string),
+        upstream_request_id: upstream
+            .last_request_id()
+            .filter(|_| !refused)
+            .map(str::to_string),
         outcome,
         is_error,
         latency_ms: start.elapsed().as_millis(),

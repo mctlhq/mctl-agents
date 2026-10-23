@@ -18,7 +18,7 @@ const USAGE: &str = "usage: mctl-runtime <command> [options]
 
 commands:
   proxy   [--upstream URL] [--allowlist PATH] [--timeout-ms N]
-  init    --host fixture|claude-code [--token-file PATH] [--upstream URL]
+  init    --host fixture|claude-code [--token-file PATH] [--upstream URL] [--allowlist PATH]
           [--write --config-dir DIR]
   doctor  [--upstream URL] [--allowlist PATH] [--timeout-ms N]
   --version
@@ -126,7 +126,7 @@ fn cmd_proxy(args: &[String]) -> ExitCode {
 fn cmd_init(args: &[String]) -> ExitCode {
     let flags = match parse_flags(
         args,
-        &["--host", "--token-file", "--upstream", "--config-dir"],
+        &["--host", "--token-file", "--upstream", "--config-dir", "--allowlist"],
         &["--write"],
     ) {
         Ok(f) => f,
@@ -141,11 +141,21 @@ fn cmd_init(args: &[String]) -> ExitCode {
             |_| "mctl-runtime".to_string(),
             |p| p.to_string_lossy().into_owned(),
         );
+    let allow_arg = flags
+        .get("--allowlist")
+        .map_or(DEFAULT_ALLOWLIST, String::as_str);
+    let allow_abs = std::fs::canonicalize(allow_arg)
+        .or_else(|_| std::env::current_dir().map(|d| d.join(allow_arg)))
+        .map_or_else(
+            |_| allow_arg.to_string(),
+            |p| p.to_string_lossy().into_owned(),
+        );
     let content = hostcfg::render(
         host,
         &exe,
         flags.get("--upstream").map(String::as_str),
         flags.get("--token-file").map(String::as_str),
+        &allow_abs,
     );
     if !flags.contains_key("--write") {
         print!("{content}");
