@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use crate::credential::Secret;
-use crate::http::{self, HttpError};
+use crate::http::{self, Connector, HttpError};
 use crate::json::{self, Value};
 
 #[derive(Debug)]
@@ -61,6 +61,7 @@ pub struct Upstream {
     initialized: bool,
     next_id: u64,
     last_request_id: Option<String>,
+    connector: Connector,
 }
 
 /// Data payloads of the events in a `text/event-stream` body.
@@ -107,7 +108,15 @@ impl Upstream {
             initialized: false,
             next_id: 0,
             last_request_id: None,
+            connector: Connector::default(),
         }
+    }
+
+    /// Use `cfg` for https upstreams instead of the bundled-roots config.
+    #[cfg(feature = "tls")]
+    pub fn with_tls_config(mut self, cfg: std::sync::Arc<rustls::ClientConfig>) -> Upstream {
+        self.connector = Connector::with_config(cfg);
+        self
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -236,7 +245,7 @@ impl Upstream {
         if let Some(i) = invocation_id {
             headers.push(("X-Mctl-Invocation-Id".to_string(), i.to_string()));
         }
-        let resp = http::post(&url, &headers, body.as_bytes(), deadline)?;
+        let resp = http::post_with(&url, &headers, body.as_bytes(), deadline, &self.connector)?;
         self.last_request_id = resp.header("x-request-id").map(str::to_string);
         if self.session_id.is_none() {
             if let Some(sid) = resp.header("mcp-session-id") {
@@ -321,6 +330,7 @@ mod tests {
         assert!(find_sse_reply(body, 3).is_none());
     }
 
+    #[cfg(not(feature = "tls"))]
     #[test]
     fn https_is_provider_unavailable_without_io() {
         let mut up = Upstream::new(

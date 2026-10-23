@@ -59,7 +59,7 @@ as stubs that return `Unsupported`.
   (=0.23.46, `ring` provider, no aws-lc-rs, so no cmake/NASM in cross-builds)
   and `webpki-roots` (=1.0.11, bundled Mozilla roots, so the binary does not
   read the host trust store). `src/tls.rs` builds the client config; the
-  https upstream path is not wired yet (slice 3b). `Cargo.lock` lists these
+  https upstream path is wired in `src/http.rs` (slice 3b, #780). `Cargo.lock` lists these
   crates for every build, but only `--features tls` compiles them, and
   `cargo audit` scans them either way. The lock was generated on the pinned
   toolchain with `CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo
@@ -68,11 +68,12 @@ as stubs that return `Unsupported`.
   `tools/list`, `tools/call` and `ping`. Streamable HTTP only; the legacy MCP
   SSE transport is not implemented. A `text/event-stream` response to a POST is
   accepted as the body form.
-- **http-only upstream.** The upstream client speaks plain `http://`. An
-  `https://` upstream, including the real `api.mctl.ai/mcp`, is refused with
-  `provider-unavailable` ("https upstream requires TLS (deferred, see README)")
-  until slice 3b wires the `tls` feature into the upstream client. A live `doctor` round trip is therefore not
-  possible yet.
+- **https upstream only with `tls`.** The default build speaks plain `http://`; an
+  `https://` upstream is refused with `provider-unavailable` and no network I/O.
+  With `--features tls` the client wraps the connection in rustls (default port
+  443, certificate checked against the bundled roots, no request bytes sent
+  after a failed handshake). `tests/tls.rs` covers it offline with the
+  `fixtures/tls/` test CA.
 - `upstream_request_id` is taken from the `X-Request-Id` response header and
   `upstream_session_id` from `Mcp-Session-Id`; both are `null` when absent.
 - Canonical JSON keeps number text as received, so a number such as `1.0` is not

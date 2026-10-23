@@ -42,16 +42,24 @@ def main(argv):
     lines += [
         "## Results",
         "",
-        "| Subject | Metric | Value | Unit | Status | Reason | Note |",
-        "|---|---|---|---|---|---|---|",
+        "| Subject | Variant | Metric | Value | Unit | Status | Reason | Note |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for rec in records:
         reason = str(rec.get("reason") or "").replace("|", "/")
         note = str(rec.get("note") or "").replace("|", "/")
         lines.append(
-            f"| {rec.get('subject')} | {rec.get('metric')} | {cell(rec)} | {rec.get('unit') or ''} "
+            f"| {rec.get('subject')} | {rec.get('variant') or ''} | {rec.get('metric')} | {cell(rec)} | {rec.get('unit') or ''} "
             f"| {rec.get('status')} | {reason} | {note} |"
         )
+    lines += ["", "## Rust proxy: default vs tls", "", "| Metric | Unit | default | tls |", "|---|---|---|---|"]
+    pivot = {}
+    for rec in records:
+        if rec.get("subject") == "rust-proxy" and rec.get("variant") in ("default", "tls"):
+            key = (rec.get("metric"), rec.get("unit") or "")
+            pivot.setdefault(key, {})[rec["variant"]] = cell(rec)
+    for (metric, unit), by_variant in sorted(pivot.items()):
+        lines.append(f"| {metric} | {unit} | {by_variant.get('default', 'n/a')} | {by_variant.get('tls', 'n/a')} |")
     with open(os.path.join(out_dir, f"{label}.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
     return 0

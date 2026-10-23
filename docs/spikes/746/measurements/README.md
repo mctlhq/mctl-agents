@@ -33,7 +33,8 @@ Each `<os>.json` file is an array of records:
 | `unit` | `s`, `ms`, `bytes`, `kB`, `lines`, `distributions` or empty |
 | `status` | `measured`, `unmeasured` or `failed` |
 | `reason` | why a record is `unmeasured` or `failed`; context for a measured one |
-| `note` | `http-only, TLS not included` on every Rust size, build, dependency and startup record |
+| `variant` | `default` (std-only build) or `tls` (`--features tls`); python-baseline, python-uv-run and live records are written once with `default` |
+| `note` | `http-only, TLS not included` on default-variant Rust size, build, dependency and startup records; absent on `tls` records |
 | `os`, `head_sha`, `run_id` | where and from which commit and run the record came |
 
 The rendered `<os>.md` adds the environment block (CPU, cores, memory, OS,
@@ -62,13 +63,15 @@ rustc, Python and uv versions).
   cold start is a second number (`python-uv-run`).
 - The live run against `api.mctl.ai` is `unmeasured` (not run in this slice).
 
-## TLS limit
+## TLS variant
 
-The measured Rust build is the default, std-only one and speaks plain `http://`;
-the optional `tls` feature (#779) is not used. Every Rust size, build,
-dependency and startup number here is **http-only, TLS not included**. A
-TLS-capable binary will be larger, take longer to build and add dependencies.
-That variant is unmeasured here; slice 3b (#780) measures it.
+`measure.sh` measures the Rust proxy twice, `default` (std-only, plain `http://`) and `tls` (`--features tls`, #780), each
+built into its own target directory. Default records keep the **http-only, TLS not included** note; `tls` records have none.
+The `tls` startup, latency and RSS runs use the plain-http fake upstream, so the TLS handshake is not timed. The
+`cross-build.json` records carry `variant` and a `prerequisite` field naming the toolchain a failed or extra-configured
+ring build needed (empty when none). The files here come from the slice 3b CI run `40028550067` (head `83f6527`); the slice 3
+files from run `40002256127` are in git history at `2c56358`. In `cross-build.json` the `reason` of a failed build is the
+last 300 characters of its cargo log, whitespace collapsed.
 
 ## Known measurement defects
 
@@ -79,4 +82,4 @@ That variant is unmeasured here; slice 3b (#780) measures it.
 - `python-baseline build_time` is a `uv sync` against a warm uv cache, so it measures
   environment linking, not a download and install. It is not comparable with the
   Rust compile time.
-- Rust size, build, dependency and startup numbers are http-only, TLS not included.
+- Default-variant Rust size, build, dependency and startup numbers are http-only, TLS not included.
