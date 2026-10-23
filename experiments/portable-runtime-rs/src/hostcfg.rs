@@ -237,12 +237,13 @@ mod tests {
         let c = render(Host::ClaudeCode, "/bin/mctl-runtime", None, Some("/tmp/t"), "/a/allow.toml");
         assert_eq!(
             c,
-            "{\"mcpServers\":{\"mctl\":{\"command\":\"/bin/mctl-runtime\",\"args\":[\"proxy\"],\"env\":{\"MCTL_RUNTIME_TOKEN_FILE\":\"/tmp/t\"}}}}\n"
+            "{\"mcpServers\":{\"mctl\":{\"command\":\"/bin/mctl-runtime\",\"args\":[\"proxy\",\"--allowlist\",\"/a/allow.toml\"],\"env\":{\"MCTL_RUNTIME_TOKEN_FILE\":\"/tmp/t\"}}}}\n"
         );
         let f = render(Host::Fixture, "/bin/x", Some("http://h/mcp"), None, "/a/allow.toml");
         assert!(f.starts_with("{\"servers\":[{\"name\":\"mctl\""));
         assert!(f.contains("MCTL_TOKEN"));
         assert!(f.contains("--upstream"));
+        assert!(f.contains("--allowlist"));
     }
 
     #[test]

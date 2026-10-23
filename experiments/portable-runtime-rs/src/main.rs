@@ -150,6 +150,10 @@ fn cmd_init(args: &[String]) -> ExitCode {
             |_| allow_arg.to_string(),
             |p| p.to_string_lossy().into_owned(),
         );
+    if !Path::new(&allow_abs).is_file() {
+        eprintln!("mctl-runtime: init: allowlist not found: {allow_abs} (pass --allowlist <file>)");
+        return ExitCode::from(2);
+    }
     let content = hostcfg::render(
         host,
         &exe,

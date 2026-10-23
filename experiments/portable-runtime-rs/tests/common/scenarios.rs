@@ -302,16 +302,18 @@ pub fn t7_no_credential_in_argv_env_or_config() {
     }
 
     // Generated host config references the credential, never contains it.
+    let allowlist_path = write_file(&files, "init-allow.toml", ALLOWLIST_TEXT);
+    let allowlist_str = path_str(&allowlist_path);
     for host_kind in ["fixture", "claude-code"] {
         let r = run_cli(
-            &["init", "--host", host_kind],
+            &["init", "--host", host_kind, "--allowlist", allowlist_str],
             &[("MCTL_TOKEN", SENTINEL)],
             files.path(),
         );
         assert_eq!(r.code, 0, "{}", r.stderr);
         assert!(!r.combined().contains(SENTINEL));
         let r = run_cli(
-            &["init", "--host", host_kind, "--token-file", token_file_str],
+            &["init", "--host", host_kind, "--allowlist", allowlist_str, "--token-file", token_file_str],
             &[("MCTL_TOKEN", SENTINEL)],
             files.path(),
         );
@@ -335,10 +337,22 @@ pub fn t8_correlation() {
         result_of(&resp).get("isError").and_then(Value::as_bool),
         Some(false)
     );
+    let refused = host.call_tool("not_allowlisted_tool", json::parse("{}").expect("args"));
+    assert_refusal(&refused, "not-eligible");
     let stderr = host.finish();
 
-    let lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with('{')).collect();
-    assert_eq!(lines.len(), 1, "expected one correlation line, stderr: {stderr}");
+    let all: Vec<&str> = stderr.lines().filter(|l| l.starts_with('{')).collect();
+    assert_eq!(all.len(), 2, "expected two correlation lines, stderr: {stderr}");
+    let refused_rec = json::parse(all[1]).expect("refused record JSON");
+    assert_eq!(refused_rec.get("outcome").and_then(Value::as_str), Some("not-eligible"));
+    for field in ["upstream_session_id", "upstream_request_id"] {
+        assert!(
+            matches!(refused_rec.get(field), None | Some(Value::Null)),
+            "refused call carries {field}: {}",
+            all[1]
+        );
+    }
+    let lines: Vec<&str> = all[..1].to_vec();
     let rec = json::parse(lines[0]).expect("correlation JSON");
     for field in [
         "invocation_id",
@@ -397,6 +411,8 @@ pub fn t9_init_dry_run() {
     let home = TempDir::new("t9-home");
     let home_str = path_str(home.path());
     let fixture_str = path_str(fixture.path());
+    let allowlist_path = manifest_dir().join("fixtures").join("allowlist.toml");
+    let allowlist_str = path_str(&allowlist_path);
     let before = fixture.listing();
     assert!(!before.is_empty(), "fixture dir should not be empty");
     let mtime_before = std::fs::metadata(fixture.path())
@@ -404,9 +420,18 @@ pub fn t9_init_dry_run() {
         .expect("mtime");
 
     for kind in ["fixture", "claude-code"] {
-        let r = run_cli(&["init", "--host", kind], &[("HOME", home_str)], fixture.path());
+        let r = run_cli(
+            &["init", "--host", kind, "--allowlist", allowlist_str],
+            &[("HOME", home_str)],
+            fixture.path(),
+        );
         assert_eq!(r.code, 0, "{}", r.stderr);
         assert!(r.stdout.contains("\"command\""), "{}", r.stdout);
+        assert!(r.stdout.contains(allowlist_str), "{}", r.stdout);
+    }
+    for kind in ["fixture", "claude-code"] {
+        let r = run_cli(&["init", "--host", kind], &[("HOME", home_str)], fixture.path());
+        assert_eq!(r.code, 2, "missing allowlist must be refused: {}", r.stdout);
     }
     assert_eq!(fixture.listing(), before, "dry run wrote files");
     let mtime_after = std::fs::metadata(fixture.path())
