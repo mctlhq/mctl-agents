@@ -8,6 +8,17 @@ with the identity of the DevLoopWorkflow that owns the issue — the same
 describe + `work_context` query; it never starts, signals or updates a loop,
 and never mints or ends a WorkItem execution.
 
+Known limitation: the loop's own first investigate step already sealed a
+context snapshot under this same `we_`, and the work-item store keeps one
+immutable snapshot per execution (`dev_loop.py` strips the identity from its
+human-input continuation for that reason). A reinvestigate run assembles a
+later context (new issue comments), so under the `observe` rollout the store
+records SNAPSHOT_DIVERGED and does not hold what this run was given, and
+under `enforce`/`only` the run can fail with `SnapshotNotPersisted` after the
+poller has acked. Resolving that needs a fresh `we_` for directive runs or a
+binder that accepts `work_item_id` without `execution_id`; both need mctl-api
+or loop changes outside this module.
+
 `NoExecution` is a definite answer (reply and ack); `ExecutionLookupUnavailable`
 means Temporal could not answer (transient, retried within the poller's
 dispatch-attempt budget).
