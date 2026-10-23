@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.97.0](https://github.com/mctlhq/mctl-agents/compare/1.96.0...1.97.0) (2026-10-23)
+
+
+### Features
+
+* **agents:** issue-777-spike-runtime-746-slice-3-thin-adapter-b ([2c56358](https://github.com/mctlhq/mctl-agents/commit/2c56358b156c5dc475fda6fb194c1e7143264b3f))
+* **agents:** issue-780-spike-runtime-746-slice-3b-https-upstrea ([1539405](https://github.com/mctlhq/mctl-agents/commit/15394054b8b55246f539371e54f7f269b8a61f91))
+* **agents:** issue-780-spike-runtime-746-slice-3b-https-upstrea ([83f6527](https://github.com/mctlhq/mctl-agents/commit/83f6527a522fc9175645e688c5d1293781e021e0))
+* **agents:** issue-785-feat-implementer-run-the-ci-mypy-check-i ([11d5f6b](https://github.com/mctlhq/mctl-agents/commit/11d5f6bbcea3ad482588f959992a175fa0f0fc1c))
+* **agents:** issue-785-feat-implementer-run-the-ci-mypy-check-i ([3317b23](https://github.com/mctlhq/mctl-agents/commit/3317b23b08d253006e71bd6581b044933251ab88))
+
+
+### Bug Fixes
+
+* **implementer:** pass an allowlisted env to the pre-push type check ([fce2583](https://github.com/mctlhq/mctl-agents/commit/fce2583bf6a4e42d2ebee029bf7606b057a9d848)), closes [#785](https://github.com/mctlhq/mctl-agents/issues/785)
+* **implementer:** run non-uv type-check commands as a single step ([b853a09](https://github.com/mctlhq/mctl-agents/commit/b853a09369fbc82974a07311c4f177e73d35c302))
+* **spike:** keep the cross-build record when no error line matches ([b7c62d1](https://github.com/mctlhq/mctl-agents/commit/b7c62d1f5ea520f1c402bb9b5f06dc23320d6288))
+
 ## [1.96.0](https://github.com/mctlhq/mctl-agents/compare/1.95.0...1.96.0) (2026-10-23)
 
 
