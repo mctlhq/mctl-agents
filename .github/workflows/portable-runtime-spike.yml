@@ -34,10 +34,13 @@ jobs:
           fi
           # A failed or partial listing fails this job; it never reads as
           # "nothing changed". The files API stops at 3000 entries, so a
-          # listing that long is treated as unknown and cargo runs.
-          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename')
-          count=$(printf '%s\n' "$files" | grep -c . || true)
-          if [ "$count" -ge 3000 ] || printf '%s\n' "$files" | grep -qE '^(experiments/portable-runtime-rs/|\.github/workflows/portable-runtime-spike\.yml$)'; then
+          # listing that long is treated as unknown and cargo runs. A rename
+          # counts under both its old and new path.
+          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | .filename, (.previous_filename // empty)')
+          count=$(grep -c . <<<"$files" || true)
+          # Here-strings, not pipes: under pipefail, `grep -q` closing a pipe
+          # early would SIGPIPE the writer and read as "no match".
+          if [ "$count" -ge 3000 ] || grep -qE '^(experiments/portable-runtime-rs/|\.github/workflows/portable-runtime-spike\.yml$)' <<<"$files"; then
             echo "spike=true" >> "$GITHUB_OUTPUT"
           else
             echo "spike=false" >> "$GITHUB_OUTPUT"
