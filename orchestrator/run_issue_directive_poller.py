@@ -807,6 +807,10 @@ async def _handle_directive(
         return "dry-run"
 
     if outcome == "dispatch":
+        if execution is None:  # unreachable; narrows for mypy and fails closed
+            return await _record_dispatch_failure(
+                directive, issue_url, RuntimeError("no execution resolved"), prior_failures
+            )
         try:
             try:
                 workflow_name = await submit_investigate(issue_url, ref.slug, directive.author, execution)

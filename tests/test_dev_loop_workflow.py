@@ -5393,10 +5393,14 @@ class TestWorkContextResume:
             assert after.executions[1].execution_id == "e2"
             assert after.execution_id == "e2"
             assert after.execution_sequence == 2
+            assert after.canonical_execution_id not in ("", "e2")
+            assert after.canonical_open is True
 
             # carol's transition asked for a fresh grant (a new attempt).
             await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test_a1"})
             result = await handle.result()
+            closed = await handle.query(DevLoopWorkflow.work_context)
+            assert closed.canonical_open is False
 
         assert result.implement is not None
         assert result.implement.phase == "Succeeded"
