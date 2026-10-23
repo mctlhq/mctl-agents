@@ -1,8 +1,7 @@
 # Spike #746: is a portable agent-side runtime worth building, and in Rust?
 
-Status: **code phase.** Run id: `unmeasured (pending bench run)`. Head SHA: `unmeasured (pending bench run)`.
-The shepherd fills both, the measurements table and G5/G6 after the CI `bench` job has run on the final code head
-(see `docs/spikes/746/measurements/README.md`). This report proposes a decision; the verdict stays with the #746 owner.
+Status: **measured.** Run id: `40002256127`. Head SHA: `12f5582` (`12f5582b45250b2059324689d244671ada2f31db`).
+Numbers come from the CI `bench` and `cross-build` jobs of that run, committed under `docs/spikes/746/measurements/`. This report proposes a decision; the verdict stays with the #746 owner.
 
 The possible decision tokens are `NO_RUNTIME`, `THIN_ADAPTER`, `PORTABLE_RUNTIME_RUST` and `PORTABLE_RUNTIME_OTHER`.
 The Decision section carries exactly one.
@@ -15,7 +14,7 @@ The Decision section carries exactly one.
 | Python baseline | `experiments/portable-runtime-rs/baseline/thin_adapter.py` on `mcp==1.29.0` |
 | Runners | ubuntu-latest and macos-14 (`bench` job); cross targets in the `cross-build` job |
 | uv / Python | uv 0.11.11, Python 3.12 (setup-uv pinned as in `spike-707-bench.yml`) |
-| Runner details | `unmeasured (pending bench run)`; the environment block is in `measurements/<os>.md` |
+| Runner details | ubuntu-latest: AMD EPYC 7763, 4 cores, 16 GB, Linux 6.17 x86_64. macos-14: Apple M1 (Virtual), 3 cores, 7 GB, Darwin 23.6 arm64. Full block in `measurements/<os>.md` |
 
 ## 1. Current-state map and friction list
 
@@ -43,25 +42,27 @@ This is an open item, not a finding.
 
 ## 3. Measurements
 
-All cells stay literal until the shepherd commits the CI artifact. Source: `measurements/ubuntu-latest.md`,
+Run `40002256127`. Source: `measurements/ubuntu-latest.md`,
 `measurements/macos-14.md`. Rust size, build, dependency and startup numbers are **http-only, TLS not included**.
 
 | Metric | Rust proxy (ubuntu-latest) | Python baseline (ubuntu-latest) | Rust proxy (macos-14) | Python baseline (macos-14) |
 |---|---|---|---|---|
-| Build time | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) |
-| Binary / package size | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) |
-| Dependency count (`ldd` / `otool -L` / distributions) | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) |
-| Cold start to ready, median / p95 (N=20) | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) |
-| Cold start through `uv run` | not applicable | unmeasured (pending bench run) | not applicable | unmeasured (pending bench run) |
-| Idle RSS | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) |
-| RSS during a call | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) |
-| First-call overhead vs direct HTTP | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) |
-| Steady-state overhead vs direct HTTP, median / p95 (N=100) | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) | unmeasured (pending bench run) |
+| Build time | 1.964 s | 0.171 s (`uv sync`, warm cache; not comparable) | 4.296 s | 0.211 s (`uv sync`, warm cache; not comparable) |
+| Binary / package size | 840824 bytes | script 7023 bytes + packages 12944 kB + interpreter (invalid measurement, see `measurements/README.md`) | 762224 bytes | script 7023 bytes + packages 12305 kB + interpreter 279558 kB |
+| Dependency count (`ldd` / `otool -L` / distributions) | 4 `ldd` lines (dynamic glibc build) | 26 distributions | 1 `otool -L` line | 26 distributions |
+| Cold start to ready, median / p95 (N=20) | 0.639 / 0.710 ms | 474.2 / 479.1 ms | 1.202 / 2.474 ms | 330.0 / 436.3 ms |
+| Cold start through `uv run` | not applicable | 488.4 / 511.3 ms | not applicable | 461.1 / 538.8 ms |
+| Idle RSS | 2348 kB | 56664 kB | 1920 kB | 58960 kB |
+| RSS during a call | 2352 kB (VmHWM 2352 kB) | 56704 kB (VmHWM 56704 kB) | 1920 kB (high-water mark unmeasured on macOS) | 58976 kB (high-water mark unmeasured on macOS) |
+| First-call overhead vs direct HTTP | 0.05 ms | 7.38 ms | -0.03 ms (within noise) | 8.94 ms |
+| Steady-state overhead vs direct HTTP, median / p95 (N=100) | 0.090 / 0.088 ms | 2.17 / 2.37 ms | 0.092 / 0.213 ms | 3.06 / 5.24 ms |
 | Live run against `api.mctl.ai` | unmeasured (not run in this slice) | unmeasured (not run in this slice) | unmeasured (not run in this slice) | unmeasured (not run in this slice) |
 
 Parity (T11): the Rust proxy and the baseline return semantically equal `result` objects for `tools/list` and for calls to
 `mctl_whoami`, `deny_tool`, `approval_tool`, `secret_tool` and an unknown name. Byte differences are a finding, recorded in
-`measurements/parity-bytes.md` (`unmeasured (pending bench run)`). The Python SDK re-serializes tool schemas through pydantic,
+`measurements/parity-bytes.md`: the Python baseline prints `1.5` and `0.1` where upstream sent `1.50` and `0.10`, reports
+different `initialize` capabilities and `serverInfo`, and orders `structuredContent` before `isError`; the `result` objects
+are otherwise equal. The Python SDK re-serializes tool schemas through pydantic,
 so key order and number text such as `1.50` can differ from the upstream bytes the Rust proxy preserves (T2). The baseline's
 error mapping is minimal (any upstream failure becomes `provider-unavailable`); timeout and 401 parity are not claimed.
 
@@ -81,14 +82,14 @@ toward a portable runtime, measuring a TLS variant is the first follow-up.
 
 | # | Dimension | Rust proxy | Python thin adapter | Evidence |
 |---|---|---|---|---|
-| 1 | Install artifact count | One binary | A script plus an interpreter and the `mcp` closure | `measurements/` dependency counts (unmeasured (pending bench run)) |
-| 2 | Cold start | unmeasured (pending bench run) | unmeasured (pending bench run) | `measurements/` ready records |
-| 3 | Steady RSS | unmeasured (pending bench run) | unmeasured (pending bench run) | `measurements/` rss records |
-| 4 | Binary / package size | unmeasured (pending bench run), http-only, TLS not included | unmeasured (pending bench run) | `measurements/` size records |
-| 5 | macOS arm64 | Native build on macos-14 in `cargo` and `bench` | Runs on macos-14 in `bench` | `measurements/macos-14.md`, `cross-build.json` (unmeasured (pending bench run)) |
-| 6 | Linux amd64 / arm64 | amd64 musl runs `--version`; arm64 musl is built, run only if an arm runner exists | Interpreter-dependent, architecture-neutral script | `measurements/cross-build.json` (unmeasured (pending bench run)) |
-| 7 | Windows feasibility | Compile-only attempt; Unix-only APIs (`credential.rs` file-mode checks) may fail | Not attempted in this slice | `measurements/cross-build.json` (unmeasured (pending bench run)) |
-| 8 | Cross-compilation / release complexity | rust-lld musl links, no Docker or Zig; one target per build | None beyond packaging an interpreter | `measurements/cross-build.json` (unmeasured (pending bench run)) |
+| 1 | Install artifact count | One binary; 4 `ldd` lines on the glibc build, static on musl | A script plus an interpreter and 26 distributions | `measurements/ubuntu-latest.md`, `measurements/cross-build.json` |
+| 2 | Cold start | 0.64 ms (ubuntu), 1.20 ms (macos) median | 474 ms (ubuntu), 330 ms (macos) median | `measurements/` ready records |
+| 3 | Steady RSS | about 2.3 MB (ubuntu), 1.9 MB (macos) | about 57 MB (ubuntu), 59 MB (macos) | `measurements/` rss records |
+| 4 | Binary / package size | 0.84 MB glibc, about 1.0 MB musl, http-only, TLS not included | 12.9 MB of packages plus an interpreter (279558 kB on macos) | `measurements/` size records |
+| 5 | macOS arm64 | Native build on macos-14 in `cargo` and `bench`; `aarch64-apple-darwin` built and ran | Runs on macos-14 in `bench` | `measurements/macos-14.md`, `measurements/cross-build.json` |
+| 6 | Linux amd64 / arm64 | amd64 musl (static-pie) built and ran; arm64 musl built on ubuntu-latest and built and ran on ubuntu-24.04-arm | Interpreter-dependent, architecture-neutral script | `measurements/cross-build.json` |
+| 7 | Windows feasibility | `x86_64-pc-windows-msvc` compiles (555520 bytes); not run, so runtime behaviour is unmeasured | Not attempted in this slice | `measurements/cross-build.json` |
+| 8 | Cross-compilation / release complexity | rust-lld musl links, no Docker or Zig; 5 of 5 targets built, one target per build; no signing or update channel | None beyond packaging an interpreter | `measurements/cross-build.json` |
 | 9 | TLS / OAuth / MCP ecosystem maturity | Hand-rolled MCP subset and HTTP/1.1, no TLS, no OAuth; the official Rust SDK was not used | Official `mcp` SDK, TLS through `httpx`, OAuth helpers available | README of the crate, T11 |
 | 10 | Child-process credential exposure | Token from file or env, never in argv; `spawn.rs` strips it from children | Same sources; the interpreter's environment and memory hold it | T6, T7, T10 |
 | 11 | Embedding / library reuse with current MCTL | None: MCTL is Python, the crate is a separate binary | Reusable from the Python code base in principle | T11 |
@@ -187,18 +188,18 @@ Marks: met, not met or unproven. Each line cites a measurement file or a test id
 - **G2** one artifact materially reduces friction: **unproven**; `init` plus a single binary or script helps, but the same `init` output works for either subject (T9, T11).
 - **G3** no new local authorization or business-logic authority: **met**; policy is preflight only and the server stays authoritative (T2, T3, T4).
 - **G4** credential handling no worse than the direct path, with a credible storage or handoff model: **met**, with the limits in J3 (T6, T7, T10).
-- **G5** proxy overhead small enough for interactive use: **unproven**; `measurements/ubuntu-latest.md` and `measurements/macos-14.md` are pending the bench run.
-- **G6** packaging and update story simple enough to justify another component: **unproven**; a TLS-capable artifact is unmeasured, see `measurements/cross-build.json` and the TLS limit (pending the bench run).
+- **G5** proxy overhead small enough for interactive use: **met** against the local fixture; steady overhead over direct HTTP is 0.09 ms median for the Rust proxy and 2.2 to 3.1 ms for the Python baseline, first call under 9 ms for both (`measurements/ubuntu-latest.md`, `measurements/macos-14.md`). A live run against `api.mctl.ai` is unmeasured.
+- **G6** packaging and update story simple enough to justify another component: **unproven**; http-only builds succeed for 5 of 5 targets and run on 3 (`measurements/cross-build.json`), but a TLS-capable artifact is unmeasured and no signing or update channel exists (see the TLS limit).
 - **G7** at least two hosts or environments can reuse the boundary: **unproven**; only the fixture host is exercised (T9), see `measurements/` host notes.
-- **Rust clause** a material packaging, runtime or sandbox advantage that outweighs adding Rust: **not met on current evidence**; the baseline passes the same parity test (T11) and size and startup are pending in `measurements/`.
+- **Rust clause** a material packaging, runtime or sandbox advantage that outweighs adding Rust: **not met on current evidence**; the Rust proxy has a measured runtime advantage (start 0.6 to 1.2 ms vs 330 to 474 ms, RSS about 2 MB vs 57 MB, `measurements/ubuntu-latest.md`), but it is http-only, the baseline passes the same parity test (T11), and with G1 and G7 unproven there is no portable runtime for the advantage to serve.
 
 ## Decision
 
 Proposed: `THIN_ADAPTER`.
 
 Basis: G1 and G7 are unproven, so a portable runtime is not supported. Bootstrap and config generation (T9) carry the value
-that is shown, and the Python baseline matches the Rust proxy on the compared behaviour (T11). G5 and G6 are re-checked by the
-shepherd after the bench run. This is a proposal; the verdict stays with the #746 owner.
+that is shown, and the Python baseline matches the Rust proxy on the compared behaviour (T11). After the bench run G5 is met and G6
+stays unproven; neither changes the token, which rests on G1 and G7. This is a proposal; the verdict stays with the #746 owner.
 
 ## Recommendations and follow-ups
 

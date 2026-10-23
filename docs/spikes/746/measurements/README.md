@@ -1,12 +1,11 @@
 # Spike #746 measurements
 
-Status: **code phase.** No bench artifact is committed yet. The shepherd commits
-the artifacts of one CI run on the PR's final code head into this directory and
-fills in the lines below. Until then every number in
-`docs/spikes/746-portable-runtime.md` reads `unmeasured (pending bench run)`.
+Status: **measured.** The artifacts of one CI run on the PR's final code head are
+committed here and the numbers in `docs/spikes/746-portable-runtime.md` come from
+them. The files are the artifacts as downloaded, unedited.
 
-- Run id: `unmeasured (pending bench run)`
-- Head SHA: `unmeasured (pending bench run)`
+- Run id: `40002256127`
+- Head SHA: `12f5582b45250b2059324689d244671ada2f31db`
 - Workflow: `.github/workflows/portable-runtime-spike.yml`, jobs `bench` and `cross-build`
 
 ## Files the shepherd commits here
@@ -69,3 +68,14 @@ The Rust crate is std-only and speaks plain `http://`. Every Rust size, build,
 dependency and startup number here is **http-only, TLS not included**. A
 TLS-capable binary will be larger, take longer to build and add dependencies.
 That variant is unmeasured.
+
+## Known measurement defects
+
+- `ubuntu-latest.json` reports `python-baseline interpreter_size` as 40427530 kB.
+  The value is invalid: on the runner `sys.base_prefix` is `/usr`, so `du` measured
+  the whole system prefix, not the interpreter. The report does not use it. The
+  macos-14 value (279558 kB, a standalone Python) is a real interpreter size.
+- `python-baseline build_time` is a `uv sync` against a warm uv cache, so it measures
+  environment linking, not a download and install. It is not comparable with the
+  Rust compile time.
+- Rust size, build, dependency and startup numbers are http-only, TLS not included.
