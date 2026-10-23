@@ -4,8 +4,20 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 description = "EXPERIMENTAL spike (#746). Not shipped. Default-off."
+rust-version = "1.85"
+
+[features]
+default = []
+# TLS client for https upstreams (#777 split). Off by default, so the default
+# build stays std-only; the bench measures both variants.
+tls = ["dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
+# ring provider instead of the aws-lc-rs default: no cmake/NASM in the
+# cross-build matrix. Roots are bundled so the single binary does not read the
+# host trust store.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "=1.0.11", optional = true }
 
 # Standalone: never join a parent workspace.
 [workspace]
