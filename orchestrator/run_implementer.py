@@ -133,6 +133,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import AsyncGenerator, Callable
 from contextlib import aclosing
 from dataclasses import dataclass, field
@@ -4239,11 +4240,39 @@ class TypecheckResult:
 _MYPY_FOUND_RE = re.compile(r"Found (\d+) errors?\b")
 
 
+# Only these variables reach the type-check child. `uv sync` runs build
+# backends and mypy runs plugins, both taken from the clone, which the agent
+# (or an injected proposal) can edit, so the orchestrator's tokens and keys
+# must never be in that environment (claude P2 on #787). An allowlist, not a
+# denylist: a secret added to the pod later stays out by default.
+_TYPECHECK_ENV_KEEP = (
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "UV_CACHE_DIR",
+    "UV_INDEX_URL",
+    "UV_PYTHON",
+    "UV_PYTHON_INSTALL_DIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
+
+
 def _typecheck_env() -> dict[str, str]:
-    """Child env that lets `uv` use the clone's own project environment."""
-    env = dict(os.environ)
-    env.pop("VIRTUAL_ENV", None)
-    parts = [p for p in env.get("PATH", "").split(os.pathsep) if p != "/app/.venv/bin"]
+    """Minimal child env that lets `uv` use the clone's own project environment.
+
+    `VIRTUAL_ENV` is dropped and `/app/.venv/bin` removed from `PATH`, so uv
+    builds the clone's environment instead of reusing the image's.
+    """
+    env = {k: os.environ[k] for k in _TYPECHECK_ENV_KEEP if k in os.environ}
+    parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p and p != "/app/.venv/bin"]
     env["PATH"] = os.pathsep.join(parts)
     return env
 
@@ -4282,6 +4311,7 @@ def _run_pre_push_typecheck(
     steps = [[cmd[0], "sync", "--locked"], run_step]
     for i, step in enumerate(steps):
         print(f"$ {' '.join(step)}  (cwd={repo_dir})")
+        started = time.monotonic()
         try:
             proc = subprocess.run(  # noqa: S603 - fixed argv list, never shell=True
                 step, cwd=repo_dir, env=env, capture_output=True, text=True, timeout=timeout
@@ -4290,6 +4320,9 @@ def _run_pre_push_typecheck(
             return TypecheckResult("unknown", "timeout", summary=f"timed out after {timeout:g}s")
         except OSError as exc:
             return TypecheckResult("unknown", "observation_failed", summary=f"could not start: {exc}")
+        # Wall time per step is the in-pod measurement #785 task 1 asks for
+        # (install vs. cold mypy under the real CPU limit), read from run logs.
+        print(f"info: typecheck step {i} exited {proc.returncode} in {time.monotonic() - started:.1f}s")
         out = (proc.stdout or "") + "\n" + (proc.stderr or "")
         if i == 0:
             if proc.returncode != 0:

@@ -44,6 +44,30 @@ def test_seeded_error_is_fail(monkeypatch, repo):
     assert calls[1] == ["uv", "run", "--locked", "--no-sync", "mypy"]
 
 
+def test_child_env_carries_no_orchestrator_secrets(monkeypatch, repo):
+    # `uv sync` and mypy run code from the clone; the orchestrator's tokens
+    # must not reach them (claude P2 on #787).
+    for k in ("GITHUB_TOKEN", "GH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "SOME_FUTURE_SECRET"):
+        monkeypatch.setenv(k, "s3cret")
+    monkeypatch.setenv("VIRTUAL_ENV", "/app/.venv")
+    monkeypatch.setenv("PATH", "/app/.venv/bin:/usr/local/bin:/usr/bin")
+    monkeypatch.setenv("HOME", "/home/agent")
+    envs: list[dict[str, str]] = []
+
+    def run(cmd, **kw):
+        envs.append(kw["env"])
+        return _proc(0, "Success: no issues found")
+
+    monkeypatch.setattr(ri.subprocess, "run", run)
+    ri._run_pre_push_typecheck(repo, "mctl-agents", None)
+    assert len(envs) == 2
+    for env in envs:
+        assert "s3cret" not in env.values()
+        assert "VIRTUAL_ENV" not in env
+        assert env["PATH"] == "/usr/local/bin:/usr/bin"
+        assert env["HOME"] == "/home/agent"
+
+
 def test_clean_tree_is_pass(monkeypatch, repo):
     _fake(monkeypatch, [_proc(0), _proc(0, "Success: no issues found")])
     tc = ri._run_pre_push_typecheck(repo, "mctl-agents", None)
