@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.95.0](https://github.com/mctlhq/mctl-agents/compare/1.94.0...1.95.0) (2026-10-23)
+
+
+### Features
+
+* **agents:** issue-707-spike-devloop-evaluate-pyrefly-as-a-fast ([e5055bf](https://github.com/mctlhq/mctl-agents/commit/e5055bf885130d19ca7294872ba6d7c56ac93028))
+* **agents:** issue-707-spike-devloop-evaluate-pyrefly-as-a-fast ([435e64e](https://github.com/mctlhq/mctl-agents/commit/435e64e47e66d7a8f00c121c41b61090bd6d0bef))
+
+
+### Bug Fixes
+
+* **spike-707:** pin the lint-job clone to the baseline SHA ([a9420d4](https://github.com/mctlhq/mctl-agents/commit/a9420d4f7ec9e2ae680d958d25146465346f378c))
+* **spike-707:** resolve config B inside the pinned worktree ([17d80a5](https://github.com/mctlhq/mctl-agents/commit/17d80a57977f57baa4b8c6bbac7dd0b82b161a9c))
+* **spike-707:** time the loop on a real re-check, count caught edits ([4bc4604](https://github.com/mctlhq/mctl-agents/commit/4bc46047130a63cd7ad9d21e7a829102c3e1d1d5))
+
 ## [1.94.0](https://github.com/mctlhq/mctl-agents/compare/1.93.0...1.94.0) (2026-10-23)
 
 
