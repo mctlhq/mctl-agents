@@ -29,7 +29,6 @@ from orchestrator.run_issue_directive_poller import (
 )
 from orchestrator.temporal.activities.gitops_state import ProposalStateRef
 
-
 EXECUTION = LoopExecution(
     work_item_id="wi_x", execution_id="we_y",
     workflow_id="dev-loop-mctlhq-mctl-web-9", run_id="run-1",
@@ -791,7 +790,9 @@ def test_issue_url_for_a_non_issue_slug_is_none():
 def _submit(monkeypatch, handler):
     monkeypatch.setenv("MCTL_TOKEN", "test-token")
     _mock_async_client(monkeypatch, handler)
-    return asyncio.run(submit_investigate("https://github.com/mctlhq/mctl-web/issues/9", "issue-9-fix", "octocat", EXECUTION))
+    return asyncio.run(
+        submit_investigate("https://github.com/mctlhq/mctl-web/issues/9", "issue-9-fix", "octocat", EXECUTION)
+    )
 
 
 def test_submit_investigate_on_a_definite_rejection_raises_http_status_error_not_ambiguous(monkeypatch):

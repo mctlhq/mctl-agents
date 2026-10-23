@@ -53,7 +53,10 @@ def _resolve(handle):
 
 
 def test_running_canonical_loop_returns_identity():
-    h = _Handle(_running(), {"work_item_id": "wi_x", "execution_id": "we_y"})
+    h = _Handle(_running(), {
+        "work_item_id": "wi_x", "execution_id": "we_foreign",
+        "canonical_execution_id": "we_y", "canonical_open": True,
+    })
     got = _resolve(h)
     assert (got.work_item_id, got.execution_id, got.run_id) == ("wi_x", "we_y", "run-1")
     assert got.workflow_id == "dev-loop-mctlhq-mctl-web-9"
@@ -75,7 +78,7 @@ def test_completed_loop_is_no_live_loop():
 
 def test_seed_hash_execution_is_not_canonical():
     with pytest.raises(NoExecution) as e:
-        _resolve(_Handle(_running(), {"work_item_id": "wi_x", "execution_id": "ab12cd"}))
+        _resolve(_Handle(_running(), {"work_item_id": "wi_x", "canonical_execution_id": "ab12cd", "canonical_open": True}))
     assert e.value.reason == "loop-not-canonical"
 
 
@@ -99,6 +102,14 @@ def test_describe_rpc_error_is_unavailable():
 
 def test_query_failure_is_unavailable():
     with pytest.raises(ExecutionLookupUnavailable):
-        _resolve(_Handle(_running(), asyncio.TimeoutError()))
+        _resolve(_Handle(_running(), TimeoutError()))
     with pytest.raises(ExecutionLookupUnavailable):
         _resolve(_Handle(_running(), WorkflowQueryFailedError("worker busy")))
+
+
+def test_closed_canonical_execution_is_no_open_execution():
+    h = _Handle(_running(), {"work_item_id": "wi_x", "execution_id": "we_y",
+                             "canonical_execution_id": "we_y", "canonical_open": False})
+    with pytest.raises(NoExecution) as e:
+        _resolve(h)
+    assert e.value.reason == "no-open-execution"

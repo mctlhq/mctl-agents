@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from temporalio import activity
 from temporalio.client import Client, WorkflowQueryFailedError
 from temporalio.service import RPCError, RPCStatusCode
 
@@ -55,8 +54,6 @@ def _field(state: Any, name: str) -> str:
 
 
 async def _client() -> Client:
-    if activity.in_activity():
-        return activity.client()
     from orchestrator.temporal.start import connect
 
     return await connect()
@@ -73,13 +70,15 @@ async def resolve_loop_execution(issue_url: str, client: Client | None = None) -
         if e.status == RPCStatusCode.NOT_FOUND:
             raise NoExecution("no-live-loop", f"no DevLoopWorkflow {workflow_id}") from e
         raise ExecutionLookupUnavailable(f"describe {workflow_id} failed: {e}") from e
-    except Exception as e:  # noqa: BLE001 — connect/timeout/anything else is "cannot answer"
+    except Exception as e: # connect/timeout/anything else is "cannot answer"
         raise ExecutionLookupUnavailable(f"describe {workflow_id} failed: {e!r}") from e
 
     status = getattr(desc, "status", None)
     if getattr(status, "name", str(status)) != "RUNNING":
         raise NoExecution("no-live-loop", f"{workflow_id} is not running ({getattr(status, 'name', status)})")
-    run_id = getattr(desc, "run_id", "") or ""
+    raw_info = getattr(getattr(desc, "raw_description", None), "workflow_execution_info", None)
+    exec_info = getattr(raw_info, "execution", None)
+    run_id = getattr(desc, "run_id", "") or getattr(exec_info, "run_id", "") or ""
 
     try:
         state = await handle.query(QUERY_NAME, rpc_timeout=_RPC_TIMEOUT)
@@ -87,13 +86,18 @@ async def resolve_loop_execution(issue_url: str, client: Client | None = None) -
         if "unknown" in str(e).lower():
             raise NoExecution("loop-not-canonical", f"{workflow_id} has no {QUERY_NAME} query") from e
         raise ExecutionLookupUnavailable(f"query {QUERY_NAME} on {workflow_id} failed: {e}") from e
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         raise ExecutionLookupUnavailable(f"query {QUERY_NAME} on {workflow_id} failed: {e!r}") from e
 
     work_item_id = _field(state, "work_item_id")
-    execution_id = _field(state, "execution_id")
+    # The loop's own canonical `we_`, never `execution_id` (`_executions[-1]`,
+    # which a resume or a delivery appends a foreign execution to).
+    execution_id = _field(state, "canonical_execution_id")
+    canonical_open = state.get("canonical_open") if isinstance(state, dict) else getattr(state, "canonical_open", False)
     if not work_item_id:
         raise NoExecution("no-work-item", f"{workflow_id} reports no work item")
+    if not canonical_open:
+        raise NoExecution("no-open-execution", f"{workflow_id} holds no open canonical execution")
     if not is_store_execution(execution_id):
         raise NoExecution("loop-not-canonical", f"{workflow_id} execution is not a store execution")
     return LoopExecution(
