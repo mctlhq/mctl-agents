@@ -1,9 +1,9 @@
 name: portable-runtime spike (experimental)
+# Runs on every PR so that its final job, `portable-runtime-spike`, can be a
+# required check: a path-filtered workflow never reports on unrelated PRs and
+# would leave them blocked. The `changes` job decides whether cargo runs.
 on:
   pull_request:
-    paths:
-      - "experiments/portable-runtime-rs/**"
-      - ".github/workflows/portable-runtime-spike.yml"
   workflow_dispatch:
 permissions:
   contents: read
@@ -11,7 +11,45 @@ concurrency:
   group: portable-runtime-spike-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      spike: ${{ steps.diff.outputs.spike }}
+    steps:
+      - id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "spike=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A failed or partial listing fails this job; it never reads as
+          # "nothing changed". The files API stops at 3000 entries, so a
+          # listing that long is treated as unknown and cargo runs. A rename
+          # counts under both its old and new path.
+          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | .filename, (.previous_filename // empty)')
+          count=$(grep -c . <<<"$files" || true)
+          # Here-strings, not pipes: under pipefail, `grep -q` closing a pipe
+          # early would SIGPIPE the writer and read as "no match".
+          if [ "$count" -ge 3000 ] || grep -qE '^(experiments/portable-runtime-rs/|\.github/workflows/portable-runtime-spike\.yml$)' <<<"$files"; then
+            echo "spike=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "spike=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "files=$count"
+
   cargo:
+    needs: changes
+    if: needs.changes.outputs.spike == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -37,3 +75,28 @@ jobs:
           # Pinned to the newest release that still builds on rustc 1.85.0 (0.22.2 needs 1.88).
           cargo install cargo-audit --version 0.22.1 --locked
           cargo audit
+
+  # The required check. Green when the spike was untouched or cargo passed on
+  # both OSes; red when change detection failed or cargo did not succeed.
+  portable-runtime-spike:
+    needs: [changes, cargo]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - env:
+          CHANGES: ${{ needs.changes.result }}
+          SPIKE: ${{ needs.changes.outputs.spike }}
+          CARGO: ${{ needs.cargo.result }}
+        run: |
+          set -euo pipefail
+          echo "changes=$CHANGES spike=$SPIKE cargo=$CARGO"
+          if [ "$CHANGES" != "success" ]; then
+            echo "::error::change detection did not complete"; exit 1
+          fi
+          if [ "$SPIKE" = "true" ] && [ "$CARGO" != "success" ]; then
+            echo "::error::spike files changed and cargo did not succeed"; exit 1
+          fi
+          if [ "$SPIKE" != "true" ] && [ "$SPIKE" != "false" ]; then
+            echo "::error::change detection produced no answer"; exit 1
+          fi
