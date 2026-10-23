@@ -131,9 +131,9 @@ jobs:
           # allowlist, i.e. the PR does ship something. Inverted here: no
           # such path means nothing ships. Here-string for the same reason
           # as the SUBJECTS check below.
-          SHIPPING_PATHS='^(tests/|docs/|\.github/)'
+          SHIPPING_PATHS='^(tests/|docs/|\.github/|experiments/)'
           if ! grep -qvE "$SHIPPING_PATHS" <<< "$FILES"; then
-            echo "Every changed path is under tests/, docs/ or .github/ — this PR ships nothing:"
+            echo "Every changed path is under tests/, docs/, .github/ or experiments/ — this PR ships nothing:"
             sed 's/^/  · /' <<< "$FILES"
             echo "Skipping the releasable-commit requirement."
             exit 0

@@ -1,0 +1,11 @@
+[package]
+name = "mctl-runtime"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "EXPERIMENTAL spike (#746). Not shipped. Default-off."
+
+[dependencies]
+
+# Standalone: never join a parent workspace.
+[workspace]

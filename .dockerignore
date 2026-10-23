@@ -26,3 +26,6 @@ README.md
 .idea/
 .vscode/
 .claude/projects/
+
+# Experimental spike, never part of the image (guarded by tests/test_portable_runtime_isolation.py)
+experiments/

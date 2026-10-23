@@ -13,3 +13,6 @@ __pycache__/
 agents/*/inbox/
 agents/*/proposals/
 agents/_mentor/digest/
+
+# Experimental Rust spike build output (#746)
+experiments/**/target/
