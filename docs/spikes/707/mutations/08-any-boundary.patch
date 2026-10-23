@@ -1,0 +1,12 @@
+diff --git a/orchestrator/ci_checks.py b/orchestrator/ci_checks.py
+index 5eee8d9..ee1d33d 100644
+--- a/orchestrator/ci_checks.py
++++ b/orchestrator/ci_checks.py
+@@ -573,6 +573,7 @@ def _fetch_one_log(repo: str, blocker: CheckBlocker) -> tuple[str | None, str]:
+         try:
+             proc = run_capturing(
+                 ["gh", "api", f"repos/{repo}/actions/jobs/{blocker.check_run_id}/logs"],
++                cwd=42,
+                 timeout=SHEPHERD_CI_LOG_TIMEOUT_SECONDS,
+                 max_output_bytes=CI_LOG_MAX_FETCH_BYTES,
+             )

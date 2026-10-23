@@ -1,0 +1,13 @@
+diff --git a/orchestrator/temporal/worker.py b/orchestrator/temporal/worker.py
+index 4222de2..f8a2ae6 100644
+--- a/orchestrator/temporal/worker.py
++++ b/orchestrator/temporal/worker.py
+@@ -160,7 +160,7 @@ def _action_fingerprint_live(action: Any) -> tuple | None:
+ 
+ async def _action_fingerprint_desired(client: Client, action: ScheduleActionStartWorkflow) -> tuple:
+     """Same tuple for the declared action, encoded by the client's own converter."""
+-    encoded = await client.data_converter.encode(list(action.args))
++    encoded = await list(action.args)
+     return (action.workflow, action.id, action.task_queue, tuple(_payload_key(p) for p in encoded))
+ 
+ 

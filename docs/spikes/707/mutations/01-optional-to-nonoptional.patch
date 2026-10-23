@@ -1,0 +1,15 @@
+diff --git a/orchestrator/ci_checks.py b/orchestrator/ci_checks.py
+index 5eee8d9..bdd3cad 100644
+--- a/orchestrator/ci_checks.py
++++ b/orchestrator/ci_checks.py
+@@ -657,10 +657,6 @@ def fetch_failure_logs(
+ 
+         raw, status = _fetch_one_log(repo, blocker)
+         fetched += 1
+-        if raw is None:
+-            out.append(dataclasses.replace(blocker, log_status=status))
+-            continue
+-
+         per_check_cap = min(CI_LOG_MAX_CHARS, remaining_total)
+         excerpt, truncated = _bound_log(raw, per_check_cap)
+         total_chars += len(excerpt)

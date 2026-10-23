@@ -1,0 +1,13 @@
+diff --git a/orchestrator/ci_checks.py b/orchestrator/ci_checks.py
+index 5eee8d9..a79fe05 100644
+--- a/orchestrator/ci_checks.py
++++ b/orchestrator/ci_checks.py
+@@ -394,7 +394,7 @@ def _classify(conclusion: str, excerpt: str, has_annotations: bool) -> str:
+     Unclassifiable defaults to "actionable" — see module docstring for why
+     that direction, not the other one, is the safe default here.
+     """
+-    c = (conclusion or "").upper()
++    c: int = (conclusion or "").upper()
+     if c in CI_INFRA_CONCLUSIONS:
+         return "infrastructure"
+     if c in CI_ACTIONABLE_CONCLUSIONS:

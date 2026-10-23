@@ -1,0 +1,13 @@
+diff --git a/orchestrator/ci_checks.py b/orchestrator/ci_checks.py
+index 5eee8d9..8db994b 100644
+--- a/orchestrator/ci_checks.py
++++ b/orchestrator/ci_checks.py
+@@ -381,7 +381,7 @@ def _build_excerpt(repo: str, node: dict[str, Any]) -> tuple[str, bool, str | No
+     text = "\n".join(p for p in (title, summary) if p)
+     if not text and node["typename"] == "StatusContext":
+         text = f"{node['name']}: {node['conclusion'] or 'unknown state'}"
+-    return _bound_excerpt(text), False, None
++    return _bound_excerpt(len(text)), False, None
+ 
+ 
+ def _matches_infra_pattern(text: str) -> bool:

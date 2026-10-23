@@ -1,0 +1,13 @@
+diff --git a/orchestrator/ci_checks.py b/orchestrator/ci_checks.py
+index 5eee8d9..11f3d04 100644
+--- a/orchestrator/ci_checks.py
++++ b/orchestrator/ci_checks.py
+@@ -248,7 +248,7 @@ def _status_state_to_conclusion(state: str | None) -> str:
+     way — GitHub draws no meaningful actionable/infra distinction between
+     "the check errored" and "the check failed" at the commit-status level.
+     """
+-    s = (state or "").upper()
++    s = state.upper()
+     if s in ("PENDING", "EXPECTED"):
+         return ""
+     if s == "ERROR":

@@ -1,0 +1,13 @@
+diff --git a/orchestrator/temporal/worker.py b/orchestrator/temporal/worker.py
+index 4222de2..c9956ed 100644
+--- a/orchestrator/temporal/worker.py
++++ b/orchestrator/temporal/worker.py
+@@ -188,7 +188,7 @@ async def _ensure_schedule(
+     not quietly un-pause it.
+     """
+     try:
+-        await client.create_schedule(schedule_id, desired)
++        client.create_schedule(schedule_id, desired)
+         logger.info("Created Temporal schedule %s for %s", schedule_id, label)
+         return
+     except ScheduleAlreadyRunningError:
