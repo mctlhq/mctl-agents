@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.94.0](https://github.com/mctlhq/mctl-agents/compare/1.93.0...1.94.0) (2026-10-23)
+
+
+### Features
+
+* **agents:** issue-556-spike-governance-compare-jev-and-clef-de ([2f69b5c](https://github.com/mctlhq/mctl-agents/commit/2f69b5cd080bb8996a9f4ffdc7eee37486cfda72))
+* **agents:** issue-556-spike-governance-compare-jev-and-clef-de ([a1d83ea](https://github.com/mctlhq/mctl-agents/commit/a1d83ea5d5b8a7a2195a225270723824c3aa8e0f))
+* **agents:** issue-764-spike-runtime-746-slice-2-rust-bridge-cr ([a3f175d](https://github.com/mctlhq/mctl-agents/commit/a3f175d84349075ddbea0437e26cd3e34b07f40f))
+* **experiments:** std-only Rust stdio-to-HTTP bridge for spike [#746](https://github.com/mctlhq/mctl-agents/issues/746) slice 2 ([0b96f3d](https://github.com/mctlhq/mctl-agents/commit/0b96f3dc1b0374a506ce9a14fae788466da53672))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-764-spike-runtime-746-slice-2-rust-bridge-cr ([2eb078a](https://github.com/mctlhq/mctl-agents/commit/2eb078aec86a3af8c49a7b15927f9e632ba79175))
+* **agents:** address P1/P2 codex findings on issue-764-spike-runtime-746-slice-2-rust-bridge-cr ([f8b7884](https://github.com/mctlhq/mctl-agents/commit/f8b788430b2c71d4f06778095da8ed560cd0d910))
+* **agents:** address P1/P2 codex findings on issue-764-spike-runtime-746-slice-2-rust-bridge-cr ([1f32ce5](https://github.com/mctlhq/mctl-agents/commit/1f32ce56741acbe1dea45304d49250c74fc36bfa))
+* **spike:** factor fake_upstream request tuple into a type alias ([4254212](https://github.com/mctlhq/mctl-agents/commit/42542128bd3c2900dd63be81d46e9280c71eaffa))
+* **spike:** factor fake_upstream request tuple into a type alias ([f9b1dba](https://github.com/mctlhq/mctl-agents/commit/f9b1dbac9b0a986e35b6e356fca41e774d7aa029)), closes [#746](https://github.com/mctlhq/mctl-agents/issues/746)
+* **spike:** map evaluate codes the way decide does ([6e3b900](https://github.com/mctlhq/mctl-agents/commit/6e3b900675ef4fde7d64ffe0826ebfc07f703038)), closes [#556](https://github.com/mctlhq/mctl-agents/issues/556)
+* **spike:** never attribute a handshake request id to tools/call ([3a4106a](https://github.com/mctlhq/mctl-agents/commit/3a4106ab82a81d9eb2d6eb957ba5e614966ab139)), closes [#746](https://github.com/mctlhq/mctl-agents/issues/746)
+* **spike:** satisfy clippy format_collect in sha256_hex ([5b178ce](https://github.com/mctlhq/mctl-agents/commit/5b178cee6f58484f72dc921f1ec7138f7d9a0705)), closes [#746](https://github.com/mctlhq/mctl-agents/issues/746)
+
 ## [1.93.0](https://github.com/mctlhq/mctl-agents/compare/1.92.0...1.93.0) (2026-10-23)
 
 
