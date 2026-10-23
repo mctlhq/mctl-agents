@@ -78,7 +78,9 @@ def test_completed_loop_is_no_live_loop():
 
 def test_seed_hash_execution_is_not_canonical():
     with pytest.raises(NoExecution) as e:
-        _resolve(_Handle(_running(), {"work_item_id": "wi_x", "canonical_execution_id": "ab12cd", "canonical_open": True}))
+        _resolve(_Handle(_running(), {
+            "work_item_id": "wi_x", "canonical_execution_id": "ab12cd", "canonical_open": True,
+        }))
     assert e.value.reason == "loop-not-canonical"
 
 
