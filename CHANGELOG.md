@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.92.0](https://github.com/mctlhq/mctl-agents/compare/1.91.0...1.92.0) (2026-10-23)
+
+
+### Features
+
+* **agents:** issue-759-spike-runtime-746-slice-1-portable-runti ([1b4f21e](https://github.com/mctlhq/mctl-agents/commit/1b4f21e88e4b160e452f84c9a9ef5578169e4347))
+* **agents:** issue-759-spike-runtime-746-slice-1-portable-runti ([ab7e942](https://github.com/mctlhq/mctl-agents/commit/ab7e94272e07dbc86ba2802fd241e2d6af49360c))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-759-spike-runtime-746-slice-1-portable-runti ([48e9876](https://github.com/mctlhq/mctl-agents/commit/48e98768f0429566ef30fbf74ef301ccc624e383))
+* **agents:** address P1/P2 codex findings on issue-759-spike-runtime-746-slice-1-portable-runti ([f99905f](https://github.com/mctlhq/mctl-agents/commit/f99905ff6a2f40dd60de4a62a15313cd7c2028a6))
+* **agents:** address P1/P2 codex findings on issue-759-spike-runtime-746-slice-1-portable-runti ([cb92c9c](https://github.com/mctlhq/mctl-agents/commit/cb92c9c759d16a4c6cd2d3efdcfb79ba58efedd6))
+* **agents:** address P1/P2 codex findings on issue-759-spike-runtime-746-slice-1-portable-runti ([aae6330](https://github.com/mctlhq/mctl-agents/commit/aae6330b8f4c4b3d2b285f1dcd7cab0f229005c2))
+
 ## [1.91.0](https://github.com/mctlhq/mctl-agents/compare/1.90.0...1.91.0) (2026-10-22)
 
 
