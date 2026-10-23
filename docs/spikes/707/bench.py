@@ -328,6 +328,10 @@ def run_lint_job(target: Path):
     with tempfile.TemporaryDirectory() as td:
         clone = Path(td) / "clone"
         sh(["git", "clone", "--no-hardlinks", "-q", str(target), str(clone)], td, check=True)
+        # Pin explicitly rather than trust the clone of a detached HEAD.
+        sh(["git", "checkout", "-q", "--detach", PINNED_SHA], clone, check=True)
+        if sh(["git", "rev-parse", "HEAD"], clone, check=True)[2].strip() != PINNED_SHA:
+            raise SystemExit("lint-job clone is not at the pinned SHA")
         env = {
             **os.environ,
             "UV_CACHE_DIR": str(Path(td) / "uv-cache"),
