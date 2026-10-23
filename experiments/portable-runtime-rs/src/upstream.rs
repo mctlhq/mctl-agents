@@ -163,6 +163,9 @@ impl Upstream {
         let deadline = Instant::now() + self.timeout;
         self.last_request_id = None;
         self.ensure_session(deadline)?;
+        // The handshake above may have recorded its own X-Request-Id; a
+        // tools/call that fails before a response must not inherit it.
+        self.last_request_id = None;
         let params = Value::obj(vec![
             ("name", Value::text(name)),
             ("arguments", arguments.clone()),
@@ -234,9 +237,7 @@ impl Upstream {
             headers.push(("X-Mctl-Invocation-Id".to_string(), i.to_string()));
         }
         let resp = http::post(&url, &headers, body.as_bytes(), deadline)?;
-        if let Some(rid) = resp.header("x-request-id") {
-            self.last_request_id = Some(rid.to_string());
-        }
+        self.last_request_id = resp.header("x-request-id").map(str::to_string);
         if self.session_id.is_none() {
             if let Some(sid) = resp.header("mcp-session-id") {
                 self.session_id = Some(sid.to_string());
