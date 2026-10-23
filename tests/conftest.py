@@ -215,3 +215,21 @@ def result_message(*, is_error=False, api_error_status=None, subtype="success"):
         subtype=subtype, duration_ms=1, duration_api_ms=0, is_error=is_error,
         num_turns=1, session_id="s", api_error_status=api_error_status,
     )
+
+
+@pytest.fixture(autouse=True)
+def _live_loop_default(monkeypatch):
+    """Default: the issue has a live canonical DevLoop (mctl-agents#758), so
+    unit tests never open a real Temporal connection."""
+    from orchestrator import run_issue_directive_poller
+    from orchestrator.directive_execution import LoopExecution
+
+    execution = LoopExecution(
+        work_item_id="wi_x", execution_id="we_y",
+        workflow_id="dev-loop-mctlhq-mctl-web-9", run_id="run-1",
+    )
+
+    async def _resolve(issue_url):
+        return execution
+
+    monkeypatch.setattr(run_issue_directive_poller, "resolve_loop_execution", _resolve)

@@ -1086,6 +1086,12 @@ class WorkContextState:
     last_surface: SurfaceRef = field(default_factory=SurfaceRef)
     last_actor: ActorRef = field(default_factory=ActorRef)
     resume_rejections: tuple[ResumeRejection, ...] = ()
+    #: This loop's own canonical `we_` and whether it is still open
+    #: (mctl-agents#758). Unlike `execution_id` (`_executions[-1]`, which a
+    #: resume or a delivery appends to), this is the identity the loop hands
+    #: its own investigate step.
+    canonical_execution_id: str = ""
+    canonical_open: bool = False
 
 
 #: How `DevLoopResult.ended` starts on every path where an operator abandoned
@@ -1934,6 +1940,8 @@ class DevLoopWorkflow:
             last_surface=self._current_surface,
             last_actor=self._current_actor,
             resume_rejections=tuple(self._resume_rejections),
+            canonical_execution_id=self._canonical_execution_id(),
+            canonical_open=self._canonical_open,
         )
 
     @workflow.query

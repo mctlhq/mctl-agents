@@ -494,18 +494,18 @@ def test_a_refused_submit_sends_no_request(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", factory)
     submit = run_issue_directive_poller.submit_investigate
-    assert asyncio.run(submit(ISSUE, "issue-9-fix", "octocat")) == "wf-1" and len(sent) == 1
+    assert asyncio.run(submit(ISSUE, "issue-9-fix", "octocat", _EXEC)) == "wf-1" and len(sent) == 1
 
     _deny_everything(monkeypatch)
     with pytest.raises(pc.PolicyRefused):
-        asyncio.run(submit(ISSUE, "issue-9-fix", "octocat"))
+        asyncio.run(submit(ISSUE, "issue-9-fix", "octocat", _EXEC))
     assert len(sent) == 1
 
 
 def test_a_refused_dispatch_is_answered_once_and_not_retried(monkeypatch):
     ref = ProposalStateRef(service="mctl-web", slug="issue-9-fix", status="proposed", pr_url=None)
 
-    async def _refused(issue_url, slug, requested_by):
+    async def _refused(issue_url, slug, requested_by, execution):
         raise pc.PolicyRefused(pc.Decision(pc.DENY, pc.CODE_DENIED, "rule x", "v1", "x", "sha256:d"))
 
     replies: list[str] = []
@@ -525,7 +525,7 @@ def test_a_refused_dispatch_is_answered_once_and_not_retried(monkeypatch):
 def test_an_undecided_checkpoint_is_retried_not_acked(monkeypatch, code):
     ref = ProposalStateRef(service="mctl-web", slug="issue-9-fix", status="proposed", pr_url=None)
 
-    async def _undecided(issue_url, slug, requested_by):
+    async def _undecided(issue_url, slug, requested_by, execution):
         raise pc.PolicyRefused(pc.Decision(pc.DENY, code, "could not decide", "v1", "", "sha256:d"))
 
     replies: list[str] = []
@@ -554,7 +554,7 @@ def test_a_refused_ack_after_a_real_dispatch_is_loud_and_not_silent(monkeypatch,
     there must take the same loud resubmit-warning path as a gh failure."""
     ref = ProposalStateRef(service="mctl-web", slug="issue-9-fix", status="proposed", pr_url=None)
 
-    async def _submitted(issue_url, slug, requested_by):
+    async def _submitted(issue_url, slug, requested_by, execution):
         return "wf-42"
 
     def _refuse(url, body):
@@ -588,7 +588,7 @@ def test_a_refused_marker_or_ambiguous_ack_raises_the_refusal_not_an_attribute_e
     PolicyRefused has no `stderr`."""
     ref = ProposalStateRef(service="mctl-web", slug="issue-9-fix", status="proposed", pr_url=None)
 
-    async def _submit(issue_url, slug, requested_by):
+    async def _submit(issue_url, slug, requested_by, execution):
         if submit_error == "ambiguous":
             raise run_issue_directive_poller.DispatchOutcomeAmbiguous("reply lost")
         raise RuntimeError("mctl-api down")
@@ -611,6 +611,9 @@ def test_a_refused_marker_or_ambiguous_ack_raises_the_refusal_not_an_attribute_e
 # Store-bound identity (mctl-api#701): the work-item store execution a run
 # resolved from mctl-api, when no sealed ADR 011 context is configured.
 # ---------------------------------------------------------------------------
+from orchestrator.directive_execution import LoopExecution  # noqa: E402
+
+_EXEC = LoopExecution("wi_x", "we_y", "dev-loop-mctlhq-mctl-web-9", "run-1")
 STORE_ID = "we_11430e2c-d486-48b3-95ed-50106add0aa6"
 STORE_ACTOR = "service:mctl-agent"
 STORE_PRN = "prn_01M39HRKDM8WJXDX9F0B3HP46F"
