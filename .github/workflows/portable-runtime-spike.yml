@@ -266,7 +266,9 @@ jobs:
               elif grep -qiE 'link\.exe|MSVC' "$log"; then
                 prerequisite="MSVC build tools"
               elif [ "$VARIANT" = tls ]; then
-                prerequisite=$(grep -m1 -iE '^error' "$log" | cut -c1-200 | jstr)
+                # `|| true`: no `^error` line is a normal case, and under pipefail
+                # a failed grep would abort the step before this variant's record is written.
+                prerequisite=$( (grep -m1 -iE '^error' "$log" || true) | cut -c1-200 | jstr)
               fi
             fi
             printf '{"name":"%s","variant":"%s","target":"%s","runner":"%s","status":"%s","ran":"%s","size_bytes":%s,"file":"%s","reason":"%s","prerequisite":"%s","note":"%s","head_sha":"%s","run_id":"%s"}\n' \

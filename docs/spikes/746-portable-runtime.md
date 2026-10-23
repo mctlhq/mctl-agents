@@ -237,8 +237,8 @@ Marks: met, not met or unproven. Each line cites a measurement file or a test id
 Recommendation: `THIN_ADAPTER`
 
 Basis: G1 and G7 are unproven, so a portable runtime is not supported. Bootstrap and config generation (T9) carry the value
-that is shown, and the Python baseline matches the Rust proxy on the compared behaviour (T11). After the bench run G5 is met and G6
-stays unproven; neither changes the token, which rests on G1 and G7. The `tls` evidence (run `40028550067`) leaves G5 met and moves G6 to not met as measured; neither touches G1 or G7, so the token does not change. This is a proposal; the verdict stays with the #746 owner.
+that is shown, and the Python baseline matches the Rust proxy on the compared behaviour (T11). After the slice 3 bench run G5 was met and G6
+was unproven; neither changes the token, which rests on G1 and G7. The `tls` evidence (run `40028550067`) leaves G5 met and moves G6 to not met as measured; neither touches G1 or G7, so the token does not change. This is a proposal; the verdict stays with the #746 owner.
 
 ## Recommendations and follow-ups
 
