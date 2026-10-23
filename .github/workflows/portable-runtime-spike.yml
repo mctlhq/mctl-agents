@@ -34,5 +34,6 @@ jobs:
         run: |
           # Unpinned on purpose: the RustSec advisory DB format moves
           # independently, and an old cargo-audit cannot parse new entries.
-          cargo install cargo-audit --locked
+          # Pinned to the newest release that still builds on rustc 1.85.0 (0.22.2 needs 1.88).
+          cargo install cargo-audit --version 0.22.1 --locked
           cargo audit
