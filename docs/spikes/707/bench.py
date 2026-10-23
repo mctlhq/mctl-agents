@@ -73,11 +73,25 @@ def stats(samples):
     }
 
 
+def config_b(target: Path) -> Path:
+    """Config (B) placed inside the target tree.
+
+    pyrefly.toml paths are relative to the file itself, so the config must
+    live at the same depth inside the pinned worktree; read from ASSETS it
+    would resolve against the spike checkout (no .venv, wrong SHA).
+    """
+    dest = target / "docs/spikes/707/pyrefly.toml"
+    if not dest.exists():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ASSETS / "pyrefly.toml", dest)
+    return dest
+
+
 def checker_cmds(target: Path):
     return {
         "mypy": MYPY,
         "pyrefly-A": PYREFLY + ["check", "--output-format", "min-text"],
-        "pyrefly-B": PYREFLY + ["check", "--config", str(ASSETS / "pyrefly.toml"), "--output-format", "min-text"],
+        "pyrefly-B": PYREFLY + ["check", "--config", str(config_b(target)), "--output-format", "min-text"],
     }
 
 
@@ -182,6 +196,8 @@ def run_diagnostics(target: Path, out: Path):
             clear_mypy_cache(target)
         rc, dt, text = sh(cmd, target)
         # The working tree path is noise; keep output reproducible.
+        if "Invalid site-packages-path" in text or "Cannot find module `temporalio" in text:
+            raise SystemExit(f"{name} cannot see the target venv; refusing to record it")
         text = text.replace(str(target) + "/", "")
         (d / f"{name}.txt").write_text(text)
         res[name] = {
@@ -191,7 +207,12 @@ def run_diagnostics(target: Path, out: Path):
         }
     m_files = mypy_file_list(target)
     a_files, a_dump = pyrefly_file_list(target, None)
-    b_files, b_dump = pyrefly_file_list(target, ASSETS / "pyrefly.toml")
+    b_files, b_dump = pyrefly_file_list(target, config_b(target))
+    # A config that reads outside the target, or cannot see its venv, is a
+    # failed measurement, not a smaller or noisier result.
+    outside = [f for f in a_files + b_files if f.startswith("/")]
+    if outside or "Invalid site-packages-path" in b_dump:
+        raise SystemExit(f"config B does not resolve inside {target}: {outside[:3]}")
     (d / "pyrefly-A-config-dump.txt").write_text(a_dump.replace(str(target) + "/", ""))
     (d / "pyrefly-B-config-dump.txt").write_text(b_dump.replace(str(target) + "/", ""))
     (d / "files-mypy.txt").write_text("\n".join(m_files) + "\n")
@@ -354,6 +375,7 @@ def main():
             results["lint_job"] = run_lint_job(target)
     finally:
         clear_mypy_cache(target)
+        shutil.rmtree(target / "docs/spikes/707", ignore_errors=True)
         (a.out / "results.json").write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
     require_clean(target)
     print(json.dumps(results["environment"], indent=2))
