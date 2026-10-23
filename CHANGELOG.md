@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.96.0](https://github.com/mctlhq/mctl-agents/compare/1.95.0...1.96.0) (2026-10-23)
+
+
+### Features
+
+* **spike:** optional tls feature for the portable-runtime crate ([0768857](https://github.com/mctlhq/mctl-agents/commit/0768857625f3cefe259e019fcc58e812aa908e0f))
+* **spike:** optional tls feature for the portable-runtime crate ([7b037d1](https://github.com/mctlhq/mctl-agents/commit/7b037d16c961df23593445dc7b3aa51d8d7f9f4b))
+
 ## [1.95.0](https://github.com/mctlhq/mctl-agents/compare/1.94.0...1.95.0) (2026-10-23)
 
 
