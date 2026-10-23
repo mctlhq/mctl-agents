@@ -4,8 +4,8 @@ Raw compact output of each subject for the T11 sequence. Semantic equality is
 what T11 enforces; this file records how the bytes differ.
 
 ```diff
---- /home/runner/work/_temp/parity/parity-rust.raw	2026-10-23 18:19:17.278849891 +0000
-+++ /home/runner/work/_temp/parity/parity-python.raw	2026-10-23 18:19:17.668850460 +0000
+--- /home/runner/work/_temp/parity/parity-rust.raw	2026-10-23 21:43:50.059791106 +0000
++++ /home/runner/work/_temp/parity/parity-python.raw	2026-10-23 21:43:50.376796720 +0000
 @@ -1,7 +1,7 @@
 -{"request":"initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"mctl-runtime","version":"0.0.0"}}}
 -{"request":"tools/list","result":{"tools":[{"name":"mctl_whoami","description":"Who am I","inputSchema":{"type":"object","properties":{"verbose":{"type":"boolean","default":false},"limit":{"type":"integer","maximum":1.50}},"required":[],"additionalProperties":false}},{"name":"deny_tool","description":"Always denied","inputSchema":{"required":["target"],"type":"object","properties":{"target":{"type":"string"},"dry_run":{"default":true,"type":"boolean"}}}},{"name":"approval_tool","description":"Needs approval","inputSchema":{"type":"object","properties":{"z":{"type":"array","items":{"type":"number","minimum":0.10}},"a":{"type":"string"}},"required":["a"]}},{"name":"slow_tool","description":"Slow","inputSchema":{"type":"object","properties":{},"additionalProperties":true}}]}}

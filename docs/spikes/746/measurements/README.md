@@ -69,8 +69,9 @@ rustc, Python and uv versions).
 built into its own target directory. Default records keep the **http-only, TLS not included** note; `tls` records have none.
 The `tls` startup, latency and RSS runs use the plain-http fake upstream, so the TLS handshake is not timed. The
 `cross-build.json` records carry `variant` and a `prerequisite` field naming the toolchain a failed or extra-configured
-ring build needed (empty when none). Files from before slice 3b carry no `variant` field; the shepherd replaces them with
-the artifacts of the slice 3b CI run (`pending CI run`).
+ring build needed (empty when none). The files here come from the slice 3b CI run `40028550067` (head `83f6527`); the slice 3
+files from run `40002256127` are in git history at `2c56358`. In `cross-build.json` the `reason` of a failed build is the
+last 300 characters of its cargo log, whitespace collapsed.
 
 ## Known measurement defects
 
