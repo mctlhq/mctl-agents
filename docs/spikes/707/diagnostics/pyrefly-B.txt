@@ -1,0 +1,15 @@
+ERROR orchestrator/capability.py:818:18-26: Argument `Any | None` is not assignable to parameter `kind` with type `str` in function `CapabilitySet.__init__` [bad-argument-type]
+ERROR orchestrator/commerce.py:332:38-85: Unpacked keyword argument `str | Any` is not assignable to parameter `schema_version` with type `int` in function `DispatchAuthorization.__init__` [bad-argument-type]
+ERROR orchestrator/commerce.py:333:34-118: Unpacked keyword argument `str | Any` is not assignable to parameter `schema_version` with type `int` in function `DispatchAuthorization.__init__` [bad-argument-type]
+ERROR orchestrator/context_assembly.py:1713:54-79: Argument `str | None` is not assignable to parameter `strategy` with type `str` in function `AssemblyConfig.__replace__` [bad-argument-type]
+ERROR orchestrator/context_snapshot.py:979:18-22: Argument `Any | None` is not assignable to parameter `kind` with type `str` in function `ContextSnapshot.__init__` [bad-argument-type]
+ERROR orchestrator/execution_evidence.py:1234:18-22: Argument `Any | None` is not assignable to parameter `kind` with type `str` in function `ExecutionEvidence.__init__` [bad-argument-type]
+ERROR orchestrator/execution_identity.py:464:18-22: Argument `Any | None` is not assignable to parameter `kind` with type `str` in function `ExecutionContext.__init__` [bad-argument-type]
+ERROR orchestrator/resolver.py:774:14-26: Argument `Any | None` is not assignable to parameter `name` with type `str` in function `ExecutionProfile.__init__` [bad-argument-type]
+ERROR orchestrator/run_issue_investigator.py:2505:29-46: `CapabilityGateway` may be uninitialized [unbound-name]
+ERROR orchestrator/run_issue_investigator.py:2507:28-56: `PolicyDecidePolicyCheckpoint` may be uninitialized [unbound-name]
+ERROR tools/diagram_facts.py:117:44-112: Cannot set item in `dict[str, str]` [unsupported-operation]
+ERROR tools/diagram_facts.py:122:43-83: Cannot set item in `dict[str, str]` [unsupported-operation]
+ERROR tools/diagram_facts.py:123:40-107: Cannot set item in `dict[str, str]` [unsupported-operation]
+ INFO Checking project configured at `docs/spikes/707/pyrefly.toml`
+ INFO 13 errors (14 suppressed, 41 warnings not shown, use `--min-severity=warn` to see them)

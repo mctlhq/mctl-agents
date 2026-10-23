@@ -1,0 +1,11 @@
+# Config (B) of the #707 spike: explicit Pyrefly config reproducing
+# [tool.mypy] (files = orchestrator/config/tools, python 3.12). The mypy
+# tests.* ignore_errors override has no counterpart: tests/ is outside
+# project-includes here, as it is outside mypy's `files`.
+# Paths are relative to this file. Used only via `--config`; never at repo root.
+project-includes = ["../../../orchestrator", "../../../config", "../../../tools"]
+project-excludes = ["**/__pycache__/**", "**/.venv/**"]
+python-version = "3.12"
+search-path = ["../../..", "../../../tools"]
+site-package-path = ["../../../.venv/lib/python3.12/site-packages"]
+

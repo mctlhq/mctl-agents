@@ -1,0 +1,13 @@
+diff --git a/orchestrator/ci_checks.py b/orchestrator/ci_checks.py
+index 5eee8d9..75b89bd 100644
+--- a/orchestrator/ci_checks.py
++++ b/orchestrator/ci_checks.py
+@@ -302,7 +302,7 @@ def _bound_excerpt(text: str) -> str:
+     text = (text or "").strip()
+     if len(text) <= CI_MAX_EXCERPT_CHARS:
+         return text
+-    return text[:CI_MAX_EXCERPT_CHARS].rstrip() + " ...(truncated)"
++    return len(text)
+ 
+ 
+ def _render_annotations(annotations: list[dict[str, Any]]) -> str:
