@@ -1,9 +1,12 @@
-//! Minimal HTTP/1.1 POST client over `TcpStream`. Plain `http://` only: TLS is
-//! deferred (see README). One deadline bounds connect, write and every read.
+//! Minimal HTTP/1.1 POST client over `TcpStream`. Plain `http://` always;
+//! `https://` only when built with the `tls` feature (rustls, see `tls.rs`).
+//! One deadline bounds connect, TLS handshake, write and every read.
 
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(feature = "tls")]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -30,6 +33,8 @@ pub struct Url {
     pub host: String,
     pub port: u16,
     pub path: String,
+    /// True for `https://` (only produced by the `tls` build).
+    pub tls: bool,
 }
 
 #[derive(Debug)]
@@ -53,16 +58,26 @@ fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a st
         .map(|(_, v)| v.as_str())
 }
 
-/// Parse an `http://host[:port]/path` URL. `https://` is refused.
+/// Parse an `http://host[:port]/path` URL. `https://` is accepted only with
+/// the `tls` feature (default port 443); otherwise it is refused.
 pub fn parse_url(url: &str) -> Result<Url, HttpError> {
+    #[cfg(feature = "tls")]
+    if let Some(rest) = url.strip_prefix("https://") {
+        return parse_authority(url, rest, 443, true);
+    }
+    #[cfg(not(feature = "tls"))]
     if url.starts_with("https://") {
         return Err(HttpError::Unsupported(
-            "https upstream requires TLS (deferred, see README)".to_string(),
+            "https upstream requires the tls feature".to_string(),
         ));
     }
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| HttpError::Unavailable(format!("unsupported URL scheme: {url}")))?;
+    parse_authority(url, rest, 80, false)
+}
+
+fn parse_authority(url: &str, rest: &str, default_port: u16, tls: bool) -> Result<Url, HttpError> {
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, "/".to_string()),
@@ -74,7 +89,7 @@ pub fn parse_url(url: &str) -> Result<Url, HttpError> {
                 .map_err(|_| HttpError::Unavailable(format!("bad port in URL: {url}")))?;
             (h, port)
         }
-        None => (authority, 80),
+        None => (authority, default_port),
     };
     if host.is_empty() {
         return Err(HttpError::Unavailable(format!("missing host in URL: {url}")));
@@ -83,6 +98,7 @@ pub fn parse_url(url: &str) -> Result<Url, HttpError> {
         host: host.to_string(),
         port,
         path,
+        tls,
     })
 }
 
@@ -195,12 +211,38 @@ pub fn parse_response(buf: &[u8], eof: bool) -> Result<Option<Response>, String>
     }))
 }
 
+/// How `post_with` reaches an https upstream. Empty in the default build.
+#[derive(Clone, Default)]
+pub struct Connector {
+    /// Client config for https; `None` builds `tls::client_config()` on use.
+    #[cfg(feature = "tls")]
+    pub tls: Option<Arc<rustls::ClientConfig>>,
+}
+
+impl Connector {
+    #[cfg(feature = "tls")]
+    pub fn with_config(cfg: Arc<rustls::ClientConfig>) -> Connector {
+        Connector { tls: Some(cfg) }
+    }
+}
+
 /// POST `body` to `url` and read one response, all within `deadline`.
 pub fn post(
     url: &Url,
     headers: &[(String, String)],
     body: &[u8],
     deadline: Instant,
+) -> Result<Response, HttpError> {
+    post_with(url, headers, body, deadline, &Connector::default())
+}
+
+/// Like `post`, with an explicit connector (test-injected TLS config).
+pub fn post_with(
+    url: &Url,
+    headers: &[(String, String)],
+    body: &[u8],
+    deadline: Instant,
+    connector: &Connector,
 ) -> Result<Response, HttpError> {
     let addrs: Vec<_> = (url.host.as_str(), url.port)
         .to_socket_addrs()
@@ -218,11 +260,80 @@ pub fn post(
             Err(e) => last_err = map_io(e),
         }
     }
-    let Some(mut stream) = stream else {
+    let Some(stream) = stream else {
         return Err(last_err);
     };
     let _ = stream.set_nodelay(true);
 
+    if url.tls {
+        #[cfg(feature = "tls")]
+        {
+            return tls_exchange(stream, url, headers, body, deadline, connector);
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            let _ = connector;
+            return Err(HttpError::Unsupported(
+                "https upstream requires the tls feature".to_string(),
+            ));
+        }
+    }
+    let mut io = &stream;
+    exchange(&mut io, &stream, url, headers, body, deadline)
+}
+
+/// Handshake, then the exchange, over rustls. A handshake failure (untrusted
+/// or mismatched certificate) returns before any request byte is written.
+#[cfg(feature = "tls")]
+fn tls_exchange(
+    tcp: TcpStream,
+    url: &Url,
+    headers: &[(String, String)],
+    body: &[u8],
+    deadline: Instant,
+    connector: &Connector,
+) -> Result<Response, HttpError> {
+    let cfg = match &connector.tls {
+        Some(c) => Arc::clone(c),
+        None => crate::tls::client_config().map_err(|e| HttpError::Unavailable(format!("tls: {e}")))?,
+    };
+    let name = rustls::pki_types::ServerName::try_from(url.host.clone())
+        .map_err(|e| HttpError::Unavailable(format!("tls: bad server name: {e:?}")))?;
+    let mut conn = rustls::ClientConnection::new(cfg, name)
+        .map_err(|e| HttpError::Unavailable(format!("tls: {e}")))?;
+    // The same socket, kept to set timeouts while the stream owns `tcp`.
+    let ctl = tcp
+        .try_clone()
+        .map_err(|e| HttpError::Unavailable(e.to_string()))?;
+    let mut sock = tcp;
+    while conn.is_handshaking() {
+        let budget = remaining(deadline)?;
+        ctl.set_read_timeout(Some(budget)).map_err(map_io)?;
+        ctl.set_write_timeout(Some(budget)).map_err(map_io)?;
+        conn.complete_io(&mut sock).map_err(map_tls_io)?;
+    }
+    let mut stream = rustls::StreamOwned::new(conn, sock);
+    exchange(&mut stream, &ctl, url, headers, body, deadline)
+}
+
+#[cfg(feature = "tls")]
+fn map_tls_io(e: std::io::Error) -> HttpError {
+    match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => HttpError::Timeout,
+        _ => HttpError::Unavailable(format!("tls: {e}")),
+    }
+}
+
+/// Write the request and read one framed response. `ctl` is the socket under
+/// `stream`; its timeouts are set from `deadline` before each I/O.
+fn exchange<S: Read + Write>(
+    stream: &mut S,
+    ctl: &TcpStream,
+    url: &Url,
+    headers: &[(String, String)],
+    body: &[u8],
+    deadline: Instant,
+) -> Result<Response, HttpError> {
     let mut head = format!(
         "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Length: {}\r\nConnection: close\r\n",
         url.path,
@@ -234,11 +345,11 @@ pub fn post(
         head.push_str(&format!("{k}: {v}\r\n"));
     }
     head.push_str("\r\n");
-    stream
-        .set_write_timeout(Some(remaining(deadline)?))
+    ctl.set_write_timeout(Some(remaining(deadline)?))
         .map_err(map_io)?;
     stream.write_all(head.as_bytes()).map_err(map_io)?;
     stream.write_all(body).map_err(map_io)?;
+    stream.flush().map_err(map_io)?;
 
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -246,8 +357,7 @@ pub fn post(
         if let Some(resp) = parse_response(&buf, false).map_err(HttpError::Unavailable)? {
             return Ok(resp);
         }
-        stream
-            .set_read_timeout(Some(remaining(deadline)?))
+        ctl.set_read_timeout(Some(remaining(deadline)?))
             .map_err(map_io)?;
         match stream.read(&mut chunk) {
             Ok(0) => {
@@ -260,6 +370,13 @@ pub fn post(
             }
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // A TLS stream ends without close_notify: the framing check above
+            // already returned every complete response, so this is truncation.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(HttpError::Unavailable(
+                    "connection closed before a complete response".to_string(),
+                ));
+            }
             Err(e) => return Err(map_io(e)),
         }
     }
@@ -276,10 +393,18 @@ mod tests {
         assert_eq!(u.port, 8080);
         assert_eq!(u.path, "/mcp");
         assert_eq!(parse_url("http://example.test").unwrap().port, 80);
+        #[cfg(not(feature = "tls"))]
         assert!(matches!(
             parse_url("https://api.mctl.ai/mcp"),
             Err(HttpError::Unsupported(_))
         ));
+        #[cfg(feature = "tls")]
+        {
+            let u = parse_url("https://api.mctl.ai/mcp").unwrap();
+            assert_eq!(u.port, 443);
+            assert!(u.tls);
+            assert!(!parse_url("http://example.test").unwrap().tls);
+        }
         assert!(parse_url("ftp://x").is_err());
     }
 

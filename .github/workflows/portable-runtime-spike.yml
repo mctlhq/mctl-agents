@@ -110,6 +110,8 @@ jobs:
         run: experiments/portable-runtime-rs/bench/parity.sh
       - name: T12 report shape
         run: experiments/portable-runtime-rs/bench/check_report.sh docs/spikes/746-portable-runtime.md
+      - name: T4 variant schema
+        run: python3 -I experiments/portable-runtime-rs/bench/check_variant.py --self-check experiments/portable-runtime-rs/bench/variant-fixture.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
@@ -148,6 +150,8 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           MEASURE_OS: ${{ matrix.os }}
         run: experiments/portable-runtime-rs/bench/measure.sh
+      - name: T4 variant schema on the real output
+        run: python3 -I experiments/portable-runtime-rs/bench/check_variant.py "$RUNNER_TEMP"/measurements/*.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
@@ -231,33 +235,49 @@ jobs:
           set -uo pipefail
           out="$RUNNER_TEMP/cross"
           mkdir -p "$out"
-          log="$out/$NAME.log"
           jstr() { tr '\n\r\t' '   ' | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
           if [ -n "$LINKER_VAR" ]; then export "$LINKER_VAR=rust-lld"; fi
-          status=built
-          size=null
-          ran=unmeasured
-          desc=""
-          reason=""
-          if rustup target add "$TARGET" >"$log" 2>&1 && cargo build --release --locked --target "$TARGET" >>"$log" 2>&1; then
-            bin="target/$TARGET/release/mctl-runtime$EXT"
-            size=$(wc -c <"$bin" | tr -d ' ')
-            desc=$(file -b "$bin" 2>/dev/null | cut -c1-200 | jstr)
-            if [ "$RUN_BINARY" = true ]; then
-              if "$bin" --version >>"$log" 2>&1; then ran=yes; else ran=no; fi
+          rustup target add "$TARGET" >"$out/$NAME-target.log" 2>&1
+          for VARIANT in default tls; do
+            log="$out/$NAME-$VARIANT.log"
+            features=()
+            note="http-only, TLS not included"
+            if [ "$VARIANT" = tls ]; then features=(--features tls); note=""; fi
+            status=built
+            size=null
+            ran=unmeasured
+            desc=""
+            reason=""
+            prerequisite=""
+            export CARGO_TARGET_DIR="$PWD/target/cross-$VARIANT"
+            if cargo build --release --locked --target "$TARGET" ${features[@]+"${features[@]}"} >"$log" 2>&1; then
+              bin="$CARGO_TARGET_DIR/$TARGET/release/mctl-runtime$EXT"
+              size=$(wc -c <"$bin" | tr -d ' ')
+              desc=$(file -b "$bin" 2>/dev/null | cut -c1-200 | jstr)
+              if [ "$RUN_BINARY" = true ]; then
+                if "$bin" --version >>"$log" 2>&1; then ran=yes; else ran=no; fi
+              fi
+            else
+              status=failed
+              reason=$(tail -n 20 "$log" | jstr)
+              # Name the toolchain prerequisite a failed ring build needed.
+              if grep -qiE 'failed to find tool|ToolNotFound|error occurred in cc-rs|unable to find .*(clang|gcc)' "$log"; then
+                prerequisite="C cross-compiler for $TARGET (for example clang, or a musl cross gcc)"
+              elif grep -qiE 'link\.exe|MSVC' "$log"; then
+                prerequisite="MSVC build tools"
+              elif [ "$VARIANT" = tls ]; then
+                prerequisite=$(grep -m1 -iE '^error' "$log" | cut -c1-200 | jstr)
+              fi
             fi
-          else
-            status=failed
-            reason=$(tail -n 20 "$log" | jstr)
-          fi
-          printf '{"name":"%s","target":"%s","runner":"%s","status":"%s","ran":"%s","size_bytes":%s,"file":"%s","reason":"%s","note":"http-only, TLS not included","head_sha":"%s","run_id":"%s"}\n' \
-            "$NAME" "$TARGET" "$RUNNER_OS_NAME" "$status" "$ran" "$size" "$desc" "$reason" "$HEAD_SHA" "$RUN_ID" >"$out/$NAME.json"
-          cat "$out/$NAME.json"
+            printf '{"name":"%s","variant":"%s","target":"%s","runner":"%s","status":"%s","ran":"%s","size_bytes":%s,"file":"%s","reason":"%s","prerequisite":"%s","note":"%s","head_sha":"%s","run_id":"%s"}\n' \
+              "$NAME" "$VARIANT" "$TARGET" "$RUNNER_OS_NAME" "$status" "$ran" "$size" "$desc" "$reason" "$prerequisite" "$note" "$HEAD_SHA" "$RUN_ID" >"$out/$NAME-$VARIANT.json"
+            cat "$out/$NAME-$VARIANT.json"
+          done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: portable-runtime-cross-build-${{ matrix.name }}
-          path: ${{ runner.temp }}/cross/${{ matrix.name }}.json
+          path: ${{ runner.temp }}/cross/${{ matrix.name }}-*.json
           if-no-files-found: warn
 
   # The required check. Green when the spike was untouched or cargo and parity

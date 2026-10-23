@@ -17,11 +17,14 @@ HEAD_SHA=${HEAD_SHA:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown
 OS_LABEL=${MEASURE_OS:-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)}
 export RUN_ID HEAD_SHA
 
-BIN=target/release/mctl-runtime
 DRIVER=target/release/examples/bench_driver
 FAKE=target/release/examples/fake_upstream
 ALLOW=bench/allowlist.toml
-NOTE="http-only, TLS not included"
+NOTE_DEFAULT="http-only, TLS not included"
+# The build variant a record belongs to: `default` (std-only) or `tls`.
+# Python-baseline, python-uv-run and live records are not build variants and
+# are written once, in the default pass.
+VARIANT=default
 
 mkdir -p "$OUT"
 REC="$OUT/$OS_LABEL.jsonl"
@@ -33,13 +36,14 @@ jstr() {
 }
 
 # rec SUBJECT METRIC VALUE UNIT STATUS REASON [NOTE]; an empty VALUE is null.
+# Every record carries "variant": $VARIANT.
 rec() {
   local subject=$1 metric=$2 value=$3 unit=$4 status=$5 reason=$6 note=${7:-}
   local note_json=""
   if [ -z "$value" ]; then value=null; fi
   if [ -n "$note" ]; then note_json=",\"note\":\"$(jstr "$note")\""; fi
-  printf '{"subject":"%s","metric":"%s","value":%s,"unit":"%s","status":"%s","reason":"%s","os":"%s","head_sha":"%s","run_id":"%s"%s}\n' \
-    "$subject" "$metric" "$value" "$unit" "$status" "$(jstr "$reason")" "$OS_LABEL" "$HEAD_SHA" "$RUN_ID" "$note_json" >>"$REC"
+  printf '{"subject":"%s","metric":"%s","value":%s,"unit":"%s","status":"%s","reason":"%s","os":"%s","head_sha":"%s","run_id":"%s","variant":"%s"%s}\n' \
+    "$subject" "$metric" "$value" "$unit" "$status" "$(jstr "$reason")" "$OS_LABEL" "$HEAD_SHA" "$RUN_ID" "$VARIANT" "$note_json" >>"$REC"
 }
 
 now_ns() { python3 -c 'import time; print(time.time_ns())'; }
@@ -88,73 +92,103 @@ try() { "$@" 2>/dev/null || echo unknown; }
   echo "head_sha: $HEAD_SHA"
 } >"$OUT/$OS_LABEL.env"
 
-# ---- build time ------------------------------------------------------------
+# ---- build the examples once (default features) --------------------------
 cargo clean --release >/dev/null 2>&1 || true
-timed_step rust-proxy build_time "$NOTE" cargo build --release --locked --bin mctl-runtime
 if ! cargo build --release --locked --examples >"$BENCH_TMP/examples.log" 2>&1; then
-  rec rust-proxy examples_build "" "" failed "cargo build --examples failed: $(tail -n 5 "$BENCH_TMP/examples.log")"
+  rec rust-proxy examples_build "" "" failed "cargo build --examples failed: $(tail -n 5 "$BENCH_TMP/examples.log")" "$NOTE_DEFAULT"
 fi
-# A clean environment for the whole project; it carries dependencies beyond the adapter's.
-timed_step python-baseline build_time "uv sync --locked of the full project environment" \
-  env UV_PROJECT_ENVIRONMENT="$BENCH_TMP/venv" uv sync --locked --project "$ROOT"
 
-# ---- size and dependencies -------------------------------------------------
-if [ -f "$BIN" ]; then
-  rec rust-proxy binary_size "$(wc -c <"$BIN" | tr -d ' ')" bytes measured "" "$NOTE"
-  if [ "$(uname -s)" = Darwin ]; then
-    deps=$(otool -L "$BIN" | tail -n +2 | wc -l | tr -d ' ')
-  else
-    if ldd_out=$(ldd "$BIN" 2>&1); then
-      deps=$(wc -l <<<"$ldd_out" | tr -d ' ')
-    elif grep -qiE 'not a dynamic executable|statically linked' <<<"$ldd_out"; then
-      deps=0   # measured: a static binary has no dynamic dependencies
+FAKE_OK=0
+if [ -x "$FAKE" ] && [ -x "$DRIVER" ]; then
+  if start_fake; then FAKE_OK=1; fi
+fi
+
+# ---- one pass per build variant ---------------------------------------------
+for VARIANT in default tls; do
+  FEATURES=()
+  NOTE=$NOTE_DEFAULT
+  NOTE_ARGS=(--note "$NOTE_DEFAULT")
+  if [ "$VARIANT" = tls ]; then
+    FEATURES=(--features tls)
+    NOTE=""
+    NOTE_ARGS=()
+  fi
+  export CARGO_TARGET_DIR="$HERE/target/bench-$VARIANT"
+  BIN="$CARGO_TARGET_DIR/release/mctl-runtime"
+
+  # ---- build time (clean, per variant) ----
+  cargo clean --release >/dev/null 2>&1 || true
+  timed_step rust-proxy build_time "$NOTE" cargo build --release --locked --bin mctl-runtime ${FEATURES[@]+"${FEATURES[@]}"}
+  if [ "$VARIANT" = default ]; then
+    # A clean environment for the whole project; it carries dependencies beyond the adapter's.
+    timed_step python-baseline build_time "uv sync --locked of the full project environment" \
+      env UV_PROJECT_ENVIRONMENT="$BENCH_TMP/venv" uv sync --locked --project "$ROOT"
+  fi
+
+  # ---- size and dependencies ----
+  if [ -f "$BIN" ]; then
+    rec rust-proxy binary_size "$(wc -c <"$BIN" | tr -d ' ')" bytes measured "" "$NOTE"
+    ldd_out=""
+    if [ "$(uname -s)" = Darwin ]; then
+      deps=$(otool -L "$BIN" | tail -n +2 | wc -l | tr -d ' ')
     else
-      deps=""
+      if ldd_out=$(ldd "$BIN" 2>&1); then
+        deps=$(wc -l <<<"$ldd_out" | tr -d ' ')
+      elif grep -qiE 'not a dynamic executable|statically linked' <<<"$ldd_out"; then
+        deps=0   # measured: a static binary has no dynamic dependencies
+      else
+        deps=""
+      fi
+    fi
+    if [ -n "$deps" ]; then
+      rec rust-proxy dependency_lines "$deps" lines measured "$(file -b "$BIN" | cut -c1-200)" "$NOTE"
+    else
+      rec rust-proxy dependency_lines "" lines failed "ldd failed: $(head -c 200 <<<"$ldd_out")" "$NOTE"
+    fi
+  else
+    rec rust-proxy binary_size "" bytes failed "release binary missing" "$NOTE"
+    rec rust-proxy dependency_lines "" lines failed "release binary missing" "$NOTE"
+  fi
+
+  if [ "$VARIANT" = default ]; then
+    rec python-baseline script_size "$(wc -c <baseline/thin_adapter.py | tr -d ' ')" bytes measured ""
+    if pkg=$("$VENV/bin/python" -I "$HERE/bench/pkg_size.py" 2>"$BENCH_TMP/pkg.err"); then
+      read -r dist_count pkg_kb interp_kb <<<"$pkg"
+      rec python-baseline packages_size "$pkg_kb" kB measured "mcp and its transitive dependencies"
+      rec python-baseline dependency_count "$dist_count" distributions measured "closure of mcp's requirements"
+      rec python-baseline interpreter_size "$interp_kb" kB measured "du of sys.base_prefix (interpreter and stdlib)"
+    else
+      rec python-baseline packages_size "" kB failed "metadata walk failed: $(tail -n 3 "$BENCH_TMP/pkg.err")"
+      rec python-baseline dependency_count "" distributions failed "metadata walk failed"
+      rec python-baseline interpreter_size "" kB failed "metadata walk failed"
     fi
   fi
-  if [ -n "$deps" ]; then
-    rec rust-proxy dependency_lines "$deps" lines measured "$(file -b "$BIN" | cut -c1-200)" "$NOTE"
+
+  # ---- startup, latency, RSS (plain-http fake upstream: no handshake is timed) ----
+  if [ "$FAKE_OK" = 1 ]; then
+    rust_cmd=("$BIN" proxy --upstream "$URL" --allowlist "$ALLOW")
+    py_cmd=("$VENV/bin/python" -I baseline/thin_adapter.py --upstream "$URL" --allowlist "$ALLOW")
+    uv_cmd=(uv run --locked --project "$ROOT" python -I "$HERE/baseline/thin_adapter.py" --upstream "$URL" --allowlist "$HERE/$ALLOW")
+
+    for mode in ready latency rss; do
+      run_driver rust-proxy "$mode" --subject rust-proxy --variant "$VARIANT" ${NOTE_ARGS[@]+"${NOTE_ARGS[@]}"} --upstream "$URL" -- "${rust_cmd[@]}"
+      if [ "$VARIANT" = default ]; then
+        run_driver python-baseline "$mode" --subject python-baseline --variant default --upstream "$URL" -- "${py_cmd[@]}"
+      fi
+    done
+    if [ "$VARIANT" = default ]; then
+      # How a user would launch it: through `uv run`.
+      run_driver python-uv-run ready --subject python-uv-run --variant default --upstream "$URL" -- "${uv_cmd[@]}"
+    fi
   else
-    rec rust-proxy dependency_lines "" lines failed "ldd failed: $(head -c 200 <<<"$ldd_out")" "$NOTE"
+    if [ "$VARIANT" = default ]; then subjects="rust-proxy python-baseline python-uv-run"; else subjects="rust-proxy"; fi
+    for subject in $subjects; do
+      rec "$subject" driver_run "" "" failed "bench_driver or fake_upstream was not built, or the fake upstream printed no URL within 10 s"
+    done
   fi
-else
-  rec rust-proxy binary_size "" bytes failed "release binary missing" "$NOTE"
-  rec rust-proxy dependency_lines "" lines failed "release binary missing" "$NOTE"
-fi
-
-rec python-baseline script_size "$(wc -c <baseline/thin_adapter.py | tr -d ' ')" bytes measured ""
-if pkg=$("$VENV/bin/python" -I "$HERE/bench/pkg_size.py" 2>"$BENCH_TMP/pkg.err"); then
-  read -r dist_count pkg_kb interp_kb <<<"$pkg"
-  rec python-baseline packages_size "$pkg_kb" kB measured "mcp and its transitive dependencies"
-  rec python-baseline dependency_count "$dist_count" distributions measured "closure of mcp's requirements"
-  rec python-baseline interpreter_size "$interp_kb" kB measured "du of sys.base_prefix (interpreter and stdlib)"
-else
-  rec python-baseline packages_size "" kB failed "metadata walk failed: $(tail -n 3 "$BENCH_TMP/pkg.err")"
-  rec python-baseline dependency_count "" distributions failed "metadata walk failed"
-  rec python-baseline interpreter_size "" kB failed "metadata walk failed"
-fi
-
-# ---- startup, latency, RSS -------------------------------------------------
-if [ -x "$FAKE" ] && [ -x "$DRIVER" ] && ! start_fake; then
-  for subject in rust-proxy python-baseline python-uv-run; do
-    rec "$subject" driver_run "" "" failed "fake upstream did not print a URL within 10 s"
-  done
-elif [ -x "$FAKE" ] && [ -x "$DRIVER" ]; then
-  rust_cmd=("$BIN" proxy --upstream "$URL" --allowlist "$ALLOW")
-  py_cmd=("$VENV/bin/python" -I baseline/thin_adapter.py --upstream "$URL" --allowlist "$ALLOW")
-  uv_cmd=(uv run --locked --project "$ROOT" python -I "$HERE/baseline/thin_adapter.py" --upstream "$URL" --allowlist "$HERE/$ALLOW")
-
-  for mode in ready latency rss; do
-    run_driver rust-proxy "$mode" --subject rust-proxy --note "$NOTE" --upstream "$URL" -- "${rust_cmd[@]}"
-    run_driver python-baseline "$mode" --subject python-baseline --upstream "$URL" -- "${py_cmd[@]}"
-  done
-  # How a user would launch it: through `uv run`.
-  run_driver python-uv-run ready --subject python-uv-run --upstream "$URL" -- "${uv_cmd[@]}"
-else
-  for subject in rust-proxy python-baseline python-uv-run; do
-    rec "$subject" driver_run "" "" failed "bench_driver or fake_upstream was not built"
-  done
-fi
+done
+unset CARGO_TARGET_DIR
+VARIANT=default
 
 # ---- live run --------------------------------------------------------------
 if [ "${MCTL_RUNTIME_LIVE:-}" = 1 ]; then

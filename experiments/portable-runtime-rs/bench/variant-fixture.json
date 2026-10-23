@@ -1,0 +1,6 @@
+[
+  {"subject": "rust-proxy", "metric": "binary_size", "value": 1, "unit": "bytes", "status": "measured", "variant": "default", "note": "http-only, TLS not included"},
+  {"subject": "rust-proxy", "metric": "binary_size", "value": 2, "unit": "bytes", "status": "measured", "variant": "tls"},
+  {"subject": "python-baseline", "metric": "script_size", "value": 3, "unit": "bytes", "status": "measured", "variant": "default"},
+  {"subject": "both", "metric": "live", "value": null, "unit": "", "status": "unmeasured", "variant": "default"}
+]

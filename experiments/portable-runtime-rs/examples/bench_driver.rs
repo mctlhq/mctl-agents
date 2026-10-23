@@ -1,6 +1,6 @@
 //! std-only stdio driver for the #746 slice 3 measurements.
 //!
-//! bench_driver <mode> --upstream URL [--n N] [--subject NAME] [--note TEXT] [--raw] -- <server command...>
+//! bench_driver <mode> --upstream URL [--n N] [--subject NAME] [--note TEXT] [--variant NAME] [--raw] -- <server command...>
 //!
 //! Modes: `ready`, `latency`, `rss`, `parity`. One driver measures both
 //! subjects (the Rust proxy and the Python baseline) with the same clock, the
@@ -33,6 +33,7 @@ struct Opts {
     n: usize,
     subject: String,
     note: Option<String>,
+    variant: String,
     raw: bool,
     command: Vec<String>,
 }
@@ -46,6 +47,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         n: 0,
         subject: "subject".to_string(),
         note: None,
+        variant: "default".to_string(),
         raw: false,
         command: Vec::new(),
     };
@@ -58,6 +60,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--raw" => o.raw = true,
             "--upstream" => o.upstream = it.next().ok_or("--upstream needs a value")?.clone(),
             "--subject" => o.subject = it.next().ok_or("--subject needs a value")?.clone(),
+            "--variant" => o.variant = it.next().ok_or("--variant needs a value")?.clone(),
             "--note" => o.note = Some(it.next().ok_or("--note needs a value")?.clone()),
             "--n" => {
                 let v = it.next().ok_or("--n needs a value")?;
@@ -78,6 +81,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
 struct Ctx {
     subject: String,
     note: Option<String>,
+    variant: String,
     os: String,
     head_sha: String,
     run_id: String,
@@ -104,6 +108,7 @@ impl Ctx {
             ("os", Value::text(&self.os)),
             ("head_sha", Value::text(&self.head_sha)),
             ("run_id", Value::text(&self.run_id)),
+            ("variant", Value::text(&self.variant)),
         ];
         if let (Some(note), true) = (&self.note, subject == self.subject) {
             pairs.push(("note", Value::text(note)));
@@ -412,6 +417,7 @@ fn main() {
     let ctx = Ctx {
         subject: o.subject.clone(),
         note: o.note.clone(),
+        variant: o.variant.clone(),
         os: std::env::consts::OS.to_string(),
         head_sha: env_or("HEAD_SHA", "unknown"),
         run_id: env_or("RUN_ID", "local"),

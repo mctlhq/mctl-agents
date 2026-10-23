@@ -55,7 +55,11 @@ impl Recorded {
     }
 }
 
+type Recorder = Arc<Mutex<Vec<Recorded>>>;
+type Serve = Arc<dyn Fn(TcpStream, &Knobs, &Recorder, &Arc<AtomicU64>) + Send + Sync>;
+
 pub struct FakeUpstream {
+    scheme: &'static str,
     addr: SocketAddr,
     recorded: Arc<Mutex<Vec<Recorded>>>,
     stop: Arc<AtomicBool>,
@@ -63,6 +67,30 @@ pub struct FakeUpstream {
 
 impl FakeUpstream {
     pub fn start(knobs: Knobs) -> FakeUpstream {
+        let serve: Serve = Arc::new(|mut stream: TcpStream, knobs: &Knobs, recorded: &Recorder, counter: &Arc<AtomicU64>| {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            handle(&mut stream, knobs, recorded, counter);
+        });
+        FakeUpstream::spawn("http", knobs, serve)
+    }
+
+    /// Same server behind rustls; sends `close_notify` after the response.
+    #[cfg(feature = "tls")]
+    pub fn start_tls(knobs: Knobs, config: Arc<rustls::ServerConfig>) -> FakeUpstream {
+        let serve: Serve = Arc::new(move |tcp: TcpStream, knobs: &Knobs, recorded: &Recorder, counter: &Arc<AtomicU64>| {
+            let _ = tcp.set_read_timeout(Some(Duration::from_secs(10)));
+            let Ok(conn) = rustls::ServerConnection::new(Arc::clone(&config)) else {
+                return;
+            };
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            handle(&mut tls, knobs, recorded, counter);
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+        });
+        FakeUpstream::spawn("https", knobs, serve)
+    }
+
+    fn spawn(scheme: &'static str, knobs: Knobs, serve: Serve) -> FakeUpstream {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake upstream");
         let addr = listener.local_addr().expect("local addr");
         let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -80,13 +108,15 @@ impl FakeUpstream {
                     let recorded = Arc::clone(&recorded);
                     let counter = Arc::clone(&counter);
                     let knobs = knobs.clone();
+                    let serve = Arc::clone(&serve);
                     std::thread::spawn(move || {
-                        handle(stream, &knobs, &recorded, &counter);
+                        serve(stream, &knobs, &recorded, &counter);
                     });
                 }
             });
         }
         FakeUpstream {
+            scheme,
             addr,
             recorded,
             stop,
@@ -94,7 +124,7 @@ impl FakeUpstream {
     }
 
     pub fn url(&self) -> String {
-        format!("http://{}/mcp", self.addr)
+        format!("{}://{}/mcp", self.scheme, self.addr)
     }
 
     pub fn recorded(&self) -> Vec<Recorded> {
@@ -141,8 +171,7 @@ pub fn closed_port_url() -> String {
 /// Request headers and body as read off the socket.
 type Request = (Vec<(String, String)>, Vec<u8>);
 
-fn read_request(stream: &TcpStream) -> Option<Request> {
-    let mut reader = BufReader::new(stream.try_clone().ok()?);
+fn read_request<R: BufRead>(reader: &mut R) -> Option<Request> {
     let mut request_line = String::new();
     reader.read_line(&mut request_line).ok()?;
     if request_line.trim().is_empty() {
@@ -169,8 +198,8 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     Some((headers, body))
 }
 
-fn write_response(
-    stream: &mut TcpStream,
+fn write_response<W: Write>(
+    stream: &mut W,
     status: &str,
     content_type: &str,
     extra: &[(String, String)],
@@ -204,14 +233,17 @@ fn write_response(
     let _ = stream.flush();
 }
 
-fn handle(
-    mut stream: TcpStream,
+fn handle<S: Read + Write>(
+    stream: &mut S,
     knobs: &Knobs,
     recorded: &Arc<Mutex<Vec<Recorded>>>,
     counter: &Arc<AtomicU64>,
 ) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let Some((headers, body)) = read_request(&stream) else {
+    let request = {
+        let mut reader = BufReader::new(&mut *stream);
+        read_request(&mut reader)
+    };
+    let Some((headers, body)) = request else {
         return;
     };
     let text = String::from_utf8_lossy(&body).into_owned();
@@ -230,7 +262,7 @@ fn handle(
     }
     if knobs.status_401 {
         write_response(
-            &mut stream,
+            stream,
             "401 Unauthorized",
             "application/json",
             &[],
@@ -292,7 +324,7 @@ fn handle(
         }
         _ => {
             // Notifications and anything else: accepted, no body.
-            write_response(&mut stream, "202 Accepted", "", &extra, "", false);
+            write_response(stream, "202 Accepted", "", &extra, "", false);
             return;
         }
     };
@@ -306,8 +338,8 @@ fn handle(
     };
     if knobs.sse {
         let event = format!("event: message\ndata: {reply}\n\n");
-        write_response(&mut stream, "200 OK", "text/event-stream", &extra, &event, true);
+        write_response(stream, "200 OK", "text/event-stream", &extra, &event, true);
     } else {
-        write_response(&mut stream, "200 OK", "application/json", &extra, &reply, false);
+        write_response(stream, "200 OK", "application/json", &extra, &reply, false);
     }
 }

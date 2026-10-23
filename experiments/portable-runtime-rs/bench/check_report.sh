@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # T12: report shape. The `## Decision` section must contain exactly one of the
-# four decision tokens, and every GO-checklist line must cite a `measurements/`
+# four decision tokens, the file has exactly one `Recommendation: ` line, and every GO-checklist line must cite a `measurements/`
 # path or a test id (T<n>). The script also proves that it fails on a copy with
 # two tokens and on a copy with an uncited GO line.
 #
@@ -24,6 +24,11 @@ check() {
   count=$(printf '%s\n' "$decision" | { grep -oE "$TOKENS" || true; } | wc -l | tr -d ' ')
   if [ "$count" != 1 ]; then
     echo "Decision section must contain exactly one token, found $count" >&2
+    bad=1
+  fi
+  count=$(grep -cE '^Recommendation: ' "$file" || true)
+  if [ "$count" != 1 ]; then
+    echo "report must contain exactly one 'Recommendation: ' line, found $count" >&2
     bad=1
   fi
   go=$(section "$file" '^## GO checklist' | grep -E '^- \*\*(G[1-7]|Rust)' || true)
@@ -53,6 +58,12 @@ trap 'rm -rf "$tmp"' EXIT
 awk '{ print } /^## Decision/ { print "THIN_ADAPTER NO_RUNTIME" }' "$REPORT" >"$tmp/two-tokens.md"
 if check "$tmp/two-tokens.md" 2>/dev/null; then
   echo "self-check failed: a two-token Decision passed" >&2
+  exit 1
+fi
+# Self-check 1b: a second Recommendation line must fail.
+{ cat "$REPORT"; echo 'Recommendation: `NO_RUNTIME`'; } >"$tmp/two-recs.md"
+if check "$tmp/two-recs.md" 2>/dev/null; then
+  echo "self-check failed: two Recommendation lines passed" >&2
   exit 1
 fi
 # Self-check 2: an uncited GO line must fail.
