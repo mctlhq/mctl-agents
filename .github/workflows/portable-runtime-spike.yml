@@ -32,5 +32,7 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - name: Audit dependencies
         run: |
-          cargo install cargo-audit --locked --version 0.21.2
+          # Unpinned on purpose: the RustSec advisory DB format moves
+          # independently, and an old cargo-audit cannot parse new entries.
+          cargo install cargo-audit --locked
           cargo audit
