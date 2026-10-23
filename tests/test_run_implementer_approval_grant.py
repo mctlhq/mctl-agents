@@ -276,7 +276,7 @@ def pr_create(monkeypatch):
         return type("P", (), {"stdout": "https://github.com/mctlhq/mctl-web/pull/9\n", "returncode": 0})()
 
     monkeypatch.setattr(run_implementer, "_run", fake_run)
-    monkeypatch.setattr(run_implementer, "_pr_title_and_body", lambda _ref: ("t", "b"))
+    monkeypatch.setattr(run_implementer, "_pr_title_and_body", lambda _ref, _typecheck=None: ("t", "b"))
     monkeypatch.setattr(policy_checkpoint, "require", lambda _d: None)
     monkeypatch.setattr(policy_checkpoint, "checkpoint", lambda *_a, **_kw: None)
     return sent
