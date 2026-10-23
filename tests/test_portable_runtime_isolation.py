@@ -14,7 +14,7 @@ EXPERIMENT = REPO_ROOT / "experiments" / "portable-runtime-rs"
 FORBIDDEN = ("experiments/", "mctl-runtime")
 GUARDED_DIRS = ("orchestrator", "config", "agents")
 GUARDED_FILES = ("Dockerfile", "entrypoint.sh", "pyproject.toml", "uv.lock")
-PRUNE_DIRS = {".git", ".venv", "venv", "_gitops", "target", "node_modules"}
+PRUNE_DIRS = {".git", ".venv", "venv", "_gitops", "target", "node_modules", ".claude"}
 
 requires_experiment = pytest.mark.skipif(not EXPERIMENT.is_dir(), reason="experiments/portable-runtime-rs absent")
 
@@ -23,7 +23,8 @@ _IGNORE_ENTRIES = {"experiments", "experiments/", "experiments/**", "/experiment
 
 
 def dockerfile_copies_experiments(text: str) -> list[str]:
-    return [line for line in text.splitlines() if _COPY_RE.match(line)]
+    joined = re.sub(r"\\[ \t]*\r?\n", " ", text)
+    return [line for line in joined.splitlines() if _COPY_RE.match(line)]
 
 
 def dockerignore_excludes_experiments(text: str) -> bool:
@@ -83,6 +84,7 @@ def test_no_cargo_toml_outside_experiment() -> None:
 def test_detector_flags_injected_copy() -> None:
     real = (REPO_ROOT / "Dockerfile").read_text()
     assert dockerfile_copies_experiments(real + "\nCOPY experiments/ ./experiments/\n")
+    assert dockerfile_copies_experiments(real + "\nCOPY \\\n  experiments/ ./experiments/\n")
     assert dockerfile_copies_experiments(real) == []
     assert dockerignore_excludes_experiments("experiments/\n")
     assert not dockerignore_excludes_experiments("# experiments/\n")
