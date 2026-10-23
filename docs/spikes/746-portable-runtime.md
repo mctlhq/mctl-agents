@@ -10,7 +10,7 @@ The Decision section carries exactly one.
 
 | Item | Value |
 |---|---|
-| Rust crate | `experiments/portable-runtime-rs/` (std-only, `rust-toolchain.toml` pins 1.85.0, `Cargo.lock` holds only the package) |
+| Rust crate | `experiments/portable-runtime-rs/` (std-only by default, `rust-toolchain.toml` pins 1.85.0; the optional `tls` feature from #779 adds exact-pinned `rustls` and `webpki-roots`, and `Cargo.lock` holds 27 entries) |
 | Python baseline | `experiments/portable-runtime-rs/baseline/thin_adapter.py` on `mcp==1.29.0` |
 | Runners | ubuntu-latest and macos-14 (`bench` job); cross targets in the `cross-build` job |
 | uv / Python | uv 0.11.11, Python 3.12 (setup-uv pinned as in `spike-707-bench.yml`) |
@@ -68,15 +68,17 @@ error mapping is minimal (any upstream failure becomes `provider-unavailable`); 
 
 ## 4. TLS limit
 
-The crate is std-only and speaks plain `http://`; an `https://` upstream, including the real `api.mctl.ai/mcp`, is refused.
-Adding `rustls` would need checksummed registry entries in `Cargo.lock` that the offline implementer cannot produce, would
-arrive in a commit that skipped review, and would end the one-entry lock that `cargo audit` relies on. So the limit is
-documented and every affected number is labelled `http-only, TLS not included`.
+The default build is std-only and speaks plain `http://`; an `https://` upstream, including the real `api.mctl.ai/mcp`,
+is refused. This slice's implementer could not add `rustls` itself: the checksummed registry entries in `Cargo.lock`
+had to come from a reviewed change. #779 added them separately as the optional `tls` feature (exact pins, a 27-entry
+lock generated on the pinned toolchain, `--features tls` in CI), but the https upstream path is not wired yet. Every
+number in this report comes from the default build and is labelled `http-only, TLS not included`.
 
 Consequences: the Rust size, build-time, dependency-count and startup numbers are lower bounds. A TLS-capable artifact is
-unmeasured, and no estimate is made here beyond that it will be larger and add dependencies. The Python baseline already
-carries TLS through `httpx`, so the size comparison favours Rust more than a like-for-like build would. If the verdict leans
-toward a portable runtime, measuring a TLS variant is the first follow-up.
+unmeasured here, and no estimate is made beyond that it will be larger and add dependencies. The Python baseline already
+carries TLS through `httpx`, so the size comparison favours Rust more than a like-for-like build would. Slice 3b (#780)
+wires the https upstream behind `tls`, adds a `--features tls` bench variant and re-checks G6 on that build. Under the
+split recorded on #777, the #746 verdict is taken only after #780, whatever this report proposes.
 
 ## 5. Matrix
 
@@ -90,7 +92,7 @@ toward a portable runtime, measuring a TLS variant is the first follow-up.
 | 6 | Linux amd64 / arm64 | amd64 musl (static-pie) built and ran; arm64 musl built on ubuntu-latest and built and ran on ubuntu-24.04-arm | Interpreter-dependent, architecture-neutral script | `measurements/cross-build.json` |
 | 7 | Windows feasibility | `x86_64-pc-windows-msvc` compiles (555520 bytes); not run, so runtime behaviour is unmeasured | Not attempted in this slice | `measurements/cross-build.json` |
 | 8 | Cross-compilation / release complexity | rust-lld musl links, no Docker or Zig; 5 of 5 builds succeed (4 distinct targets), one target per build; no signing or update channel | None beyond packaging an interpreter | `measurements/cross-build.json` |
-| 9 | TLS / OAuth / MCP ecosystem maturity | Hand-rolled MCP subset and HTTP/1.1, no TLS, no OAuth; the official Rust SDK was not used | Official `mcp` SDK, TLS through `httpx`, OAuth helpers available | README of the crate, T11 |
+| 9 | TLS / OAuth / MCP ecosystem maturity | Hand-rolled MCP subset and HTTP/1.1, no https upstream yet (`tls` feature unwired until #780), no OAuth; the official Rust SDK was not used | Official `mcp` SDK, TLS through `httpx`, OAuth helpers available | README of the crate, T11 |
 | 10 | Child-process credential exposure | Token from file or env, never in argv; `spawn.rs` strips it from children | Same sources; the interpreter's environment and memory hold it | T6, T7, T10 |
 | 11 | Embedding / library reuse with current MCTL | None: MCTL is Python, the crate is a separate binary | Reusable from the Python code base in principle | T11 |
 | 12 | Sandbox / WASM potential | std-only code is a candidate for a wasm target; not attempted | Not applicable | Q8 below |
@@ -189,7 +191,7 @@ Marks: met, not met or unproven. Each line cites a measurement file or a test id
 - **G3** no new local authorization or business-logic authority: **met**; policy is preflight only and the server stays authoritative (T2, T3, T4).
 - **G4** credential handling no worse than the direct path, with a credible storage or handoff model: **met**, with the limits in J3 (T6, T7, T10).
 - **G5** proxy overhead small enough for interactive use: **met** against the local fixture; steady overhead over direct HTTP is 0.09 ms median for the Rust proxy and 2.2 to 3.1 ms for the Python baseline, first call under 9 ms for both (`measurements/ubuntu-latest.md`, `measurements/macos-14.md`). A live run against `api.mctl.ai` is unmeasured.
-- **G6** packaging and update story simple enough to justify another component: **unproven**; http-only builds succeed for 5 of 5 builds (4 distinct targets) and run on 3 (`measurements/cross-build.json`), but a TLS-capable artifact is unmeasured and no signing or update channel exists (see the TLS limit).
+- **G6** packaging and update story simple enough to justify another component: **unproven**; http-only builds succeed for 5 of 5 builds (4 distinct targets) and run on 3 (`measurements/cross-build.json`), but a TLS-capable artifact is unmeasured here and no signing or update channel exists; slice 3b (#780) measures the `--features tls` build and re-checks G6 (see the TLS limit).
 - **G7** at least two hosts or environments can reuse the boundary: **unproven**; only the fixture host is exercised (T9), see `measurements/` host notes.
 - **Rust clause** a material packaging, runtime or sandbox advantage that outweighs adding Rust: **not met on current evidence**; the Rust proxy has a measured runtime advantage (start 0.6 to 1.2 ms vs 330 to 474 ms, RSS about 2 MB vs 57 MB, `measurements/ubuntu-latest.md`), but it is http-only, the baseline passes the same parity test (T11), and with G1 and G7 unproven there is no portable runtime for the advantage to serve.
 

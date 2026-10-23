@@ -64,10 +64,11 @@ rustc, Python and uv versions).
 
 ## TLS limit
 
-The Rust crate is std-only and speaks plain `http://`. Every Rust size, build,
+The measured Rust build is the default, std-only one and speaks plain `http://`;
+the optional `tls` feature (#779) is not used. Every Rust size, build,
 dependency and startup number here is **http-only, TLS not included**. A
 TLS-capable binary will be larger, take longer to build and add dependencies.
-That variant is unmeasured.
+That variant is unmeasured here; slice 3b (#780) measures it.
 
 ## Known measurement defects
 
