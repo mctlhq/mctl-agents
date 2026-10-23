@@ -233,7 +233,16 @@ pub fn t6_token_absent_or_rejected() {
     );
     assert_refusal(&host.call_tool("mctl_whoami", empty()), "credential-rejected");
     assert_eq!(rejecting.total(), 1, "401 must cost exactly one upstream attempt");
-    host.finish();
+    let stderr = host.finish();
+    // A handshake that fails before any request id is issued must not
+    // report a stale id from an earlier call.
+    let rec_line = stderr.lines().find(|l| l.starts_with('{')).expect("correlation line");
+    let rec = json::parse(rec_line).expect("correlation JSON");
+    assert_eq!(rec.get("outcome").and_then(Value::as_str), Some("credential-rejected"));
+    assert!(
+        matches!(rec.get("upstream_request_id"), None | Some(Value::Null)),
+        "failed handshake carries a request id: {rec_line}"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -440,7 +449,7 @@ pub fn t9_init_dry_run() {
     assert_eq!(mtime_before, mtime_after, "dry run touched the directory");
 
     let r = run_cli(
-        &["init", "--host", "fixture", "--write"],
+        &["init", "--host", "fixture", "--write", "--allowlist", allowlist_str],
         &[("HOME", home_str)],
         fixture.path(),
     );
@@ -448,7 +457,7 @@ pub fn t9_init_dry_run() {
     assert_eq!(fixture.listing(), before);
 
     let r = run_cli(
-        &["init", "--host", "fixture", "--write", "--config-dir", fixture_str],
+        &["init", "--host", "fixture", "--write", "--config-dir", fixture_str, "--allowlist", allowlist_str],
         &[("HOME", home_str)],
         fixture.path(),
     );
@@ -462,7 +471,7 @@ pub fn t9_init_dry_run() {
 
     let claude_dir = TempDir::new("t9-claude");
     let r = run_cli(
-        &["init", "--host", "claude-code", "--write", "--config-dir", path_str(claude_dir.path())],
+        &["init", "--host", "claude-code", "--write", "--config-dir", path_str(claude_dir.path()), "--allowlist", allowlist_str],
         &[("HOME", home_str)],
         fixture.path(),
     );
@@ -474,7 +483,7 @@ pub fn t9_init_dry_run() {
         let dir = home.path().join(sub);
         std::fs::create_dir_all(&dir).expect("create fake host dir");
         let r = run_cli(
-            &["init", "--host", "claude-code", "--write", "--config-dir", path_str(&dir)],
+            &["init", "--host", "claude-code", "--write", "--config-dir", path_str(&dir), "--allowlist", allowlist_str],
             &[("HOME", home_str)],
             fixture.path(),
         );
