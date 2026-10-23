@@ -68,6 +68,10 @@ jobs:
       - run: cargo build --locked
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
+      # The `tls` feature (#777 split): same checks with rustls compiled in.
+      - run: cargo build --locked --features tls
+      - run: cargo test --locked --features tls
+      - run: cargo clippy --locked --all-targets --features tls -- -D warnings
       - name: Audit dependencies
         run: |
           # Unpinned on purpose: the RustSec advisory DB format moves

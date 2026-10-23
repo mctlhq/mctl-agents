@@ -51,11 +51,19 @@ as stubs that return `Unsupported`.
 
 ## Design choices and limits
 
-- **std-only.** The crate has no registry dependency and `Cargo.lock` holds only
-  the package itself, so `cargo build --locked` and `cargo audit` cannot fail on
-  lockfile or advisory problems. JSON, SHA-256, UUIDv4 and HTTP/1.1 are
-  hand-rolled (each with unit tests). `rmcp` was not used because the offline
-  implementer cannot produce checksummed lock entries for it.
+- **std-only by default.** The default build has no registry dependency. JSON,
+  SHA-256, UUIDv4 and HTTP/1.1 are hand-rolled (each with unit tests). `rmcp`
+  was not used because the offline implementer cannot produce checksummed lock
+  entries for it.
+- **Optional `tls` feature.** `cargo build --features tls` adds `rustls`
+  (=0.23.46, `ring` provider, no aws-lc-rs, so no cmake/NASM in cross-builds)
+  and `webpki-roots` (=1.0.11, bundled Mozilla roots, so the binary does not
+  read the host trust store). `src/tls.rs` builds the client config; the
+  https upstream path is not wired yet (slice 3b). `Cargo.lock` lists these
+  crates for every build, but only `--features tls` compiles them, and
+  `cargo audit` scans them either way. The lock was generated on the pinned
+  toolchain with `CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo
+  generate-lockfile` (network required; regenerate the same way).
 - **MCP subset.** Hand-rolled `initialize`, `notifications/initialized`,
   `tools/list`, `tools/call` and `ping`. Streamable HTTP only; the legacy MCP
   SSE transport is not implemented. A `text/event-stream` response to a POST is
@@ -63,7 +71,7 @@ as stubs that return `Unsupported`.
 - **http-only upstream.** The upstream client speaks plain `http://`. An
   `https://` upstream, including the real `api.mctl.ai/mcp`, is refused with
   `provider-unavailable` ("https upstream requires TLS (deferred, see README)")
-  until a later slice adds TLS. A live `doctor` round trip is therefore not
+  until slice 3b wires the `tls` feature into the upstream client. A live `doctor` round trip is therefore not
   possible yet.
 - `upstream_request_id` is taken from the `X-Request-Id` response header and
   `upstream_session_id` from `Mcp-Session-Id`; both are `null` when absent.
