@@ -1,0 +1,2 @@
+# Tools the local runtime may expose. The allowlist only narrows what upstream offers.
+tools = ["mctl_whoami", "mctl_list_services", "mctl_get_service_status"]
