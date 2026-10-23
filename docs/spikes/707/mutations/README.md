@@ -19,7 +19,7 @@ it in a `finally` block. Each is a one-to-three line change on real code.
 ## Detection table
 
 Detection result from the linked `spike-707-bench` run
-[39987958862](https://github.com/mctlhq/mctl-agents/actions/runs/39987958862)
+[39989820303](https://github.com/mctlhq/mctl-agents/actions/runs/39989820303)
 (`results.json` `mutations`; mypy with a primed cache, detection only, no
 timings). "Actionable" means the message names the file, the line and the
 cause. Pyrefly codes are the same in (A) and (B).

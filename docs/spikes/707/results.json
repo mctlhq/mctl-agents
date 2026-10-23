@@ -1,32 +1,32 @@
 {
   "cold": {
     "mypy": {
-      "max_s": 8.4774,
-      "median_s": 8.3695,
-      "min_s": 8.2736,
+      "max_s": 11.7648,
+      "median_s": 11.691,
+      "min_s": 11.6154,
       "n": 10,
-      "p95_s": 8.4774
+      "p95_s": 11.7648
     },
     "mypy-warm-cache": {
-      "max_s": 0.2321,
-      "median_s": 0.2279,
-      "min_s": 0.223,
+      "max_s": 0.307,
+      "median_s": 0.3036,
+      "min_s": 0.2993,
       "n": 10,
-      "p95_s": 0.2321
+      "p95_s": 0.307
     },
     "pyrefly-A": {
-      "max_s": 0.8225,
-      "median_s": 0.7025,
-      "min_s": 0.6821,
+      "max_s": 0.9836,
+      "median_s": 0.9767,
+      "min_s": 0.9499,
       "n": 10,
-      "p95_s": 0.8225
+      "p95_s": 0.9836
     },
     "pyrefly-B": {
-      "max_s": 0.7724,
-      "median_s": 0.7269,
-      "min_s": 0.6998,
+      "max_s": 1.1027,
+      "median_s": 0.982,
+      "min_s": 0.955,
       "n": 10,
-      "p95_s": 0.7724
+      "p95_s": 1.1027
     }
   },
   "diagnostics": {
@@ -42,48 +42,48 @@
     "mypy": {
       "diagnostics": 0,
       "exit_code": 0,
-      "seconds": 8.361
+      "seconds": 11.756
     },
     "pyrefly-A": {
       "diagnostics": 15,
       "exit_code": 1,
-      "seconds": 0.669
+      "seconds": 0.966
     },
     "pyrefly-B": {
       "diagnostics": 13,
       "exit_code": 1,
-      "seconds": 0.722
+      "seconds": 1.041
     }
   },
   "edit": {
     "mypy": {
-      "iterations_nonzero_exit": 20,
-      "max_s": 0.4451,
-      "median_s": 0.2569,
-      "min_s": 0.2239,
+      "iterations_caught": 20,
+      "max_s": 0.5763,
+      "median_s": 0.3461,
+      "min_s": 0.3003,
       "n": 20,
-      "p95_s": 0.4439
+      "p95_s": 0.5717
     },
     "pyrefly-A": {
-      "iterations_nonzero_exit": 20,
-      "max_s": 0.7422,
-      "median_s": 0.6945,
-      "min_s": 0.672,
+      "iterations_caught": 20,
+      "max_s": 1.0146,
+      "median_s": 0.9704,
+      "min_s": 0.9493,
       "n": 20,
-      "p95_s": 0.7123
+      "p95_s": 0.9985
     },
     "pyrefly-B": {
-      "iterations_nonzero_exit": 20,
-      "max_s": 0.7717,
-      "median_s": 0.7196,
-      "min_s": 0.6898,
+      "iterations_caught": 20,
+      "max_s": 1.0216,
+      "median_s": 0.9728,
+      "min_s": 0.9489,
       "n": 20,
-      "p95_s": 0.7505
+      "p95_s": 1.0037
     }
   },
   "environment": {
     "cores": 4,
-    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
     "memory_mb": 15989,
     "mypy": "mypy 2.3.1 (compiled: yes)",
     "os": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
@@ -94,95 +94,95 @@
     "uv": "uv 0.11.11 (x86_64-unknown-linux-gnu)"
   },
   "lint_job": {
-    "lint_job_total_s": 10.675,
+    "lint_job_total_s": 14.119,
     "mypy_exit": 0,
     "mypy_install_mb": 13.4,
-    "mypy_s": 8.684,
-    "pyrefly_cold_fetch_s": 0.277,
+    "mypy_s": 11.777,
+    "pyrefly_cold_fetch_s": 0.406,
     "pyrefly_download_cache_delta_mb": 71.3,
     "pyrefly_tool_env_mb": 0.0,
-    "ruff_s": 0.156,
-    "uv_sync_locked_s": 1.835
+    "ruff_s": 0.206,
+    "uv_sync_locked_s": 2.136
   },
   "loop": {
     "01-optional-to-nonoptional": {
       "mypy": {
-        "checker_s": 0.224,
+        "checker_s": 0.359,
         "pytest_file": "tests/test_ci_checks.py",
-        "pytest_s": 1.059,
-        "ruff_s": 0.015,
-        "static_feedback_s": 0.239
+        "pytest_s": 1.113,
+        "ruff_s": 0.018,
+        "static_feedback_s": 0.376
       },
       "pyrefly-B": {
-        "checker_s": 0.717,
+        "checker_s": 0.959,
         "pytest_file": "tests/test_ci_checks.py",
-        "pytest_s": 0.344,
-        "ruff_s": 0.013,
-        "static_feedback_s": 0.73
+        "pytest_s": 0.461,
+        "ruff_s": 0.018,
+        "static_feedback_s": 0.977
       }
     },
     "02-incompatible-assignment": {
       "mypy": {
-        "checker_s": 0.224,
+        "checker_s": 0.346,
         "pytest_file": "tests/test_ci_checks.py",
-        "pytest_s": 0.353,
-        "ruff_s": 0.015,
-        "static_feedback_s": 0.24
+        "pytest_s": 0.455,
+        "ruff_s": 0.018,
+        "static_feedback_s": 0.364
       },
       "pyrefly-B": {
-        "checker_s": 0.727,
+        "checker_s": 0.979,
         "pytest_file": "tests/test_ci_checks.py",
-        "pytest_s": 0.341,
-        "ruff_s": 0.013,
-        "static_feedback_s": 0.74
+        "pytest_s": 0.457,
+        "ruff_s": 0.02,
+        "static_feedback_s": 0.998
       }
     },
     "03-wrong-argument-type": {
       "mypy": {
-        "checker_s": 0.224,
+        "checker_s": 0.345,
         "pytest_file": "tests/test_ci_checks.py",
-        "pytest_s": 0.356,
-        "ruff_s": 0.015,
-        "static_feedback_s": 0.24
+        "pytest_s": 0.472,
+        "ruff_s": 0.018,
+        "static_feedback_s": 0.363
       },
       "pyrefly-B": {
-        "checker_s": 0.731,
+        "checker_s": 1.004,
         "pytest_file": "tests/test_ci_checks.py",
-        "pytest_s": 0.358,
-        "ruff_s": 0.013,
-        "static_feedback_s": 0.744
+        "pytest_s": 0.461,
+        "ruff_s": 0.019,
+        "static_feedback_s": 1.023
       }
     },
     "05-attribute-on-optional": {
       "mypy": {
-        "checker_s": 0.226,
+        "checker_s": 0.35,
         "pytest_file": "tests/test_ci_checks.py",
-        "pytest_s": 0.345,
-        "ruff_s": 0.015,
-        "static_feedback_s": 0.241
+        "pytest_s": 0.458,
+        "ruff_s": 0.018,
+        "static_feedback_s": 0.369
       },
       "pyrefly-B": {
-        "checker_s": 0.712,
+        "checker_s": 0.997,
         "pytest_file": "tests/test_ci_checks.py",
-        "pytest_s": 0.348,
-        "ruff_s": 0.013,
-        "static_feedback_s": 0.725
+        "pytest_s": 0.459,
+        "ruff_s": 0.018,
+        "static_feedback_s": 1.015
       }
     },
     "06-unawaited-coroutine": {
       "mypy": {
-        "checker_s": 0.227,
+        "checker_s": 0.483,
         "pytest_file": "tests/test_worker_schedules.py",
-        "pytest_s": 1.311,
-        "ruff_s": 0.016,
-        "static_feedback_s": 0.243
+        "pytest_s": 1.489,
+        "ruff_s": 0.019,
+        "static_feedback_s": 0.502
       },
       "pyrefly-B": {
-        "checker_s": 0.747,
+        "checker_s": 0.984,
         "pytest_file": "tests/test_worker_schedules.py",
-        "pytest_s": 0.71,
-        "ruff_s": 0.013,
-        "static_feedback_s": 0.76
+        "pytest_s": 0.916,
+        "ruff_s": 0.019,
+        "static_feedback_s": 1.003
       }
     }
   },

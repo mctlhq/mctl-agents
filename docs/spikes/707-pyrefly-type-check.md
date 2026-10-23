@@ -2,8 +2,8 @@
 
 Every timed number and every diagnostic below comes from one run of
 `.github/workflows/spike-707-bench.yml` on a GitHub-hosted `ubuntu-latest`
-runner: [run 39987958862](https://github.com/mctlhq/mctl-agents/actions/runs/39987958862)
-on spike head `17d80a5`. Its artifact is committed as
+runner: [run 39989820303](https://github.com/mctlhq/mctl-agents/actions/runs/39989820303)
+on spike head `a9420d4`. Its artifact is committed as
 `docs/spikes/707/results.json` and `docs/spikes/707/diagnostics/`.
 
 An earlier run (39986902434, head `435e64e`) is void for config (B). The
@@ -11,7 +11,10 @@ harness passed `docs/spikes/707/pyrefly.toml` from the spike checkout, so its
 relative paths resolved against that checkout instead of the pinned worktree:
 no `.venv`, wrong SHA, 193 `missing-import` errors and 0 of 8 mutations seen.
 `17d80a5` copies the config to the same depth inside the target and refuses to
-record a checker that cannot see the target venv.
+record a checker that cannot see the target venv. Run 39987958862 (head
+`17d80a5`) is superseded: its loop timed mypy on a cache built from the
+already-mutated tree, a no-op. `4bc4604` warms on the clean tree instead.
+Its diagnostics match the final run line for line.
 
 ## Environment
 
@@ -25,7 +28,7 @@ record a checker that cannot see the target venv.
 | Ruff | 0.16.2 |
 | CPU / cores / memory | AMD EPYC 7763 64-Core Processor / 4 / 15989 MB |
 | OS | Ubuntu 24.04.5 LTS, `Linux-6.17.0-1022-azure-x86_64-with-glibc2.39` |
-| Workflow run | [39987958862](https://github.com/mctlhq/mctl-agents/actions/runs/39987958862) |
+| Workflow run | [39989820303](https://github.com/mctlhq/mctl-agents/actions/runs/39989820303) |
 
 ## Configuration (A and B)
 
@@ -39,9 +42,10 @@ record a checker that cannot see the target venv.
   (dump in `diagnostics/pyrefly-B-config-dump.txt`). It includes
   `orchestrator`, `config` and `tools`, sets Python 3.12, and puts the repo
   root and `tools/` on the search path (mypy resolves `tools/*.py` as
-  top-level modules). It adds the venv site-packages, and a `tests/**`
-  sub-config with no errors mirrors the `tests.*` `ignore_errors` override.
-  Nothing is stricter than mypy. Size: 13 lines.
+  top-level modules). It adds the venv site-packages. The mypy `tests.*`
+  `ignore_errors` override has no counterpart: `tests/` is outside
+  `project-includes`, as it is outside mypy's `files`. Nothing is stricter
+  than mypy. Size: 10 lines, 6 of them settings.
 - (C) stricter mode: not run (optional extra).
 
 ## Checked file sets
@@ -60,13 +64,14 @@ its cold and edit numbers are the same kind of run.
 
 | Metric | mypy | Pyrefly (A) | Pyrefly (B) |
 | --- | --- | --- | --- |
-| Cold median / p95 | 8.370 s / 8.477 s | 0.703 s / 0.823 s | 0.727 s / 0.772 s |
-| Warm-cache median / p95 (mypy only) | 0.228 s / 0.232 s | n/a | n/a |
-| Edit-loop median / p95 (20 iterations) | 0.257 s / 0.444 s | 0.695 s / 0.712 s | 0.720 s / 0.751 s |
+| Cold median / p95 | 11.691 s / 11.765 s | 0.977 s / 0.984 s | 0.982 s / 1.103 s |
+| Warm-cache median / p95 (mypy only, no edit) | 0.304 s / 0.307 s | n/a | n/a |
+| Edit-loop median / p95 (20 iterations) | 0.346 s / 0.572 s | 0.970 s / 0.999 s | 0.973 s / 1.004 s |
+| Edit iterations with an error on the mutated file | 20 / 20 | 20 / 20 | 20 / 20 |
 
-Pyrefly is about 11.5x faster than a cold mypy run. Once mypy has its
-incremental cache, every later check is about 2.8x faster with mypy (0.26 s
-against 0.72 s median).
+Pyrefly is about 11.9x faster than a cold mypy run. Once mypy has its
+incremental cache, every later check after an edit is about 2.8x faster with
+mypy (0.35 s against 0.97 s median).
 
 ## Lint-job timing
 
@@ -75,19 +80,19 @@ separately (`results.json` `lint_job`):
 
 | Phase | Seconds |
 | --- | --- |
-| `uv sync --locked` | 1.835 |
-| Ruff | 0.156 |
-| mypy (cold) | 8.684 |
-| Total of the timed phases | 10.675 |
+| `uv sync --locked` | 2.136 |
+| Ruff | 0.206 |
+| mypy (cold) | 11.777 |
+| Total of the timed phases | 14.119 |
 
 This excludes checkout, `setup-uv` and the Python download, which the runner
 does in both cases. Contrary to the `lint` job's comment, mypy, not setup,
-is the largest timed phase on this runner (81 %). Replacing it would save
-about 8 s per lint job. The decision criteria weigh repeated-check latency,
+is the largest timed phase on this runner (83 %). Replacing it would save
+about 11 s per lint job. The decision criteria weigh repeated-check latency,
 not this number (see Recommendation).
 
 Install size: Pyrefly adds 71.3 MB to the uv download cache. A first fetch
-took 0.277 s. mypy plus mypyc in the synced venv take 13.4 MB.
+took 0.406 s. mypy plus mypyc in the synced venv take 13.4 MB.
 
 ## Diagnostic comparison
 
@@ -160,17 +165,17 @@ The candidate integration point is the "Service-specific notes" section of
 
 Pinning is by exact version and committed config. The production image is
 built with `uv sync --locked --no-dev`, so a per-run `uvx` fetch costs 71.3 MB
-and 0.277 s on this runner. Static feedback per seeded patch (checker, then
+and 0.406 s on this runner. Static feedback per seeded patch (checker, then
 Ruff) in `results.json` `loop`, five patches:
 
 | Sequence | Checker median | Ruff | Static feedback median |
 | --- | --- | --- | --- |
-| mypy (warm cache) -> Ruff -> targeted pytest | 0.224 s | 0.015 s | 0.240 s |
-| Pyrefly (B) -> Ruff -> targeted pytest | 0.727 s | 0.013 s | 0.740 s |
+| mypy (cache warmed on the clean tree) -> Ruff -> targeted pytest | 0.350 s | 0.018 s | 0.369 s |
+| Pyrefly (B) -> Ruff -> targeted pytest | 0.984 s | 0.019 s | 1.003 s |
 
 An implementer session pays one cold check, then a warm one per edit. With
-Pyrefly that one check is 7.6 s faster on this runner. After that, every
-check is about 0.5 s slower than warm mypy. The cold-start gap can be closed
+Pyrefly that one check is 10.7 s faster on this runner. After that, every
+check is about 0.6 s slower than warm mypy. The cold-start gap can be closed
 without a second checker: run `uv run --locked mypy` once when the session
 starts, so the cache is warm before the first edit.
 
@@ -181,14 +186,14 @@ starts, so the cache is warm before the first edit.
 | Version | 2.3.1 | 1.4.0 |
 | Exit code / diagnostics on baseline | 0 / 0 | 1 / 15 (A), 1 / 13 (B) |
 | Files checked | 136 | 136 (A and B) |
-| Cold median / p95 | 8.370 s / 8.477 s | 0.727 s / 0.772 s (B) |
-| Edit-loop median / p95 | 0.257 s / 0.444 s | 0.720 s / 0.751 s (B) |
-| Loop static feedback (checker + Ruff) | 0.240 s | 0.740 s (B) |
+| Cold median / p95 | 11.691 s / 11.765 s | 0.982 s / 1.103 s (B) |
+| Edit-loop median / p95 | 0.346 s / 0.572 s | 0.973 s / 1.004 s (B) |
+| Loop static feedback (checker + Ruff) | 0.369 s | 1.003 s (B) |
 | Mutations caught (of 8) | 7 | 7 (A and B) |
 | Unique useful findings | 0 | 1 root cause (3 diagnostics, tools/diagram_facts.py) |
 | False-positive / noise findings | 0 | 10 (B) |
-| Config / suppression migration issues | none | 13-line config; 10 noise findings to suppress; no `warn_unused_ignores` equivalent |
-| Lint-job timed phases | 10.675 s total, 8.684 s mypy | not measured as a gate (spike changes no gate) |
+| Config / suppression migration issues | none | 6-setting config; 10 noise findings to suppress; no `warn_unused_ignores` equivalent |
+| Lint-job timed phases | 14.119 s total, 11.777 s mypy | not measured as a gate (spike changes no gate) |
 | Install size | 13.4 MB in venv | 71.3 MB uv cache |
 
 ## Recommendation
@@ -201,8 +206,8 @@ Per criterion in the issue:
   caught, no blind spot found. (2) fails: 10 of the 13 extra diagnostics are
   noise from narrowing Pyrefly does not model (`!=`, `not in`, correlated
   conditions), so a gate would start with 10 suppressions. (3) fails:
-  repeated checks are slower with Pyrefly (0.72 s against 0.26 s). (4) is not
-  shown either way. (5) holds: the migration is a 13-line config.
+  repeated checks are slower with Pyrefly (0.97 s against 0.35 s). (4) is not
+  shown either way. (5) holds: the migration is a 6-setting config.
 - `PYREFLY_INNER_LOOP_ONLY` needs Pyrefly to be "materially faster and
   useful for early feedback". It is faster only for the first check of a
   process with no mypy cache. It is slower for every check after that, which
@@ -215,7 +220,7 @@ Per criterion in the issue:
   or 71 MB download.
 
 What this verdict does not cover: a stricter Pyrefly mode (C), Pyrefly as a
-language server, and the 8 s cold-CI saving, which no criterion here weighs.
+language server, and the 11 s cold-CI saving, which no criterion here weighs.
 The `tools/diagram_facts.py` `_grep` annotation can be fixed on its own,
 without Pyrefly. The owner records the verdict on the issue; this report only
 recommends.
