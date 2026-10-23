@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.93.0](https://github.com/mctlhq/mctl-agents/compare/1.92.0...1.93.0) (2026-10-23)
+
+
+### Features
+
+* **agents:** issue-758-fix-directives-reinvestigate-submits-inv ([12b4086](https://github.com/mctlhq/mctl-agents/commit/12b4086b4685bf170fd471c49274045c2bf5ab1d))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-758-fix-directives-reinvestigate-submits-inv ([aa3095d](https://github.com/mctlhq/mctl-agents/commit/aa3095d70a1ce1dbbe6cad3d9762d5498d9a46c5))
+* **agents:** address P1/P2 codex findings on issue-758-fix-directives-reinvestigate-submits-inv ([f346104](https://github.com/mctlhq/mctl-agents/commit/f34610480d007ee65afd666eaf82a46304f3c9ab))
+* **agents:** address P1/P2 codex findings on issue-758-fix-directives-reinvestigate-submits-inv ([813f078](https://github.com/mctlhq/mctl-agents/commit/813f0786c49182e3d28bee9956f458a876d2092d))
+* **agents:** issue-758-fix-directives-reinvestigate-submits-inv ([52f9377](https://github.com/mctlhq/mctl-agents/commit/52f93774b30e8e11080867fef5859a7358ff80ee))
+* **agents:** wrap long test line ([a6fb9cf](https://github.com/mctlhq/mctl-agents/commit/a6fb9cff395dda410c52cea15922231ee0714a72))
+
 ## [1.92.0](https://github.com/mctlhq/mctl-agents/compare/1.91.0...1.92.0) (2026-10-23)
 
 
