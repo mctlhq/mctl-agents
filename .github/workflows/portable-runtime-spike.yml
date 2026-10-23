@@ -76,10 +76,182 @@ jobs:
           cargo install cargo-audit --version 0.22.1 --locked
           cargo audit
 
-  # The required check. Green when the spike was untouched or cargo passed on
-  # both OSes; red when change detection failed or cargo did not succeed.
+  # Required (deterministic, offline): T11 baseline parity and T12 report shape.
+  parity:
+    needs: changes
+    if: needs.changes.outputs.spike == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.11.11"
+          python-version: "3.12"
+          enable-cache: false
+      - run: uv sync --locked
+      - name: Install pinned toolchain
+        working-directory: experiments/portable-runtime-rs
+        run: rustup show
+      - name: Build the binary and the examples
+        working-directory: experiments/portable-runtime-rs
+        run: |
+          cargo build --locked
+          cargo build --locked --examples
+      - name: T11 baseline parity
+        run: experiments/portable-runtime-rs/bench/parity.sh
+      - name: T12 report shape
+        run: experiments/portable-runtime-rs/bench/check_report.sh docs/spikes/746-portable-runtime.md
+
+  # Informational: timing is noisy and must not block unrelated work.
+  bench:
+    needs: changes
+    if: needs.changes.outputs.spike == 'true'
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.11.11"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Install pinned toolchain
+        working-directory: experiments/portable-runtime-rs
+        run: rustup show
+      - run: uv sync --locked
+      - name: Measure
+        env:
+          OUT: ${{ runner.temp }}/measurements
+          RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          MEASURE_OS: ${{ matrix.os }}
+        run: experiments/portable-runtime-rs/bench/measure.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: portable-runtime-measurements-${{ matrix.os }}
+          path: ${{ runner.temp }}/measurements
+          if-no-files-found: warn
+      - name: Summary
+        if: always()
+        env:
+          OUT: ${{ runner.temp }}/measurements
+        run: |
+          for f in "$OUT"/*.md; do
+            if [ -f "$f" ]; then cat "$f" >> "$GITHUB_STEP_SUMMARY"; fi
+          done
+
+  # Informational: a target that cannot build or run is recorded as failed or
+  # unmeasured and never turns the required check red.
+  cross-build:
+    needs: changes
+    if: needs.changes.outputs.spike == 'true'
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-linux-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            linker_var: CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+            run_binary: "true"
+            ext: ""
+          - name: aarch64-linux-musl-built-only
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            linker_var: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
+            run_binary: "false"
+            ext: ""
+          - name: aarch64-linux-musl-arm-runner
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            linker_var: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
+            run_binary: "true"
+            ext: ""
+          - name: aarch64-apple-darwin
+            os: macos-14
+            target: aarch64-apple-darwin
+            linker_var: ""
+            run_binary: "true"
+            ext: ""
+          - name: x86_64-windows-msvc
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            linker_var: ""
+            run_binary: "false"
+            ext: ".exe"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: experiments/portable-runtime-rs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        continue-on-error: true
+        run: rustup show
+      - name: Build and record
+        continue-on-error: true
+        env:
+          NAME: ${{ matrix.name }}
+          TARGET: ${{ matrix.target }}
+          RUNNER_OS_NAME: ${{ matrix.os }}
+          LINKER_VAR: ${{ matrix.linker_var }}
+          RUN_BINARY: ${{ matrix.run_binary }}
+          EXT: ${{ matrix.ext }}
+          RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/cross"
+          mkdir -p "$out"
+          log="$out/$NAME.log"
+          jstr() { tr '\n\r\t' '   ' | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+          if [ -n "$LINKER_VAR" ]; then export "$LINKER_VAR=rust-lld"; fi
+          status=built
+          size=null
+          ran=unmeasured
+          desc=""
+          reason=""
+          if rustup target add "$TARGET" >"$log" 2>&1 && cargo build --release --locked --target "$TARGET" >>"$log" 2>&1; then
+            bin="target/$TARGET/release/mctl-runtime$EXT"
+            size=$(wc -c <"$bin" | tr -d ' ')
+            desc=$(file -b "$bin" 2>/dev/null | cut -c1-200 | jstr)
+            if [ "$RUN_BINARY" = true ]; then
+              if "$bin" --version >>"$log" 2>&1; then ran=yes; else ran=no; fi
+            fi
+          else
+            status=failed
+            reason=$(tail -n 20 "$log" | jstr)
+          fi
+          printf '{"name":"%s","target":"%s","runner":"%s","status":"%s","ran":"%s","size_bytes":%s,"file":"%s","reason":"%s","note":"http-only, TLS not included","head_sha":"%s","run_id":"%s"}\n' \
+            "$NAME" "$TARGET" "$RUNNER_OS_NAME" "$status" "$ran" "$size" "$desc" "$reason" "$HEAD_SHA" "$RUN_ID" >"$out/$NAME.json"
+          cat "$out/$NAME.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: portable-runtime-cross-build-${{ matrix.name }}
+          path: ${{ runner.temp }}/cross/${{ matrix.name }}.json
+          if-no-files-found: warn
+
+  # The required check. Green when the spike was untouched or cargo and parity
+  # passed; red when change detection failed or cargo did not succeed.
   portable-runtime-spike:
-    needs: [changes, cargo]
+    needs: [changes, cargo, parity]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -88,14 +260,18 @@ jobs:
           CHANGES: ${{ needs.changes.result }}
           SPIKE: ${{ needs.changes.outputs.spike }}
           CARGO: ${{ needs.cargo.result }}
+          PARITY: ${{ needs.parity.result }}
         run: |
           set -euo pipefail
-          echo "changes=$CHANGES spike=$SPIKE cargo=$CARGO"
+          echo "changes=$CHANGES spike=$SPIKE cargo=$CARGO parity=$PARITY"
           if [ "$CHANGES" != "success" ]; then
             echo "::error::change detection did not complete"; exit 1
           fi
           if [ "$SPIKE" = "true" ] && [ "$CARGO" != "success" ]; then
             echo "::error::spike files changed and cargo did not succeed"; exit 1
+          fi
+          if [ "$SPIKE" = "true" ] && [ "$PARITY" != "success" ]; then
+            echo "::error::spike files changed and parity did not succeed"; exit 1
           fi
           if [ "$SPIKE" != "true" ] && [ "$SPIKE" != "false" ]; then
             echo "::error::change detection produced no answer"; exit 1
