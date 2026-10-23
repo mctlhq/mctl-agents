@@ -1,0 +1,20 @@
+ERROR orchestrator/capability.py:818:18-26: Argument `Any | None` is not assignable to parameter `kind` with type `str` in function `CapabilitySet.__init__` [bad-argument-type]
+ERROR orchestrator/commerce.py:332:38-85: Unpacked keyword argument `str | Any` is not assignable to parameter `schema_version` with type `int` in function `DispatchAuthorization.__init__` [bad-argument-type]
+ERROR orchestrator/commerce.py:333:34-118: Unpacked keyword argument `str | Any` is not assignable to parameter `schema_version` with type `int` in function `DispatchAuthorization.__init__` [bad-argument-type]
+ERROR orchestrator/context_assembly.py:1713:54-79: Argument `str | None` is not assignable to parameter `strategy` with type `str` in function `AssemblyConfig.__replace__` [bad-argument-type]
+ERROR orchestrator/context_snapshot.py:979:18-22: Argument `Any | None` is not assignable to parameter `kind` with type `str` in function `ContextSnapshot.__init__` [bad-argument-type]
+ERROR orchestrator/execution_evidence.py:1234:18-22: Argument `Any | None` is not assignable to parameter `kind` with type `str` in function `ExecutionEvidence.__init__` [bad-argument-type]
+ERROR orchestrator/execution_identity.py:464:18-22: Argument `Any | None` is not assignable to parameter `kind` with type `str` in function `ExecutionContext.__init__` [bad-argument-type]
+ERROR orchestrator/resolver.py:774:14-26: Argument `Any | None` is not assignable to parameter `name` with type `str` in function `ExecutionProfile.__init__` [bad-argument-type]
+ERROR tools/check_agent_bindings.py:69:8-26: Cannot find module `check_binding_hash` [missing-import]
+ERROR tools/check_agent_bindings.py:70:8-29: Cannot find module `publish_agent_release` [missing-import]
+ERROR tools/check_agent_bindings.py:71:1-80:2: Cannot find module `check_binding_hash` [missing-import]
+ERROR tools/diagram_facts.py:117:44-112: Cannot set item in `dict[str, str]` [unsupported-operation]
+ERROR tools/diagram_facts.py:122:43-83: Cannot set item in `dict[str, str]` [unsupported-operation]
+ERROR tools/diagram_facts.py:123:40-107: Cannot set item in `dict[str, str]` [unsupported-operation]
+ERROR tools/publish_agent_release.py:95:8-26: Cannot find module `check_binding_hash` [missing-import]
+ INFO Found `pyproject.toml` marking project root, checking root directory with auto configuration
+ INFO 15 errors (14 suppressed, 41 warnings not shown, use `--min-severity=warn` to see them)
+No `pyrefly.toml` found — using settings imported from `[tool.mypy]` in your `pyproject.toml` (preset: legacy).
+Run `pyrefly init` to continue setting up Pyrefly.
+Docs: https://pyrefly.org/en/docs/installation/

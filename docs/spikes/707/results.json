@@ -1,0 +1,356 @@
+{
+  "cold": {
+    "mypy": {
+      "max_s": 8.4774,
+      "median_s": 8.3695,
+      "min_s": 8.2736,
+      "n": 10,
+      "p95_s": 8.4774
+    },
+    "mypy-warm-cache": {
+      "max_s": 0.2321,
+      "median_s": 0.2279,
+      "min_s": 0.223,
+      "n": 10,
+      "p95_s": 0.2321
+    },
+    "pyrefly-A": {
+      "max_s": 0.8225,
+      "median_s": 0.7025,
+      "min_s": 0.6821,
+      "n": 10,
+      "p95_s": 0.8225
+    },
+    "pyrefly-B": {
+      "max_s": 0.7724,
+      "median_s": 0.7269,
+      "min_s": 0.6998,
+      "n": 10,
+      "p95_s": 0.7724
+    }
+  },
+  "diagnostics": {
+    "file_sets": {
+      "A_minus_mypy": [],
+      "B_minus_mypy": [],
+      "mypy": 136,
+      "mypy_minus_A": [],
+      "mypy_minus_B": [],
+      "pyrefly-A": 136,
+      "pyrefly-B": 136
+    },
+    "mypy": {
+      "diagnostics": 0,
+      "exit_code": 0,
+      "seconds": 8.361
+    },
+    "pyrefly-A": {
+      "diagnostics": 15,
+      "exit_code": 1,
+      "seconds": 0.669
+    },
+    "pyrefly-B": {
+      "diagnostics": 13,
+      "exit_code": 1,
+      "seconds": 0.722
+    }
+  },
+  "edit": {
+    "mypy": {
+      "iterations_nonzero_exit": 20,
+      "max_s": 0.4451,
+      "median_s": 0.2569,
+      "min_s": 0.2239,
+      "n": 20,
+      "p95_s": 0.4439
+    },
+    "pyrefly-A": {
+      "iterations_nonzero_exit": 20,
+      "max_s": 0.7422,
+      "median_s": 0.6945,
+      "min_s": 0.672,
+      "n": 20,
+      "p95_s": 0.7123
+    },
+    "pyrefly-B": {
+      "iterations_nonzero_exit": 20,
+      "max_s": 0.7717,
+      "median_s": 0.7196,
+      "min_s": 0.6898,
+      "n": 20,
+      "p95_s": 0.7505
+    }
+  },
+  "environment": {
+    "cores": 4,
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "memory_mb": 15989,
+    "mypy": "mypy 2.3.1 (compiled: yes)",
+    "os": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "pinned_sha": "68f10afcb8a96d7b1c54d5d56819d8e39979c275",
+    "pyrefly": "pyrefly 1.4.0",
+    "python": "Python 3.12.3",
+    "ruff": "ruff 0.16.2",
+    "uv": "uv 0.11.11 (x86_64-unknown-linux-gnu)"
+  },
+  "lint_job": {
+    "lint_job_total_s": 10.675,
+    "mypy_exit": 0,
+    "mypy_install_mb": 13.4,
+    "mypy_s": 8.684,
+    "pyrefly_cold_fetch_s": 0.277,
+    "pyrefly_download_cache_delta_mb": 71.3,
+    "pyrefly_tool_env_mb": 0.0,
+    "ruff_s": 0.156,
+    "uv_sync_locked_s": 1.835
+  },
+  "loop": {
+    "01-optional-to-nonoptional": {
+      "mypy": {
+        "checker_s": 0.224,
+        "pytest_file": "tests/test_ci_checks.py",
+        "pytest_s": 1.059,
+        "ruff_s": 0.015,
+        "static_feedback_s": 0.239
+      },
+      "pyrefly-B": {
+        "checker_s": 0.717,
+        "pytest_file": "tests/test_ci_checks.py",
+        "pytest_s": 0.344,
+        "ruff_s": 0.013,
+        "static_feedback_s": 0.73
+      }
+    },
+    "02-incompatible-assignment": {
+      "mypy": {
+        "checker_s": 0.224,
+        "pytest_file": "tests/test_ci_checks.py",
+        "pytest_s": 0.353,
+        "ruff_s": 0.015,
+        "static_feedback_s": 0.24
+      },
+      "pyrefly-B": {
+        "checker_s": 0.727,
+        "pytest_file": "tests/test_ci_checks.py",
+        "pytest_s": 0.341,
+        "ruff_s": 0.013,
+        "static_feedback_s": 0.74
+      }
+    },
+    "03-wrong-argument-type": {
+      "mypy": {
+        "checker_s": 0.224,
+        "pytest_file": "tests/test_ci_checks.py",
+        "pytest_s": 0.356,
+        "ruff_s": 0.015,
+        "static_feedback_s": 0.24
+      },
+      "pyrefly-B": {
+        "checker_s": 0.731,
+        "pytest_file": "tests/test_ci_checks.py",
+        "pytest_s": 0.358,
+        "ruff_s": 0.013,
+        "static_feedback_s": 0.744
+      }
+    },
+    "05-attribute-on-optional": {
+      "mypy": {
+        "checker_s": 0.226,
+        "pytest_file": "tests/test_ci_checks.py",
+        "pytest_s": 0.345,
+        "ruff_s": 0.015,
+        "static_feedback_s": 0.241
+      },
+      "pyrefly-B": {
+        "checker_s": 0.712,
+        "pytest_file": "tests/test_ci_checks.py",
+        "pytest_s": 0.348,
+        "ruff_s": 0.013,
+        "static_feedback_s": 0.725
+      }
+    },
+    "06-unawaited-coroutine": {
+      "mypy": {
+        "checker_s": 0.227,
+        "pytest_file": "tests/test_worker_schedules.py",
+        "pytest_s": 1.311,
+        "ruff_s": 0.016,
+        "static_feedback_s": 0.243
+      },
+      "pyrefly-B": {
+        "checker_s": 0.747,
+        "pytest_file": "tests/test_worker_schedules.py",
+        "pytest_s": 0.71,
+        "ruff_s": 0.013,
+        "static_feedback_s": 0.76
+      }
+    }
+  },
+  "mutations": {
+    "01-optional-to-nonoptional": {
+      "file": "orchestrator/ci_checks.py",
+      "mypy": {
+        "caught": true,
+        "diagnostics": [
+          "orchestrator/ci_checks.py:661: error: Argument 1 to \"_bound_log\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
+          "orchestrator/ci_checks.py:668: error: Item \"None\" of \"str | None\" has no attribute \"encode\"  [union-attr]"
+        ]
+      },
+      "pyrefly-A": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/ci_checks.py:661:41-44: Argument `str | None` is not assignable to parameter `text` with type `str` in function `_bound_log` [bad-argument-type]",
+          "ERROR orchestrator/ci_checks.py:668:31-41: Object of class `NoneType` has no attribute `encode` [missing-attribute]"
+        ]
+      },
+      "pyrefly-B": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/ci_checks.py:661:41-44: Argument `str | None` is not assignable to parameter `text` with type `str` in function `_bound_log` [bad-argument-type]",
+          "ERROR orchestrator/ci_checks.py:668:31-41: Object of class `NoneType` has no attribute `encode` [missing-attribute]"
+        ]
+      }
+    },
+    "02-incompatible-assignment": {
+      "file": "orchestrator/ci_checks.py",
+      "mypy": {
+        "caught": true,
+        "diagnostics": [
+          "orchestrator/ci_checks.py:397: error: Incompatible types in assignment (expression has type \"str\", variable has type \"int\")  [assignment]"
+        ]
+      },
+      "pyrefly-A": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/ci_checks.py:397:14-40: `str` is not assignable to `int` [bad-assignment]"
+        ]
+      },
+      "pyrefly-B": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/ci_checks.py:397:14-40: `str` is not assignable to `int` [bad-assignment]"
+        ]
+      }
+    },
+    "03-wrong-argument-type": {
+      "file": "orchestrator/ci_checks.py",
+      "mypy": {
+        "caught": true,
+        "diagnostics": [
+          "orchestrator/ci_checks.py:384: error: Argument 1 to \"_bound_excerpt\" has incompatible type \"int\"; expected \"str\"  [arg-type]"
+        ]
+      },
+      "pyrefly-A": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/ci_checks.py:384:27-36: Argument `int` is not assignable to parameter `text` with type `str` in function `_bound_excerpt` [bad-argument-type]"
+        ]
+      },
+      "pyrefly-B": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/ci_checks.py:384:27-36: Argument `int` is not assignable to parameter `text` with type `str` in function `_bound_excerpt` [bad-argument-type]"
+        ]
+      }
+    },
+    "04-wrong-return-type": {
+      "file": "orchestrator/ci_checks.py",
+      "mypy": {
+        "caught": true,
+        "diagnostics": [
+          "orchestrator/ci_checks.py:305: error: Incompatible return value type (got \"int\", expected \"str\")  [return-value]"
+        ]
+      },
+      "pyrefly-A": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/ci_checks.py:305:12-21: Returned type `int` is not assignable to declared return type `str` [bad-return]"
+        ]
+      },
+      "pyrefly-B": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/ci_checks.py:305:12-21: Returned type `int` is not assignable to declared return type `str` [bad-return]"
+        ]
+      }
+    },
+    "05-attribute-on-optional": {
+      "file": "orchestrator/ci_checks.py",
+      "mypy": {
+        "caught": true,
+        "diagnostics": [
+          "orchestrator/ci_checks.py:251: error: Item \"None\" of \"str | None\" has no attribute \"upper\"  [union-attr]"
+        ]
+      },
+      "pyrefly-A": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/ci_checks.py:251:9-20: Object of class `NoneType` has no attribute `upper` [missing-attribute]"
+        ]
+      },
+      "pyrefly-B": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/ci_checks.py:251:9-20: Object of class `NoneType` has no attribute `upper` [missing-attribute]"
+        ]
+      }
+    },
+    "06-unawaited-coroutine": {
+      "file": "orchestrator/temporal/worker.py",
+      "mypy": {
+        "caught": true,
+        "diagnostics": [
+          "orchestrator/temporal/worker.py:191: error: Value of type \"Coroutine[Any, Any, ScheduleHandle]\" must be used  [unused-coroutine]"
+        ]
+      },
+      "pyrefly-A": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/temporal/worker.py:191:9-53: Result of async function call is unused. Did you forget to `await`? [unused-coroutine]"
+        ]
+      },
+      "pyrefly-B": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/temporal/worker.py:191:9-53: Result of async function call is unused. Did you forget to `await`? [unused-coroutine]"
+        ]
+      }
+    },
+    "07-await-non-awaitable": {
+      "file": "orchestrator/temporal/worker.py",
+      "mypy": {
+        "caught": true,
+        "diagnostics": [
+          "orchestrator/temporal/worker.py:163: error: Incompatible types in \"await\" (actual type \"list[Any]\", expected type \"Awaitable[Any]\")  [misc]"
+        ]
+      },
+      "pyrefly-A": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/temporal/worker.py:163:15-38: Type `list[Payload]` is not awaitable [not-async]"
+        ]
+      },
+      "pyrefly-B": {
+        "caught": true,
+        "diagnostics": [
+          "ERROR orchestrator/temporal/worker.py:163:15-38: Type `list[Payload]` is not awaitable [not-async]"
+        ]
+      }
+    },
+    "08-any-boundary": {
+      "file": "orchestrator/ci_checks.py",
+      "mypy": {
+        "caught": false,
+        "diagnostics": []
+      },
+      "pyrefly-A": {
+        "caught": false,
+        "diagnostics": []
+      },
+      "pyrefly-B": {
+        "caught": false,
+        "diagnostics": []
+      }
+    }
+  }
+}
