@@ -571,9 +571,14 @@ def load_fixtures(directory: Path) -> list[Fixture]:
     return out
 
 
+# How `decide` turns an `evaluate` code into a verdict before any approval
+# lookup. A matched rule whose grant is missing is a DENY, not the rule's verdict.
+_EVALUATE_VERDICT = {pc.CODE_ALLOWED: pc.ALLOW, pc.CODE_APPROVAL_REQUIRED: pc.REQUIRE_APPROVAL}
+
+
 def deterministic_verdict(policy_name: str, request: SemanticDecisionRequest) -> str:
-    rule, _code, _reason = pc.evaluate(POLICIES[policy_name], request.action_request())
-    return rule.verdict if rule is not None else pc.DENY
+    _rule, code, _reason = pc.evaluate(POLICIES[policy_name], request.action_request())
+    return _EVALUATE_VERDICT.get(code, pc.DENY)
 
 
 # --------------------------------------------------------------------------

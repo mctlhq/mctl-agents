@@ -84,8 +84,17 @@ def test_low_confidence_applied_by_threshold() -> None:
 # T3
 def test_fixture_deterministic_verdict_has_not_drifted() -> None:
     for fx in FIXTURES:
-        rule, _code, _ = pc.evaluate(sd.POLICIES[fx.policy], fx.request.action_request())
-        assert fx.deterministic_verdict == (rule.verdict if rule else pc.DENY), fx.fixture_id
+        _rule, code, _ = pc.evaluate(sd.POLICIES[fx.policy], fx.request.action_request())
+        assert fx.deterministic_verdict == pc._verdict_for(code), fx.fixture_id
+
+
+def test_deterministic_verdict_denies_a_missing_grant() -> None:
+    spec = json.loads((V1 / "A01.json").read_text())["request"]
+    spec = {**spec, "fixture_id": "grant-missing", "scenario": "A", "grants": []}
+    request = sd.build_request(spec)
+    _rule, code, _ = pc.evaluate(pc.BUILTIN_POLICY, request.action_request())
+    assert code == pc.CODE_GRANT_MISSING
+    assert sd.deterministic_verdict("builtin", request) == pc.DENY
 
 
 # T4
