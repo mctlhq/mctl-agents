@@ -76,7 +76,11 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 
 /// Lowercase hex SHA-256 digest.
 pub fn sha256_hex(data: &[u8]) -> String {
-    sha256(data).iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    sha256(data).iter().fold(String::with_capacity(64), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
 }
 
 #[cfg(test)]
