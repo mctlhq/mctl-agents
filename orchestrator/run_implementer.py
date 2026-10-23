@@ -4237,7 +4237,9 @@ class TypecheckResult:
     summary: str = ""
 
 
-_MYPY_FOUND_RE = re.compile(r"Found (\d+) errors?\b")
+# Anchored to a line start: mypy prints the summary last, on its own line, so
+# the last anchored match is the summary and never a quoted source line.
+_MYPY_FOUND_RE = re.compile(r"^Found (\d+) errors?\b", re.MULTILINE)
 
 
 # Only these variables reach the type-check child. `uv sync` runs build
@@ -4272,7 +4274,7 @@ def _typecheck_env() -> dict[str, str]:
     builds the clone's environment instead of reusing the image's.
     """
     env = {k: os.environ[k] for k in _TYPECHECK_ENV_KEEP if k in os.environ}
-    parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p and p != "/app/.venv/bin"]
+    parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p and p.rstrip("/") != "/app/.venv/bin"]
     env["PATH"] = os.pathsep.join(parts)
     return env
 
@@ -4305,10 +4307,14 @@ def _run_pre_push_typecheck(
         return TypecheckResult("not_run", "observation_failed", summary=f"exclude write failed: {exc}")
     env = _typecheck_env()
     timeout = float(IMPLEMENTER_TYPECHECK_TIMEOUT_SECONDS)
-    # Install first, as its own step, so an install failure is never read as
-    # a mypy failure. Only the second step's exit code is a type-check result.
-    run_step = [cmd[0], "run", "--locked", "--no-sync", *cmd[3:]] if cmd[:3] == ("uv", "run", "--locked") else list(cmd)
-    steps = [[cmd[0], "sync", "--locked"], run_step]
+    # For a `uv run --locked` command, install first, as its own step, so an
+    # install failure is never read as a mypy failure. Any other registered
+    # command runs as a single step (agy P2 on #787). Only the last step's
+    # exit code is a type-check result.
+    if cmd[:3] == ("uv", "run", "--locked"):
+        steps = [["uv", "sync", "--locked"], ["uv", "run", "--locked", "--no-sync", *cmd[3:]]]
+    else:
+        steps = [list(cmd)]
     for i, step in enumerate(steps):
         print(f"$ {' '.join(step)}  (cwd={repo_dir})")
         started = time.monotonic()
@@ -4324,13 +4330,13 @@ def _run_pre_push_typecheck(
         # (install vs. cold mypy under the real CPU limit), read from run logs.
         print(f"info: typecheck step {i} exited {proc.returncode} in {time.monotonic() - started:.1f}s")
         out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        if i == 0:
+        if i < len(steps) - 1:
             if proc.returncode != 0:
                 return TypecheckResult("unknown", "observation_failed", summary="dependency install failed")
             continue
         if proc.returncode == 0:
             return TypecheckResult("pass", "exit_zero", 0, "mypy passed")
-        found = _MYPY_FOUND_RE.search(out)
+        found = next(reversed(list(_MYPY_FOUND_RE.finditer(out))), None)
         if proc.returncode == 1 and found:
             n = int(found.group(1))
             return TypecheckResult("fail", "exit_nonzero", n, found.group(0))

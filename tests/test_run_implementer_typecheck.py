@@ -68,6 +68,30 @@ def test_child_env_carries_no_orchestrator_secrets(monkeypatch, repo):
         assert env["HOME"] == "/home/agent"
 
 
+def test_non_uv_command_runs_as_single_step(monkeypatch, repo):
+    # A registered command that is not `uv run --locked` has no install step
+    # (agy P2 on #787): its own exit code is the result.
+    monkeypatch.setitem(TYPECHECK_COMMANDS, "svc", ("python", "-m", "mypy"))
+    calls = _fake(monkeypatch, [_proc(1, "x.py:1: error: bad\nFound 2 errors in 1 file\n")])
+    tc = ri._run_pre_push_typecheck(repo, "svc", None)
+    assert calls == [["python", "-m", "mypy"]]
+    assert (tc.result, tc.error_count) == ("fail", 2)
+    _fake(monkeypatch, [_proc(0, "Success: no issues found")])
+    assert ri._run_pre_push_typecheck(repo, "svc", None).result == "pass"
+
+
+def test_error_count_comes_from_summary_line(monkeypatch, repo):
+    out = 'x.py:1: error: bad  [misc]\n    s = "Found 9 errors in 9 files"\nFound 1 error in 1 file\n'
+    _fake(monkeypatch, [_proc(0), _proc(1, out)])
+    tc = ri._run_pre_push_typecheck(repo, "mctl-agents", None)
+    assert (tc.error_count, tc.summary) == (1, "Found 1 error")
+
+
+def test_venv_path_with_trailing_slash_is_dropped(monkeypatch):
+    monkeypatch.setenv("PATH", "/app/.venv/bin/:/usr/bin")
+    assert ri._typecheck_env()["PATH"] == "/usr/bin"
+
+
 def test_clean_tree_is_pass(monkeypatch, repo):
     _fake(monkeypatch, [_proc(0), _proc(0, "Success: no issues found")])
     tc = ri._run_pre_push_typecheck(repo, "mctl-agents", None)
