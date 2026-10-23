@@ -1,0 +1,36 @@
+name: portable-runtime spike (experimental)
+on:
+  pull_request:
+    paths:
+      - "experiments/portable-runtime-rs/**"
+      - ".github/workflows/portable-runtime-spike.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: portable-runtime-spike-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  cargo:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: experiments/portable-runtime-rs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - run: cargo build --locked
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Audit dependencies
+        run: |
+          cargo install cargo-audit --locked --version 0.21.2
+          cargo audit
