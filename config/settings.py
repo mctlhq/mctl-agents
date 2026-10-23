@@ -189,3 +189,15 @@ SHEPHERD_SELECTION = resolve_model(
 SERVICE_AGENT_MODEL = SERVICE_AGENT_SELECTION.model
 MENTOR_MODEL = MENTOR_SELECTION.model
 SHEPHERD_MODEL = SHEPHERD_SELECTION.model
+
+
+# Per-target CI type-check commands the Tier 2 implementer runs before its
+# first push (mctl-agents#785). Explicit, not auto-detected: a service is
+# listed only once its CI is confirmed to run the same command. The mctl-agents
+# entry mirrors the "Run mypy" step in .github/workflows/pr-validation.yml.
+TYPECHECK_COMMANDS: dict[str, tuple[str, ...]] = {
+    "mctl-agents": ("uv", "run", "--locked", "mypy"),
+}
+
+# Hard cap for one pre-push type-check step (install or mypy), in seconds.
+IMPLEMENTER_TYPECHECK_TIMEOUT_SECONDS = 300

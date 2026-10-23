@@ -283,7 +283,7 @@ def test_the_success_path_projects_a_bounded_completion(monkeypatch: Any, tmp_pa
     auth = block["authoritative"]
     assert (auth["step"], auth["outcome"], auth["stop_reason"]) == ("primary", "complete", "gates_passed")
     assert auth["head_sha"] == HEAD
-    assert auth["verification"] == {"required_passed": 4, "required_total": 4, "optional_total": 1}
+    assert auth["verification"] == {"required_passed": 4, "required_total": 4, "optional_total": 2}
     # Bounded: no per-check details, no telemetry.
     assert set(auth) == {
         "completion_id", "content_hash", "proposal_digest", "attempt_id", "step", "outcome", "stop_reason",

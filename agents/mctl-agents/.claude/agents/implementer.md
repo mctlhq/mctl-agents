@@ -82,7 +82,8 @@ This is meta-territory; be careful.
 - Sanity check: `python -c "import orchestrator.<new_module>"` for new
   modules; `pytest tests/<test_new_module>.py` if the proposal asks
   for tests; `python -m orchestrator.<new_module> --help` for any
-  new CLI to confirm argparse wiring.
+  new CLI to confirm argparse wiring; `uv run --locked mypy` for any
+  Python change (the same check CI runs).
 - Adding a new sub-agent? Place the prompt under
   `agents/_<role>/<role>.md` (cross-service) or
   `agents/<service>/.claude/agents/<role>.md` (service-scoped).
