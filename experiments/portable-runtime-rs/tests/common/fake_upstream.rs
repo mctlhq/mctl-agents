@@ -138,7 +138,10 @@ pub fn closed_port_url() -> String {
     format!("http://{addr}/mcp")
 }
 
-fn read_request(stream: &TcpStream) -> Option<(Vec<(String, String)>, Vec<u8>)> {
+/// Request headers and body as read off the socket.
+type Request = (Vec<(String, String)>, Vec<u8>);
+
+fn read_request(stream: &TcpStream) -> Option<Request> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).ok()?;
