@@ -9,6 +9,8 @@ pub mod http;
 pub mod json;
 pub mod sha256;
 pub mod spawn;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod upstream;
 pub mod uuid;
 
