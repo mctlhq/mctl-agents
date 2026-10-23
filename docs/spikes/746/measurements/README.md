@@ -1,0 +1,82 @@
+# Spike #746 measurements
+
+Status: **measured.** The artifacts of one CI run on the PR's final code head are
+committed here and the numbers in `docs/spikes/746-portable-runtime.md` come from
+them. The files are the artifacts as downloaded, unedited.
+
+- Run id: `40002256127`
+- Head SHA: `12f5582b45250b2059324689d244671ada2f31db`
+- Workflow: `.github/workflows/portable-runtime-spike.yml`, jobs `bench` and `cross-build`
+
+## Files the shepherd commits here
+
+| File | Source |
+|---|---|
+| `ubuntu-latest.json`, `ubuntu-latest.md` | artifact `portable-runtime-measurements-ubuntu-latest` |
+| `macos-14.json`, `macos-14.md` | artifact `portable-runtime-measurements-macos-14` |
+| `cross-build.json` | the `cross-build` artifacts, merged into one array |
+| `parity-bytes.md` | the byte-level parity finding written by `bench/parity.sh` |
+
+The artifact must come from a run on a head whose code matches the final head.
+A docs-only commit does not change the measured binaries, so a later docs-only
+head is fine.
+
+## Record schema
+
+Each `<os>.json` file is an array of records:
+
+| Field | Meaning |
+|---|---|
+| `subject` | `rust-proxy`, `python-baseline`, `python-uv-run`, `direct` (plain HTTP, no proxy) or `both` |
+| `metric` | for example `build_time`, `binary_size`, `ready_median_ms`, `steady_p95_ms`, `rss_idle_kb` |
+| `value` | a number, or `null` when the metric was not measured. A missing metric is never `0`. |
+| `unit` | `s`, `ms`, `bytes`, `kB`, `lines`, `distributions` or empty |
+| `status` | `measured`, `unmeasured` or `failed` |
+| `reason` | why a record is `unmeasured` or `failed`; context for a measured one |
+| `note` | `http-only, TLS not included` on every Rust size, build, dependency and startup record |
+| `os`, `head_sha`, `run_id` | where and from which commit and run the record came |
+
+The rendered `<os>.md` adds the environment block (CPU, cores, memory, OS,
+rustc, Python and uv versions).
+
+## Method
+
+- `ready`: spawn to the `initialize` response, N=20, nearest-rank median and p95.
+- `latency`: one handshake, then one first call and N=100 steady-state
+  `mctl_whoami` calls. `direct` is the same calls through the crate's own HTTP
+  client (`upstream::Upstream::call_tool`); overhead is the subject minus
+  `direct`. The Rust proxy opens its upstream session lazily on the first call,
+  the Python baseline opens it in the background at start, so the first-call
+  figures are not symmetric. The steady-state figures are.
+- `rss`: one warm call, a 300 ms pause, then idle RSS; then peak RSS sampled
+  every 20 ms during a `slow_tool` call (about 2 s). Linux reads `VmRSS` and
+  `VmHWM` from `/proc/<pid>/status`; macOS uses `ps -o rss=`. The Python figure
+  is the interpreter process itself.
+- The server is spawned with a cleared environment plus `PATH`, `HOME` and
+  `MCTL_TOKEN=bench-token-746`.
+- Size: `stat` of the release binary; for Python the script, the `mcp`
+  requirement closure and `sys.base_prefix`, reported separately.
+- Dependencies: line count of `ldd` (`otool -L` on macOS); for Python, the count
+  of installed distributions in the `mcp` requirement closure.
+- Python is launched as `python -I baseline/thin_adapter.py`; the `uv run`
+  cold start is a second number (`python-uv-run`).
+- The live run against `api.mctl.ai` is `unmeasured` (not run in this slice).
+
+## TLS limit
+
+The measured Rust build is the default, std-only one and speaks plain `http://`;
+the optional `tls` feature (#779) is not used. Every Rust size, build,
+dependency and startup number here is **http-only, TLS not included**. A
+TLS-capable binary will be larger, take longer to build and add dependencies.
+That variant is unmeasured here; slice 3b (#780) measures it.
+
+## Known measurement defects
+
+- `ubuntu-latest.json` reports `python-baseline interpreter_size` as 40427530 kB.
+  The value is invalid: on the runner `sys.base_prefix` is `/usr`, so `du` measured
+  the whole system prefix, not the interpreter. The report does not use it. The
+  macos-14 value (279558 kB, a standalone Python) is a real interpreter size.
+- `python-baseline build_time` is a `uv sync` against a warm uv cache, so it measures
+  environment linking, not a download and install. It is not comparable with the
+  Rust compile time.
+- Rust size, build, dependency and startup numbers are http-only, TLS not included.

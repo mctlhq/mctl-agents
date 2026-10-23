@@ -1,0 +1,67 @@
+[
+  {
+    "name": "aarch64-apple-darwin",
+    "target": "aarch64-apple-darwin",
+    "runner": "macos-14",
+    "status": "built",
+    "ran": "yes",
+    "size_bytes": 762176,
+    "file": "Mach-O 64-bit executable arm64 ",
+    "reason": "",
+    "note": "http-only, TLS not included",
+    "head_sha": "12f5582b45250b2059324689d244671ada2f31db",
+    "run_id": "40002256127"
+  },
+  {
+    "name": "aarch64-linux-musl-arm-runner",
+    "target": "aarch64-unknown-linux-musl",
+    "runner": "ubuntu-24.04-arm",
+    "status": "built",
+    "ran": "yes",
+    "size_bytes": 993992,
+    "file": "ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped ",
+    "reason": "",
+    "note": "http-only, TLS not included",
+    "head_sha": "12f5582b45250b2059324689d244671ada2f31db",
+    "run_id": "40002256127"
+  },
+  {
+    "name": "aarch64-linux-musl-built-only",
+    "target": "aarch64-unknown-linux-musl",
+    "runner": "ubuntu-latest",
+    "status": "built",
+    "ran": "unmeasured",
+    "size_bytes": 993976,
+    "file": "ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped ",
+    "reason": "",
+    "note": "http-only, TLS not included",
+    "head_sha": "12f5582b45250b2059324689d244671ada2f31db",
+    "run_id": "40002256127"
+  },
+  {
+    "name": "x86_64-linux-musl",
+    "target": "x86_64-unknown-linux-musl",
+    "runner": "ubuntu-latest",
+    "status": "built",
+    "ran": "yes",
+    "size_bytes": 996544,
+    "file": "ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, not stripped ",
+    "reason": "",
+    "note": "http-only, TLS not included",
+    "head_sha": "12f5582b45250b2059324689d244671ada2f31db",
+    "run_id": "40002256127"
+  },
+  {
+    "name": "x86_64-windows-msvc",
+    "target": "x86_64-pc-windows-msvc",
+    "runner": "windows-latest",
+    "status": "built",
+    "ran": "unmeasured",
+    "size_bytes": 555520,
+    "file": "PE32+ executable for MS Windows 6.00 (console), x86-64, 5 sections ",
+    "reason": "",
+    "note": "http-only, TLS not included",
+    "head_sha": "12f5582b45250b2059324689d244671ada2f31db",
+    "run_id": "40002256127"
+  }
+]

@@ -1,0 +1,4 @@
+# Allowlist for parity and bench runs against the example fake upstream.
+# secret_tool is deliberately absent (it must be refused); slow_tool is present
+# so the RSS mode can hold a call open.
+tools = ["mctl_whoami", "deny_tool", "approval_tool", "slow_tool"]
