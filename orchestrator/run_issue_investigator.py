@@ -36,7 +36,8 @@ Pipeline for one issue:
 
 The proposal stops at `status: proposed`. A human reviews the spec and flips
 .status.yaml to `accepted`, after which the existing Tier 2 implementer opens
-a PR (which carries `Closes <repo>#<N>` thanks to the `source` block).
+a PR (which carries `Closes <repo>#<N>` thanks to the `source` block, or
+`Refs <repo>#<N>` for a spike or unclassifiable issue, mctl-agents#763).
 
 Auth:
     GITHUB_TOKEN from env (gh CLI honors it) — needs `repo` read on the
@@ -744,7 +745,7 @@ def _status_disagreements(
     """Ways the published status file differs from what we wrote.
 
     Not just `status`. The `source` block names the issue the implementer
-    writes `Closes <repo>#<N>` for, so an agent that rewrote it to another
+    writes `Closes <repo>#<N>` (or `Refs` for a spike) for, so an agent that rewrote it to another
     repository would have the merge of ITS proposal silently close
     unrelated issues elsewhere in the org -- a boundary crossing of the
     same kind as forging the approval, and one the status-only check let
@@ -1254,7 +1255,7 @@ def write_status_yaml(
 
     Status starts at `proposed`. The `source` block links the proposal back
     to the originating GitHub issue — the Tier 2 implementer reads it to add
-    `Closes <repo>#<N>` to the PR, and `update_status_yaml` preserves it
+    `Closes <repo>#<N>` (`Refs` for a spike) to the PR, and `update_status_yaml` preserves it
     through every later transition (proposal_state.update_status_file merges
     by default, so the `execution` block below survives untouched unless a
     later writer explicitly overrides it).

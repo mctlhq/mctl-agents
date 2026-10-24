@@ -89,7 +89,6 @@ def classify_issue(
         return _error("spike-list", exc)
 
     want = (repo.lower(), int(number))
-    matched = False
     for entry in listing:
         name = entry.get("name") if isinstance(entry, dict) else None
         if not isinstance(name, str) or not name.endswith((".yaml", ".yml")):
@@ -109,7 +108,7 @@ def classify_issue(
         except Exception as exc:  # noqa: BLE001
             return _error(step, exc)
         if binding == want:
-            matched = True
-    if matched:
-        return SpikeClassification(SPIKE_MANIFEST)
+            # A positive match is final: a later unreadable manifest cannot
+            # make this issue less of a spike, only cost reads.
+            return SpikeClassification(SPIKE_MANIFEST)
     return SpikeClassification(NOT_SPIKE)
