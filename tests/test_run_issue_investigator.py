@@ -29,7 +29,7 @@ from orchestrator import policy_checkpoint, run_issue_investigator
 from orchestrator.proposal_state import unrunnable_reason
 from orchestrator.run_implementer import (
     ProposalRef,
-    _issue_closing_line,
+    _issue_reference_line,
     update_status_yaml,
 )
 from orchestrator.run_issue_investigator import (
@@ -462,7 +462,7 @@ def test_update_status_yaml_absent_file(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _issue_closing_line — drives the PR auto-close
+# _issue_reference_line — drives the PR auto-close (Closes vs Refs)
 # ---------------------------------------------------------------------------
 def _ref_with_status(tmp_path, status_payload):
     proposal_dir = tmp_path / "proposals" / "p"
@@ -477,22 +477,26 @@ def _ref_with_status(tmp_path, status_payload):
     )
 
 
-def test_issue_closing_line_github_issue(tmp_path):
+def test_issue_reference_line_github_issue(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.run_implementer.spike_issue.classify_issue",
+        lambda *a, **k: __import__("orchestrator.spike_issue", fromlist=["x"]).SpikeClassification("not-spike"),
+    )
     ref = _ref_with_status(tmp_path, {
         "status": "accepted",
         "source": {"type": "github_issue", "repo": "mctlhq/mctl-telegram", "issue": 123},
     })
-    assert _issue_closing_line(ref) == "\n\nCloses mctlhq/mctl-telegram#123"
+    assert _issue_reference_line(ref) == "\n\nCloses mctlhq/mctl-telegram#123"
 
 
-def test_issue_closing_line_no_status_file(tmp_path):
+def test_issue_reference_line_no_status_file(tmp_path):
     ref = _ref_with_status(tmp_path, None)
-    assert _issue_closing_line(ref) == ""
+    assert _issue_reference_line(ref) == ""
 
 
-def test_issue_closing_line_no_source(tmp_path):
+def test_issue_reference_line_no_source(tmp_path):
     ref = _ref_with_status(tmp_path, {"status": "accepted"})
-    assert _issue_closing_line(ref) == ""
+    assert _issue_reference_line(ref) == ""
 
 
 @pytest.mark.parametrize(
@@ -504,9 +508,9 @@ def test_issue_closing_line_no_source(tmp_path):
         "not-a-dict",                                          # malformed
     ],
 )
-def test_issue_closing_line_rejects_incomplete_source(tmp_path, source):
+def test_issue_reference_line_rejects_incomplete_source(tmp_path, source):
     ref = _ref_with_status(tmp_path, {"status": "accepted", "source": source})
-    assert _issue_closing_line(ref) == ""
+    assert _issue_reference_line(ref) == ""
 
 
 # ---------------------------------------------------------------------------
