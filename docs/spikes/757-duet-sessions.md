@@ -8,13 +8,13 @@ Refs mctlhq/mctl-agents#757. Fixture-only evidence; no runtime change. Prototype
 | Repo | SHA | Read |
 |---|---|---|
 | mctlhq/mctl-agents | cb3c3f99f212ef31dd6822b2707c400fb4687815 | DevLoop, approvals, policy checkpoint |
-| mctlhq/mctl-claude-remote | 989bff3b8c0da53cfb109110dfadb022de142e40 | `events/mctl_events/envelope.py` (file list only for `channel.py`, not read) |
+| mctlhq/mctl-claude-remote | 989bff3b8c0da53cfb109110dfadb022de142e40 | `events/mctl_events/envelope.py`, `events/mctl_events/channel.py` (read in review) |
 | mctlhq/.github | 92b1e28327b0d0b575b18007ab6935d45dff057d | `events/schemas/event-envelope.v1.schema.json` |
-| mctlhq/mctl-api | b42d63fb7e6e5f488d19df2b3023e9e00ca963f1 | HEAD only; producer not read |
+| mctlhq/mctl-api | b42d63fb7e6e5f488d19df2b3023e9e00ca963f1 | `docs/github-events-producer.md` (subject keys `kind`, `repository`, `number`, `head_sha`; read in review) |
 | mctlhq/mctl-telegram | 9472a39cae79455ddd1d58923d8b1033c1c7cc40 | HEAD only; not read |
 
-Not read in this run: `channel.py`, the mctl-api GitHub event producer, mctl-telegram behavior.
-Claims about them are marked as such.
+Not read in this run: mctl-telegram behavior. Claims about it are marked as such. `channel.py` and the
+mctl-api producer contract were read during review and confirm the map below.
 
 ## Q1. Current-state map
 
@@ -110,6 +110,36 @@ Also settle there how a refused envelope interacts with the rest of a wake cycle
 batch (fail closed), which also withholds valid decisions for other resources in it. The wiring should refuse per
 resource, or surface the refusal as its own decision, so one malformed delivery cannot hide a valid `NOTIFY` or
 `REQUIRE_APPROVAL`.
+
+## Why this verdict
+
+The evidence rules out the two outer outcomes:
+
+- **Not `ADD_AGENT_SESSION_CONTRACT` or `CREATE_PROACTIVE_AGENT_EPIC`.** No persistent session object was needed
+  (Q2, Q6). The only state that has to survive a wake is one `observed_state_digest` per watched resource (Q5).
+  Everything else is re-observed from the system of record, because the envelope is reference-only. Nothing here
+  needs several independently owned slices, so there is no case for a new session contract or an epic.
+- **Not `NO_NEW_CONTRACT`.** Composing what exists is not enough. Today the attention outcome is whatever the model
+  passes to `ack_event` (`handled | ignored | failed`, `channel.py`): it is untyped, it has no rule or digest
+  behind it, and it can be chosen only after the session has already been woken. `AttentionDecision v1` is a
+  small new record. It is the part that makes `IGNORE` deterministic and free of model calls, and the part that
+  makes coalescing auditable.
+
+That leaves `EXTEND_DEVLOOP_SESSION`, read as **extending the existing durable operator session with attention
+state and event wakeups**. It does not mean changing the `DevLoopWorkflow` itself. In concrete terms:
+
+- **The session that gets extended** is the long-lived claude-remote operator session. Event wakeups for it
+  already exist through the `mctl.events/v1` Channel, with deny-by-default routes, dedup after ack and
+  `max_inflight`.
+- **The extension** is a pure `decide()` call in `channel.py` `handle()`, before
+  `emit(notification_for(...))`. An `IGNORE` is acked without waking the model. Every other outcome is pushed
+  with the `AttentionDecision` attached. The per-resource digest is kept next to the existing dedup keys in Valkey.
+- **The DevLoop is untouched.** Its merge watch keeps polling, and #712 still owns DevLoop push events. A DevLoop
+  consumer of `AttentionDecision` is possible later, but this spike does not show that one is needed.
+- **Authorization and approval are untouched.** `REQUIRE_APPROVAL` only points at an existing `aar_` record.
+
+The outcome name says DevLoop because the issue was framed before the claude-remote Channel shipped. The owner
+accepted the verdict with the reading above on 2026-10-24.
 
 ## Decision
 
