@@ -17,6 +17,7 @@ import re
 import sys
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -169,8 +170,14 @@ def _rule_matches(rule: Mapping[str, Any], etype: str, observed: ObservedState |
     return True
 
 
-def _decision_id(subject_ref: str, ids: tuple[str, ...], digest: str, rule_id: str) -> str:
-    raw = json.dumps([subject_ref, sorted(ids), digest, rule_id], separators=(",", ":"))
+def _instant(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def _decision_id(subject_ref: str, ids: tuple[str, ...], digest: str, rule_id: str, decision: str, basis: str) -> str:
+    # The outcome is part of the identity: two classifier runs that disagree on the same
+    # inputs must not share an id, or a consumer deduplicating by id drops one of them.
+    raw = json.dumps([subject_ref, sorted(ids), digest, rule_id, decision, basis], separators=(",", ":"))
     return "atd_" + hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -188,7 +195,7 @@ def _build(
 ) -> AttentionDecision:
     coalesced = tuple(sorted(set(ids)))
     return AttentionDecision(
-        decision_id=_decision_id(subject_ref, coalesced, digest, rule_id),
+        decision_id=_decision_id(subject_ref, coalesced, digest, rule_id, decision, basis),
         subject_ref=subject_ref,
         session_or_workitem_ref=key,
         decision=decision,
@@ -279,7 +286,8 @@ def decide_wake_cycle(
         groups.setdefault(resource_key(env), []).append(env)
     out: list[AttentionDecision] = []
     for key in sorted(groups):
-        events = sorted(groups[key], key=lambda e: (e["occurred_at"], e["id"]))
+        # Order by the parsed instant, not the string: offsets other than Z sort wrongly as text.
+        events = sorted(groups[key], key=lambda e: (_instant(e["occurred_at"]), e["id"]))
         observed = observed_by_resource.get(key)
         scored = [
             _decide_one(

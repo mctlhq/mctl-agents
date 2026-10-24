@@ -277,3 +277,27 @@ def test_impossible_occurred_at_is_refused():
     e = _pr_event("gh-delivery-0301", "github.pull_request.opened", "2026-02-30T10:00:00Z")
     with pytest.raises(env_mod.EnvelopeRefused):
         env_mod.validate(e)
+
+
+def test_decision_id_differs_when_classifier_outcomes_differ():
+    e, o = fx("ci_failed")
+    rules = without("ci_failed")
+    a = att.decide(e, None, rules, observed=o, classifier=CountingClassifier("NOTIFY"))
+    b = att.decide(e, None, rules, observed=o, classifier=CountingClassifier("CONTINUE"))
+    assert (a.rule_id, b.rule_id) == ("unmatched", "unmatched")
+    assert a.decision_id != b.decision_id
+    again = att.decide(e, None, rules, observed=o, classifier=CountingClassifier("NOTIFY"))
+    assert again.decision_id == a.decision_id
+
+
+def test_wake_cycle_orders_by_instant_not_string():
+    # 10:30+02:00 is 08:30Z, earlier than 09:00Z, although it sorts later as text.
+    early = _pr_event("gh-delivery-0401", "github.pull_request_review.submitted", "2026-10-24T10:30:00+02:00")
+    late = _pr_event("gh-delivery-0402", "github.pull_request.synchronize", "2026-10-24T09:00:00Z")
+    late["correlation_id"] = "corr-late"
+    obs = att.ObservedState("failure", "blocked", "P3", "a1b2c3d")
+    key = att.resource_key(late)
+    for order in ([early, late], [late, early]):
+        (d,) = att.decide_wake_cycle(order, {}, RULES, observed_by_resource={key: obs})
+        assert d.decided_at == "2026-10-24T09:00:00Z"
+        assert d.subject_ref == "corr-late"
