@@ -138,20 +138,20 @@ class WorkItemClient:
 
     def __init__(self, base_url: str | None = None, token: str | None = None, timeout: int = DEFAULT_TIMEOUT_S) -> None:
         self._base = (base_url or api_base()).rstrip("/")
-        # None: resolved per request, so a client built before the run
-        # token is set up still uses it (mctlhq/mctl-agents#717).
+        # Resolved per request, so a client built before the run token is
+        # set up still uses it (mctlhq/mctl-agents#717).
         self._token = token
         self._timeout = timeout
         self._opener = _no_redirect_opener()
 
     def _bearer(self) -> str:
-        if self._token is not None:
-            return self._token
         # Deferred: run_token pulls in httpx and settings, which the
-        # Temporal workers that import this module never need.
+        # Temporal workers that import this module never need. An explicit
+        # token stands in for MCTL_TOKEN only: in enforce mode the run token
+        # still wins.
         from orchestrator import run_token
 
-        return run_token.mctl_api_bearer()
+        return run_token.mctl_api_bearer(self._token)
 
     @property
     def base_url(self) -> str:

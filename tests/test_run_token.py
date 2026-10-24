@@ -309,6 +309,30 @@ def test_enforce_gateway_connects_with_the_run_token(monkeypatch):
     assert STATIC not in str(headers)
 
 
+def test_enforce_rest_calls_ignore_an_explicit_static_token(monkeypatch):
+    from orchestrator.work_context.client import WorkItemClient
+
+    monkeypatch.setenv(run_token.MODE_ENV, "enforce")
+    client = WorkItemClient(base_url="https://api.example.test", token=STATIC)
+    opener = _CapturingOpener()
+    client._opener = opener
+    api = FakeAPI()
+    run_token.setup("investigate", post=api, get=api)
+    client.get("wi_1")
+    assert opener.bearers == [f"Bearer {RUN}"]
+
+
+def test_observe_gateway_shadows_on_the_static_token(monkeypatch):
+    from orchestrator import capability_gateway
+
+    monkeypatch.setenv(run_token.MODE_ENV, "observe")
+    api = FakeAPI()
+    run_token.setup("investigate", post=api, get=api)
+    headers = capability_gateway._default_remote_headers()
+    assert headers["Authorization"] == f"Bearer {STATIC}"
+    assert headers[run_token.SHADOW_HEADER] == "investigate"
+
+
 def test_enforce_gateway_without_setup_fails_closed(monkeypatch):
     from orchestrator import capability_gateway
 
@@ -317,7 +341,8 @@ def test_enforce_gateway_without_setup_fails_closed(monkeypatch):
         capability_gateway._default_remote_headers()
 
 
-def test_investigator_resolves_the_issue_url_after_the_run_token(monkeypatch):
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_investigator_resolves_the_issue_url_after_the_run_token(monkeypatch, dry_run):
     from orchestrator import auth, run_issue_investigator
     from orchestrator.work_context import rollout
     from orchestrator.work_context.client import WorkItemClient
@@ -333,7 +358,8 @@ def test_investigator_resolves_the_issue_url_after_the_run_token(monkeypatch):
         return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason="stub")
 
     monkeypatch.setattr(WorkItemClient, "get", _get)
-    monkeypatch.setattr("sys.argv", ["run_issue_investigator", "--work-item-id", "wi_1"])
+    argv = ["run_issue_investigator", "--work-item-id", "wi_1"] + (["--dry-run"] if dry_run else [])
+    monkeypatch.setattr("sys.argv", argv)
     with pytest.raises(SystemExit, match="could not resolve --issue-url"):
         run_issue_investigator.main()
     assert order == ["setup", "get"]

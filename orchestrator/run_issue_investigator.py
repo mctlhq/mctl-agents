@@ -4647,11 +4647,13 @@ def main() -> None:
         from orchestrator.auth import ensure_auth_for_sdk  # deferred — see the import note at the top
 
         ensure_auth_for_sdk()
-        # Before any options are built: the MCP connection takes its
-        # credential from here (mctlhq/mctl-agents#737).
-        from orchestrator import run_token  # deferred — see the import note at the top
+    # Before any options are built: the MCP connection takes its credential
+    # from here (mctlhq/mctl-agents#737). In dry-run too: it needs no Claude
+    # credential, and in enforce mode the work-item read below has no other
+    # one (#717).
+    from orchestrator import run_token  # deferred — see the import note at the top
 
-        run_token.setup(shadow_scope="investigate")
+    run_token.setup(shadow_scope="investigate")
 
     # After run_token.setup(): in enforce mode this read uses the run token,
     # which is all the pod should hold (mctlhq/mctl-agents#717).
