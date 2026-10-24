@@ -4638,6 +4638,25 @@ def main() -> None:
     args = ap.parse_args()
     _work_context_from_args(args)
 
+    # Not in dry-run: it resolves the issue and the slug and stops before
+    # the agent, so requiring Claude credentials to do that would break the
+    # one mode whose whole point is to work without them — and the --dry-run
+    # help text already promises as much (agy P2 on #248). Same guard as
+    # run_shepherd.main().
+    if not args.dry_run:
+        from orchestrator.auth import ensure_auth_for_sdk  # deferred — see the import note at the top
+
+        ensure_auth_for_sdk()
+    # Before any options are built: the MCP connection takes its credential
+    # from here (mctlhq/mctl-agents#737). In dry-run too: it needs no Claude
+    # credential, and in enforce mode the work-item read below has no other
+    # one (#717).
+    from orchestrator import run_token  # deferred — see the import note at the top
+
+    run_token.setup(shadow_scope="investigate")
+
+    # After run_token.setup(): in enforce mode this read uses the run token,
+    # which is all the pod should hold (mctlhq/mctl-agents#717).
     issue_url = args.issue_url
     if not issue_url:
         # Only reachable once _work_context_from_args has already confirmed
@@ -4649,21 +4668,6 @@ def main() -> None:
         if answer.verdict != WORK_ITEM_FOUND or answer.item is None or not answer.item.issue_url:
             raise SystemExit(f"could not resolve --issue-url from work item {args.work_item_id!r}: {answer.reason}")
         issue_url = answer.item.issue_url
-
-    # Not in dry-run: it resolves the issue and the slug and stops before
-    # the agent, so requiring Claude credentials to do that would break the
-    # one mode whose whole point is to work without them — and the --dry-run
-    # help text already promises as much (agy P2 on #248). Same guard as
-    # run_shepherd.main().
-    if not args.dry_run:
-        from orchestrator.auth import ensure_auth_for_sdk  # deferred — see the import note at the top
-
-        ensure_auth_for_sdk()
-        # Before any options are built: the MCP connection takes its
-        # credential from here (mctlhq/mctl-agents#737).
-        from orchestrator import run_token  # deferred — see the import note at the top
-
-        run_token.setup(shadow_scope="investigate")
 
     try:
         result = investigate(

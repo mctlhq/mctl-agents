@@ -366,7 +366,9 @@ def _correlation_headers(execution: ExecutionCorrelation, capability_set_id: str
 
 def _default_remote_headers() -> dict[str, str]:
     """The header set `orchestrator/options.py::mctl_mcp_config()` builds
-    for the CLI's own mctl connection: `Authorization: Bearer $MCTL_TOKEN`
+    for the CLI's own mctl connection: `Authorization: Bearer` with the
+    token `run_token.mcp_auth()` picks (the run token in enforce mode,
+    otherwise `$MCTL_TOKEN`, with the shadow scope header in observe mode)
     plus the `#196` correlation headers `_execution_context_headers()`
     computes (fails closed under `MCTL_REQUIRE_EXECUTION_CONTEXT`, inherited
     rather than reimplemented). Reused verbatim so the gateway's own
@@ -374,12 +376,17 @@ def _default_remote_headers() -> dict[str, str]:
     would have."""
     import os
 
+    from orchestrator import run_token
     from orchestrator.options import _execution_context_headers
 
     headers = dict(_execution_context_headers())
-    token = os.environ.get("MCTL_TOKEN", "").strip()
+    # The same credential choice as mctl_mcp_config(): a run-token enforce
+    # run reaches mctl through the gateway with its run token, never with
+    # the static one (mctlhq/mctl-agents#717).
+    token, scope_headers = run_token.mcp_auth(os.environ.get("MCTL_TOKEN", "").strip())
     if token:
         headers["Authorization"] = f"Bearer {token}"
+        headers.update(scope_headers)
     return headers
 
 
