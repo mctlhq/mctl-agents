@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.98.0](https://github.com/mctlhq/mctl-agents/compare/1.97.0...1.98.0) (2026-10-24)
+
+
+### Features
+
+* **run-token:** investigate REST calls use the run token in enforce ([94d840e](https://github.com/mctlhq/mctl-agents/commit/94d840ee0699d8777817510a0a385b5575eb82cf))
+* **run-token:** investigate REST calls use the run token in enforce ([072a444](https://github.com/mctlhq/mctl-agents/commit/072a44424c4af19eaf3225a0673a31e1254315a7)), closes [#717](https://github.com/mctlhq/mctl-agents/issues/717)
+
+
+### Bug Fixes
+
+* **run-token:** set up the run token in dry-run too ([896e5d8](https://github.com/mctlhq/mctl-agents/commit/896e5d88132c14abe983b545a217b7407dc6f118)), closes [#717](https://github.com/mctlhq/mctl-agents/issues/717)
+
 ## [1.97.0](https://github.com/mctlhq/mctl-agents/compare/1.96.0...1.97.0) (2026-10-23)
 
 
