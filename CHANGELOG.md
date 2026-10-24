@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.99.0](https://github.com/mctlhq/mctl-agents/compare/1.98.0...1.99.0) (2026-10-24)
+
+
+### Features
+
+* **agents:** issue-757-spike-runtime-evaluate-duet-style-persis ([ff13d38](https://github.com/mctlhq/mctl-agents/commit/ff13d38f733901eb0d93ecc2a8d345299f6d6277))
+* **agents:** issue-757-spike-runtime-evaluate-duet-style-persis ([42160c0](https://github.com/mctlhq/mctl-agents/commit/42160c0292a8a35543e333c6a3d67bc4b076f3dc)), closes [#757](https://github.com/mctlhq/mctl-agents/issues/757)
+
+
+### Bug Fixes
+
+* **spike-757:** bind decision_id to the outcome, order by instant ([573e3fe](https://github.com/mctlhq/mctl-agents/commit/573e3fed48dc9f494064285b23a931573abeb200)), closes [#757](https://github.com/mctlhq/mctl-agents/issues/757)
+
 ## [1.98.0](https://github.com/mctlhq/mctl-agents/compare/1.97.0...1.98.0) (2026-10-24)
 
 
