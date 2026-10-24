@@ -1,0 +1,21 @@
+# Attention rules for GitHub PR events (spike #757). First match wins.
+# Match keys: type (exact, or trailing-* glob), digest_unchanged, and the
+# ObservedState fields checks / mergeable / max_review_severity.
+# Rules never read envelope free text.
+version: 1
+rules:
+  - id: no_state_change
+    match: {digest_unchanged: true}
+    decision: IGNORE
+  - id: ci_failed
+    match: {type: "github.pull_request.*", checks: failure}
+    decision: NOTIFY
+  - id: ready_to_merge
+    match: {type: "github.pull_request.*", mergeable: clean, checks: success}
+    decision: REQUIRE_APPROVAL
+  - id: review_comment_p1
+    match: {type: github.pull_request_review.submitted, max_review_severity: P1}
+    decision: NOTIFY
+  - id: review_comment_p3
+    match: {type: github.pull_request_review.submitted, max_review_severity: P3}
+    decision: CONTINUE

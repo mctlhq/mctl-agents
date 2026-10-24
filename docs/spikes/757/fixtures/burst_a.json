@@ -1,0 +1,21 @@
+{
+  "envelope": {
+    "correlation_id": "corr-123",
+    "id": "gh-delivery-0004",
+    "occurred_at": "2026-10-24T10:00:00Z",
+    "source": "mctl-api",
+    "specversion": "mctl.events/v1",
+    "subject": {
+      "kind": "github.pull_request",
+      "number": "123",
+      "repository": "mctlhq/mctl-agents"
+    },
+    "type": "github.pull_request.synchronize"
+  },
+  "observed": {
+    "checks": "failure",
+    "head_sha": "a1b2c3d",
+    "max_review_severity": "P3",
+    "mergeable": "blocked"
+  }
+}
