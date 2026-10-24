@@ -23,10 +23,11 @@ from typing import Any
 import yaml
 
 
-def _load_sibling(name: str) -> Any:
+def _load_sibling(name: str, stem: str) -> Any:
+    # Namespaced key: a generic name would collide in the shared pytest process.
     if name in sys.modules:
         return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(f"{name}.py"))
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(f"{stem}.py"))
     if spec is None or spec.loader is None:
         raise ImportError(name)
     mod = importlib.util.module_from_spec(spec)
@@ -35,7 +36,7 @@ def _load_sibling(name: str) -> Any:
     return mod
 
 
-envelope_v1 = _load_sibling("envelope_v1")
+envelope_v1 = _load_sibling("spike_757_envelope_v1", "envelope_v1")
 EnvelopeRefused = envelope_v1.EnvelopeRefused
 
 SCHEMA = "attentiondecision/v1"
@@ -125,9 +126,16 @@ def type_matches(pattern: str, value: str) -> bool:
     return pattern == value
 
 
+PR_SUBJECT_KIND = "github.pull_request"
+
+
 def resource_key(envelope: Mapping[str, Any]) -> str:
+    """Watched-resource key. Fails closed: an envelope that does not name a PR is refused,
+    never grouped under an empty key with unrelated envelopes."""
     s = envelope["subject"]
-    return f"github:pr:{s.get('repository', '')}#{s.get('number', '')}"
+    if s.get("kind") != PR_SUBJECT_KIND or not s.get("repository") or not s.get("number"):
+        raise EnvelopeRefused("subject does not identify a pull request (kind, repository, number)")
+    return f"github:pr:{s['repository']}#{s['number']}"
 
 
 def observed_digest(key: str, observed: ObservedState | None) -> str:

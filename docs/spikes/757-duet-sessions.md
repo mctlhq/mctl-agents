@@ -106,6 +106,10 @@ and check events are not routed today.
 
 Wire `decide()` into mctl-claude-remote `channel.py`, filed and reviewed in that repository, re-validating the
 copied envelope shape against the producer's tests. The wake-cycle window (time vs delivery batch) is a parameter to settle there.
+Also settle there how a refused envelope interacts with the rest of a wake cycle. The prototype refuses the whole
+batch (fail closed), which also withholds valid decisions for other resources in it. The wiring should refuse per
+resource, or surface the refusal as its own decision, so one malformed delivery cannot hide a valid `NOTIFY` or
+`REQUIRE_APPROVAL`.
 
 ## Decision
 

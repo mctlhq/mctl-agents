@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 SPEC_VERSION = "mctl.events/v1"
@@ -70,6 +71,11 @@ def validate(doc: Any) -> dict[str, Any]:
         value = doc[name]
         if not isinstance(value, str) or not pattern.fullmatch(value):
             raise EnvelopeRefused(f"invalid {name}")
+    try:
+        # The pattern admits impossible dates such as 02-30; the source parses too.
+        datetime.fromisoformat(doc["occurred_at"].replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise EnvelopeRefused("invalid occurred_at") from exc
     subject = doc["subject"]
     if not isinstance(subject, dict) or "kind" not in subject:
         raise EnvelopeRefused("subject must be an object with a kind")

@@ -23,8 +23,8 @@ def _load(name, path):
     return mod
 
 
-att = _load("attention", HERE / "attention.py")
-env_mod = _load("envelope_v1", HERE / "envelope_v1.py")
+env_mod = _load("spike_757_envelope_v1", HERE / "envelope_v1.py")
+att = _load("spike_757_attention", HERE / "attention.py")
 RULES = att.load_rules(HERE / "rules" / "github_pr.yaml")
 REF = "aar_fixture_0001"
 
@@ -106,7 +106,8 @@ def test_t4_burst_coalesces_to_one_notify():
 def test_t5_mutations_turn_each_scenario_red():
     assert run_unchanged(without("no_state_change")).decision != "IGNORE"
     assert run_ci(without("ci_failed")).rule_id != "ci_failed"
-    assert run_ci(without("ci_failed")).decision != "NOTIFY" or run_ci(without("ci_failed")).basis == "model"
+    fell = run_ci(without("ci_failed"))
+    assert (fell.decision, fell.basis, fell.rule_id) == ("NOTIFY", "model", "unmatched")
     assert run_ready(without("ready_to_merge")).decision != "REQUIRE_APPROVAL"
     # without ci_failed the burst loses its NOTIFY-by-rule (falls to the p3 CONTINUE / unmatched)
     assert run_burst(without("ci_failed"))[0].rule_id != "ci_failed"
@@ -212,3 +213,67 @@ def test_closed_enums():
         type(d)(**{**d.__dict__, "decision": "SHRUG"})
     with pytest.raises(att.AttentionError):
         type(d)(**{**d.__dict__, "basis": "vibes"})
+
+
+def _pr_event(eid, etype, at, head="a1b2c3d"):
+    return {
+        "specversion": "mctl.events/v1",
+        "id": eid,
+        "type": etype,
+        "source": "mctl-api",
+        "occurred_at": at,
+        "correlation_id": "corr-fold",
+        "subject": {
+            "kind": "github.pull_request",
+            "repository": "mctlhq/mctl-agents",
+            "number": "123",
+            "head_sha": head,
+        },
+    }
+
+
+def test_new_head_sha_with_same_state_is_not_ignored():
+    # A new push with the same checks/mergeable/severity is a state change, not a no-op.
+    e, _ = fx("ci_failed")
+    key = att.resource_key(e)
+    old = att.ObservedState("failure", "blocked", "none", "a1b2c3d")
+    new = att.ObservedState("failure", "blocked", "none", "e4f5a6b")
+    d = att.decide(e, att.observed_digest(key, old), RULES, observed=new)
+    assert d.rule_id != "no_state_change" and d.decision != "IGNORE"
+
+
+def test_wake_cycle_folds_to_highest_severity_regardless_of_position():
+    # The lower-severity event (review P3 -> CONTINUE) sorts first; the fold must still pick NOTIFY.
+    review = _pr_event("gh-delivery-0101", "github.pull_request_review.submitted", "2026-10-24T10:00:00Z")
+    push = _pr_event("gh-delivery-0102", "github.pull_request.synchronize", "2026-10-24T10:01:00Z")
+    obs = att.ObservedState("failure", "blocked", "P3", "a1b2c3d")
+    key = att.resource_key(push)
+    assert att.decide(review, None, RULES, observed=obs).decision == "CONTINUE"
+    for order in ([review, push], [push, review]):
+        out = att.decide_wake_cycle(order, {}, RULES, observed_by_resource={key: obs})
+        assert [(d.decision, d.rule_id) for d in out] == [("NOTIFY", "ci_failed")]
+        assert out[0].coalesced_event_ids == ("gh-delivery-0101", "gh-delivery-0102")
+        assert out[0].decided_at == "2026-10-24T10:01:00Z"
+    a = att.decide_wake_cycle([review, push], {}, RULES, observed_by_resource={key: obs})
+    b = att.decide_wake_cycle([push, review], {}, RULES, observed_by_resource={key: obs})
+    assert a == b
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        {"kind": "github.pull_request", "repository": "mctlhq/mctl-agents"},
+        {"kind": "github.pull_request", "number": "123"},
+        {"kind": "github.issue", "repository": "mctlhq/mctl-agents", "number": "123"},
+    ],
+)
+def test_envelope_without_pr_identity_is_refused(subject):
+    e = {**_pr_event("gh-delivery-0201", "github.pull_request.opened", "2026-10-24T10:00:00Z"), "subject": subject}
+    with pytest.raises(env_mod.EnvelopeRefused):
+        att.decide(e, None, RULES, observed=att.ObservedState("failure", "blocked", "none", "a1b2c3d"))
+
+
+def test_impossible_occurred_at_is_refused():
+    e = _pr_event("gh-delivery-0301", "github.pull_request.opened", "2026-02-30T10:00:00Z")
+    with pytest.raises(env_mod.EnvelopeRefused):
+        env_mod.validate(e)

@@ -22,6 +22,7 @@ uv run pytest tests/test_spike_757_attention.py -q
 - `test_attention.py`: scenario and mutation tests, collected by
   `tests/test_spike_757_attention.py`.
 
-The subject keys used by the fixtures (`repository`, `number`) are assumed from the
-deployed route policy (`subject.repository: mctlhq/*`); the producer's exact GitHub
-subject keys were not read in this run.
+The subject keys used by the fixtures (`kind: github.pull_request`, `repository`,
+`number`, `head_sha`) match the producer contract in mctlhq/mctl-api
+`docs/github-events-producer.md` at `b42d63fb7e6e5f488d19df2b3023e9e00ca963f1`. `resource_key()` refuses an envelope
+that does not carry all three of `kind`, `repository` and `number`.
