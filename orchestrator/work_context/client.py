@@ -2,7 +2,8 @@
 
 Synchronous `urllib`, structurally copied from
 `orchestrator/lifecycle/client.py`'s `OwnershipClient`: same `MCTL_TOKEN`
-bearer auth, same https-only refusal, same no-redirect opener, same
+bearer auth (the run token instead in a run-token enforce run,
+`orchestrator.run_token.mctl_api_bearer`), same https-only refusal, same no-redirect opener, same
 "uncertainty is a value, never an exception" contract. There is exactly one
 caller shape today (an ordinary CLI process — `run_issue_investigator.py`
 inside an Argo pod), so unlike `lifecycle/client.py` this module defines no
@@ -137,9 +138,20 @@ class WorkItemClient:
 
     def __init__(self, base_url: str | None = None, token: str | None = None, timeout: int = DEFAULT_TIMEOUT_S) -> None:
         self._base = (base_url or api_base()).rstrip("/")
-        self._token = token if token is not None else os.environ.get("MCTL_TOKEN", "").strip()
+        # None: resolved per request, so a client built before the run
+        # token is set up still uses it (mctlhq/mctl-agents#717).
+        self._token = token
         self._timeout = timeout
         self._opener = _no_redirect_opener()
+
+    def _bearer(self) -> str:
+        if self._token is not None:
+            return self._token
+        # Deferred: run_token pulls in httpx and settings, which the
+        # Temporal workers that import this module never need.
+        from orchestrator import run_token
+
+        return run_token.mctl_api_bearer()
 
     @property
     def base_url(self) -> str:
@@ -149,8 +161,9 @@ class WorkItemClient:
     # -- transport ------------------------------------------------------
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> _HTTPResult:
-        if not self._token:
-            raise WorkItemUnavailable("MCTL_TOKEN is not set")
+        token = self._bearer()
+        if not token:
+            raise WorkItemUnavailable("no mctl-api credential: MCTL_TOKEN is not set, or enforce mode has no run token")
         url = f"{self._base}{path}"
         if not url.startswith("https://"):
             # Refuse non-https rather than sending a bearer token in the
@@ -159,7 +172,7 @@ class WorkItemClient:
             raise WorkItemUnavailable(f"refusing non-https MCTL_API_BASE_URL: {self._base}")
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(url, data=data, method=method)  # noqa: S310 — scheme checked above
-        req.add_header("Authorization", f"Bearer {self._token}")
+        req.add_header("Authorization", f"Bearer {token}")
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:

@@ -235,3 +235,105 @@ def test_enforce_logs_a_refused_probe(monkeypatch, capsys):
     api = FakeAPI()
     run_token.setup("investigate", post=api, get=api)
     assert "out-of-scope probe refused as expected" in capsys.readouterr().out
+
+
+# -- REST calls (mctlhq/mctl-agents#717) ------------------------------------
+
+
+class _CapturingOpener:
+    """Stands in for WorkItemClient's opener: records the bearer of every
+    request and answers 404 not_found, so a get() ends after one read."""
+
+    def __init__(self) -> None:
+        self.bearers: list[str] = []
+
+    def open(self, req, timeout=None):
+        import io
+        import json
+        import urllib.error
+
+        self.bearers.append(req.get_header("Authorization"))
+        raise urllib.error.HTTPError(
+            req.full_url, 404, "not found", {}, io.BytesIO(json.dumps({"code": "work_item_not_found"}).encode())
+        )
+
+
+def _work_item_client():
+    from orchestrator.work_context.client import WorkItemClient
+
+    client = WorkItemClient(base_url="https://api.example.test")
+    opener = _CapturingOpener()
+    client._opener = opener
+    return client, opener
+
+
+def test_rest_bearer_is_the_static_token_outside_enforce(monkeypatch):
+    assert run_token.mctl_api_bearer() == STATIC
+    monkeypatch.setenv(run_token.MODE_ENV, "observe")
+    api = FakeAPI()
+    run_token.setup("investigate", post=api, get=api)
+    assert run_token.mctl_api_bearer() == STATIC
+
+
+def test_enforce_rest_calls_use_the_run_token(monkeypatch):
+    monkeypatch.setenv(run_token.MODE_ENV, "enforce")
+    # Built before setup(), as an early caller would: the bearer is read per
+    # request, so it still goes out with the run token.
+    client, opener = _work_item_client()
+    api = FakeAPI()
+    run_token.setup("investigate", post=api, get=api)
+    assert run_token.mctl_api_bearer() == RUN
+    client.get("wi_1")
+    assert opener.bearers == [f"Bearer {RUN}"]
+
+
+def test_enforce_rest_calls_without_a_run_token_send_nothing(monkeypatch):
+    from orchestrator.work_context.contract import WORK_ITEM_UNKNOWN
+
+    monkeypatch.setenv(run_token.MODE_ENV, "enforce")
+    # The static token is still in the environment and must not be used.
+    assert run_token.mctl_api_bearer() == ""
+    client, opener = _work_item_client()
+    assert client.get("wi_1").verdict == WORK_ITEM_UNKNOWN
+    assert opener.bearers == []
+
+
+def test_enforce_gateway_connects_with_the_run_token(monkeypatch):
+    from orchestrator import capability_gateway
+
+    monkeypatch.setenv(run_token.MODE_ENV, "enforce")
+    api = FakeAPI()
+    run_token.setup("investigate", post=api, get=api)
+    headers = capability_gateway._default_remote_headers()
+    assert headers["Authorization"] == f"Bearer {RUN}"
+    assert STATIC not in str(headers)
+
+
+def test_enforce_gateway_without_setup_fails_closed(monkeypatch):
+    from orchestrator import capability_gateway
+
+    monkeypatch.setenv(run_token.MODE_ENV, "enforce")
+    with pytest.raises(run_token.RunTokenError):
+        capability_gateway._default_remote_headers()
+
+
+def test_investigator_resolves_the_issue_url_after_the_run_token(monkeypatch):
+    from orchestrator import auth, run_issue_investigator
+    from orchestrator.work_context import rollout
+    from orchestrator.work_context.client import WorkItemClient
+    from orchestrator.work_context.contract import WORK_ITEM_UNKNOWN, WorkItemAnswer
+
+    order: list[str] = []
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.ONLY)
+    monkeypatch.setattr(auth, "ensure_auth_for_sdk", lambda: None)
+    monkeypatch.setattr(run_token, "setup", lambda **_: order.append("setup"))
+
+    def _get(self, work_item_id):
+        order.append("get")
+        return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason="stub")
+
+    monkeypatch.setattr(WorkItemClient, "get", _get)
+    monkeypatch.setattr("sys.argv", ["run_issue_investigator", "--work-item-id", "wi_1"])
+    with pytest.raises(SystemExit, match="could not resolve --issue-url"):
+        run_issue_investigator.main()
+    assert order == ["setup", "get"]

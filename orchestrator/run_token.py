@@ -17,8 +17,10 @@ execution) -- this module sends no claims, only the Kubernetes token.
   that was meant to be scoped never silently falls back to the static
   credential.
 
-Stage one covers the MCP connection only; the pod's own REST clients still
-use MCTL_TOKEN.
+In enforce mode the pod's own REST calls to mctl-api use the run token too
+(`mctl_api_bearer`, mctlhq/mctl-agents#717): the work-item client, and so
+the snapshot seal. What the scope does not admit is refused by mctl-api,
+never retried with the static token.
 
 The run token is held in this module, not in the environment, so it does
 not reach the agent's subprocesses.
@@ -244,6 +246,22 @@ def mcp_auth(static_token: str) -> tuple[str, dict[str, str]]:
     if _state.mode == MODE_OBSERVE and _state.scope and static_token:
         return static_token, {SHADOW_HEADER: _state.scope}
     return static_token, {}
+
+
+def mctl_api_bearer(static_token: str | None = None) -> str:
+    """The bearer for this process's own REST calls to mctl-api: the run
+    token in enforce mode, otherwise the static token (`MCTL_TOKEN` unless
+    one is passed).
+
+    Enforce mode without a run token answers "" -- no credential, which the
+    REST clients turn into their own unknown answer -- and never the static
+    token: a run meant to be scoped does not fall back to it. Like
+    `mcp_auth`, the environment decides enforce, not only setup()."""
+    if _state.mode == MODE_ENFORCE or mode() == MODE_ENFORCE:
+        return _state.token.token if _state.token is not None else ""
+    if static_token is None:
+        static_token = os.environ.get("MCTL_TOKEN", "")
+    return static_token.strip()
 
 
 def _reset_for_tests() -> None:

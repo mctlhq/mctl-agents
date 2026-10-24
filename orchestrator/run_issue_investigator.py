@@ -4638,18 +4638,6 @@ def main() -> None:
     args = ap.parse_args()
     _work_context_from_args(args)
 
-    issue_url = args.issue_url
-    if not issue_url:
-        # Only reachable once _work_context_from_args has already confirmed
-        # --work-item-id is set and the mode is `only`.
-        from orchestrator.work_context.client import WorkItemClient
-        from orchestrator.work_context.contract import WORK_ITEM_FOUND
-
-        answer = WorkItemClient().get(args.work_item_id)
-        if answer.verdict != WORK_ITEM_FOUND or answer.item is None or not answer.item.issue_url:
-            raise SystemExit(f"could not resolve --issue-url from work item {args.work_item_id!r}: {answer.reason}")
-        issue_url = answer.item.issue_url
-
     # Not in dry-run: it resolves the issue and the slug and stops before
     # the agent, so requiring Claude credentials to do that would break the
     # one mode whose whole point is to work without them — and the --dry-run
@@ -4664,6 +4652,20 @@ def main() -> None:
         from orchestrator import run_token  # deferred — see the import note at the top
 
         run_token.setup(shadow_scope="investigate")
+
+    # After run_token.setup(): in enforce mode this read uses the run token,
+    # which is all the pod should hold (mctlhq/mctl-agents#717).
+    issue_url = args.issue_url
+    if not issue_url:
+        # Only reachable once _work_context_from_args has already confirmed
+        # --work-item-id is set and the mode is `only`.
+        from orchestrator.work_context.client import WorkItemClient
+        from orchestrator.work_context.contract import WORK_ITEM_FOUND
+
+        answer = WorkItemClient().get(args.work_item_id)
+        if answer.verdict != WORK_ITEM_FOUND or answer.item is None or not answer.item.issue_url:
+            raise SystemExit(f"could not resolve --issue-url from work item {args.work_item_id!r}: {answer.reason}")
+        issue_url = answer.item.issue_url
 
     try:
         result = investigate(
