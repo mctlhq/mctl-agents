@@ -112,6 +112,16 @@ def test_non_canonical_binding_is_observation_error(bad):
     assert "step=spike-manifest:x.yaml" in (r.detail or "")
 
 
+def test_match_returns_before_a_later_unreadable_manifest():
+    calls: list[str] = []
+    manifests = {"duet-sessions.yaml": (FIX / "duet-sessions.yaml").read_text(),
+                 "z.yaml": RuntimeError("500")}
+    r = spike_issue.classify_issue(
+        "mctlhq/mctl-agents", 757, gh_api_json=_gh(manifests=manifests, calls=calls))
+    assert r.outcome == "spike-manifest"
+    assert not any(c.endswith("/z.yaml") for c in calls)
+
+
 def test_manifest_fetch_or_yaml_failure():
     for m in ({"x.yaml": RuntimeError("500")}, {"x.yaml": "a: [unterminated"}):
         r = spike_issue.classify_issue("a/b", 1, gh_api_json=_gh(manifests=m))
@@ -144,6 +154,15 @@ def test_not_spike_gives_closes(tmp_path, monkeypatch):
     monkeypatch.setattr(run_implementer, "_gh_api_json", _gh())
     src = {"type": "github_issue", "repo": "mctlhq/mctl-agents", "issue": 763}
     assert _issue_reference_line(_ref(tmp_path, src)) == "\n\nCloses mctlhq/mctl-agents#763"
+
+
+def test_spike_manifest_gives_refs_and_no_closing_keyword(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(run_implementer, "_gh_api_json", _gh())
+    src = {"type": "github_issue", "repo": "mctlhq/mctl-agents", "issue": 757}
+    line = _issue_reference_line(_ref(tmp_path, src))
+    assert line == "\n\nRefs mctlhq/mctl-agents#757"
+    assert not CLOSING.search(line)
+    assert "outcome=spike-manifest keyword=Refs" in capsys.readouterr().out
 
 
 def test_observation_error_gives_refs_and_logs(tmp_path, monkeypatch, capsys):

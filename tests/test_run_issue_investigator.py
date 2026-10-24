@@ -25,7 +25,7 @@ import pytest
 import yaml
 from claude_agent_sdk import TaskUpdatedMessage
 
-from orchestrator import policy_checkpoint, run_issue_investigator
+from orchestrator import policy_checkpoint, run_issue_investigator, spike_issue
 from orchestrator.proposal_state import unrunnable_reason
 from orchestrator.run_implementer import (
     ProposalRef,
@@ -480,7 +480,7 @@ def _ref_with_status(tmp_path, status_payload):
 def test_issue_reference_line_github_issue(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "orchestrator.run_implementer.spike_issue.classify_issue",
-        lambda *a, **k: __import__("orchestrator.spike_issue", fromlist=["x"]).SpikeClassification("not-spike"),
+        lambda *a, **k: spike_issue.SpikeClassification(spike_issue.NOT_SPIKE),
     )
     ref = _ref_with_status(tmp_path, {
         "status": "accepted",

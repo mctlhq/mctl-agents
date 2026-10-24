@@ -116,7 +116,9 @@ DevLoopWorkflow's `approve()` signal submits the `mctl-agents-approve`
 CWFT, which commits the `proposed → accepted` flip to gitops; outside a
 DevLoop the same operation can be run directly), Tier 2 implements it,
 and the PR carries `Closes <repo>#<N>`
-(read from the `source` block) so the issue auto-closes on merge.
+(read from the `source` block) so the issue auto-closes on merge. A spike
+issue, or one the implementer cannot classify, gets `Refs <repo>#<N>`
+instead, so the owner records the verdict before closing it (#763).
 Triggered on demand — by the `mctl_trigger_issue` MCP tool or an operator
 submitting the `mctl-agents-investigate` workflow.
 
