@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.100.0](https://github.com/mctlhq/mctl-agents/compare/1.99.0...1.100.0) (2026-10-24)
+
+
+### Features
+
+* **agents:** issue-763-fix-implementer-use-refs-not-closes-in-p ([4259e8a](https://github.com/mctlhq/mctl-agents/commit/4259e8a26ef9f2b6b8cf0d0d8fb3ece19fcf7629))
+
+
+### Bug Fixes
+
+* **agents:** issue-763-fix-implementer-use-refs-not-closes-in-p ([9aaebee](https://github.com/mctlhq/mctl-agents/commit/9aaebee28361d6458c740bf7d75d356d48d25132))
+* **implementer:** stop the spike scan at the first manifest match ([a284f4d](https://github.com/mctlhq/mctl-agents/commit/a284f4dc2955943bba39acdc6c5eb22ac50119eb))
+* **implementer:** stop the spike scan at the first manifest match ([44fda96](https://github.com/mctlhq/mctl-agents/commit/44fda96fadfdb0a572285f63b28f934312e82e4d)), closes [#763](https://github.com/mctlhq/mctl-agents/issues/763)
+
 ## [1.99.0](https://github.com/mctlhq/mctl-agents/compare/1.98.0...1.99.0) (2026-10-24)
 
 
