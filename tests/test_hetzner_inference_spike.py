@@ -216,3 +216,23 @@ def test_decision_rule():
     assert hs.decide(base + weak, ["m"], "b")[0] == "REJECT"
     mixed = [rec("m", "tool-use", True)] * 2 + [rec("m", "implementation", False)] * 3
     assert hs.decide(base + mixed, ["m"], "b")[0] == "LIMITED_BENCH_ONLY"
+
+
+def test_baseline_with_extra_side_model_is_not_a_mismatch():
+    base = {"provider": hs.BASELINE_PROVIDER, "model": "m"}
+    assert hs._models_ok(base, {"m", "small"})
+    assert not hs._models_ok(base, {"small"})
+    assert not hs._models_ok({"provider": hs.CANDIDATE_PROVIDER, "model": "m"}, {"m", "small"})
+
+
+def test_upstream_failure_is_not_a_shim_gap():
+    import pytest
+    with pytest.raises(RuntimeError):
+        hs._upstream_json({"status": 429, "json": {"error": "x"}})
+    assert hs._upstream_json({"status": 200, "json": {"choices": []}}) == {"choices": []}
+
+
+def test_candidate_env_is_allowlisted():
+    out = hs.hetzner_session_env({"PATH": "/bin", "AWS_SECRET_ACCESS_KEY": "s", "HCLOUD_TOKEN": "h"},
+                                 base_url="u", token="t", model="M")
+    assert "AWS_SECRET_ACCESS_KEY" not in out and "HCLOUD_TOKEN" not in out and out["PATH"] == "/bin"

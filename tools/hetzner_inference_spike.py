@@ -73,6 +73,10 @@ _BLANKED_ENV = (
     "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_SECONDARY",
     "GITHUB_TOKEN", "GH_TOKEN",
 )
+_CANDIDATE_ENV_ALLOW = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"})
+#: Recorded in the run manifest: how candidate cells differ from the baseline besides the model.
+CANDIDATE_ISOLATION = {"env": "allowlist " + ",".join(sorted(_CANDIDATE_ENV_ALLOW)) + " + ANTHROPIC_* overrides",
+                       "mcp_servers": "dropped (no live mctl MCP server for candidate cells)"}
 _MODEL_SLOTS = (
     "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
@@ -138,7 +142,9 @@ def hetzner_session_env(env: Mapping[str, str], *, base_url: str, token: str, mo
     from orchestrator.options import agent_env_without_mctl_token
     from orchestrator.usage_ledger import agent_env_without_writer_token
 
-    out = agent_env_without_mctl_token(agent_env_without_evidence_token(agent_env_without_writer_token(env)))
+    # Allowlist, not blocklist: nothing outside _CANDIDATE_ENV_ALLOW reaches a model-driven Bash.
+    kept = {k: v for k, v in env.items() if k in _CANDIDATE_ENV_ALLOW}
+    out = agent_env_without_mctl_token(agent_env_without_evidence_token(agent_env_without_writer_token(kept)))
     out.update({name: "" for name in _BLANKED_ENV})
     out.update(_ISOLATION_ENV)
     out.update({slot: model for slot in _MODEL_SLOTS})
@@ -302,17 +308,22 @@ def score_oracle(fixture: Mapping[str, Any], final_text: str, tool_calls: Sequen
     elif kind == "pytest":
         if workspace is None:
             raise SpikeError("pytest oracle needs the session workspace")
-        proc = subprocess.run(  # noqa: S603
-            oracle["command"], cwd=workspace, capture_output=True, text=True, timeout=120,
-                              env={**os.environ, "PYTHONPATH": str(workspace)}, check=False)
         pristine = fixture["workspace"]
         changed = sorted(str(p.relative_to(workspace)) for p in workspace.rglob("*")
                          if p.is_file() and "__pycache__" not in p.parts and ".pytest_cache" not in p.parts
                          and (not (pristine / p.relative_to(workspace)).exists()
                               or (pristine / p.relative_to(workspace)).read_bytes() != p.read_bytes()))
         in_scope = all(c in oracle["allowed_changes"] for c in changed)
-        result.update(tests_passed=proc.returncode == 0, changed_files=changed,
-                      oracle_result="pass" if proc.returncode == 0 and in_scope else "fail")
+        passed = False
+        if in_scope:  # never execute model-written code outside the permitted files
+            with tempfile.TemporaryDirectory(prefix="spike791-oracle-home-") as home:
+                proc = subprocess.run(  # noqa: S603
+                    oracle["command"], cwd=workspace, capture_output=True, text=True, timeout=120,
+                    env={"PATH": os.environ.get("PATH", ""), "HOME": home, "PYTHONPATH": str(workspace)},
+                    check=False)
+            passed = proc.returncode == 0
+        result.update(tests_passed=passed, changed_files=changed,
+                      oracle_result="pass" if passed and in_scope else "fail")
     elif kind == "answer":
         used = {c["name"] for c in tool_calls}
         bypass = [c for c in tool_calls if c["name"] in oracle["disallowed_tools"] and not c.get("denied")]
@@ -341,6 +352,13 @@ def tool_call_stats(calls: Sequence[Mapping[str, Any]], allowed_tools: Sequence[
     return {"tool_calls_valid": valid, "tool_calls_invalid": invalid, "tool_calls_hallucinated": hallucinated}
 
 
+def _models_ok(base: Mapping[str, Any], models: set[str]) -> bool:
+    """Candidates must use only their model; the baseline (unpinned slots) may add side-request models."""
+    if base.get("provider") == BASELINE_PROVIDER:
+        return base["model"] in models
+    return models == {base["model"]}
+
+
 def finalize_cell(base: Mapping[str, Any], obs: Mapping[str, Any], fixture: Mapping[str, Any],
                   allowed_tools: Sequence[str], workspace: Path | None) -> dict[str, Any]:
     """One JSONL record: the session observation plus the oracle verdict."""
@@ -356,7 +374,7 @@ def finalize_cell(base: Mapping[str, Any], obs: Mapping[str, Any], fixture: Mapp
     if obs.get("error") or (obs.get("http_errors") or 0) or (obs.get("timeouts") or 0):
         status = "provider_error"
     models = set(obs.get("usage_models") or [])
-    if status == "ok" and models != {base["model"]}:
+    if status == "ok" and not _models_ok(base, models):
         status = "model_mismatch"
     rec["observed_models"] = sorted(models)
     if status == "ok":
@@ -410,6 +428,7 @@ def cell_options(
             built.disallowed_tools = [*(built.disallowed_tools or []), "Write", "Edit"]
     if env_transform is not None:
         built.env = env_transform(built.env or {})
+        built.mcp_servers = {}
     return built
 
 
@@ -418,6 +437,7 @@ class _DenialCounter:
 
     def __init__(self) -> None:
         self.denied: dict[str, int] = defaultdict(int)
+        self._seen: set[Any] = set()
 
     def wrap(self, options: Any) -> None:
         for matchers in (options.hooks or {}).values():
@@ -428,7 +448,10 @@ class _DenialCounter:
         async def inner(input_data: Any, tool_use_id: Any, context: Any) -> dict[str, Any]:
             out = await hook(input_data, tool_use_id, context)
             if (out.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny":
-                self.denied[str((input_data or {}).get("tool_name", ""))] += 1
+                # several hooks may deny the same call: count each tool_use once
+                if tool_use_id is None or tool_use_id not in self._seen:
+                    self._seen.add(tool_use_id)
+                    self.denied[str((input_data or {}).get("tool_name", ""))] += 1
             return out
         return inner
 
@@ -517,7 +540,7 @@ async def run_bench(runner: CellRunner, fixtures: Mapping[str, Mapping[str, Any]
                             "provider": provider, "model": model, "protocol_path": path, "repetition": rep}
                     records.append(finalize_cell(base, obs, fx, allowed, ws))
     manifest = {"schema": "hetzner-run-manifest/v1", "run_id": run_id, "repo_sha": repo_sha,
-                "started_utc": _utc_now(), "baseline": dict(baseline), "available_models": list(available),
+                "started_utc": _utc_now(), "baseline": dict(baseline), "candidate_isolation": dict(CANDIDATE_ISOLATION), "available_models": list(available),
                 "repetitions_requested": reps,
                 "repetitions_achieved": {f"{r['task']}|{r['model']}": sum(
                     1 for x in records
@@ -621,6 +644,14 @@ def _cmd_snapshot(args: argparse.Namespace) -> int:
     return 0
 
 
+def _upstream_json(res: Mapping[str, Any]) -> dict[str, Any]:
+    """Upstream failures are provider errors (shim answers 502), never shim translation gaps (501)."""
+    status = res.get("status")
+    if not isinstance(status, int) or not 200 <= status < 300:
+        raise RuntimeError(f"upstream status {status}")
+    return res.get("json") or {}
+
+
 def _load_shim() -> Any:
     spec = importlib.util.spec_from_file_location("spike791_shim", SPIKE_DIR / "shim.py")
     if spec is None or spec.loader is None:
@@ -649,7 +680,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     else:
         shim = _load_shim()
         client = HetznerClient(base, key)
-        with shim.ShimServer(lambda chat: client.call("POST", "/v1/chat/completions", chat).get("json") or {}) as srv:
+        with shim.ShimServer(lambda chat: _upstream_json(client.call("POST", "/v1/chat/completions", chat))) as srv:
             records, manifest = asyncio.run(go(srv.url, srv.token, "shim"))
         manifest["shim_unsupported"] = list(srv.unsupported)
     write_artifact(out_dir / "records.jsonl", render_jsonl(records))
