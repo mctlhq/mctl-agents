@@ -17,6 +17,10 @@ Rules (design.md of the proposal):
 - Artifacts reach the repo only after `contains_credential` passes. Raw transcripts go only to
   `--record-raw DIR`, which must be outside any repository.
 - Nothing under `orchestrator/` imports this module.
+- PRECONDITION: candidate cells keep Bash on the machine running `bench`. The per-cell HOME swap does
+  not stop them reading absolute paths (e.g. /home/<op>/.aws/credentials, ~/.config/gh, .env files),
+  and their output goes to Hetzner as tool results. Run `bench` only on a throwaway host or dedicated
+  user that holds no credentials and cannot read any operator home.
 """
 from __future__ import annotations
 
@@ -76,7 +80,9 @@ _BLANKED_ENV = (
 _CANDIDATE_ENV_ALLOW = frozenset({"PATH", "LANG", "LC_ALL", "TMPDIR"})
 #: Recorded in the run manifest: how candidate cells differ from the baseline besides the model.
 CANDIDATE_ISOLATION = {"env": "allowlist " + ",".join(sorted(_CANDIDATE_ENV_ALLOW)) + " + ANTHROPIC_* overrides",
-                       "home": "per-cell empty temp dir (operator HOME and its on-disk credentials are not exposed)",
+                       "home": "per-cell empty temp dir; this only changes what ~ expands to and is NOT isolation: "
+                               "candidate Bash can read absolute paths, so run bench ONLY on a throwaway host/user "
+                               "with no credentials and no readable operator home",
                        "mcp_servers": "dropped (no live mctl MCP server for candidate cells); mcp__* calls are "
                                       "rejected by the CLI and scored as denied, not as policy bypasses"}
 _MODEL_SLOTS = (
@@ -320,11 +326,14 @@ def score_oracle(fixture: Mapping[str, Any], final_text: str, tool_calls: Sequen
         passed = False
         if in_scope:  # never execute model-written code outside the permitted files
             with tempfile.TemporaryDirectory(prefix="spike791-oracle-home-") as home:
-                proc = subprocess.run(  # noqa: S603
-                    oracle["command"], cwd=workspace, capture_output=True, text=True, timeout=120,
-                    env={"PATH": os.environ.get("PATH", ""), "HOME": home, "PYTHONPATH": str(workspace)},
-                    check=False)
-            passed = proc.returncode == 0
+                try:
+                    proc = subprocess.run(  # noqa: S603
+                        oracle["command"], cwd=workspace, capture_output=True, text=True, timeout=120,
+                        env={"PATH": os.environ.get("PATH", ""), "HOME": home, "PYTHONPATH": str(workspace)},
+                        check=False)
+                    passed = proc.returncode == 0
+                except subprocess.TimeoutExpired:
+                    passed = False
         result.update(tests_passed=passed, changed_files=changed,
                       oracle_result="pass" if passed and in_scope else "fail")
     elif kind == "answer":
