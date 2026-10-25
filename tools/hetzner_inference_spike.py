@@ -73,10 +73,12 @@ _BLANKED_ENV = (
     "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_SECONDARY",
     "GITHUB_TOKEN", "GH_TOKEN",
 )
-_CANDIDATE_ENV_ALLOW = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"})
+_CANDIDATE_ENV_ALLOW = frozenset({"PATH", "LANG", "LC_ALL", "TMPDIR"})
 #: Recorded in the run manifest: how candidate cells differ from the baseline besides the model.
 CANDIDATE_ISOLATION = {"env": "allowlist " + ",".join(sorted(_CANDIDATE_ENV_ALLOW)) + " + ANTHROPIC_* overrides",
-                       "mcp_servers": "dropped (no live mctl MCP server for candidate cells)"}
+                       "home": "per-cell empty temp dir (operator HOME and its on-disk credentials are not exposed)",
+                       "mcp_servers": "dropped (no live mctl MCP server for candidate cells); mcp__* calls are "
+                                      "rejected by the CLI and scored as denied, not as policy bypasses"}
 _MODEL_SLOTS = (
     "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
@@ -146,6 +148,7 @@ def hetzner_session_env(env: Mapping[str, str], *, base_url: str, token: str, mo
     kept = {k: v for k, v in env.items() if k in _CANDIDATE_ENV_ALLOW}
     out = agent_env_without_mctl_token(agent_env_without_evidence_token(agent_env_without_writer_token(kept)))
     out.update({name: "" for name in _BLANKED_ENV})
+    out["HOME"] = tempfile.mkdtemp(prefix="spike791-cell-home-")
     out.update(_ISOLATION_ENV)
     out.update({slot: model for slot in _MODEL_SLOTS})
     out["ANTHROPIC_BASE_URL"] = base_url
@@ -364,6 +367,9 @@ def finalize_cell(base: Mapping[str, Any], obs: Mapping[str, Any], fixture: Mapp
     """One JSONL record: the session observation plus the oracle verdict."""
     rec: dict[str, Any] = {**base, "oracle_result": "fail", "future_cost": "unknown"}
     calls = obs.get("tool_calls", [])
+    if base.get("provider") != BASELINE_PROVIDER:
+        # candidate cells have no MCP servers: the CLI rejects mcp__* calls before any hook runs
+        calls = [{**c, "denied": True} if str(c["name"]).startswith("mcp__") else c for c in calls]
     rec.update(tool_call_stats(calls, allowed_tools))
     for key in ("turns", "retries", "input_tokens", "output_tokens", "reasoning_tokens", "ttft_ms", "wall_ms",
                 "http_errors", "http_429", "timeouts", "finish_reasons", "context_limit_hit", "cost_usd_current",
@@ -437,6 +443,7 @@ class _DenialCounter:
 
     def __init__(self) -> None:
         self.denied: dict[str, int] = defaultdict(int)
+        self.denied_ids: set[str] = set()
         self._seen: set[Any] = set()
 
     def wrap(self, options: Any) -> None:
@@ -451,6 +458,8 @@ class _DenialCounter:
                 # several hooks may deny the same call: count each tool_use once
                 if tool_use_id is None or tool_use_id not in self._seen:
                     self._seen.add(tool_use_id)
+                    if tool_use_id is not None:
+                        self.denied_ids.add(str(tool_use_id))
                     self.denied[str((input_data or {}).get("tool_name", ""))] += 1
             return out
         return inner
@@ -475,7 +484,7 @@ async def sdk_session(options: Any, prompt: str, max_turns: int, max_budget: flo
                         obs["ttft_ms"] = _ms(started)
                     for block in message.content:
                         if isinstance(block, ToolUseBlock):
-                            obs["tool_calls"].append({"name": block.name})
+                            obs["tool_calls"].append({"name": block.name, "id": block.id})
                 elif isinstance(message, ResultMessage):
                     usage = message.usage or {}
                     obs.update(final_text=message.result or "", turns=message.num_turns,
@@ -492,8 +501,7 @@ async def sdk_session(options: Any, prompt: str, max_turns: int, max_budget: flo
         obs["timeouts"] += int("Timeout" in type(exc).__name__)
     obs["wall_ms"] = _ms(started)
     for call in obs["tool_calls"]:
-        if counter.denied.get(call["name"]):
-            counter.denied[call["name"]] -= 1
+        if call.get("id") is not None and str(call["id"]) in counter.denied_ids:
             call["denied"] = True
     obs["policy_denials"] = sum(1 for c in obs["tool_calls"] if c.get("denied"))
     obs["retries"] = 0
@@ -540,7 +548,8 @@ async def run_bench(runner: CellRunner, fixtures: Mapping[str, Mapping[str, Any]
                             "provider": provider, "model": model, "protocol_path": path, "repetition": rep}
                     records.append(finalize_cell(base, obs, fx, allowed, ws))
     manifest = {"schema": "hetzner-run-manifest/v1", "run_id": run_id, "repo_sha": repo_sha,
-                "started_utc": _utc_now(), "baseline": dict(baseline), "candidate_isolation": dict(CANDIDATE_ISOLATION), "available_models": list(available),
+                "started_utc": _utc_now(), "baseline": dict(baseline), "candidate_isolation": dict(CANDIDATE_ISOLATION),
+                "available_models": list(available),
                 "repetitions_requested": reps,
                 "repetitions_achieved": {f"{r['task']}|{r['model']}": sum(
                     1 for x in records

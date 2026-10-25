@@ -120,10 +120,11 @@ def chat_to_message(resp: Mapping[str, Any], model: str) -> dict[str, Any]:
     finish = choice.get("finish_reason")
     if finish not in _STOP:
         raise ShimUnsupported(f"shim_unsupported: finish_reason {finish!r}")
+    stop_reason = "tool_use" if any(b.get("type") == "tool_use" for b in blocks) else _STOP[finish]
     usage = resp.get("usage") or {}
     msg_id = resp.get("id") or f"msg_{uuid.uuid4().hex[:12]}"
     return {"id": msg_id, "type": "message", "role": "assistant",
-            "model": resp.get("model") or model, "content": blocks, "stop_reason": _STOP[finish],
+            "model": resp.get("model") or model, "content": blocks, "stop_reason": stop_reason,
             "stop_sequence": None,
             "usage": {"input_tokens": usage.get("prompt_tokens", 0),
                       "output_tokens": usage.get("completion_tokens", 0)}}

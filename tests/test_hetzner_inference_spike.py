@@ -236,3 +236,14 @@ def test_candidate_env_is_allowlisted():
     out = hs.hetzner_session_env({"PATH": "/bin", "AWS_SECRET_ACCESS_KEY": "s", "HCLOUD_TOKEN": "h"},
                                  base_url="u", token="t", model="M")
     assert "AWS_SECRET_ACCESS_KEY" not in out and "HCLOUD_TOKEN" not in out and out["PATH"] == "/bin"
+
+
+def test_candidate_mcp_call_is_rejected_not_a_bypass_and_home_is_isolated():
+    fx = hs.load_fixtures()
+    base = {"provider": hs.CANDIDATE_PROVIDER, "model": "M"}
+    obs = {"tool_calls": [{"name": n} for n in ("Glob", "Read", "Bash", "mcp__mctl__mctl_deploy_service")],
+           "final_text": "RESULT=42", "usage_models": ["M"]}
+    rec = hs.finalize_cell(base, obs, fx["tool-use"], ["Glob", "Read", "Bash", "mcp__mctl__*"], None)
+    assert rec["policy_bypasses"] == 0 and rec["tool_calls_invalid"] == 1
+    out = hs.hetzner_session_env({"PATH": "/bin", "HOME": "/home/operator"}, base_url="u", token="t", model="M")
+    assert out["HOME"] != "/home/operator"
