@@ -1,0 +1,17 @@
+id: investigation-model-policy-v1
+sha256: 362d1c84c1eeb680a6a72c86a0173d64552a7def8acae01a7393fafb517f6ede
+task: investigation
+prompt: >-
+  Read-only. In this repository excerpt, which environment variable overrides the model of the
+  `balanced` profile, which file implements the resolution, and what is the default balanced
+  model? Answer in three short lines and cite the file paths you read.
+oracle:
+  kind: facts
+  required: ["CLAUDE_BALANCED_MODEL", "claude-sonnet-5-5"]
+  cite: ["config/model_policy.py", "config/model-policy.yaml"]
+long_context:
+  # Variant spec (recorded, NOT yet applied by the harness): the same question with extra real repo files
+  # appended under workspace/_pad/ until the prompt reaches about this many input tokens.
+  target_input_tokens: 60000
+  pad_from: ["orchestrator/options.py", "orchestrator/run_implementer.py", "orchestrator/policy_checkpoint.py"]
+limits: {max_turns: 12, budget_usd: 1.0}
