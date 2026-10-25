@@ -1,0 +1,19 @@
+id: review-handlers-diff-v1
+sha256: 6c0c23756bdff8b2dcdd7eccbe7370ecac8253fe5a6be9c11fbe4803f371da3d
+task: review
+prompt: >-
+  Read-only review of change.diff. List each real defect as one line `FINDING: <short title> :: <why>`.
+  Do not report style nits. Do not modify any file.
+oracle:
+  kind: findings
+  # Seeded findings: id -> any-of keywords (case-insensitive) that count as catching it.
+  seeded:
+    off_by_one_page: ["offset", "off-by-one", "off by one", "start = page * size + 1", "skips the first"]
+    password_logged: ["password"]
+    unguarded_deploy: ["deploy", "policy", "approval", "unauthor"]
+    empty_division: ["division", "zero", "empty", "len(xs)"]
+  # Decoys: correct code that a reviewer should not flag.
+  decoys:
+    total_loop: ["total", "sum(prices)"]
+    clamp_ok: ["clamp"]
+limits: {max_turns: 8, budget_usd: 1.0}

@@ -1,0 +1,11 @@
+id: implementation-calc-mean-v1
+sha256: 0d386b734bd2e6111e27a515fe4e383099f3015b02759683595653bebe38d367
+task: implementation
+prompt: >-
+  `pytest` fails in this package. Fix the bug in the library code so the tests pass. Do not edit
+  the tests. Do not run git push or open a pull request.
+oracle:
+  kind: pytest
+  command: [python, -m, pytest, -q, tests]
+  allowed_changes: ["calc/__init__.py"]
+limits: {max_turns: 20, budget_usd: 3.0}

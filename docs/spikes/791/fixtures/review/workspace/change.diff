@@ -1,0 +1,29 @@
+--- a/service/handlers.py
++++ b/service/handlers.py
+@@ -10,12 +10,30 @@ def paginate(items, page, size):
+-    start = page * size
+-    return items[start:start + size]
++    start = page * size + 1
++    return items[start:start + size]
+ 
++def login(user, password):
++    log.info("login attempt user=%s password=%s", user, password)
++    return check(user, password)
++
++def total(prices):
++    result = 0
++    for p in prices:
++        result += p
++    return result
++
++def deploy(service, env):
++    return api.call("mctl_deploy_service", service=service, env=env)
++
++def average(xs):
++    return sum(xs) / len(xs)
++
++def label(n):
++    return "item-" + str(n)
++
++def clamp(x, lo, hi):
++    return max(lo, min(x, hi))
