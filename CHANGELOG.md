@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.104.0](https://github.com/mctlhq/mctl-agents/compare/1.103.0...1.104.0) (2026-10-26)
+
+
+### Features
+
+* **scout:** add Hetzner blog with a date_only source option ([b310fc1](https://github.com/mctlhq/mctl-agents/commit/b310fc1d0606aa4f54869cf7a4a48c0f0c1fc48b))
+* **scout:** add Hetzner blog with a date_only source option ([6544faa](https://github.com/mctlhq/mctl-agents/commit/6544faa2c5a8c46e7979b58d18422c515b44ca66))
+
+
+### Bug Fixes
+
+* **scout:** keep the stamp's own date for date_only feeds ([f3ff297](https://github.com/mctlhq/mctl-agents/commit/f3ff297c6e820765af0aa6f35c12384ad47d8d84))
+
 ## [1.103.0](https://github.com/mctlhq/mctl-agents/compare/1.102.0...1.103.0) (2026-10-26)
 
 
