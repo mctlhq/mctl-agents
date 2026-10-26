@@ -90,7 +90,7 @@ jobs:
           if printf '%s' "$REA_REF" | grep -Eq '^[0-9a-f]{40}$'; then
             SHA="$REA_REF"
           else
-            SHA=$(git ls-remote "$REPO" "$REA_REF" "refs/heads/$REA_REF" "refs/tags/$REA_REF" 2>/dev/null | awk 'NR==1{print $1}')
+            SHA=$(git ls-remote -- "$REPO" "$REA_REF" "refs/heads/$REA_REF" "refs/tags/$REA_REF" 2>/dev/null | awk 'NR==1{print $1}')
           fi
           if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
             REASON="rea_ref-unresolved"; SHA=""
@@ -106,9 +106,9 @@ jobs:
             VERSION=$(node -p "require('$RUNNER_TEMP/rea/package.json').version" 2>/dev/null || echo "")
             [ -n "$VERSION" ] || { REASON="rea-version-unreadable"; VERSION=unobserved; }
           fi
-          INSTALL="npm install --prefix \$RUNNER_TEMP/rea-prefix rea-agents@$VERSION"
+          INSTALL="npm install --ignore-scripts --prefix \$RUNNER_TEMP/rea-prefix rea-agents@$VERSION"
           if [ -z "$REASON" ]; then
-            npm install --prefix "$RUNNER_TEMP/rea-prefix" "rea-agents@$VERSION" >"$RUNNER_TEMP/rea-install.log" 2>&1 \
+            npm install --ignore-scripts --prefix "$RUNNER_TEMP/rea-prefix" "rea-agents@$VERSION" >"$RUNNER_TEMP/rea-install.log" 2>&1 \
               && "$RUNNER_TEMP/rea-prefix/node_modules/.bin/rea" --help >/dev/null 2>&1 \
               || REASON="rea-install-failed"
           fi
@@ -143,8 +143,8 @@ jobs:
         run: |
           set -u
           first() { "$@" 2>&1 | head -n 1; }
-          NC=$(sh docs/spikes/796/fixtures/native-codec/build.sh 2>"$RUNNER_TEMP/nc.err"); NC_RC=$?
-          PA=$(sh docs/spikes/796/fixtures/packaged-app/build.sh 2>"$RUNNER_TEMP/pa.err"); PA_RC=$?
+          NC_RC=0; NC=$(sh docs/spikes/796/fixtures/native-codec/build.sh 2>"$RUNNER_TEMP/nc.err") || NC_RC=$?
+          PA_RC=0; PA=$(sh docs/spikes/796/fixtures/packaged-app/build.sh 2>"$RUNNER_TEMP/pa.err") || PA_RC=$?
           [ "$NC_RC" -eq 0 ] || echo "infra_failed=1" >> "$GITHUB_ENV"
           [ "$PA_RC" -eq 0 ] || echo "infra_failed=1" >> "$GITHUB_ENV"
           NC="$NC" NC_RC="$NC_RC" PA="$PA" PA_RC="$PA_RC" \
@@ -207,7 +207,7 @@ jobs:
           : > "$BUNDLE/records.jsonl"
 
           infra() { # step fixture arm rc reason errfile
-            STEP="$1" FX="$2" ARM="$3" RC="$4" REASON="$5" ERRF="$6" python3 -I - >> "$BUNDLE/records.jsonl" <<'PY'
+            STEP="$1" FX="$2" ARM="$3" RC="$4" REASON="$5" ERRF="$6" uv run --locked python - >> "$BUNDLE/records.jsonl" <<'PY'
           import json, os, sys
           sys.path.insert(0, ".")
           from tools.rea_spike import bounded_summary
@@ -225,7 +225,7 @@ jobs:
             local step=$1 fx=$2 arm=$3 dest=$4 maxrc=$5; shift 5
             local out err rc
             out=$(mktemp); err=$(mktemp)
-            uv run --locked python tools/rea_spike.py "$@" >"$out" 2>"$err"; rc=$?
+            rc=0; uv run --locked python tools/rea_spike.py "$@" >"$out" 2>"$err" || rc=$?
             if [ "$rc" -le "$maxrc" ] && [ "$(wc -l <"$out")" -eq 1 ] \
                && python3 -I -c 'import json,sys; assert isinstance(json.loads(open(sys.argv[1]).read()), dict)' "$out" 2>/dev/null; then
               cat "$out" >> "$BUNDLE/$dest"

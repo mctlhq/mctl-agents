@@ -37,6 +37,22 @@ def test_rea_env_strips_credentials() -> None:
     assert "kept-value" in out
 
 
+def test_no_errexit_swallowed_exit_status_capture() -> None:
+    """Default `bash -e` aborts before a bare `; rc=$?` capture ever runs."""
+    for step in _steps():
+        run = step.get("run", "")
+        if "set +e" in run:
+            continue
+        assert not re.search(r"\)\s*;\s*\w+=\$\?|[^|]\s*;\s*rc=\$\?", run), step.get("name")
+
+
+def test_npm_install_ignores_scripts() -> None:
+    for step in _steps():
+        for line in step.get("run", "").splitlines():
+            if "npm install" in line:
+                assert "--ignore-scripts" in line, line
+
+
 def test_triggers_permissions_concurrency() -> None:
     wf = _wf()
     assert set(wf.get("on", wf.get(True))) == {"workflow_dispatch"}
