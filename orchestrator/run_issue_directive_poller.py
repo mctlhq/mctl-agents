@@ -396,7 +396,7 @@ async def investigation_in_flight(client: Client) -> str | None:
             try:
                 if await handle.query("investigate_in_flight"):
                     return str(wf.id)
-            except Exception as qe:
+            except Exception as qe:  # noqa: BLE001 — one broken loop must not disable the verb fleet-wide
                 print(
                     f"investigate_in_flight query failed for {wf.id}: "
                     f"{type(qe).__name__}: {qe}; treating as not in flight",
