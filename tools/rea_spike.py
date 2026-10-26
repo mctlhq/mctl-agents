@@ -338,11 +338,41 @@ def _live_stage(prompt: str, model: str, fixture_dir: Path, arm: str) -> dict[st
     return anyio.run(_go)
 
 
+RUNTIME_ARTIFACTS = {"native-codec": "codec", "packaged-app": "build/app.jar"}
+
+
+def stage_runtime_fixture(fixture: str, dest_root: Path) -> Path:
+    """Copy only the built target and task.md into dest_root/<fixture>.
+
+    The agent's cwd must not expose sources or oracle.yaml (the answer key).
+    """
+    import shutil
+
+    src = SPIKE_DIR / "fixtures" / fixture
+    out = dest_root / fixture
+    out.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src / "task.md", out / "task.md")
+    artifact = RUNTIME_ARTIFACTS[fixture]
+    shutil.copy2(src / artifact, out / Path(artifact).name)
+    return out
+
+
+def _fixture_dir(args: argparse.Namespace) -> Path:
+    root = getattr(args, "fixture_root", "")
+    return Path(root) / args.fixture if root else SPIKE_DIR / "fixtures" / args.fixture
+
+
+def _cmd_stage_fixture(args: argparse.Namespace) -> int:
+    for fx in RUNTIME_ARTIFACTS:
+        stage_runtime_fixture(fx, Path(args.dest))
+    return 0
+
+
 def _cmd_probe(args: argparse.Namespace) -> int:
     if not _require_live(args):
         return 2
     model = args.model or _read_active_model()
-    fixture_dir = SPIKE_DIR / "fixtures" / args.fixture
+    fixture_dir = _fixture_dir(args)
 
     prior: list[tuple[str, str]] = []
 
@@ -367,7 +397,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     import time
 
     model = args.model or _read_active_model()
-    fixture_dir = SPIKE_DIR / "fixtures" / args.fixture
+    fixture_dir = _fixture_dir(args)
     started = time.monotonic()
     sig = _live_stage((fixture_dir / "task.md").read_text(), model, fixture_dir, args.arm)
     rec = {
@@ -449,12 +479,16 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--fixture", required=True)
             sp.add_argument("--arm", choices=ARMS, default="baseline")
             sp.add_argument("--model", default="")
+            sp.add_argument("--fixture-root", default="", help="staged runtime-only fixtures (cwd for the agent)")
         sp.set_defaults(func=fn)
         return sp
 
     live("run", _cmd_run)
     live("probe-stages", _cmd_probe).add_argument("--store-text", action="store_true")
     live("schema-bytes", _cmd_schema_bytes, fixture=False)
+    st = sub.add_parser("stage-fixtures")
+    st.add_argument("dest")
+    st.set_defaults(func=_cmd_stage_fixture)
     sc = sub.add_parser("score")
     sc.add_argument("records")
     sc.add_argument("grading")

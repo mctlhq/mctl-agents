@@ -215,7 +215,8 @@ jobs:
           set -u
           export ISSUE_INVESTIGATOR_MODEL="$MODEL"
           export REA_SPIKE_MCP_CMD="sh $GITHUB_WORKSPACE/docs/spikes/796/rea-env.sh $RUNNER_TEMP/rea-prefix/node_modules/.bin/rea mcp"
-          export PATH="$RUNNER_TEMP/rea-bin:$PATH"
+          FXROOT="$RUNNER_TEMP/runtime-fixtures"
+          uv run --locked python tools/rea_spike.py stage-fixtures "$FXROOT"
           : > "$BUNDLE/records.jsonl"
 
           infra() { # step fixture arm rc reason errfile
@@ -237,7 +238,9 @@ jobs:
             local step=$1 fx=$2 arm=$3 dest=$4 maxrc=$5; shift 5
             local out err rc
             out=$(mktemp); err=$(mktemp)
-            rc=0; uv run --locked python tools/rea_spike.py "$@" >"$out" 2>"$err" || rc=$?
+            local rpath="$PATH"
+            [ "$arm" = rea-cli ] && rpath="$RUNNER_TEMP/rea-bin:$PATH"
+            rc=0; PATH="$rpath" uv run --locked python tools/rea_spike.py "$@" >"$out" 2>"$err" || rc=$?
             if [ "$rc" -le "$maxrc" ] && [ "$(wc -l <"$out")" -eq 1 ] \
                && python3 -I -c 'import json,sys; assert isinstance(json.loads(open(sys.argv[1]).read()), dict)' "$out" 2>/dev/null; then
               cat "$out" >> "$BUNDLE/$dest"
@@ -260,7 +263,7 @@ jobs:
                 infra run "$fx" "$arm" 0 rea-unavailable ""
                 continue
               fi
-              invoke run "$fx" "$arm" records.jsonl 1 run --allow-live --fixture "$fx" --arm "$arm" --model "$MODEL"
+              invoke run "$fx" "$arm" records.jsonl 1 run --allow-live --fixture "$fx" --fixture-root "$FXROOT" --arm "$arm" --model "$MODEL"
             done
           done
 
@@ -269,7 +272,7 @@ jobs:
               infra probe-stages "$fx" "$PROBE_ARM" 0 rea-unavailable ""
               continue
             fi
-            invoke probe-stages "$fx" "$PROBE_ARM" records.jsonl 0 probe-stages --allow-live --fixture "$fx" --arm "$PROBE_ARM" --model "$MODEL"
+            invoke probe-stages "$fx" "$PROBE_ARM" records.jsonl 0 probe-stages --allow-live --fixture "$fx" --fixture-root "$FXROOT" --arm "$PROBE_ARM" --model "$MODEL"
           done
 
       - name: Report and grading template

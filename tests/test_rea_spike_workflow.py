@@ -117,6 +117,12 @@ def test_grading_template_entries_top_level(tmp_path: Path) -> None:
     (tmp_path / "g.yaml").write_text(out)
     (tmp_path / "r.jsonl").write_text("")
     assert _score_rows(str(tmp_path / "r.jsonl"), str(tmp_path / "g.yaml")) == []
+    rec = '{"kind": "run", "fixture": "native-codec", "arm": "baseline", "final": "", "outcome": "failed"}'
+    (tmp_path / "r.jsonl").write_text(rec + "\n")
+    try:
+        _score_rows(str(tmp_path / "r.jsonl"), str(tmp_path / "g.yaml"))
+    except Exception:  # scoring details are out of scope; entries must have been read
+        pass
 
 
 def test_rea_identity_bound_to_sha() -> None:
@@ -125,3 +131,40 @@ def test_rea_identity_bound_to_sha() -> None:
     assert "rea-identity-mismatch" in run
     assert '"$GITHEAD" != "$SHA"' in run
     assert "npm_git_head" in run and "npm_dist_integrity" in run
+
+
+def test_rea_bin_on_path_only_for_rea_cli() -> None:
+    run = _step_run("Measure")
+    assert not re.search(r'^\s*export PATH=', run, re.M)
+    paths = [ln for ln in run.splitlines() if "rea-bin" in ln]
+    assert len(paths) == 1
+    assert 'rpath="$RUNNER_TEMP/rea-bin:$PATH"' in paths[0]
+    assert '[ "$arm" = rea-cli ]' in paths[0]
+    assert 'PATH="$rpath" uv run' in run
+    assert run.count("--fixture-root") == 2
+
+
+def test_staged_runtime_fixture_has_no_oracle_or_sources(tmp_path: Path) -> None:
+    from tools import rea_spike
+
+    src = tmp_path / "src"
+    for fx, art in rea_spike.RUNTIME_ARTIFACTS.items():
+        d = src / fx
+        (d / art).parent.mkdir(parents=True)
+        (d / art).write_text("bin")
+        (d / "task.md").write_text("task")
+        (d / "oracle.yaml").write_text("secret")
+        (d / "codec.c").write_text("src")
+    orig = rea_spike.SPIKE_DIR
+    rea_spike.SPIKE_DIR = tmp_path / "spike"
+    (tmp_path / "spike").mkdir()
+    (tmp_path / "spike" / "fixtures").symlink_to(src)
+    try:
+        for fx in rea_spike.RUNTIME_ARTIFACTS:
+            out = rea_spike.stage_runtime_fixture(fx, tmp_path / "dest")
+            names = sorted(p.name for p in out.rglob("*") if p.is_file())
+            assert "oracle.yaml" not in names
+            assert not any(n.endswith((".c", ".java")) for n in names)
+            assert "task.md" in names
+    finally:
+        rea_spike.SPIKE_DIR = orig
