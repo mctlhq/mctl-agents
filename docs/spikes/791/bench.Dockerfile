@@ -12,6 +12,7 @@ FROM python:3.12-slim
 COPY --from=ghcr.io/astral-sh/uv@sha256:798712e57f879c5393777cbda2bb309b29fcdeb0532129d4b1c3125c5385975a /uv /usr/local/bin/uv
 
 RUN useradd --create-home bench
+RUN install -d -o bench -g bench /work
 WORKDIR /work
 COPY --chown=bench:bench . .
 USER bench
