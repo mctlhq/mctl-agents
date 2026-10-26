@@ -282,3 +282,21 @@ def test_run_all_failed_exits_1(monkeypatch, tmp_path):
     rc = asyncio.run(run_scout.run_scout(False, None, cfg, client_factory=_factory(None, []),
                                          http_transport=tr, now=NOW))
     assert rc == 1 and "all sources failed" in sent[0]
+
+
+def test_session_failure_still_renders_digest(monkeypatch, tmp_path, capsys):
+    monkeypatch.delenv("SCOUT_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("SCOUT_TELEGRAM_CHAT_ID", raising=False)
+    cfg = _env_feed(monkeypatch, tmp_path)
+    date = NOW.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    tr = httpx.MockTransport(lambda r: httpx.Response(200, text=RSS.format(date=date)))
+
+    @asynccontextmanager
+    async def boom(options):
+        raise RuntimeError("cli died")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(run_scout.backlog_mod, "collect_backlog", lambda: [])
+    rc = asyncio.run(run_scout.run_scout(True, None, cfg, client_factory=boom, http_transport=tr, now=NOW))
+    cap = capsys.readouterr()
+    assert rc == 0 and "RuntimeError" in cap.err and "fetched 1" in cap.out

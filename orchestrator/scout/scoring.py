@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
@@ -94,15 +95,19 @@ async def _session(
     """One structured-output session. Returns items list or None on failure."""
     options = build_scout_options(agent_dir, model, schema)
     options.max_budget_usd = min(options.max_budget_usd or budget.remaining, budget.remaining)
-    async with factory(options) as client:
-        await client.query(prompt)
-        async for msg in client.receive_response():
-            if isinstance(msg, ResultMessage) or type(msg).__name__ == "ResultMessage":
-                budget.spent += float(getattr(msg, "total_cost_usd", 0) or 0)
-                out = getattr(msg, "structured_output", None)
-                if isinstance(out, dict) and isinstance(out.get("items"), list):
-                    return [r for r in out["items"] if isinstance(r, dict)]
-                return None
+    try:
+        async with factory(options) as client:
+            await client.query(prompt)
+            async for msg in client.receive_response():
+                if isinstance(msg, ResultMessage) or type(msg).__name__ == "ResultMessage":
+                    budget.spent += float(getattr(msg, "total_cost_usd", 0) or 0)
+                    out = getattr(msg, "structured_output", None)
+                    if isinstance(out, dict) and isinstance(out.get("items"), list):
+                        return [r for r in out["items"] if isinstance(r, dict)]
+                    return None
+    except Exception as exc:  # noqa: BLE001 - one failed batch must not abort the digest run
+        print(f"scout: session failed: {type(exc).__name__}", file=sys.stderr)
+        return None
     return None
 
 
