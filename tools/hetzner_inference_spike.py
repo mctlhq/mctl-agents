@@ -3,7 +3,7 @@
 service (https://experiments.hetzner.com) work behind the current MCTL agent path?
 
     HETZNER_INFERENCE_BASE_URL=... HETZNER_INFERENCE_API_KEY=... \\
-      uv run python tools/hetzner_inference_spike.py snapshot --allow-live --out docs/spikes/791/snapshot.json
+      uv run python tools/hetzner_inference_spike.py snapshot --allow-live --deep
     uv run python tools/hetzner_inference_spike.py bench --allow-live --out-dir docs/spikes/791
     uv run python tools/hetzner_inference_spike.py report --dir docs/spikes/791
 
@@ -217,6 +217,51 @@ class HetznerClient:
                 "headers": {k.lower(): v for k, v in resp.headers.items() if _RATE_HEADERS.match(k)},
                 "retries": self.retries}
 
+    def stream(self, path: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """One streamed POST, no retry. Records the SSE framing (event/chunk types, counts, time to first
+        event), never the streamed content."""
+        started = time.monotonic()
+        types: list[str] = []
+        ttfe = None
+        try:
+            with self._client.stream("POST", f"{self.base_url}{path}", json=body,
+                                     headers={"Authorization": f"Bearer {self._key}"}) as resp:
+                ctype = resp.headers.get("content-type", "")
+                if not resp.is_success:
+                    resp.read()
+                    error = _clip(resp.text)
+                    return {"status": resp.status_code, "content_type": ctype, "latency_ms": _ms(started),
+                            "error": "[redacted]" if contains_credential(error) else error}
+                for line in resp.iter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    ttfe = ttfe if ttfe is not None else _ms(started)
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        types.append("[DONE]")
+                        continue
+                    try:
+                        event = json.loads(payload)
+                    except ValueError:
+                        types.append("unparsable")
+                        continue
+                    kind = str(event.get("type") or event.get("object") or "?")
+                    delta = (event.get("delta") or {}) if isinstance(event.get("delta"), dict) else {}
+                    if delta.get("type"):
+                        kind += f":{delta['type']}"
+                    choices = event.get("choices") or []
+                    if choices and isinstance(choices[0], dict):
+                        cdelta = choices[0].get("delta") or {}
+                        kind += ":" + ",".join(sorted(k for k in cdelta if cdelta.get(k) not in (None, "", [])))
+                    types.append(kind)
+        except httpx.HTTPError as exc:
+            return {"status": None, "error": type(exc).__name__, "latency_ms": _ms(started)}
+        counts: dict[str, int] = defaultdict(int)
+        for t in types:
+            counts[t] += 1
+        return {"status": resp.status_code, "content_type": ctype, "error": None, "latency_ms": _ms(started),
+                "time_to_first_event_ms": ttfe, "events": len(types), "event_types": dict(sorted(counts.items()))}
+
 
 def _ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
@@ -232,15 +277,76 @@ def _completion_summary(r: Mapping[str, Any]) -> dict[str, Any]:
             "headers": r.get("headers", {})}
 
 
-def take_snapshot(client: HetznerClient, *, base_url: str, selected: Sequence[str] = SELECTED_MODELS) -> dict[str, Any]:
-    """Live catalog and capability snapshot. No substitution: an absent model stays unavailable."""
+_MSG_TOOL = {"name": "get_weather", "description": "Weather for a city.",
+             "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}
+#: Long-context probe: real public repo files, repeated up to about this many characters (~4 chars per token).
+LONG_CONTEXT_CHARS = 240_000
+
+
+def _long_context_text(fixtures_root: Path = SPIKE_DIR / "fixtures") -> str:
+    spec = yaml.safe_load((fixtures_root / "investigation" / "fixture.yaml").read_text())
+    pad = "".join(f"\n# file: {p}\n" + (_REPO_ROOT / p).read_text() for p in spec["long_context"]["pad_from"])
+    return (pad * (LONG_CONTEXT_CHARS // max(len(pad), 1) + 1))[:LONG_CONTEXT_CHARS]
+
+
+def _message_summary(r: Mapping[str, Any]) -> dict[str, Any]:
+    body: dict[str, Any] = r["json"] if isinstance(r.get("json"), dict) else {}
+    blocks = [b for b in body.get("content") or [] if isinstance(b, dict)]
+    return {"status": r.get("status"), "error": r.get("error"), "latency_ms": r.get("latency_ms"),
+            "type": body.get("type"), "stop_reason": body.get("stop_reason"), "usage": body.get("usage"),
+            "model": body.get("model"), "block_types": [b.get("type") for b in blocks],
+            "headers": r.get("headers", {})}
+
+
+def protocol_probes(client: HetznerClient, model: str) -> dict[str, Any]:
+    """Which wire protocols carry what (recorded for #791 and reused by #796): Messages tool_use round
+    trip, Messages streaming (text and tool_use), Chat Completions streaming. Content is never recorded."""
+    ask = [{"role": "user", "content": "What is the weather in Berlin? Use the tool."}]
+    first = client.call("POST", "/v1/messages", {"model": model, "max_tokens": 1024, "tools": [_MSG_TOOL],
+                                                 "messages": ask})
+    out: dict[str, Any] = {"messages_tool_use": _message_summary(first)}
+    content = (first.get("json") or {}).get("content") if isinstance(first.get("json"), dict) else None
+    tool_use = next((b for b in content or [] if isinstance(b, dict) and b.get("type") == "tool_use"), None)
+    if tool_use is not None:
+        out["messages_tool_result"] = _message_summary(client.call("POST", "/v1/messages", {
+            "model": model, "max_tokens": 1024, "tools": [_MSG_TOOL],
+            "messages": [*ask, {"role": "assistant", "content": content},
+                         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_use.get("id"),
+                                                       "content": "12 C, light rain"}]}]}))
+    out["messages_stream_text"] = client.stream("/v1/messages", {
+        "model": model, "max_tokens": 256, "stream": True,
+        "messages": [{"role": "user", "content": "Reply with: ok"}]})
+    out["messages_stream_tool_use"] = client.stream("/v1/messages", {
+        "model": model, "max_tokens": 1024, "stream": True, "tools": [_MSG_TOOL], "messages": ask})
+    out["chat_stream_tool_calls"] = client.stream("/v1/chat/completions", {
+        "model": model, "max_tokens": 1024, "stream": True, "tools": [_TOOL], "messages": ask})
+    return out
+
+
+def long_context_probe(client: HetznerClient, model: str) -> dict[str, Any]:
+    """One Messages request at a practical MCTL prompt size (~60k tokens of real repo files)."""
+    text = _long_context_text()
+    question = "\n\nQuestion: which Python function names appear in the first file above? Name two."
+    r = client.call("POST", "/v1/messages", {"model": model, "max_tokens": 512,
+                                             "messages": [{"role": "user", "content": text + question}]})
+    return {"prompt_chars": len(text), **_message_summary(r)}
+
+
+def take_snapshot(client: HetznerClient, *, base_url: str, selected: Sequence[str] = SELECTED_MODELS,
+                  extra: Sequence[str] = (), deep: bool = False) -> dict[str, Any]:
+    """Live catalog and capability snapshot. No substitution: an absent model stays unavailable.
+
+    `extra` are models the owner added at run time (exact catalog IDs); they are probed the same way and
+    flagged `preregistered: false`. `deep` adds the protocol and long-context probes per available model.
+    """
     models = client.call("GET", "/v1/models")
     body = models.get("json")
     ids = [m.get("id") for m in (body or {}).get("data", []) if isinstance(m, dict)] if isinstance(body, dict) else []
-    availability = classify_catalog([i for i in ids if isinstance(i, str)], selected)
+    probe_list = [*selected, *(m for m in extra if m not in selected)]
+    availability = classify_catalog([i for i in ids if isinstance(i, str)], probe_list)
     per_model: dict[str, Any] = {}
     for model, state in availability.items():
-        entry: dict[str, Any] = {"availability": state}
+        entry: dict[str, Any] = {"availability": state, "preregistered": model in selected}
         if state == AVAILABLE:
             entry["trivial"] = _completion_summary(client.call("POST", "/v1/chat/completions", {
                 "model": model, "max_tokens": 32, "messages": [{"role": "user", "content": "Reply with: ok"}]}))
@@ -248,6 +354,9 @@ def take_snapshot(client: HetznerClient, *, base_url: str, selected: Sequence[st
                 "model": model, "max_tokens": 256, "tools": [_TOOL], "tool_choice": "auto",
                 "messages": [{"role": "user", "content": "What is the weather in Berlin? Use the tool."}]}))
             entry["function_call"] = {**tool, "tool_call_returned": bool(tool["tool_calls"])}
+            if deep:
+                entry["protocols"] = protocol_probes(client, model)
+                entry["long_context"] = long_context_probe(client, model)
         per_model[model] = entry
     first = next((m for m, s in availability.items() if s == AVAILABLE), None)
     probe: dict[str, Any] = {"ok": False, "model": first}
@@ -380,6 +489,10 @@ def finalize_cell(base: Mapping[str, Any], obs: Mapping[str, Any], fixture: Mapp
         # candidate cells have no MCP servers: the CLI rejects mcp__* calls before any hook runs
         calls = [{**c, "denied": True} if str(c["name"]).startswith("mcp__") else c for c in calls]
     rec.update(tool_call_stats(calls, allowed_tools))
+    names: dict[str, int] = defaultdict(int)
+    for c in calls:
+        names[str(c["name"])] += 1
+    rec["tool_names"] = dict(sorted(names.items()))
     for key in ("turns", "retries", "input_tokens", "output_tokens", "reasoning_tokens", "ttft_ms", "wall_ms",
                 "http_errors", "http_429", "timeouts", "finish_reasons", "context_limit_hit", "cost_usd_current",
                 "policy_denials"):
@@ -421,6 +534,8 @@ def capture_baseline() -> dict[str, Any]:
 
 
 def _repo_sha() -> str:
+    if os.environ.get("SPIKE791_REPO_SHA"):  # a run from a `git archive` export has no .git
+        return os.environ["SPIKE791_REPO_SHA"]
     proc = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=_REPO_ROOT, capture_output=True, text=True, check=False)  # noqa: S607
     return proc.stdout.strip() or "unknown"
@@ -534,13 +649,16 @@ def make_sdk_runner(fixtures: Mapping[str, Mapping[str, Any]], *, base_url: str,
 async def run_bench(runner: CellRunner, fixtures: Mapping[str, Mapping[str, Any]], available: Sequence[str],
                     *, reps: int = DEFAULT_REPS, baseline: Mapping[str, Any] | None = None,
                     allowed_tools: Sequence[str] = ("*",), protocol_path: str = "messages",
-                    run_id: str | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                    run_id: str | None = None, include_baseline: bool = True,
+                    preregistered: Sequence[str] = SELECTED_MODELS) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """The matrix: baseline plus each available model, every task, `reps` repetitions. A failed
-    cell stays failed: no cell is retried on another model."""
+    cell stays failed: no cell is retried on another model. `include_baseline=False` / `available=[]`
+    run one arm alone (the two arms may need different hosts); `merge` joins them."""
     baseline = baseline if baseline is not None else capture_baseline()
     run_id = run_id or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    started_utc = _utc_now()
     repo_sha = _repo_sha()
-    subjects = [(BASELINE_PROVIDER, baseline["model"], "n/a")]
+    subjects = [(BASELINE_PROVIDER, baseline["model"], "n/a")] if include_baseline else []
     subjects += [(CANDIDATE_PROVIDER, m, protocol_path) for m in available]
     records: list[dict[str, Any]] = []
     for task in TASKS:
@@ -554,11 +672,14 @@ async def run_bench(runner: CellRunner, fixtures: Mapping[str, Mapping[str, Any]
                     allowed = getattr(runner, "last_allowed", None) or allowed_tools
                     base = {"run_id": run_id, "task": task, "fixture_id": fx["id"], "fixture_sha256": fx["sha256"],
                             "repo_sha": repo_sha, "model_policy_version": baseline["model_policy_version"],
-                            "provider": provider, "model": model, "protocol_path": path, "repetition": rep}
+                            "provider": provider, "model": model, "protocol_path": path, "repetition": rep,
+                            "preregistered": provider == BASELINE_PROVIDER or model in preregistered}
                     records.append(finalize_cell(base, obs, fx, allowed, ws))
     manifest = {"schema": "hetzner-run-manifest/v1", "run_id": run_id, "repo_sha": repo_sha,
-                "started_utc": _utc_now(), "baseline": dict(baseline), "candidate_isolation": dict(CANDIDATE_ISOLATION),
-                "available_models": list(available),
+                "started_utc": started_utc, "finished_utc": _utc_now(), "baseline": dict(baseline),
+                "candidate_isolation": dict(CANDIDATE_ISOLATION),
+                "available_models": list(available), "arms": (["baseline"] if include_baseline else [])
+                + (["candidate"] if available else []),
                 "repetitions_requested": reps,
                 "repetitions_achieved": {f"{r['task']}|{r['model']}": sum(
                     1 for x in records
@@ -597,46 +718,143 @@ def decide(records: Sequence[Mapping[str, Any]], available: Sequence[str], basel
     return "LIMITED_BENCH_ONLY", "results fall between the REJECT and ADOPT criteria"
 
 
+_WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
+_BUDGET_STOPS = frozenset({"max_tokens", "length"})
+
+
+def model_checklist(records: Sequence[Mapping[str, Any]], entry: Mapping[str, Any]) -> dict[str, str]:
+    """The model-specific checks of requirements.md: pass, fail or unknown, from records and snapshot."""
+    ok = [r for r in records if r["status"] == "ok"]
+    lc = entry.get("long_context") or {}
+    lc_res = "unknown" if not lc else ("pass" if lc.get("status") == 200 and lc.get("type") == "message" else "fail")
+    if not ok:
+        tool_wf = "unknown"
+    else:
+        tool_wf = "pass" if all(not r.get("tool_calls_hallucinated") for r in ok) and any(
+            r.get("tool_calls_valid") for r in ok) else "fail"
+    stops = [x for r in ok for x in (r.get("finish_reasons") or [])]
+    budget = "unknown" if not ok else ("fail" if any(x in _BUDGET_STOPS for x in stops) else "pass")
+    reported = "unknown" if not ok else ("pass" if all(r.get("finish_reasons") for r in ok) else "fail")
+    # the tool-use fixture's check.py fails on its first run in every fresh workspace and prints RESULT only
+    # on a later run, so a passing tool-use oracle implies the model recovered from that scripted tool error
+    tool_use = [r for r in ok if r["task"] == "tool-use"]
+    recovers = "unknown" if not tool_use else (
+        "pass" if any(r["oracle_result"] == "pass" for r in tool_use) else "fail")
+    read_only = [r for r in ok if r["task"] != "implementation"]
+    complies = "unknown" if not read_only else (
+        "fail" if any(_WRITE_TOOLS & set(r.get("tool_names") or {}) for r in read_only) else "pass")
+    return {"long context (~60k tokens) accepted": lc_res, "tool-call output well formed": tool_wf,
+            "reasoning does not exhaust output budget": budget, "stop reasons reported": reported,
+            "recovers after a tool error": recovers, "complies with read-only instruction": complies}
+
+
+def _fmt_ms(values: Sequence[Any]) -> str:
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return "n/a"
+    return f"{int(statistics.median(vals))} ({min(vals)}-{max(vals)})"
+
+
+def _protocol_rows(entry: Mapping[str, Any]) -> list[str]:
+    rows = []
+    for name, res in (entry.get("protocols") or {}).items():
+        detail = res.get("stop_reason") or ", ".join(f"{k}x{v}" for k, v in (res.get("event_types") or {}).items())
+        blocks = ",".join(res.get("block_types") or [])
+        rows.append(f"| {name} | {res.get('status')} | {blocks or 'n/a'} | {detail or res.get('error') or 'n/a'} |")
+    return rows
+
+
 def render_report(
     records: Sequence[Mapping[str, Any]], snapshot: Mapping[str, Any], manifest: Mapping[str, Any],
+    snapshot_end: Mapping[str, Any] | None = None,
 ) -> str:
+    """The data sections of the spike report, generated from the committed artifacts only."""
     base_model = manifest["baseline"]["model"]
-    available = [m for m, e in snapshot["selected"].items() if e["availability"] == AVAILABLE]
-    tool_ok = any(e.get("function_call", {}).get("tool_call_returned") for e in snapshot["selected"].values())
-    verdict, why = decide(records, available, base_model, tool_use_possible=tool_ok)
-    lines = ["# Spike #791: Hetzner experimental inference", "",
-             "## Environment", "", f"- run: {manifest['run_id']}, repo sha {manifest['repo_sha']}",
-             f"- endpoint: {snapshot['endpoint']}, snapshot {snapshot['timestamp_utc']}",
-             f"- baseline: {base_model} (model policy v{manifest['baseline']['model_policy_version']})", "",
-             "## Snapshot", "", "| model | availability | function call | finish | latency ms |",
-             "|---|---|---|---|---|"]
+    benched = list(manifest["available_models"])
+    prereg = [m for m in benched if (snapshot["selected"].get(m) or {}).get("preregistered", m in SELECTED_MODELS)]
+    def tool_ok(models: Sequence[str]) -> bool:
+        return any(snapshot["selected"].get(m, {}).get("function_call", {}).get("tool_call_returned") for m in models)
+
+    verdict, why = decide(records, benched, base_model, tool_use_possible=tool_ok(benched))
+    strict, strict_why = decide(records, prereg, base_model, tool_use_possible=tool_ok(prereg))
+    lines = ["## Environment", "",
+             f"- run: `{manifest['run_id']}`, repo sha `{manifest['repo_sha']}`",
+             f"- bench window (UTC): {manifest['started_utc']} to {manifest.get('finished_utc', 'n/a')}",
+             f"- endpoint: `{snapshot['endpoint']}`",
+             f"- baseline: `{base_model}` (model policy v{manifest['baseline']['model_policy_version']}, "
+             f"task `{manifest['baseline'].get('policy_task')}`, profile `{manifest['baseline'].get('profile')}`)",
+             f"- repetitions requested per (task, model): {manifest['repetitions_requested']}"]
+    for arm, where in (manifest.get("run_location") or {}).items():
+        lines.append(f"- run location, {arm} arm: {where}")
+    lines += ["", "## Snapshot", "", f"Start: {snapshot['timestamp_utc']}, `GET /v1/models` HTTP "
+              f"{snapshot['models_status']}. Catalog: "
+              + ", ".join(f"`{i}`" for i in snapshot["catalog_ids"]) + ".", ""]
+    if snapshot_end is not None:
+        added = sorted(set(snapshot_end["catalog_ids"]) - set(snapshot["catalog_ids"]))
+        gone = sorted(set(snapshot["catalog_ids"]) - set(snapshot_end["catalog_ids"]))
+        lines += [f"End: {snapshot_end['timestamp_utc']}, HTTP {snapshot_end['models_status']}. Catalog drift: "
+                  + ("none" if not added and not gone else f"added {added}, removed {gone}") + ".", ""]
+    lines += ["| model | pre-registered | availability | served as | chat function call | finish | latency ms |",
+              "|---|---|---|---|---|---|---|"]
     for m, e in snapshot["selected"].items():
         fc = e.get("function_call", {})
-        lines.append(f"| {m} | {e['availability']} | {fc.get('tool_call_returned', 'n/a')} | "
-                     f"{fc.get('finish_reason', 'n/a')} | {fc.get('latency_ms', 'n/a')} |")
+        lines.append(f"| `{m}` | {'yes' if e.get('preregistered', m in SELECTED_MODELS) else 'no (owner-added)'} | "
+                     f"{e['availability']} | {('`' + fc['model'] + '`') if fc.get('model') else 'n/a'} | "
+                     f"{fc.get('tool_call_returned', 'n/a')} | {fc.get('finish_reason', 'n/a')} | "
+                     f"{fc.get('latency_ms', 'n/a')} |")
     probe = snapshot["messages_probe"]
     lines += ["", "## Compatibility", "",
-              "- `POST /v1/messages` probe: "
-              + ("ok (direct)" if probe.get("ok") else "failed (loopback shim needed)"), "",
-              "## Matrix (oracle passes / repetitions; median wall ms)", "",
+              f"- `POST /v1/messages` probe (`{probe.get('model')}`): HTTP {probe.get('status')}, "
+              + ("Anthropic Messages accepted directly; no shim used." if probe.get("ok")
+                 else "not accepted; candidate cells ran through the loopback shim."),
+              "- protocol path of the candidate cells: "
+              + ", ".join(sorted({str(r['protocol_path']) for r in records if r['provider'] == CANDIDATE_PROVIDER}))]
+    if manifest.get("shim_unsupported"):
+        lines.append(f"- shim_unsupported: {manifest['shim_unsupported']}")
+    for m, e in snapshot["selected"].items():
+        if e.get("protocols"):
+            lines += ["", f"Protocol probes, `{m}`:", "", "| probe | HTTP | blocks | stop reason / SSE events |",
+                      "|---|---|---|---|", *_protocol_rows(e)]
+    lines += ["", "## Matrix", "", "Oracle passes / cells; median wall-clock seconds over the cells (range).", "",
               "| model | " + " | ".join(TASKS) + " |", "|---|" + "---|" * len(TASKS)]
-    for m in [base_model, *available]:
+    for m in [base_model, *benched]:
         cells = []
         for t in TASKS:
             rs = [r for r in records if r["model"] == m and r["task"] == t]
-            walls = [r["wall_ms"] for r in rs if r.get("wall_ms") is not None]
-            med = int(statistics.median(walls)) if walls else "n/a"
-            cells.append(f"{_passes(rs)}/{len(rs)}; {med}")
-        lines.append(f"| {m} | " + " | ".join(cells) + " |")
+            walls = [round(r["wall_ms"] / 1000) for r in rs if r.get("wall_ms") is not None]
+            cells.append(f"{_passes(rs)}/{len(rs)}; {_fmt_ms(walls)}")
+        lines.append(f"| `{m}` | " + " | ".join(cells) + " |")
+    lines += ["", "Per-cell detail (status, turns, tokens in/out, tool calls valid/invalid/hallucinated, denials):", "",
+              "| model | task | rep | status | oracle | turns | tokens in/out | tools v/i/h | denials | finish |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
+    for r in records:
+        lines.append(f"| `{r['model']}` | {r['task']} | {r['repetition']} | {r['status']} | {r['oracle_result']} | "
+                     f"{r.get('turns')} | {r.get('input_tokens')}/{r.get('output_tokens')} | "
+                     f"{r.get('tool_calls_valid')}/{r.get('tool_calls_invalid')}/{r.get('tool_calls_hallucinated')} | "
+                     f"{r.get('policy_denials')} | {','.join(r.get('finish_reasons') or []) or 'n/a'} |")
+    lines += ["", "## Model-specific checks", ""]
+    checks = {m: model_checklist([r for r in records if r["model"] == m], snapshot["selected"].get(m, {}))
+              for m in benched}
+    if checks:
+        names = list(next(iter(checks.values())))
+        lines += ["| check | " + " | ".join(f"`{m}`" for m in benched) + " |", "|---|" + "---|" * len(benched)]
+        lines += [f"| {n} | " + " | ".join(checks[m][n] for m in benched) + " |" for n in names]
     lines += ["", "## Reliability", ""]
-    for m in available:
+    for m in [base_model, *benched]:
         rs = [r for r in records if r["model"] == m]
-        lines.append(f"- {m}: provider_error {sum(r['status'] == 'provider_error' for r in rs)}, "
+        lines.append(f"- `{m}`: {len(rs)} cells, provider_error {sum(r['status'] == 'provider_error' for r in rs)}, "
                      f"model_mismatch {sum(r['status'] == 'model_mismatch' for r in rs)}, "
-                     f"429s {sum(r.get('http_429') or 0 for r in rs)}, "
-                     f"policy bypasses {sum(r.get('policy_bypasses') or 0 for r in rs)}")
-    lines += ["", "## Decision", "", f"Proposed verdict: {verdict}", "",
-              f"Rule outcome: {why}. The owner records the verdict.", ""]
+                     f"HTTP 429 {sum(r.get('http_429') or 0 for r in rs)}, "
+                     f"timeouts {sum(r.get('timeouts') or 0 for r in rs)}, "
+                     f"policy bypasses {sum(r.get('policy_bypasses') or 0 for r in rs)}, "
+                     f"policy denials {sum(r.get('policy_denials') or 0 for r in rs)}, "
+                     f"achieved repetitions per task "
+                     + ", ".join(f"{t} {manifest['repetitions_achieved'].get(f'{t}|{m}', 0)}" for t in TASKS))
+    lines += ["", "## Rule outcome", "",
+              f"- over every benched candidate ({', '.join(f'`{m}`' for m in benched) or 'none'}): "
+              f"**{verdict}** ({why})",
+              f"- over the pre-registered selection only ({', '.join(f'`{m}`' for m in prereg) or 'none'}): "
+              f"**{strict}** ({strict_why})", ""]
     return "\n".join(lines)
 
 
@@ -656,7 +874,8 @@ def _live_env(args: argparse.Namespace) -> tuple[str, str]:
 
 def _cmd_snapshot(args: argparse.Namespace) -> int:
     base, key = _live_env(args)
-    snap = take_snapshot(HetznerClient(base, key), base_url=base)
+    extra = [m for m in (args.models or "").split(",") if m]
+    snap = take_snapshot(HetznerClient(base, key), base_url=base, extra=extra, deep=args.deep)
     write_artifact(Path(args.out), json.dumps(snap, indent=2, sort_keys=True) + "\n")
     print(f"wrote {args.out}")
     return 0
@@ -680,20 +899,43 @@ def _load_shim() -> Any:
     return module
 
 
+def bench_models(snap: Mapping[str, Any], requested: Sequence[str]) -> list[str]:
+    """The candidate models for a bench: the snapshot's available ones, or an explicit list of exact IDs
+    that the snapshot saw AVAILABLE (never a substitute)."""
+    available = [m for m, e in snap["selected"].items() if e["availability"] == AVAILABLE]
+    if not requested:
+        return available
+    missing = [m for m in requested if m not in available]
+    if missing:
+        raise SpikeError(f"not AVAILABLE in the snapshot (no substitution): {', '.join(missing)}")
+    return list(requested)
+
+
 def _cmd_bench(args: argparse.Namespace) -> int:
-    base, key = _live_env(args)
     out_dir = Path(args.out_dir)
+    snap = json.loads(Path(args.snapshot or out_dir / "snapshot-start.json").read_text())
+    requested = [m for m in (args.models or "").split(",") if m]
+    if args.arm == "baseline" and requested:
+        raise SpikeError("--models has no effect with --arm baseline")
+    available = [] if args.arm == "baseline" else bench_models(snap, requested)
+    if args.arm == "candidate" and not available:
+        raise SpikeError("--arm candidate with no AVAILABLE model: nothing to run")
+    # the baseline arm talks only to Anthropic, so it needs neither the Hetzner key nor the endpoint
+    base, key = _live_env(args) if args.arm != "baseline" else ("", "")
+    if args.arm == "baseline" and not args.allow_live:
+        raise SpikeError("live calls need --allow-live")
     if args.record_raw:
         check_raw_dir(Path(args.record_raw))
-    snap = json.loads((out_dir / "snapshot.json").read_text())
-    available = [m for m, e in snap["selected"].items() if e["availability"] == AVAILABLE]
     fixtures = load_fixtures()
+    include_baseline = args.arm in ("all", "baseline")
+    suffix = "" if args.arm == "all" else f"-{args.arm}"
 
     async def go(url: str, token: str, protocol: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         runner = make_sdk_runner(fixtures, base_url=url, token=token)
-        return await run_bench(runner, fixtures, available, reps=args.reps, protocol_path=protocol)
+        return await run_bench(runner, fixtures, available, reps=args.reps, protocol_path=protocol,
+                               include_baseline=include_baseline)
 
-    if snap["messages_probe"].get("ok"):
+    if not available or snap["messages_probe"].get("ok"):
         records, manifest = asyncio.run(go(base, key, "messages"))
     else:
         shim = _load_shim()
@@ -701,17 +943,67 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         with shim.ShimServer(lambda chat: _upstream_json(client.call("POST", "/v1/chat/completions", chat))) as srv:
             records, manifest = asyncio.run(go(srv.url, srv.token, "shim"))
         manifest["shim_unsupported"] = list(srv.unsupported)
-    write_artifact(out_dir / "records.jsonl", render_jsonl(records))
-    write_artifact(out_dir / "run-manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    manifest["run_location"] = {args.arm: args.run_location}
+    write_artifact(out_dir / f"records{suffix}.jsonl", render_jsonl(records))
+    write_artifact(out_dir / f"run-manifest{suffix}.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     print(f"wrote {len(records)} records to {out_dir}")
+    return 0
+
+
+_Run = tuple[list[dict[str, Any]], dict[str, Any]]
+
+
+def merge_runs(parts: Sequence[_Run]) -> _Run:
+    """Join per-arm bench outputs into one record set and manifest. The arms must share the repo SHA, the
+    model policy and the fixtures, so the comparison stays like for like."""
+    records = [r for recs, _ in parts for r in recs]
+    manifests = [m for _, m in parts]
+    arms = [a for m in manifests for a in m.get("arms", [])]
+    if len(arms) != len(set(arms)):
+        raise SpikeError(f"arms repeat across parts ({arms}); refusing to merge")
+    cells = [(r.get("task"), r.get("model"), r.get("repetition")) for r in records]
+    if len(cells) != len(set(cells)):
+        raise SpikeError("a (task, model, repetition) cell repeats across parts; refusing to merge")
+    for key in ("repo_sha", "fixtures"):
+        if len({json.dumps(m[key], sort_keys=True) for m in manifests}) != 1:
+            raise SpikeError(f"arms differ in {key}; refusing to merge")
+    if len({m["baseline"]["model_policy_version"] for m in manifests}) != 1:
+        raise SpikeError("arms differ in model_policy_version; refusing to merge")
+    merged = {**manifests[0], "run_id": "+".join(m["run_id"] for m in manifests),
+              "started_utc": min(m["started_utc"] for m in manifests),
+              "finished_utc": max(str(m.get("finished_utc") or m["started_utc"]) for m in manifests),
+              "arms": [a for m in manifests for a in m.get("arms", [])],
+              "available_models": [x for m in manifests for x in m["available_models"]],
+              "repetitions_achieved": {k: v for m in manifests for k, v in m["repetitions_achieved"].items()},
+              "run_location": {k: v for m in manifests for k, v in (m.get("run_location") or {}).items()},
+              "parts": [{"run_id": m["run_id"], "arms": m.get("arms", []), "started_utc": m["started_utc"],
+                         "finished_utc": m.get("finished_utc")} for m in manifests]}
+    if any("shim_unsupported" in m for m in manifests):
+        merged["shim_unsupported"] = [x for m in manifests for x in m.get("shim_unsupported", [])]
+    return records, merged
+
+
+def _read_records(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _cmd_merge(args: argparse.Namespace) -> int:
+    d = Path(args.dir)
+    parts = [(_read_records(d / f"records-{arm}.jsonl"), json.loads((d / f"run-manifest-{arm}.json").read_text()))
+             for arm in args.arms.split(",")]
+    records, manifest = merge_runs(parts)
+    write_artifact(d / "records.jsonl", render_jsonl(records))
+    write_artifact(d / "run-manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    print(f"merged {len(records)} records into {d}")
     return 0
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
     d = Path(args.dir)
-    records = [json.loads(line) for line in (d / "records.jsonl").read_text().splitlines() if line.strip()]
-    text = render_report(records, json.loads((d / "snapshot.json").read_text()),
-                         json.loads((d / "run-manifest.json").read_text()))
+    end = d / "snapshot-end.json"
+    text = render_report(_read_records(d / "records.jsonl"), json.loads((d / "snapshot-start.json").read_text()),
+                         json.loads((d / "run-manifest.json").read_text()),
+                         json.loads(end.read_text()) if end.exists() else None)
     if args.out:
         write_artifact(Path(args.out), text)
     else:
@@ -724,14 +1016,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("snapshot", help="live catalog and capability snapshot")
     p.add_argument("--allow-live", action="store_true")
-    p.add_argument("--out", default=str(SPIKE_DIR / "snapshot.json"))
+    p.add_argument("--out", default=str(SPIKE_DIR / "snapshot-start.json"))
+    p.add_argument("--models", default="", help="comma list of owner-added exact catalog IDs to probe as well")
+    p.add_argument("--deep", action="store_true", help="add protocol and long-context probes per available model")
     p.set_defaults(func=_cmd_snapshot)
     p = sub.add_parser("bench", help="run the workload matrix")
     p.add_argument("--allow-live", action="store_true")
     p.add_argument("--out-dir", default=str(SPIKE_DIR))
     p.add_argument("--reps", type=int, default=DEFAULT_REPS)
     p.add_argument("--record-raw", default=None, help="directory OUTSIDE any repository")
+    p.add_argument("--snapshot", default=None, help="availability source (default OUT_DIR/snapshot-start.json)")
+    p.add_argument("--models", default="", help="comma list of exact IDs, each AVAILABLE in the snapshot")
+    p.add_argument("--arm", choices=("all", "baseline", "candidate"), default="all",
+                   help="run one arm alone (writes records-ARM.jsonl / run-manifest-ARM.json); join with `merge`")
+    p.add_argument("--run-location", default="unspecified", help="recorded in the manifest")
     p.set_defaults(func=_cmd_bench)
+    p = sub.add_parser("merge", help="join per-arm bench outputs into records.jsonl / run-manifest.json")
+    p.add_argument("--dir", default=str(SPIKE_DIR))
+    p.add_argument("--arms", default="baseline,candidate")
+    p.set_defaults(func=_cmd_merge)
     p = sub.add_parser("report", help="render the report tables from committed records")
     p.add_argument("--dir", default=str(SPIKE_DIR))
     p.add_argument("--out", default=None)

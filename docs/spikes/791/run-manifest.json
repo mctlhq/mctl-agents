@@ -1,0 +1,142 @@
+{
+  "arms": [
+    "baseline",
+    "candidate"
+  ],
+  "available_models": [
+    "Qwen/Qwen3.6-35B-A3B-FP8",
+    "Qwen/Qwen3.6-35B-A3B",
+    "Qwen/Qwen3.8-27B",
+    "Qwen3.8-27B"
+  ],
+  "baseline": {
+    "agent_manifests": {
+      "authoring-canary": {
+        "sha256": "4af4245df12133259961558f52a409cbf1ca8cca2ed08d5476942c22f62fe513",
+        "version": null
+      },
+      "implementer": {
+        "sha256": "e3e689d9e3615bbd15ba0a947cc90f2992f4d815d4462421ef120a8f5d2bad6e",
+        "version": null
+      },
+      "incident-responder": {
+        "sha256": "7e31a9de9d3707e41dbb5a81245e40bb411d10edb716ee5b31db32efc4923cd2",
+        "version": null
+      },
+      "issue-investigator": {
+        "sha256": "5d021d9b64b053fee2187688b8f240c9ee18f400838d8733482c93c279602f1f",
+        "version": null
+      },
+      "mentor": {
+        "sha256": "dab2a7dea2726ab9ef1610e4f1c3a8f84efbbe1a65376c36b4daa5bacf305f0f",
+        "version": null
+      },
+      "scout": {
+        "sha256": "59562c69a35bc43b3bb8614d64b8444f4c5d4234a2a6709427795de1ade58c36",
+        "version": null
+      },
+      "service-agent": {
+        "sha256": "6924c606e46792db6bd2e87728b545c201c23ae7b9ffbfc93f439898bf21a5d7",
+        "version": null
+      },
+      "shepherd": {
+        "sha256": "c985510309726ded7d515590d3f8e509b100c22a59de9e4b358aca2808d98901",
+        "version": null
+      }
+    },
+    "model": "claude-sonnet-5-5",
+    "model_policy_version": 1,
+    "policy_task": "service_agent",
+    "profile": "balanced",
+    "source": "policy"
+  },
+  "candidate_isolation": {
+    "env": "allowlist LANG,LC_ALL,PATH,TMPDIR + ANTHROPIC_* overrides",
+    "home": "per-cell empty temp dir; this only changes what ~ expands to and is NOT isolation: candidate Bash can read absolute paths, so run bench ONLY on a throwaway host/user with no credentials and no readable operator home",
+    "mcp_servers": "dropped (no live mctl MCP server for candidate cells); mcp__* calls are rejected by the CLI and scored as denied, not as policy bypasses"
+  },
+  "finished_utc": "2026-10-26T21:42:46Z",
+  "fixtures": {
+    "implementation": {
+      "id": "implementation-calc-mean-v1",
+      "limits": {
+        "budget_usd": 3.0,
+        "max_turns": 20
+      },
+      "sha256": "0d386b734bd2e6111e27a515fe4e383099f3015b02759683595653bebe38d367"
+    },
+    "investigation": {
+      "id": "investigation-model-policy-v1",
+      "limits": {
+        "budget_usd": 1.0,
+        "max_turns": 12
+      },
+      "sha256": "362d1c84c1eeb680a6a72c86a0173d64552a7def8acae01a7393fafb517f6ede"
+    },
+    "review": {
+      "id": "review-handlers-diff-v1",
+      "limits": {
+        "budget_usd": 1.0,
+        "max_turns": 8
+      },
+      "sha256": "6c0c23756bdff8b2dcdd7eccbe7370ecac8253fe5a6be9c11fbe4803f371da3d"
+    },
+    "tool-use": {
+      "id": "tool-use-check-v1",
+      "limits": {
+        "budget_usd": 0.5,
+        "max_turns": 10
+      },
+      "sha256": "dbbef307b974f8abab3cec37168d241f80dfdf14b9198d0c2eb5bacc654baa22"
+    }
+  },
+  "parts": [
+    {
+      "arms": [
+        "baseline"
+      ],
+      "finished_utc": "2026-10-26T21:37:45Z",
+      "run_id": "20261026T213518Z",
+      "started_utc": "2026-10-26T21:35:18Z"
+    },
+    {
+      "arms": [
+        "candidate"
+      ],
+      "finished_utc": "2026-10-26T21:42:46Z",
+      "run_id": "20261026T213516Z",
+      "started_utc": "2026-10-26T21:35:16Z"
+    }
+  ],
+  "repetitions_achieved": {
+    "implementation|Qwen/Qwen3.6-35B-A3B": 3,
+    "implementation|Qwen/Qwen3.6-35B-A3B-FP8": 3,
+    "implementation|Qwen/Qwen3.8-27B": 0,
+    "implementation|Qwen3.8-27B": 0,
+    "implementation|claude-sonnet-5-5": 3,
+    "investigation|Qwen/Qwen3.6-35B-A3B": 3,
+    "investigation|Qwen/Qwen3.6-35B-A3B-FP8": 3,
+    "investigation|Qwen/Qwen3.8-27B": 0,
+    "investigation|Qwen3.8-27B": 0,
+    "investigation|claude-sonnet-5-5": 3,
+    "review|Qwen/Qwen3.6-35B-A3B": 3,
+    "review|Qwen/Qwen3.6-35B-A3B-FP8": 3,
+    "review|Qwen/Qwen3.8-27B": 0,
+    "review|Qwen3.8-27B": 0,
+    "review|claude-sonnet-5-5": 3,
+    "tool-use|Qwen/Qwen3.6-35B-A3B": 3,
+    "tool-use|Qwen/Qwen3.6-35B-A3B-FP8": 3,
+    "tool-use|Qwen/Qwen3.8-27B": 0,
+    "tool-use|Qwen3.8-27B": 0,
+    "tool-use|claude-sonnet-5-5": 3
+  },
+  "repetitions_requested": 3,
+  "repo_sha": "49712bc8e18ff1bfb4013602a43c5467f83c2e4c",
+  "run_id": "20261026T213518Z+20261026T213516Z",
+  "run_location": {
+    "baseline": "recorded workstation run on the owner's Mac (darwin/arm64), clean env (HOME, USER, PATH only), CLI authenticated by the existing local Claude Code login; no credential written to disk",
+    "candidate": "recorded workstation run: throwaway Docker container (python:3.12-slim, linux/arm64) on the owner's Mac, git-archive export, no host mounts except the output dir, no credentials except the Hetzner key"
+  },
+  "schema": "hetzner-run-manifest/v1",
+  "started_utc": "2026-10-26T21:35:16Z"
+}
