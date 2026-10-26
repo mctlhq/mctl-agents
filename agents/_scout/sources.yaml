@@ -1,0 +1,22 @@
+# Scout feed list and ranking config (mctlhq/mctl-agents#797).
+# Feed URLs were not verified from the authoring environment (no network);
+# verify with `python -m orchestrator.run_scout --dry-run` before unsuspending.
+window_hours: 26
+dedupe_days: 90
+ranking:
+  top_n: 10
+  weights: {impact: 3.0, novelty: 2.0, urgency: 1.0, cost: 1.0}
+sources:
+  - {name: InfoQ, url: "https://feed.infoq.com/", weight: 1.0}
+  - {name: The New Stack, url: "https://thenewstack.io/feed/", weight: 1.0}
+  - {name: Cloudflare Blog, url: "https://blog.cloudflare.com/rss/", weight: 1.0}
+  - {name: GitHub Blog, url: "https://github.blog/feed/", weight: 1.0}
+  - {name: GitHub Changelog, url: "https://github.blog/changelog/feed/", weight: 1.0}
+  - name: Anthropic News
+    url: "https://www.anthropic.com/news"
+    enabled: false
+    note: no official RSS/Atom feed known; HTML scraping is out of scope
+  - name: claude.com Blog
+    url: "https://claude.com/blog"
+    enabled: false
+    note: no official RSS/Atom feed known; HTML scraping is out of scope
