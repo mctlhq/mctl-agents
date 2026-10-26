@@ -165,6 +165,22 @@ def test_sitemap_config_is_validated(tmp_path):
     assert feeds.load_sources(cfg).sources[0]["path_prefix"] == "/news/"
 
 
+def test_date_only_source_lands_in_exactly_one_run():
+    items = "".join(f"<item><title>{d}</title><link>https://x.test/{d}</link><pubDate>{d} Oct 2026 00:00:00 GMT"
+                    f"</pubDate></item>" for d in (24, 25, 26))
+    body = f'<?xml version="1.0"?><rss version="2.0"><channel>{items}</channel></rss>'
+    src = {"name": "H", "url": "https://x.test/rss.xml"}
+    with _client(lambda req: httpx.Response(200, text=body)) as c:
+        plain = feeds.fetch_source(c, src, NOW)
+        dated = feeds.fetch_source(c, {**src, "date_only": True}, NOW)
+    # Without the option a post from yesterday is ~30h old at the 06:40 run and lost.
+    assert [i.title for i in feeds.in_window(plain.items, NOW, 26)[0]] == ["26"]
+    # With it: yesterday's post is in today's run; today's waits for tomorrow's.
+    assert [i.title for i in feeds.in_window(dated.items, NOW, 26)[0]] == ["25"]
+    tomorrow = NOW + timedelta(days=1)
+    assert [i.title for i in feeds.in_window(dated.items, tomorrow, 26)[0]] == ["26"]
+
+
 def test_window():
     def it(h):
         return feeds.Item("t", "l", "", None if h is None else NOW - timedelta(hours=h), "s")

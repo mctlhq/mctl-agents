@@ -5,8 +5,8 @@ import html
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, time, timedelta
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -338,7 +338,19 @@ def fetch_source(client: httpx.Client, src: dict[str, Any], now: datetime | None
         return SourceResult(name, "malformed", str(exc)[:80])
     if src.get("type", "feed") == "sitemap":
         items = _describe_recent(client, items, now or datetime.now(UTC))
+    if src.get("date_only"):
+        items = [_end_of_day(i) for i in items]
     return SourceResult(name, "ok", items=items)
+
+
+def _end_of_day(item: Item) -> Item:
+    """Date-only feeds stamp a post 00:00 of its day whenever it went up, so a daily
+    run would see it ~30h old and drop it. Dating it at the end of its day puts it in
+    exactly one run: the first after that day ends."""
+    if item.published is None:
+        return item
+    day = item.published.astimezone(UTC).date()
+    return replace(item, published=datetime.combine(day, time.min, UTC) + timedelta(days=1))
 
 
 def make_client(transport: httpx.BaseTransport | None = None) -> httpx.Client:
