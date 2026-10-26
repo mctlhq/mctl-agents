@@ -1,0 +1,66 @@
+{
+  "description": "Immutable record of one verification of a landed fix.",
+  "properties": {
+    "artifact_digest": {
+      "type": "string"
+    },
+    "attempt_id": {
+      "type": "string"
+    },
+    "declared_strength": {
+      "type": "string"
+    },
+    "derived_strength": {
+      "description": "The lower of the mechanism and the recorder's ceiling",
+      "type": "string"
+    },
+    "evidence_refs": {
+      "items": {
+        "$ref": "#/components/schemas/SecurityEvidenceRef"
+      },
+      "type": "array"
+    },
+    "id": {
+      "description": "svr_...",
+      "type": "string"
+    },
+    "mechanism": {
+      "enum": [
+        "deterministic_regression_test",
+        "assurance_replay",
+        "scanner_rerun_exact_revision",
+        "provider_claim",
+        "manual"
+      ],
+      "type": "string"
+    },
+    "occurrence_id": {
+      "type": "string"
+    },
+    "recorded_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "recorded_by": {
+      "type": "string"
+    },
+    "result": {
+      "enum": [
+        "passed",
+        "failed",
+        "unavailable",
+        "error",
+        "timeout",
+        "unverifiable"
+      ],
+      "type": "string"
+    },
+    "revision": {
+      "type": "string"
+    },
+    "source_observation_id": {
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

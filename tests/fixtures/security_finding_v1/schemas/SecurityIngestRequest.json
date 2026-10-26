@@ -1,0 +1,19 @@
+{
+  "properties": {
+    "delivery_id": {
+      "type": "string"
+    },
+    "observations": {
+      "items": {
+        "$ref": "#/components/schemas/SecurityObservationInput"
+      },
+      "maxItems": 100,
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "observations"
+  ],
+  "type": "object"
+}

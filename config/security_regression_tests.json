@@ -1,0 +1,4 @@
+{
+  "_comment": "PR-reviewed mapping used by orchestrator/security_findings/verification.py RegressionTestVerifier. Never populated from provider text. entries: [{\"repository\": \"owner/repo\", \"identity_key\": \"cve:CVE-YYYY-N\", \"check\": \"<check-run name>\"}]",
+  "entries": []
+}

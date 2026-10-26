@@ -1,0 +1,6 @@
+{"id":"soc_1","finding_id":"sf_1","tenant":"admins","state":"reopened","state_version":9,
+ "subject":{"repository":"github.com/mctlhq/svc","package_purl":"pkg:golang/x@1"},
+ "remediation_attempts":[
+  {"id":"sra_1","occurrence_id":"soc_1","seq":1,"work_item_id":"wi_1","devloop_workflow_id":"dev-loop-mctlhq-svc-7","landed_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","outcome":"resolved","landed_at":"2026-10-02T00:00:00Z"}],
+ "verifications":[{"id":"svr_1","attempt_id":"sra_1","occurrence_id":"soc_1","mechanism":"scanner_rerun_exact_revision","derived_strength":"scanner_rerun_exact_revision","result":"passed","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","recorded_by":"provider:scan","recorded_at":"2026-10-03T00:00:00Z"}],
+ "observations":[{"id":"sob_2","provider_ref":"scan","observation_hash":"h2","claimed_action":"present","observed_revision":"cccccccccccccccccccccccccccccccccccccccc"}]}

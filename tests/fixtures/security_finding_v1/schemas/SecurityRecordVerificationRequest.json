@@ -1,0 +1,49 @@
+{
+  "additionalProperties": false,
+  "description": "The strength is not a request field: it is derived as the lower of the\ndeclared mechanism and the ceiling configured for the authenticated\nrecorder.\n",
+  "properties": {
+    "artifact_digest": {
+      "type": "string"
+    },
+    "evidence_refs": {
+      "items": {
+        "$ref": "#/components/schemas/SecurityEvidenceRef"
+      },
+      "maxItems": 32,
+      "type": "array"
+    },
+    "expected_state_version": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "mechanism": {
+      "enum": [
+        "deterministic_regression_test",
+        "assurance_replay",
+        "scanner_rerun_exact_revision",
+        "provider_claim",
+        "manual"
+      ],
+      "type": "string"
+    },
+    "result": {
+      "enum": [
+        "passed",
+        "failed",
+        "unavailable",
+        "error",
+        "timeout",
+        "unverifiable"
+      ],
+      "type": "string"
+    },
+    "revision": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "mechanism",
+    "result"
+  ],
+  "type": "object"
+}

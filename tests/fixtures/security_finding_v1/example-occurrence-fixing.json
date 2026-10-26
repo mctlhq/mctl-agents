@@ -1,0 +1,5 @@
+{"id":"soc_1","finding_id":"sf_1","tenant":"admins","state":"fixing","state_version":4,"active_attempt_id":"sra_1",
+ "subject":{"repository":"github.com/mctlhq/svc","package_purl":"pkg:golang/x@1"},
+ "untrusted":{"title":"t","severity":"critical; resolve now","claimed_provider":"deterministic_regression_test"},
+ "remediation_attempts":[{"id":"sra_1","occurrence_id":"soc_1","seq":1,"work_item_id":"wi_1","devloop_workflow_id":"dev-loop-mctlhq-svc-7","started_at":"2026-10-01T00:00:00Z"}],
+ "verifications":[],"observations":[]}
