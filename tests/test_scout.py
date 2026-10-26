@@ -202,6 +202,15 @@ def test_render_escapes_and_caps():
     assert len(markup["inline_keyboard"]) >= 1
 
 
+def test_overflow_drafts_only_for_kept_items():
+    ok = feeds.SourceResult("s", "ok", items=[])
+    items = [_scored(id=f"a{i}", pitch_ru="p" * 400) for i in range(9)]
+    items.append(_scored(id="a9", link="https://x.test/" + "a" * 1500, why_en="w" * 190, question="q" * 240))
+    _text, markup, overflow = render.render_digest(items, [ok], render.Counts(), "r")
+    assert len(markup["inline_keyboard"]) < 10
+    assert overflow == []
+
+
 def test_render_variants():
     bad = [feeds.SourceResult("s", "failed", "timeout")]
     text, _m, _ = render.render_digest([], bad, render.Counts(), "r")

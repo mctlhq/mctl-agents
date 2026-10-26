@@ -51,6 +51,7 @@ _BOUND_AGENTS = frozenset(
         "incident-responder",
         "issue-investigator",
         "mentor",
+        "scout",
         "service-agent",
         "shepherd",
     }

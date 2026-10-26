@@ -108,7 +108,7 @@ def render_digest(
         return "Scout: no relevant items were found.\n\n" + footer, None, []
     rows: list[list[dict[str, str]]] = []
     blocks: list[str] = []
-    fallbacks: list[str] = []
+    fallbacks: list[tuple[int, str]] = []
     for n, it in enumerate(ranked, 1):
         url, full = draft_url(it, run_id)
         rel = ("adds to " if it.adds_to else "related: ") + ", ".join(it.related) if it.related else ""
@@ -120,7 +120,7 @@ def render_digest(
         blocks.append(block)
         rows.append([{"text": f"Draft spike {n}", "url": url}])
         if full:
-            fallbacks.append(f"Draft {n}:\n{html.escape(full)}")
+            fallbacks.append((n, f"Draft {n}:\n{html.escape(full)}"))
     tail = "\n\n" + footer
     keep = len(blocks)
     while keep > 1 and len("\n\n".join(blocks[:keep])) + len(tail) > MAX_MESSAGE_CHARS:
@@ -128,5 +128,6 @@ def render_digest(
     text = "\n\n".join(blocks[:keep]) + tail
     if len(text) > MAX_MESSAGE_CHARS:
         text = text[: MAX_MESSAGE_CHARS - 1] + "~"
-    overflow = [f[:MAX_MESSAGE_CHARS] for f in fallbacks[:keep]]
+    # Only items still in the message: fallbacks holds just the overflowing ones.
+    overflow = [f[:MAX_MESSAGE_CHARS] for n, f in fallbacks if n <= keep]
     return text, {"inline_keyboard": rows[:keep]}, overflow
