@@ -77,6 +77,9 @@ class FakeGitHub:
         self.edit_calls: list[list[str]] = []
         self._next_id = 1
         self.login = "mctl-agents[bot]"
+        self.list_fail_repos: set[str] = set()
+        self.pr_urls: set[str] = set()
+        self.reads: list[str] = []
 
     def add_comment(
         self,
@@ -101,8 +104,22 @@ class FakeGitHub:
     def run(self, cmd: list[str]) -> subprocess.CompletedProcess:
         if cmd[:3] == ["gh", "api", "graphql"]:
             return subprocess.CompletedProcess(cmd, 0, stdout=self.login + "\n", stderr="")
+        if cmd[:2] == ["gh", "api"] and "/issues/comments?" in cmd[-1]:
+            repo = cmd[-1].split("/")[2]
+            if repo in self.list_fail_repos:
+                raise subprocess.CalledProcessError(1, cmd, stderr="boom")
+            lines = []
+            for url, comments in self.comments.items():
+                if not url.startswith(f"https://github.com/mctlhq/{repo}/issues/"):
+                    continue
+                kind = "pull" if url in self.pr_urls else "issues"
+                for c in comments:
+                    html = url.replace("/issues/", f"/{kind}/") + f"#issuecomment-{c['id']}"
+                    lines.append(json.dumps({**c, "html_url": html}) + "\n")
+            return subprocess.CompletedProcess(cmd, 0, stdout="".join(lines), stderr="")
         if cmd[:2] == ["gh", "api"] and cmd[-1].endswith("/comments"):
             issue_url = self._url_for_rest_path(cmd[-1])
+            self.reads.append(issue_url)
             # `--jq '.[]'` output: one compact JSON object per line.
             body = "".join(
                 json.dumps(c) + "\n" for c in self.comments.get(issue_url, [])
@@ -1265,3 +1282,204 @@ def test_dry_run_resolves_but_neither_posts_nor_replies(monkeypatch, capsys):
     assert submits == []
     assert "execution_id=we_y" in capsys.readouterr().out
     assert [c for c in gh.comments[issue_url] if c["user"]["login"] == "mctl-agents[bot]"] == []
+
+
+# ---------------------------------------------------------------------------
+# mctl-agents#799 — `@MCTL investigate` on an issue with no proposal
+# ---------------------------------------------------------------------------
+from temporalio.client import WorkflowExecutionStatus  # noqa: E402
+from temporalio.exceptions import WorkflowAlreadyStartedError  # noqa: E402
+from temporalio.service import RPCError, RPCStatusCode  # noqa: E402
+
+FRESH_URL = "https://github.com/mctlhq/mctl-web/issues/791"
+FRESH_URL_2 = "https://github.com/mctlhq/mctl-web/issues/796"
+
+
+class _FakeHandle:
+    def __init__(self, client, wf_id):
+        self._c, self.id, self.run_id = client, wf_id, "run-x"
+
+    async def describe(self):
+        st = self._c.statuses.get(self.id)
+        if st is None:
+            raise RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
+        return type("D", (), {"status": st})()
+
+    async def query(self, name):
+        if self._c.query_error:
+            raise RuntimeError("query failed")
+        return self._c.busy.get(self.id, False)
+
+
+class FakeTemporal:
+    def __init__(self):
+        self.statuses: dict = {}
+        self.busy: dict = {}
+        self.running: list[str] = []
+        self.query_error = False
+        self.list_error = False
+        self.started: list[tuple] = []
+        self.start_raises = None
+
+    def get_workflow_handle(self, wf_id, run_id=None):
+        return _FakeHandle(self, wf_id)
+
+    async def list_workflows(self, query):
+        if self.list_error:
+            raise RuntimeError("visibility down")
+        for wf_id in self.running:
+            yield type("W", (), {"id": wf_id, "run_id": "r"})()
+
+
+@pytest.fixture
+def fresh(monkeypatch):
+    gh = FakeGitHub()
+    tc = FakeTemporal()
+    monkeypatch.setattr(run_issue_directive_poller, "_run", gh.run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([]))
+    monkeypatch.setattr(run_issue_directive_poller, "SERVICES", ["mctl-web"])
+    monkeypatch.setattr(run_issue_directive_poller, "MARKER_POST_RETRY_DELAY_SECONDS", 0)
+
+    async def _connect():
+        return tc
+
+    async def _start(issue_url, client, *, requested_by=None):
+        if tc.start_raises:
+            raise tc.start_raises
+        tc.started.append((issue_url, requested_by))
+        wf_id = run_issue_directive_poller.workflow_id_for(issue_url)
+        tc.statuses[wf_id] = WorkflowExecutionStatus.RUNNING
+        return type("H", (), {"id": wf_id, "result_run_id": "run-1"})()
+
+    monkeypatch.setattr(run_issue_directive_poller, "_connect_client", _connect)
+    monkeypatch.setattr(run_issue_directive_poller, "start_dev_loop_workflow", _start)
+    return gh, tc
+
+
+def _bodies(gh, url):
+    return [c["body"] for c in gh.comments.get(url, []) if c["user"]["login"] == "mctl-agents[bot]"]
+
+
+def test_investigate_starts_loop_on_fresh_issue_and_acks_after(fresh):
+    gh, tc = fresh
+    gh.add_comment(FRESH_URL, body="@MCTL investigate", author="alice")
+    result = _run_scan(max_directives=10)
+    assert tc.started == [(FRESH_URL, "alice")]
+    assert result.dispatched == 1
+    bodies = _bodies(gh, FRESH_URL)
+    assert len(bodies) == 1 and "dev-loop-mctlhq-mctl-web-791" in bodies[0]
+    assert "mctl-directive-ack: c1" in bodies[0]
+    # Next tick: acked, nothing more.
+    result = _run_scan(max_directives=10)
+    assert result.dispatched == 0 and result.replied == 0
+    assert len(tc.started) == 1
+
+
+def test_investigate_unauthorized_starts_nothing(fresh):
+    gh, tc = fresh
+    gh.add_comment(FRESH_URL, body="@MCTL investigate", association="NONE")
+    _run_scan(max_directives=10)
+    assert tc.started == []
+    assert "not accepted" in _bodies(gh, FRESH_URL)[0]
+
+
+def test_investigate_refused_when_another_investigation_in_flight(fresh):
+    gh, tc = fresh
+    tc.running, tc.busy = ["dev-loop-mctlhq-mctl-api-1"], {"dev-loop-mctlhq-mctl-api-1": True}
+    gh.add_comment(FRESH_URL, body="@MCTL investigate")
+    _run_scan(max_directives=10)
+    assert tc.started == []
+    body = _bodies(gh, FRESH_URL)[0]
+    assert "another investigation" in body and "mctl-directive-ack: c1" in body
+
+
+def test_only_one_investigate_started_per_tick(fresh):
+    gh, tc = fresh
+    gh.add_comment(FRESH_URL, body="@MCTL investigate")
+    gh.add_comment(FRESH_URL_2, body="@MCTL investigate")
+    result = _run_scan(max_directives=10)
+    assert len(tc.started) == 1
+    assert result.dispatched == 1
+    assert "another investigation" in _bodies(gh, FRESH_URL_2)[0]
+
+
+def test_in_flight_check_failure_is_unacked_failed_attempt(fresh):
+    gh, tc = fresh
+    tc.list_error = True
+    gh.add_comment(FRESH_URL, body="@MCTL investigate")
+    for expected_attempt in (1, 2):
+        result = _run_scan(max_directives=10)
+        assert result.failed == 1 and tc.started == []
+        assert f"{expected_attempt}/3" in _bodies(gh, FRESH_URL)[-1]
+    _run_scan(max_directives=10)
+    assert "Giving up" in _bodies(gh, FRESH_URL)[-1]
+    assert "mctl-directive-ack: c1" in _bodies(gh, FRESH_URL)[-1]
+
+
+def test_repo_listing_failure_acts_on_nothing_then_recovers(fresh):
+    gh, tc = fresh
+    gh.add_comment(FRESH_URL, body="@MCTL investigate")
+    gh.list_fail_repos.add("mctl-web")
+    result = _run_scan(max_directives=10)
+    assert result.failed == 1 and tc.started == [] and _bodies(gh, FRESH_URL) == []
+    gh.list_fail_repos.clear()
+    assert _run_scan(max_directives=10).dispatched == 1
+
+
+def test_list_repo_comments_malformed_payload_raises(monkeypatch):
+    def _bad(cmd):
+        return subprocess.CompletedProcess(cmd, 0, stdout="{not json\n", stderr="")
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", _bad)
+    with pytest.raises(run_issue_directive_poller.RepoCommentScanError):
+        run_issue_directive_poller.list_repo_comments("mctl-web", "2026-10-22T00:00:00Z")
+
+
+def test_pr_comments_are_ignored(fresh):
+    gh, tc = fresh
+    gh.add_comment(FRESH_URL, body="@MCTL investigate")
+    gh.pr_urls.add(FRESH_URL)
+    result = _run_scan(max_directives=10)
+    assert tc.started == [] and result.replied == 0
+
+
+def test_investigate_with_existing_proposal_names_it(fresh, monkeypatch):
+    gh, tc = fresh
+    ref = _ref(slug="issue-791-x", status="merged")
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref]))
+    gh.add_comment(FRESH_URL, body="@MCTL investigate")
+    _run_scan(max_directives=10)
+    body = _bodies(gh, FRESH_URL)[0]
+    assert tc.started == [] and "mctl-web/issue-791-x (merged)" in body and "@MCTL reinvestigate" in body
+    assert gh.reads.count(FRESH_URL) == 1
+
+
+def test_investigate_running_or_completed_loop_replies(fresh):
+    gh, tc = fresh
+    wf = "dev-loop-mctlhq-mctl-web-791"
+    tc.statuses[wf] = WorkflowExecutionStatus.RUNNING
+    gh.add_comment(FRESH_URL, body="@MCTL investigate")
+    _run_scan(max_directives=10)
+    assert "already running" in _bodies(gh, FRESH_URL)[0] and tc.started == []
+    tc.statuses[wf] = WorkflowExecutionStatus.COMPLETED
+    gh.add_comment(FRESH_URL, body="@MCTL investigate")
+    _run_scan(max_directives=10)
+    assert "already handled" in _bodies(gh, FRESH_URL)[-1] and tc.started == []
+
+
+def test_investigate_failed_prior_run_is_restarted_and_already_started_error_replies(fresh):
+    gh, tc = fresh
+    tc.statuses["dev-loop-mctlhq-mctl-web-791"] = WorkflowExecutionStatus.FAILED
+    gh.add_comment(FRESH_URL, body="@MCTL investigate")
+    assert _run_scan(max_directives=10).dispatched == 1
+    gh.add_comment(FRESH_URL_2, body="@MCTL investigate")
+    tc.start_raises = WorkflowAlreadyStartedError("wf", "DevLoopWorkflow")
+    _run_scan(max_directives=10)
+    assert "already handled" in _bodies(gh, FRESH_URL_2)[-1]
+
+
+def test_reinvestigate_on_fresh_issue_points_at_investigate(fresh):
+    gh, _tc = fresh
+    gh.add_comment(FRESH_URL, body="@MCTL reinvestigate")
+    _run_scan(max_directives=10)
+    assert "@MCTL investigate" in _bodies(gh, FRESH_URL)[0]

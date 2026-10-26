@@ -126,8 +126,8 @@ def test_unprivileged_associations_are_not_authorized(association):
     assert directive.authorized is False
 
 
-def test_verbs_vocabulary_is_exactly_reinvestigate():
-    assert VERBS == frozenset({"reinvestigate"})
+def test_verbs_vocabulary_is_exactly_investigate_and_reinvestigate():
+    assert VERBS == frozenset({"investigate", "reinvestigate"})
 
 
 def test_parse_comments_drops_non_directives():

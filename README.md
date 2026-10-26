@@ -124,18 +124,30 @@ submitting the `mctl-agents-investigate` workflow.
 
 #### Directive comments
 
-A comment on an issue that owns a proposal can also trigger a
-re-investigation, without an operator finding and running the
-`mctl_trigger_issue` dispatch by hand (mctlhq/mctl-agents#417):
+A comment can trigger an investigation without an operator running the
+`mctl_trigger_issue` dispatch by hand (mctlhq/mctl-agents#417, #799):
 
 ```
+@MCTL investigate
 @MCTL reinvestigate
 ```
 
+`investigate` starts the issue's `DevLoopWorkflow` (the same start the
+`agents:intake` label uses, with the commenter recorded as requester) on an
+issue that has no proposal and no running or completed loop. It also works on
+a fresh issue: besides the issues of existing proposals, the scan lists each
+`SERVICES` repository's recent issue comments (lookback
+`MCTL_DIRECTIVE_LOOKBACK_HOURS`, default 72; `MCTL_DIRECTIVE_FRESH_ISSUES_ENABLED=false`
+turns this pass off). Investigations started this way run one at a time: at
+most one per tick, and while any running loop is investigating the comment is
+answered with a refusal asking to comment `@MCTL investigate` again once it
+finishes. An issue that already has a proposal or loop gets a reply pointing
+to `@MCTL reinvestigate`. `reinvestigate` rewrites an existing proposal:
+
 posted as the first thing on its own line (mid-line and quoted mentions do
 not count) by an author whose association with the repository is `OWNER`,
-`MEMBER` or `COLLABORATOR`. `reinvestigate` is the only supported verb today
-— every other imperative-looking word gets an explicit "not a recognised
+`MEMBER` or `COLLABORATOR`. `investigate` and `reinvestigate` are the only
+supported verbs — every other imperative-looking word gets an explicit "not a recognised
 instruction" reply rather than silence. `orchestrator/
 run_issue_directive_poller.py` runs as a second pass of the same 15-minute
 `IssuePollWorkflow` tick that drives the `agents:intake` label, and always
@@ -144,9 +156,9 @@ did not (no proposal yet, an ambiguous or non-overwritable proposal, an
 unauthorized author, or an unrecognised verb). A reply carries a hidden
 `<!-- mctl-directive-ack: ... -->` marker so the same comment is never acted
 on twice; asking again is a new comment. The comment path never touches
-the `agents:intake` label and never starts or signals a `DevLoopWorkflow` —
-a parked approval gate stays parked, and the human who later approves it
-approves the *rewritten* proposal.
+the `agents:intake` label. `reinvestigate` never starts or signals a
+`DevLoopWorkflow` — a parked approval gate stays parked, and the human who
+later approves it approves the *rewritten* proposal.
 
 ### Tier 2 — implementer
 

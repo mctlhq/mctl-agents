@@ -872,6 +872,10 @@ class IssueRef:
     #: the fulfilled request, not from this input: see
     #: `activities/execution_requests.py`.
     execution_request_id: str | None = None
+    #: Login of the maintainer whose `@MCTL investigate` comment started this
+    #: loop (mctl-agents#799). Defaulted so histories recorded before this
+    #: field existed still deserialize; None on every other start.
+    requested_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1871,6 +1875,14 @@ class DevLoopWorkflow:
         # or continues as new (`_hopping`).
         self._exiting = False
         self._hopping = False
+        # True only while a `mctl-agents-investigate` CWFT is being awaited
+        # (mctl-agents#799). Plain instance state: adds no command.
+        self._investigate_in_flight = False
+
+    @workflow.query
+    def investigate_in_flight(self) -> bool:
+        """Is this loop awaiting a `mctl-agents-investigate` CWFT right now?"""
+        return self._investigate_in_flight
 
     @workflow.query
     def holds_execution_request(self, request_id: str) -> bool:
@@ -3577,7 +3589,11 @@ class DevLoopWorkflow:
                 # the execution identity is still `execution_id`.
                 investigate_params["execution_request_id"] = str(issue.execution_request_id)
 
-            investigate_result = await _run_cwft("mctl-agents-investigate", investigate_params)
+            self._investigate_in_flight = True
+            try:
+                investigate_result = await _run_cwft("mctl-agents-investigate", investigate_params)
+            finally:
+                self._investigate_in_flight = False
             await _record("issue-investigator", investigator_release, investigate_result, target_repo)
         except (Exception, asyncio.CancelledError):
             # Not BaseException: GeneratorExit and the SDK eviction teardown
@@ -3732,7 +3748,11 @@ class DevLoopWorkflow:
                     # it changes only an existing activity's input, which
                     # replay does not compare, and schedules no command.
                     continuation_params["work_item_owner_principal_id"] = self._human_input_owner_principal_id
-                investigate_result = await _run_cwft("mctl-agents-investigate", continuation_params)
+                self._investigate_in_flight = True
+                try:
+                    investigate_result = await _run_cwft("mctl-agents-investigate", continuation_params)
+                finally:
+                    self._investigate_in_flight = False
                 if self._canonical_open:
                     # The own `we_` is still open (#636): it ends with the
                     # latest investigate's phase (agy P2 on #651). A raise

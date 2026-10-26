@@ -1,5 +1,5 @@
-"""Directive-comment scan — turns `@MCTL reinvestigate` into a real,
-answered trigger (mctl-agents#417).
+"""Directive-comment scan — turns `@MCTL reinvestigate` and `@MCTL
+investigate` into real, answered triggers (mctl-agents#417, #799).
 
 Before this module, a directive comment on an issue that owns a proposal
 did nothing: no run was scheduled, no state changed, and no reply said so
@@ -42,10 +42,20 @@ report is blind to the same issue too. This is a scope decision, not an
 oversight: a directive on a fully closed-out issue has nothing left to
 reopen through this path (claude P3 on head `f7a42ab`).
 
-This module reads (describe + `work_context` query, via
+`@MCTL reinvestigate` reads (describe + `work_context` query, via
 `orchestrator.directive_execution`) the issue's DevLoopWorkflow to borrow its
-execution identity, but never starts, signals or updates one, and never touches
-the `agents:intake` label: the comment path and the label path are
+execution identity, but never starts, signals or updates one.
+
+`@MCTL investigate` (mctl-agents#799) is the one verb that may start a
+DevLoopWorkflow, through the same `start_dev_loop_workflow` the label path
+uses, and only for an issue with no proposal directory and no running or
+completed loop. Such issues are invisible to the proposal-driven discovery
+above, so a second pass lists the repo-wide issue-comments endpoint of every
+`config.settings.SERVICES` repository within a lookback window
+(`MCTL_DIRECTIVE_LOOKBACK_HOURS`, default 72). Investigations started this
+way are serial: at most one per tick, and none while any running loop reports
+`investigate_in_flight` (refused with a retry hint, not queued). Neither verb
+touches the `agents:intake` label: the comment path and the label path are
 independent by construction (see tests/test_run_issue_directive_poller.py's
 acceptance test).
 
@@ -65,9 +75,14 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 import httpx
+from temporalio.client import Client, WorkflowExecutionStatus
+from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError, RPCStatusCode
 
+from config.settings import SERVICES
 from orchestrator import policy_checkpoint
 from orchestrator.directive_execution import (
     ExecutionLookupUnavailable,
@@ -97,7 +112,11 @@ from orchestrator.run_issue_investigator import (
     _run,
 )
 from orchestrator.temporal.activities.gitops_state import ProposalStateRef, list_proposal_refs
+from orchestrator.temporal.activities.visibility import ACTIVE_DEV_LOOPS_QUERY
+from orchestrator.temporal.issue_ref import workflow_id_for
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
+from orchestrator.temporal.start import connect as _temporal_connect
+from orchestrator.temporal.start import start_dev_loop_workflow
 from orchestrator.work_context.snapshots import is_store_execution
 
 # A tick dispatches at most this many directives. Unlike run_issue_poller's
@@ -146,6 +165,46 @@ _SUBMIT_TIMEOUT_SECONDS = 30.0
 
 _SLUG_ISSUE_RE = re.compile(r"^issue-(\d+)-")
 
+# html_url of a comment on an issue or a pull request (the repo-wide
+# listing mixes both).
+_COMMENT_URL_RE = re.compile(r"^https://github\.com/mctlhq/([^/]+)/(issues|pull)/(\d+)#")
+
+DEFAULT_LOOKBACK_HOURS = 72
+
+START_OPERATION = "dev-loop-start"
+
+
+class RepoCommentScanError(Exception):
+    """A repo-wide comment listing failed (any page); nothing from it is used."""
+
+
+class InFlightUnknown(Exception):
+    """Whether an investigation is in flight could not be determined."""
+
+
+@dataclass(frozen=True)
+class RepoComment:
+    issue_url: str
+    comment: RawComment
+
+
+class _InvestigateGate:
+    """Per-tick state for `investigate` directives: one Temporal client and
+    at most one start per tick."""
+
+    def __init__(self) -> None:
+        self.client: Client | None = None
+        self.started_workflow_id: str | None = None
+
+    async def get_client(self) -> Client:
+        if self.client is None:
+            self.client = await _connect_client()
+        return self.client
+
+
+async def _connect_client() -> Client:
+    return await _temporal_connect()
+
 
 class DispatchOutcomeAmbiguous(Exception):
     """Raised by `submit_investigate` when the POST to mctl-api may already
@@ -174,6 +233,23 @@ def _scan_disabled() -> bool:
     return os.environ.get("MCTL_DIRECTIVE_SCAN_ENABLED", "true").strip().lower() in {
         "false", "0", "no", "off",
     }
+
+
+def _fresh_issues_disabled() -> bool:
+    """MCTL_DIRECTIVE_FRESH_ISSUES_ENABLED=false turns off only the repo-wide
+    discovery pass, returning the scan to proposal-driven discovery."""
+    return os.environ.get("MCTL_DIRECTIVE_FRESH_ISSUES_ENABLED", "true").strip().lower() in {
+        "false", "0", "no", "off",
+    }
+
+
+def _lookback_hours() -> float:
+    raw = os.environ.get("MCTL_DIRECTIVE_LOOKBACK_HOURS", "").strip()
+    try:
+        value = float(raw) if raw else float(DEFAULT_LOOKBACK_HOURS)
+    except ValueError:
+        return float(DEFAULT_LOOKBACK_HOURS)
+    return value if value > 0 else float(DEFAULT_LOOKBACK_HOURS)
 
 
 def issue_url_for(service: str, slug: str) -> str | None:
@@ -265,6 +341,61 @@ def read_issue_comments(issue_url: str) -> list[RawComment]:
             author_association=str(c.get("author_association") or ""),
         ))
     return comments
+
+
+def list_repo_comments(repo: str, since: str) -> list[RepoComment]:
+    """Issue comments of one repository updated since ``since`` (ISO 8601),
+    every page, pull-request comments dropped. Never returns a partial
+    list: any `gh` failure or unparseable line raises `RepoCommentScanError`.
+    Deliberately the REST listing, not the search API (index lag)."""
+    try:
+        proc = _run([
+            "gh", "api", "--paginate", "--jq", ".[]",
+            f"repos/mctlhq/{repo}/issues/comments?since={since}&sort=updated&direction=asc&per_page=100",
+        ])
+    except subprocess.CalledProcessError as e:
+        raise RepoCommentScanError(f"{repo}: gh failed: {e.stderr or e}") from e
+    out: list[RepoComment] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            c = json.loads(line)
+            node_id = str(c["node_id"])
+            html_url = str(c["html_url"])
+        except (ValueError, KeyError, TypeError) as e:
+            raise RepoCommentScanError(f"{repo}: unparseable comment payload: {e!r}") from e
+        m = _COMMENT_URL_RE.match(html_url)
+        if not m or not node_id:
+            raise RepoCommentScanError(f"{repo}: unexpected comment url {html_url!r}")
+        if m.group(2) == "pull":
+            continue
+        out.append(RepoComment(
+            issue_url=f"https://github.com/mctlhq/{m.group(1)}/issues/{m.group(3)}",
+            comment=RawComment(
+                id=node_id,
+                author=((c.get("user") or {}).get("login")) or "",
+                created_at=c.get("created_at") or "",
+                body=c.get("body") or "",
+                author_association=str(c.get("author_association") or ""),
+            ),
+        ))
+    return out
+
+
+async def investigation_in_flight(client: Client) -> str | None:
+    """The workflow id of a running DevLoopWorkflow that reports an
+    investigation in flight, or None. Any listing or query error raises
+    `InFlightUnknown`: unknown is never read as "none"."""
+    try:
+        async for wf in client.list_workflows(ACTIVE_DEV_LOOPS_QUERY):
+            handle = client.get_workflow_handle(wf.id, run_id=wf.run_id)
+            if await handle.query("investigate_in_flight"):
+                return str(wf.id)
+    except Exception as e:
+        raise InFlightUnknown(f"{type(e).__name__}: {e}") from e
+    return None
 
 
 async def submit_investigate(
@@ -437,8 +568,50 @@ def _reply_unrecognised(author: str, comment_id: str) -> str:
 
 def _reply_no_proposal(author: str, comment_id: str) -> str:
     return _with_ack(
-        f"@{author} there is no proposal to rewrite for this issue yet. Add the "
-        "`agents:intake` label to create one.",
+        f"@{author} there is no proposal to rewrite for this issue yet. Comment "
+        "`@MCTL investigate` or add the `agents:intake` label to create one.",
+        comment_id,
+    )
+
+
+def _reply_investigate_has_proposal(author: str, comment_id: str, matches: list[ProposalStateRef]) -> str:
+    names = ", ".join(sorted(f"{m.service}/{m.slug} ({m.status})" for m in matches))
+    return _with_ack(
+        f"@{author} this issue already has a proposal: {names}. Nothing was started; "
+        "comment `@MCTL reinvestigate` to rewrite it.",
+        comment_id,
+    )
+
+
+def _reply_investigate_loop_running(author: str, comment_id: str, workflow_id: str, state: str) -> str:
+    return _with_ack(
+        f"@{author} the DevLoop `{workflow_id}` for this issue is already {state}. Nothing was "
+        "started; comment `@MCTL reinvestigate` to rewrite its proposal.",
+        comment_id,
+    )
+
+
+def _reply_investigate_already_handled(author: str, comment_id: str, workflow_id: str) -> str:
+    return _with_ack(
+        f"@{author} this issue was already handled by DevLoop `{workflow_id}`. Nothing was "
+        "started; an operator can restart it with `mctl_trigger_issue` (`use_temporal=true`).",
+        comment_id,
+    )
+
+
+def _reply_investigate_busy(author: str, comment_id: str, busy_workflow_id: str | None) -> str:
+    which = f" (`{busy_workflow_id}`)" if busy_workflow_id else ""
+    return _with_ack(
+        f"@{author} another investigation{which} is running and only one runs at a time. "
+        "Nothing was started; comment `@MCTL investigate` again once it finishes.",
+        comment_id,
+    )
+
+
+def _reply_investigate_started(author: str, comment_id: str, workflow_id: str, run_id: str | None) -> str:
+    run = f" (run `{run_id}`)" if run_id else ""
+    return _with_ack(
+        f"@{author} investigation started: DevLoop `{workflow_id}`{run}.",
         comment_id,
     )
 
@@ -706,15 +879,19 @@ async def _handle_directive(
     directive: Directive,
     *,
     issue_url: str,
-    ref: ProposalStateRef,
+    ref: ProposalStateRef | None,
     all_refs: list[ProposalStateRef],
     dry_run: bool,
     prior_failures: int = 0,
+    gate: _InvestigateGate | None = None,
 ) -> str:
     """Run the decision table for one unacked directive. Returns one of:
     "unauthorized", "unrecognised", "no-proposal", "ambiguous",
     "not-overwritable", "dispatched", "dispatch-failed",
-    "dispatch-ambiguous", "policy-refused", "no-execution", or "dry-run".
+    "dispatch-ambiguous", "policy-refused", "no-execution", "dry-run", or,
+    for `investigate`, "investigate-started", "investigate-has-proposal",
+    "investigate-loop-running", "investigate-already-handled" or
+    "investigate-busy".
 
     `prior_failures` is the number of previously recorded dispatch-failure
     attempts for this exact comment id (`orchestrator.directives.
@@ -725,8 +902,17 @@ async def _handle_directive(
         outcome, body = "unauthorized", _reply_unauthorized(directive.author, directive.comment_id)
     elif directive.verb is None:
         outcome, body = "unrecognised", _reply_unrecognised(directive.author, directive.comment_id)
+    elif directive.verb == "investigate":
+        return await _handle_investigate(
+            directive, issue_url=issue_url, all_refs=all_refs, dry_run=dry_run,
+            prior_failures=prior_failures, gate=gate or _InvestigateGate(),
+        )
     else:
-        number = _issue_number(ref.slug)
+        if ref is not None:
+            service, number = ref.service, _issue_number(ref.slug)
+        else:
+            parsed = _parse_issue_url(issue_url)
+            service, number = parsed.repo, str(parsed.number)
         # Deliberately UNFILTERED by status, unlike `scan()`'s own
         # TERMINAL_STATUSES-excluded `candidates`: this list is the input to
         # the shared resolver, which needs to see every directory claiming
@@ -755,7 +941,7 @@ async def _handle_directive(
         # Pre-existing and unchanged by the resolver (the same single match
         # reached `len(matches) > 1` before), recorded here rather than
         # claimed away (claude P3 on head `77107d0`).
-        matches = [r for r in all_refs if r.service == ref.service and _issue_number(r.slug) == number]
+        matches = [r for r in all_refs if r.service == service and _issue_number(r.slug) == number]
         resolved: str | None = None
         if matches:
             try:
@@ -764,9 +950,13 @@ async def _handle_directive(
                 )
             except AmbiguousProposalError:
                 resolved = None
+        if ref is None and resolved is not None:
+            # Reached through the repo-wide pass (every proposal of the
+            # issue is terminal): walk the one the resolver chose.
+            ref = next((m for m in matches if m.slug == resolved), None)
         if not matches:
             outcome, body = "no-proposal", _reply_no_proposal(directive.author, directive.comment_id)
-        elif resolved != ref.slug:
+        elif ref is None or resolved != ref.slug:
             # Either the resolver refused, or it named a directory other than
             # the one being walked. The second cannot happen today (`scan()`
             # only walks non-terminal refs, and a lone survivor of a
@@ -783,6 +973,7 @@ async def _handle_directive(
 
     execution: LoopExecution | None = None
     if outcome == "dispatch":
+        assert ref is not None  # noqa: S101 — "dispatch" is only reached with a resolved ref
         # Resolved before the dry-run branch, the policy checkpoint and the
         # POST. ExecutionLookupUnavailable is deliberately NOT caught here
         # beyond the retry accounting below: it shares the generic
@@ -807,7 +998,7 @@ async def _handle_directive(
         return "dry-run"
 
     if outcome == "dispatch":
-        if execution is None:  # unreachable; narrows for mypy and fails closed
+        if execution is None or ref is None:  # unreachable; narrows for mypy and fails closed
             return await _record_dispatch_failure(
                 directive, issue_url, RuntimeError("no execution resolved"), prior_failures
             )
@@ -912,6 +1103,123 @@ async def _handle_directive(
     return outcome
 
 
+async def _handle_investigate(
+    directive: Directive,
+    *,
+    issue_url: str,
+    all_refs: list[ProposalStateRef],
+    dry_run: bool,
+    prior_failures: int,
+    gate: _InvestigateGate,
+) -> str:
+    """The `investigate` branch (mctl-agents#799): start the issue's
+    DevLoopWorkflow when it has no proposal and no running or completed loop,
+    and no other investigation is in flight. Every definite non-start outcome
+    is an acked reply; an unknown outcome is an unacked failed attempt."""
+    parsed = _parse_issue_url(issue_url)
+    number = str(parsed.number)
+    author, cid = directive.author, directive.comment_id
+    workflow_id = workflow_id_for(issue_url)
+
+    async def reply(outcome: str, body: str) -> str:
+        if dry_run:
+            print(f"[dry-run] {issue_url} comment {cid}: would reply/act as '{outcome}'")
+            return "dry-run"
+        await asyncio.to_thread(_post_reply_with_retries, issue_url, body)
+        return outcome
+
+    async def failed(e: Exception) -> str:
+        if dry_run:
+            print(f"[dry-run] {issue_url} comment {cid}: investigate check unavailable: {e!r}")
+            return "dry-run"
+        return await _record_dispatch_failure(directive, issue_url, e, prior_failures)
+
+    matches = [r for r in all_refs if r.service == parsed.repo and _issue_number(r.slug) == number]
+    if matches:
+        return await reply(
+            "investigate-has-proposal", _reply_investigate_has_proposal(author, cid, matches)
+        )
+
+    try:
+        client = await gate.get_client()
+        try:
+            status = (await client.get_workflow_handle(workflow_id).describe()).status
+        except RPCError as e:
+            if e.status != RPCStatusCode.NOT_FOUND:
+                raise
+            status = None
+    except Exception as e:  # noqa: BLE001 — unknown outcome: no ack, counted attempt
+        return await failed(e)
+
+    if status == WorkflowExecutionStatus.RUNNING:
+        return await reply(
+            "investigate-loop-running",
+            _reply_investigate_loop_running(author, cid, workflow_id, "running"),
+        )
+    if status == WorkflowExecutionStatus.COMPLETED:
+        return await reply(
+            "investigate-already-handled", _reply_investigate_already_handled(author, cid, workflow_id)
+        )
+
+    busy: str | None
+    if gate.started_workflow_id is not None:
+        busy = gate.started_workflow_id
+    else:
+        try:
+            busy = await investigation_in_flight(client)
+        except InFlightUnknown as e:
+            return await failed(e)
+    if busy is not None:
+        return await reply("investigate-busy", _reply_investigate_busy(author, cid, busy))
+
+    if dry_run:
+        print(f"[dry-run] {issue_url} comment {cid}: would start DevLoop {workflow_id} for {author}")
+        return "dry-run"
+
+    try:
+        try:
+            policy_checkpoint.require(policy_checkpoint.checkpoint(
+                policy_checkpoint.MCTL_OPERATION_EXECUTE,
+                f"execute:{START_OPERATION}",
+                START_OPERATION,
+                {"issue_url": issue_url, "requested_by": author},
+                metadata={"issue_url": issue_url, "workflow_id": workflow_id},
+            ))
+        except policy_checkpoint.PolicyRefused as e:
+            if e.decision.undecided:
+                raise PolicyCheckpointUndecided(e.decision) from e
+            raise
+        handle = await start_dev_loop_workflow(issue_url, client, requested_by=author)
+    except policy_checkpoint.PolicyRefused as e:
+        print(f"POLICY: investigate for directive comment {cid} ({issue_url}) refused: {e}")
+        await asyncio.to_thread(
+            _post_reply_with_retries, issue_url, _with_ack(_reply_policy_refused(author, e.decision), cid)
+        )
+        return "policy-refused"
+    except WorkflowAlreadyStartedError:
+        return await reply(
+            "investigate-already-handled", _reply_investigate_already_handled(author, cid, workflow_id)
+        )
+    except Exception as e:  # noqa: BLE001 — surfaced as a per-directive failure, comment kept unacked
+        return await _record_dispatch_failure(directive, issue_url, e, prior_failures)
+
+    gate.started_workflow_id = str(handle.id)
+    try:
+        await asyncio.to_thread(
+            _post_reply_with_retries,
+            issue_url,
+            _reply_investigate_started(author, cid, str(handle.id), getattr(handle, "result_run_id", None)),
+        )
+    except (subprocess.CalledProcessError, policy_checkpoint.PolicyRefused) as post_e:
+        print(
+            f"FAIL: directive comment {cid} ({issue_url}) started DevLoop {handle.id!r} but posting "
+            f"the acknowledgement reply failed after retries ({getattr(post_e, 'stderr', None) or post_e}) — "
+            "the next tick finds the loop RUNNING and answers then."
+        )
+        raise
+    return "investigate-started"
+
+
 def _current_gh_login() -> str:
     """The GitHub login `gh`/`git` subprocess calls in this process actually
     authenticate writes as, per the App-installation token
@@ -994,41 +1302,25 @@ async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIV
     # claude P3 on #421). `matches` is re-derived from the issue number
     # inside `_handle_directive` regardless of which of the tied refs is
     # passed in, so any one representative ref for the issue is sufficient.
-    pending_by_issue: dict[str, list[tuple[ProposalStateRef, str, Directive, int]]] = {}
+    pending_by_issue: dict[str, list[tuple[ProposalStateRef | None, str, Directive, int]]] = {}
     issue_order: list[str] = []
     seen_issue_urls: set[str] = set()
     failed = 0
-    for ref in candidates:
-        issue_url = issue_url_for(ref.service, ref.slug)
-        if issue_url is None:
-            continue
-        if issue_url in seen_issue_urls:
-            continue
-        seen_issue_urls.add(issue_url)
+    async def enqueue(issue_url: str, ref: ProposalStateRef | None) -> None:
+        nonlocal failed
         try:
-            # Off the event loop: this scan can make one `gh issue view`
-            # call per non-terminal proposal (tens of them at production
-            # scale), and each is a blocking subprocess round-trip. Run
-            # synchronously inside this coroutine it would freeze the
-            # Temporal worker's asyncio event loop for the sum of all of
-            # them, stalling every other activity/workflow task the same
-            # worker process is scheduling (codex review on #417) — the
-            # same `asyncio.to_thread` wrapping activities/discovery.py
-            # already uses for the identical call.
+            # Off the event loop: see the note on blocking `gh` calls above.
             comments = await asyncio.to_thread(read_issue_comments, issue_url)
         except subprocess.CalledProcessError as e:
             print(f"WARN: could not read comments for {issue_url}: {e.stderr or e}")
             failed += 1
-            continue
+            return
         except (json.JSONDecodeError, KeyError, ValueError) as e:
-            # A malformed/unexpected `gh` payload (bad JSON, a missing key,
-            # a shape `read_issue_comments` cannot parse) is a per-issue
-            # failure, not a tick-ending crash — same tolerance as a
-            # `CalledProcessError`, so one bad payload cannot take down
-            # every other candidate's scan this tick (codex review on #417).
+            # A malformed/unexpected `gh` payload is a per-issue failure, not
+            # a tick-ending crash (codex review on #417).
             print(f"WARN: malformed gh payload for {issue_url}: {e}")
             failed += 1
-            continue
+            return
 
         acked = acked_comment_ids(comments)
         fail_counts = failed_attempt_counts(comments)
@@ -1042,6 +1334,41 @@ async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIV
                 (ref, issue_url, directive, fail_counts.get(directive.comment_id, 0))
             )
 
+    for cand in candidates:
+        issue_url = issue_url_for(cand.service, cand.slug)
+        if issue_url is None:
+            continue
+        if issue_url in seen_issue_urls:
+            continue
+        seen_issue_urls.add(issue_url)
+        await enqueue(issue_url, cand)
+
+    # Fresh-issue pass (mctl-agents#799): issues with no proposal are never
+    # reached above. List each repository's recent comments and read the full
+    # comment list only of issues with a not-yet-acked mention.
+    if not _fresh_issues_disabled():
+        since = (datetime.now(UTC) - timedelta(hours=_lookback_hours())).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for repo in SERVICES:
+            try:
+                repo_comments = await asyncio.to_thread(list_repo_comments, repo, since)
+            except RepoCommentScanError as e:
+                print(f"WARN: could not list recent comments for {repo}: {e}")
+                failed += 1
+                continue
+            by_issue: dict[str, list[RawComment]] = {}
+            for rc in repo_comments:
+                by_issue.setdefault(rc.issue_url, []).append(rc.comment)
+            for issue_url, listed in by_issue.items():
+                if issue_url in seen_issue_urls:
+                    continue
+                acked_listed = acked_comment_ids(listed)
+                if not any(
+                    d.comment_id and d.comment_id not in acked_listed for d in parse_comments(listed)
+                ):
+                    continue
+                seen_issue_urls.add(issue_url)
+                await enqueue(issue_url, None)
+
     total_pending = sum(len(v) for v in pending_by_issue.values())
 
     if max_directives > 0 and total_pending > max_directives:
@@ -1052,7 +1379,7 @@ async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIV
         # tick's budget and starve every other issue's directive out of
         # every tick (codex review on #417).
         buckets = [pending_by_issue[key] for key in issue_order]
-        actionable: list[tuple[ProposalStateRef, str, Directive, int]] = []
+        actionable: list[tuple[ProposalStateRef | None, str, Directive, int]] = []
         while len(actionable) < max_directives and any(buckets):
             for bucket in buckets:
                 if not bucket:
@@ -1071,11 +1398,12 @@ async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIV
 
     dispatched = 0
     replied = 0
+    gate = _InvestigateGate()
     for ref, issue_url, directive, fail_count in actionable:
         try:
             outcome = await _handle_directive(
                 directive, issue_url=issue_url, ref=ref, all_refs=all_refs, dry_run=dry_run,
-                prior_failures=fail_count,
+                prior_failures=fail_count, gate=gate,
             )
         except subprocess.CalledProcessError as e:
             print(f"FAIL: could not reply on {issue_url}: {e.stderr or e}")
@@ -1090,7 +1418,7 @@ async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIV
 
         if dry_run:
             continue
-        if outcome == "dispatched":
+        if outcome in ("dispatched", "investigate-started"):
             dispatched += 1
             replied += 1
         elif outcome in ("dispatch-failed", "dispatch-ambiguous", "policy-refused"):
@@ -1105,7 +1433,7 @@ async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIV
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Directive-comment scan — dispatch `@MCTL reinvestigate` directives"
+        description="Directive-comment scan — dispatch `@MCTL investigate` / `@MCTL reinvestigate` directives"
     )
     ap.add_argument(
         "--dry-run",
