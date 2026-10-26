@@ -185,6 +185,8 @@ SHEPHERD_SELECTION = resolve_model(
     "review_findings_normalize",
     legacy_model_env="SHEPHERD_MODEL",
 )
+SCOUT_RELEVANCE_SELECTION = resolve_model("scout_relevance")
+SCOUT_SCORING_SELECTION = resolve_model("scout_scoring")
 
 SERVICE_AGENT_MODEL = SERVICE_AGENT_SELECTION.model
 MENTOR_MODEL = MENTOR_SELECTION.model

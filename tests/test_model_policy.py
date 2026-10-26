@@ -114,7 +114,9 @@ def test_committed_routing_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
             "balanced",
             "claude-sonnet-5-5",
         )
-    assert "cheap" not in policy._tasks.values()
+    # Scout's title+summary relevance filter is the one deliberate `cheap`
+    # task (#797): a miss only drops an article from a digest.
+    assert [t for t, p in policy._tasks.items() if p == "cheap"] == ["scout_relevance"]
     assert policy._profiles["balanced"]["model_env"] == "CLAUDE_BALANCED_MODEL"
 
 

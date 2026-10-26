@@ -344,6 +344,26 @@ agents:
     riskLevel: low
     triggeredBy: []
 
+  # mctlhq/mctl-agents#797: daily ranked tech-news digest to Telegram.
+  # Tool-free model calls; docs/operations/scout.md.
+  - name: scout
+    driver: orchestrator/run_scout.py
+    entrypoint: orchestrator.run_scout:run_scout
+    optionsBuilder: orchestrator.options:build_scout_options
+    promptSources:
+      - inline: orchestrator/run_scout.py:RELEVANCE_PROMPT
+      - inline: orchestrator/run_scout.py:SCORING_PROMPT
+      - file: agents/_scout/PLATFORM.md
+      - file: agents/_scout/sources.yaml
+    modelPolicyTask: scout_scoring
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-scout
+    writes: nothing (Telegram sendMessage only)
+    riskLevel: low
+    triggeredBy:
+      - cronworkflow-mctl-agents-scout
+
 # ---------------------------------------------------------------------------
 # Orchestration — NOT agents. No manifest, no version, no release.
 # ---------------------------------------------------------------------------

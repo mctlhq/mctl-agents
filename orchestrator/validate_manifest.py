@@ -96,6 +96,9 @@ _AGENT_BY_CATALOG_PROFILE = {
     # mctlhq/mctl-agents#596: mapped ahead of the profile (a mctl-gitops
     # follow-up), for the same reason as the #470 entries above.
     "authoring-canary-default": "authoring-canary",
+    # mctlhq/mctl-agents#797: mapped ahead of the profile (mctl-gitops
+    # scout-default), for the same reason as the #470 entries above.
+    "scout-default": "scout",
 }
 
 # Every build_*_options() builder consults mctl_mcp_config()/_mctl_tool_globs(),
@@ -132,6 +135,7 @@ _DUMMY_PATH = Path("/nonexistent/agent-manifest-validation")
 _ENV_VARS_AFFECTING_OPTIONS_DEFAULTS = (
     "SERVICE_AGENT_BUDGET_USD",
     "MENTOR_BUDGET_USD",
+    "SCOUT_BUDGET_USD",
     "IMPLEMENTER_BUDGET_USD",
     "IMPLEMENTER_TIMEOUT_SECONDS",
     "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS",
