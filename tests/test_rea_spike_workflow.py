@@ -94,3 +94,34 @@ def test_no_store_text_and_no_retry() -> None:
             assert "continue-on-error" not in step
             assert not re.search(r"\b(while|until)\b", step["run"])
             assert "retry" not in step["run"].lower().replace("no retries", "")
+
+
+def _step_run(prefix: str) -> str:
+    for step in _steps():
+        if step.get("name", "").startswith(prefix):
+            return str(step["run"])
+    raise AssertionError(prefix)
+
+
+def test_grading_template_entries_top_level(tmp_path: Path) -> None:
+    run = _step_run("Report and grading template")
+    m = re.search(r"<<'PY'\n(.*?)\nPY\n", run.split("grading-template.yaml", 1)[1], re.S)
+    assert m
+    out = subprocess.run(["python3", "-I", "-"], input=m.group(1), capture_output=True, text=True, check=True).stdout
+    grading = yaml.safe_load(out)
+    assert "entries" in grading and "grading" not in grading
+    assert len(grading["entries"]) == 6
+    assert all({"fixture", "arm"} <= set(e) for e in grading["entries"])
+    from tools.rea_spike import _score_rows
+
+    (tmp_path / "g.yaml").write_text(out)
+    (tmp_path / "r.jsonl").write_text("")
+    assert _score_rows(str(tmp_path / "r.jsonl"), str(tmp_path / "g.yaml")) == []
+
+
+def test_rea_identity_bound_to_sha() -> None:
+    run = _step_run("Resolve and install REA")
+    assert 'npm view "rea-agents@$VERSION" gitHead dist.integrity --json' in run
+    assert "rea-identity-mismatch" in run
+    assert '"$GITHEAD" != "$SHA"' in run
+    assert "npm_git_head" in run and "npm_dist_integrity" in run
