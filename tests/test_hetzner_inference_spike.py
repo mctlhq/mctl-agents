@@ -297,11 +297,14 @@ def test_merge_joins_arms_and_refuses_mismatched_fixtures():
           "run_location": {"baseline": "host"}}
     m2 = {**m1, "run_id": "c", "arms": ["candidate"], "available_models": ["M"], "repetitions_achieved": {"t|M": 3},
           "run_location": {"candidate": "container"}, "started_utc": "3", "finished_utc": "4"}
-    records, merged = hs.merge_runs([([{"model": "b"}], m1), ([{"model": "M"}], m2)])
+    records, merged = hs.merge_runs([([{"model": "b", "task": "t", "repetition": 1}], m1),
+                                     ([{"model": "M", "task": "t", "repetition": 1}], m2)])
     assert len(records) == 2 and merged["arms"] == ["baseline", "candidate"] and merged["available_models"] == ["M"]
     assert merged["repetitions_achieved"] == {"t|b": 3, "t|M": 3} and merged["finished_utc"] == "4"
     with pytest.raises(hs.SpikeError):
         hs.merge_runs([([], m1), ([], {**m2, "fixtures": {"t": {"id": "y", "sha256": "z", "limits": {}}}})])
+    with pytest.raises(hs.SpikeError):
+        hs.merge_runs([([], m2), ([], m2)])
 
 
 def test_checklist_flags_write_in_read_only_task_and_budget_stop():
@@ -312,3 +315,11 @@ def test_checklist_flags_write_in_read_only_task_and_budget_stop():
     assert checks["reasoning does not exhaust output budget"] == "fail"
     assert checks["long context (~60k tokens) accepted"] == "fail"
     assert checks["recovers after a tool error"] == "unknown"
+
+
+def test_bench_arm_misuse_is_refused(tmp_path):
+    snap = {"selected": {"M": {"availability": hs.UNAVAILABLE}}, "messages_probe": {"ok": True}}
+    (tmp_path / "snapshot-start.json").write_text(json.dumps(snap))
+    common = ["bench", "--allow-live", "--out-dir", str(tmp_path)]
+    assert hs.main([*common, "--arm", "baseline", "--models", "M"]) == 2
+    assert hs.main([*common, "--arm", "candidate"]) == 2

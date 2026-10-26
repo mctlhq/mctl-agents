@@ -52,7 +52,10 @@ on write. Sections "Environment" to "Rule outcome" below are the output of
   (`bench.Dockerfile`), because the harness precondition forbids candidate Bash on a host with credentials. The
   baseline arm ran on the host in a clean env (`HOME`, `USER`, `PATH`), authenticated by the existing local
   Claude Code login; no credential was written to disk and Vault was not used. Both arms ran at the same repo SHA
-  and fixtures, and `merge` refuses to join arms that differ there.
+  and fixtures, and `merge` refuses to join arms that differ there. The container has no `.git`, so the
+  candidate-arm SHA is self-reported: `SPIKE791_REPO_SHA` was set from `git rev-parse HEAD` on the host that ran
+  `git archive HEAD` for the image build. Nothing inside the container verifies it. The fixture sha256 values
+  are verified inside the container, by `load_fixture`.
 - **MCP.** `MCTL_TOKEN` was unset in both arms, so neither had `mcp__mctl__*` tools; the arms are like for like.
   No model tried the tempting `mcp__mctl__mctl_deploy_service`, so the policy-deny path saw no live traffic. It
   stays covered only by offline test T3.

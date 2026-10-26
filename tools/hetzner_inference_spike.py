@@ -735,6 +735,8 @@ def model_checklist(records: Sequence[Mapping[str, Any]], entry: Mapping[str, An
     stops = [x for r in ok for x in (r.get("finish_reasons") or [])]
     budget = "unknown" if not ok else ("fail" if any(x in _BUDGET_STOPS for x in stops) else "pass")
     reported = "unknown" if not ok else ("pass" if all(r.get("finish_reasons") for r in ok) else "fail")
+    # the tool-use fixture's check.py fails on its first run in every fresh workspace and prints RESULT only
+    # on a later run, so a passing tool-use oracle implies the model recovered from that scripted tool error
     tool_use = [r for r in ok if r["task"] == "tool-use"]
     recovers = "unknown" if not tool_use else (
         "pass" if any(r["oracle_result"] == "pass" for r in tool_use) else "fail")
@@ -770,9 +772,11 @@ def render_report(
     base_model = manifest["baseline"]["model"]
     benched = list(manifest["available_models"])
     prereg = [m for m in benched if (snapshot["selected"].get(m) or {}).get("preregistered", m in SELECTED_MODELS)]
-    tool_ok = any(e.get("function_call", {}).get("tool_call_returned") for e in snapshot["selected"].values())
-    verdict, why = decide(records, benched, base_model, tool_use_possible=tool_ok)
-    strict, strict_why = decide(records, prereg, base_model, tool_use_possible=tool_ok)
+    def tool_ok(models: Sequence[str]) -> bool:
+        return any(snapshot["selected"].get(m, {}).get("function_call", {}).get("tool_call_returned") for m in models)
+
+    verdict, why = decide(records, benched, base_model, tool_use_possible=tool_ok(benched))
+    strict, strict_why = decide(records, prereg, base_model, tool_use_possible=tool_ok(prereg))
     lines = ["## Environment", "",
              f"- run: `{manifest['run_id']}`, repo sha `{manifest['repo_sha']}`",
              f"- bench window (UTC): {manifest['started_utc']} to {manifest.get('finished_utc', 'n/a')}",
@@ -910,7 +914,12 @@ def bench_models(snap: Mapping[str, Any], requested: Sequence[str]) -> list[str]
 def _cmd_bench(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
     snap = json.loads(Path(args.snapshot or out_dir / "snapshot-start.json").read_text())
-    available = [] if args.arm == "baseline" else bench_models(snap, [m for m in (args.models or "").split(",") if m])
+    requested = [m for m in (args.models or "").split(",") if m]
+    if args.arm == "baseline" and requested:
+        raise SpikeError("--models has no effect with --arm baseline")
+    available = [] if args.arm == "baseline" else bench_models(snap, requested)
+    if args.arm == "candidate" and not available:
+        raise SpikeError("--arm candidate with no AVAILABLE model: nothing to run")
     # the baseline arm talks only to Anthropic, so it needs neither the Hetzner key nor the endpoint
     base, key = _live_env(args) if args.arm != "baseline" else ("", "")
     if args.arm == "baseline" and not args.allow_live:
@@ -949,6 +958,12 @@ def merge_runs(parts: Sequence[_Run]) -> _Run:
     model policy and the fixtures, so the comparison stays like for like."""
     records = [r for recs, _ in parts for r in recs]
     manifests = [m for _, m in parts]
+    arms = [a for m in manifests for a in m.get("arms", [])]
+    if len(arms) != len(set(arms)):
+        raise SpikeError(f"arms repeat across parts ({arms}); refusing to merge")
+    cells = [(r.get("task"), r.get("model"), r.get("repetition")) for r in records]
+    if len(cells) != len(set(cells)):
+        raise SpikeError("a (task, model, repetition) cell repeats across parts; refusing to merge")
     for key in ("repo_sha", "fixtures"):
         if len({json.dumps(m[key], sort_keys=True) for m in manifests}) != 1:
             raise SpikeError(f"arms differ in {key}; refusing to merge")
