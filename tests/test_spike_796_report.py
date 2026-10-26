@@ -49,7 +49,13 @@ def test_no_runtime_path_changed() -> None:
 
 
 def test_no_binaries_or_oversized_files_committed() -> None:
-    for path in SPIKE.rglob("*"):
+    tracked = subprocess.run(
+        ["git", "ls-files", str(SPIKE)], cwd=ROOT, text=True, capture_output=True,
+    )
+    if tracked.returncode != 0:
+        pytest.skip("git ls-files unavailable")
+    for rel in tracked.stdout.splitlines():
+        path = ROOT / rel
         if not path.is_file():
             continue
         data = path.read_bytes()

@@ -129,10 +129,24 @@ def test_collect_maps_refusal_stop_reason_to_declined() -> None:
 
 
 def test_collect_maps_tool_error_and_clean_run() -> None:
-    sig = _collect(_Msg(content=[_Msg(is_error=True)]), _Msg(is_error=False, num_turns=1, usage={}))
+    sig = _collect(
+        _Msg(content=[_Msg(id="t1", name="mcp__rea__query", input={})]),
+        _Msg(content=[_Msg(tool_use_id="t1", is_error=True)]),
+        _Msg(is_error=False, num_turns=1, usage={}),
+    )
     assert sig["ok"] is False and rs.classify(sig) == rs.REA_TOOL_FAILURE
     ok = _collect(_Msg(content=[_Msg(text="done")]), _Msg(is_error=False, num_turns=1, usage={}))
     assert ok["ok"] is True and ok["text"] == "done"
+
+
+def test_collect_non_rea_tool_error_does_not_fail_stage() -> None:
+    sig = _collect(
+        _Msg(content=[_Msg(id="t1", name="Bash", input={"command": "grep foo bar"})]),
+        _Msg(content=[_Msg(tool_use_id="t1", is_error=True)]),
+        _Msg(is_error=False, num_turns=1, usage={}),
+    )
+    assert sig["ok"] is True and sig["other_tool_errors"] == 1
+    assert rs.classify(sig) != rs.REA_TOOL_FAILURE
 
 
 def test_rea_mcp_without_command_fails_fast(monkeypatch: pytest.MonkeyPatch, tmp_path: object) -> None:

@@ -26,6 +26,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -252,10 +253,22 @@ def _read_active_model() -> str:
     return model
 
 
+def _is_rea_tool_use(block: Any) -> bool:
+    """True for an MCP REA tool call, or a Bash call that invokes the REA CLI."""
+    name = block.name
+    if name.startswith("mcp__rea__"):
+        return True
+    if name == "Bash":
+        command = (getattr(block, "input", None) or {}).get("command", "")
+        return isinstance(command, str) and re.search(r"(^|[\s;&|/])rea(\s|$)", command) is not None
+    return False
+
+
 async def _collect(stream: Any, sig: dict[str, Any]) -> dict[str, Any]:
     """Fold an SDK message stream into the signals `classify` reads. Duck-typed
     so a stubbed stream can drive it in unit tests."""
     text: list[str] = []
+    rea_use_ids: set[str] = set()
     try:
         async for msg in stream:
             if hasattr(msg, "is_error") and hasattr(msg, "num_turns"):  # ResultMessage
@@ -275,11 +288,18 @@ async def _collect(stream: Any, sig: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(content, list):
                 continue
             for block in content:
+                use_id = getattr(block, "id", None)
+                if isinstance(use_id, str) and isinstance(getattr(block, "name", None), str):  # ToolUseBlock
+                    if _is_rea_tool_use(block):
+                        rea_use_ids.add(use_id)
+                if getattr(block, "is_error", None) is True:  # failed tool result
+                    if getattr(block, "tool_use_id", None) in rea_use_ids:
+                        sig["ok"] = False
+                        sig["tool_error"] = True
+                    else:  # Bash/Read/Glob misses are normal; count, do not fail the stage
+                        sig["other_tool_errors"] = int(sig.get("other_tool_errors", 0)) + 1
                 if isinstance(getattr(block, "text", None), str):
                     text.append(block.text)
-                elif getattr(block, "is_error", None) is True:  # failed tool result
-                    sig["ok"] = False
-                    sig["tool_error"] = True
     except Exception as exc:  # noqa: BLE001 - recorded, never retried
         sig["ok"] = False
         sig["transport_error"] = True
