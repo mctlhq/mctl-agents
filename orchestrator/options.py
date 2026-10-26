@@ -4,6 +4,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ import anyio.to_thread
 from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk.types import HookMatcher
 
+from config.model_policy import ProviderSpec, provider_session_env
 from config.settings import MCTL_MCP_URL
 from orchestrator.ci_checks import CI_LOG_MAX_CHECKS
 from orchestrator.evidence_producer import agent_env_without_evidence_token
@@ -1239,7 +1241,9 @@ def agent_env_without_mctl_token(env: Mapping[str, str]) -> dict[str, str]:
     return {**env, MCTL_TOKEN_ENV: ""}
 
 
-def _scrubbed(options: ClaudeAgentOptions) -> ClaudeAgentOptions:
+def _scrubbed(
+    options: ClaudeAgentOptions, *, provider: ProviderSpec | None = None
+) -> ClaudeAgentOptions:
     """Every SDK session's options in this module pass through here.
 
     Blanks the usage-writer token (mctlhq/.github#50), the evidence-writer
@@ -1252,10 +1256,25 @@ def _scrubbed(options: ClaudeAgentOptions) -> ClaudeAgentOptions:
     client in this process only. A builder cannot opt out:
     tests/test_usage_ledger.py fails on any `ClaudeAgentOptions(...)` here
     that is not the direct argument of this function.
+
+    ``provider`` (model policy provider seam): the session targets a
+    non-Anthropic endpoint. The env is derived from the policy alone over the
+    EFFECTIVE env (process env overlaid with the builder's), every Anthropic
+    credential is blanked, and the CLI gets an empty config dir so a stored
+    login cannot reach the third party. No fallback model is allowed.
     """
     options.env = agent_env_without_mctl_token(
         agent_env_without_evidence_token(agent_env_without_writer_token(options.env or os.environ))
     )
+    if provider is not None:
+        if options.fallback_model is not None:
+            raise ValueError("a provider session must not set fallback_model")
+        if not options.model or not options.model.strip():
+            raise ValueError("a provider session requires a non-empty model")
+        effective = {**os.environ, **options.env}
+        env = provider_session_env(provider, options.model, effective)
+        env["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="mctl-provider-claude-")
+        options.env = env
     return options
 
 
@@ -1580,7 +1599,7 @@ def build_issue_investigator_options_from_plan(
             hooks=_compose_hooks(
                 _command_audit_hooks(), _policy_hooks(allowed_tools), _read_only_dirs_hooks(gitops_dirs),
             ),
-        ))
+        ), provider=plan.provider)
     # gateway is not None: the capability gateway's own SDK server replaces
     # the remote mctl connection entirely — the model never sees
     # mcp__mctl__* directly, only mcp__capability__* (capability_search/
@@ -1604,7 +1623,7 @@ def build_issue_investigator_options_from_plan(
             _read_only_dirs_hooks(gitops_dirs),
         ),
         strict_mcp_config=True,
-    ))
+    ), provider=plan.provider)
 
 
 #: SDK-visible prefix of the capability gateway's own tools

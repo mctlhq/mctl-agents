@@ -1,7 +1,7 @@
 """mctl platform configuration."""
 from pathlib import Path
 
-from config.model_policy import resolve_model
+from config.model_policy import ModelPolicyError, resolve_model
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENTS_DIR = REPO_ROOT / "agents"
@@ -187,6 +187,22 @@ SHEPHERD_SELECTION = resolve_model(
 )
 SCOUT_RELEVANCE_SELECTION = resolve_model("scout_relevance")
 SCOUT_SCORING_SELECTION = resolve_model("scout_scoring")
+
+# The *_MODEL constants below carry a model string only, so they cannot carry
+# a provider endpoint. Fail closed at import (stops the whole worker process,
+# intentionally) instead of sending a third-party model name to Anthropic.
+for _selection in (
+    SERVICE_AGENT_SELECTION,
+    MENTOR_SELECTION,
+    SHEPHERD_SELECTION,
+    SCOUT_RELEVANCE_SELECTION,
+    SCOUT_SCORING_SELECTION,
+):
+    if _selection.provider is not None:
+        raise ModelPolicyError(
+            f"task {_selection.task!r} resolves to provider profile "
+            f"{_selection.profile!r}, which string-only model paths cannot carry"
+        )
 
 SERVICE_AGENT_MODEL = SERVICE_AGENT_SELECTION.model
 MENTOR_MODEL = MENTOR_SELECTION.model
