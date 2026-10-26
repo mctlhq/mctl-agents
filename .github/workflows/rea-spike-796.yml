@@ -214,9 +214,8 @@ jobs:
         run: |
           set -u
           export ISSUE_INVESTIGATOR_MODEL="$MODEL"
-          export REA_SPIKE_MCP_CMD="sh $GITHUB_WORKSPACE/docs/spikes/796/rea-env.sh $RUNNER_TEMP/rea-prefix/node_modules/.bin/rea mcp"
+          MCPCMD="sh $GITHUB_WORKSPACE/docs/spikes/796/rea-env.sh $RUNNER_TEMP/rea-prefix/node_modules/.bin/rea mcp"
           FXROOT="$RUNNER_TEMP/runtime-fixtures"
-          uv run --locked python tools/rea_spike.py stage-fixtures "$FXROOT"
           : > "$BUNDLE/records.jsonl"
 
           infra() { # step fixture arm rc reason errfile
@@ -240,7 +239,9 @@ jobs:
             out=$(mktemp); err=$(mktemp)
             local rpath="$PATH"
             [ "$arm" = rea-cli ] && rpath="$RUNNER_TEMP/rea-bin:$PATH"
-            rc=0; PATH="$rpath" uv run --locked python tools/rea_spike.py "$@" >"$out" 2>"$err" || rc=$?
+            local mcp=""
+            if [ "$arm" = rea-mcp ] || [ "$step" = schema-bytes ]; then mcp="$MCPCMD"; fi
+            rc=0; REA_SPIKE_MCP_CMD="$mcp" PATH="$rpath" uv run --locked python tools/rea_spike.py "$@" >"$out" 2>"$err" || rc=$?
             if [ "$rc" -le "$maxrc" ] && [ "$(wc -l <"$out")" -eq 1 ] \
                && python3 -I -c 'import json,sys; assert isinstance(json.loads(open(sys.argv[1]).read()), dict)' "$out" 2>/dev/null; then
               cat "$out" >> "$BUNDLE/$dest"
@@ -250,6 +251,18 @@ jobs:
             rm -f "$out" "$err"
           }
 
+          staged=""
+          for fx in native-codec packaged-app; do
+            serr=$(mktemp); src=0
+            uv run --locked python tools/rea_spike.py stage-fixtures "$FXROOT" --fixture "$fx" >/dev/null 2>"$serr" || src=$?
+            if [ "$src" -eq 0 ]; then
+              staged="$staged $fx"
+            else
+              infra stage-fixtures "$fx" "" "$src" "fixture-stage-failed" "$serr"
+            fi
+            rm -f "$serr"
+          done
+
           # schema-bytes (REA-dependent)
           if [ "$rea_ok" = true ]; then
             invoke schema-bytes "" "" schema-bytes.json 0 schema-bytes --allow-live
@@ -258,6 +271,7 @@ jobs:
           fi
 
           for fx in native-codec packaged-app; do
+            case " $staged " in *" $fx "*) ;; *) continue ;; esac
             for arm in baseline rea-mcp rea-cli; do
               if [ "$arm" != baseline ] && [ "$rea_ok" != true ]; then
                 infra run "$fx" "$arm" 0 rea-unavailable ""
@@ -268,6 +282,7 @@ jobs:
           done
 
           for fx in native-codec packaged-app; do
+            case " $staged " in *" $fx "*) ;; *) continue ;; esac
             if [ "$PROBE_ARM" != baseline ] && [ "$rea_ok" != true ]; then
               infra probe-stages "$fx" "$PROBE_ARM" 0 rea-unavailable ""
               continue

@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -119,10 +120,7 @@ def test_grading_template_entries_top_level(tmp_path: Path) -> None:
     assert _score_rows(str(tmp_path / "r.jsonl"), str(tmp_path / "g.yaml")) == []
     rec = '{"kind": "run", "fixture": "native-codec", "arm": "baseline", "final": "", "outcome": "failed"}'
     (tmp_path / "r.jsonl").write_text(rec + "\n")
-    try:
-        _score_rows(str(tmp_path / "r.jsonl"), str(tmp_path / "g.yaml"))
-    except Exception:  # scoring details are out of scope; entries must have been read
-        pass
+    assert isinstance(_score_rows(str(tmp_path / "r.jsonl"), str(tmp_path / "g.yaml")), list)
 
 
 def test_rea_identity_bound_to_sha() -> None:
@@ -142,6 +140,30 @@ def test_rea_bin_on_path_only_for_rea_cli() -> None:
     assert '[ "$arm" = rea-cli ]' in paths[0]
     assert 'PATH="$rpath" uv run' in run
     assert run.count("--fixture-root") == 2
+    assert not re.search(r'export\s+REA_SPIKE_MCP_CMD', run)
+    assert 'REA_SPIKE_MCP_CMD="$mcp" PATH="$rpath" uv run' in run
+    assert '[ "$arm" = rea-mcp ] || [ "$step" = schema-bytes ]' in run
+    assert "fixture-stage-failed" in run
+
+
+def test_stage_fixtures_missing_artifact_nonzero(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    from tools import rea_spike
+
+    src = tmp_path / "src" / "native-codec"
+    src.mkdir(parents=True)
+    (src / "task.md").write_text("task")  # artifact `codec` missing
+    orig = rea_spike.SPIKE_DIR
+    rea_spike.SPIKE_DIR = tmp_path / "spike"
+    (tmp_path / "spike").mkdir()
+    (tmp_path / "spike" / "fixtures").symlink_to(tmp_path / "src")
+    try:
+        rc = rea_spike._cmd_stage_fixture(argparse.Namespace(dest=str(tmp_path / "d"), fixture="native-codec"))
+    finally:
+        rea_spike.SPIKE_DIR = orig
+    assert rc == 1
+    assert "native-codec" in capsys.readouterr().err
 
 
 def test_staged_runtime_fixture_has_no_oracle_or_sources(tmp_path: Path) -> None:

@@ -363,9 +363,15 @@ def _fixture_dir(args: argparse.Namespace) -> Path:
 
 
 def _cmd_stage_fixture(args: argparse.Namespace) -> int:
-    for fx in RUNTIME_ARTIFACTS:
-        stage_runtime_fixture(fx, Path(args.dest))
-    return 0
+    fixtures = [args.fixture] if getattr(args, "fixture", "") else list(RUNTIME_ARTIFACTS)
+    rc = 0
+    for fx in fixtures:
+        try:
+            stage_runtime_fixture(fx, Path(args.dest))
+        except (OSError, KeyError) as exc:
+            print(f"stage-fixtures: {fx}: {exc}", file=sys.stderr)
+            rc = 1
+    return rc
 
 
 def _cmd_probe(args: argparse.Namespace) -> int:
@@ -488,6 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
     live("schema-bytes", _cmd_schema_bytes, fixture=False)
     st = sub.add_parser("stage-fixtures")
     st.add_argument("dest")
+    st.add_argument("--fixture", default="")
     st.set_defaults(func=_cmd_stage_fixture)
     sc = sub.add_parser("score")
     sc.add_argument("records")
