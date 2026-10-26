@@ -50,7 +50,7 @@ def _fake_hetzner(catalog: list[str], messages_ok: bool = False):
 def test_snapshot_missing_model_is_unavailable_and_not_substituted():
     catalog = ["Kimi-K2.7-Code", "GLM-5.2-NVFP4", "Qwen/Qwen3.6-35B-A3B-FP8", "DeepSeek-V4-Flash"]  # near miss
     snap = hs.take_snapshot(_client(_fake_hetzner(catalog)), base_url="https://example.test")
-    assert snap["selected"]["DeepSeek-V4-Flash-0731"] == {"availability": hs.UNAVAILABLE}
+    assert snap["selected"]["DeepSeek-V4-Flash-0731"] == {"availability": hs.UNAVAILABLE, "preregistered": True}
     assert snap["selected"]["Kimi-K2.7-Code"]["function_call"]["tool_call_returned"] is True
     assert snap["messages_probe"]["ok"] is False
     assert "timestamp_utc" in snap and not hs.contains_credential(json.dumps(snap))
@@ -176,7 +176,8 @@ def test_bench_dry_run_and_model_mismatch(tmp_path):
     assert manifest["baseline"]["model"] == "claude-test" and set(manifest["fixtures"]) == set(hs.TASKS)
     hs.write_artifact(tmp_path / "records.jsonl", hs.render_jsonl(records))
     snapshot = hs.take_snapshot(_client(_fake_hetzner(["Kimi-K2.7-Code"])), base_url="https://example.test")
-    assert "Proposed verdict:" in hs.render_report(records, snapshot, manifest)
+    text = hs.render_report(records, snapshot, manifest, snapshot)
+    assert "## Rule outcome" in text and "Catalog drift: none" in text
 
 
 # T7
@@ -247,3 +248,67 @@ def test_candidate_mcp_call_is_rejected_not_a_bypass_and_home_is_isolated():
     assert rec["policy_bypasses"] == 0 and rec["tool_calls_invalid"] == 1
     out = hs.hetzner_session_env({"PATH": "/bin", "HOME": "/home/operator"}, base_url="u", token="t", model="M")
     assert out["HOME"] != "/home/operator"
+
+
+def test_owner_added_model_is_probed_and_flagged_and_bench_never_substitutes():
+    snap = hs.take_snapshot(_client(_fake_hetzner(["Qwen/Qwen3.6-35B-A3B-FP8", "Qwen3.8-27B"])),
+                            base_url="https://example.test", extra=["Qwen3.8-27B", "Absent-1"])
+    assert snap["selected"]["Qwen3.8-27B"]["preregistered"] is False
+    assert snap["selected"]["Qwen3.8-27B"]["function_call"]["tool_call_returned"] is True
+    assert snap["selected"]["Absent-1"]["availability"] == hs.UNAVAILABLE
+    assert hs.bench_models(snap, []) == ["Qwen/Qwen3.6-35B-A3B-FP8", "Qwen3.8-27B"]
+    assert hs.bench_models(snap, ["Qwen3.8-27B"]) == ["Qwen3.8-27B"]
+    with pytest.raises(hs.SpikeError):
+        hs.bench_models(snap, ["Absent-1"])
+
+
+def test_deep_probes_record_protocol_framing_not_content():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "M"}]})
+        body = json.loads(request.content)
+        if body.get("stream"):
+            sse = (b'data: {"type":"message_start"}\n\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"secret-ish"}}\n\n'
+                   b"data: [DONE]\n\n")
+            return httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
+        if request.url.path == "/v1/messages":
+            last = body["messages"][-1]["content"]
+            if body.get("tools") and isinstance(last, str):
+                return httpx.Response(200, json={"type": "message", "stop_reason": "tool_use", "model": "M",
+                                                 "content": [{"type": "tool_use", "id": "t1", "name": "get_weather", "input": {}}]})
+            return httpx.Response(200, json={"type": "message", "stop_reason": "end_turn", "model": "M",
+                                             "content": [{"type": "text", "text": "ok"}], "usage": {"input_tokens": 5}})
+        return _fake_hetzner(["M"])(request)
+
+    snap = hs.take_snapshot(_client(handler), base_url="https://example.test", selected=("M",), deep=True)
+    probes = snap["selected"]["M"]["protocols"]
+    assert probes["messages_tool_use"]["stop_reason"] == "tool_use"
+    assert probes["messages_tool_result"]["stop_reason"] == "end_turn"
+    assert probes["messages_stream_text"]["event_types"] == {"message_start": 1, "content_block_delta:text_delta": 1, "[DONE]": 1}
+    assert "secret-ish" not in json.dumps(snap)
+    assert snap["selected"]["M"]["long_context"]["status"] == 200
+    assert snap["selected"]["M"]["long_context"]["prompt_chars"] == hs.LONG_CONTEXT_CHARS
+
+
+def test_merge_joins_arms_and_refuses_mismatched_fixtures():
+    fx = {"t": {"id": "x", "sha256": "s", "limits": {}}}
+    m1 = {"run_id": "a", "repo_sha": "r", "fixtures": fx, "baseline": {"model_policy_version": 1}, "started_utc": "1",
+          "finished_utc": "2", "arms": ["baseline"], "available_models": [], "repetitions_achieved": {"t|b": 3},
+          "run_location": {"baseline": "host"}}
+    m2 = {**m1, "run_id": "c", "arms": ["candidate"], "available_models": ["M"], "repetitions_achieved": {"t|M": 3},
+          "run_location": {"candidate": "container"}, "started_utc": "3", "finished_utc": "4"}
+    records, merged = hs.merge_runs([([{"model": "b"}], m1), ([{"model": "M"}], m2)])
+    assert len(records) == 2 and merged["arms"] == ["baseline", "candidate"] and merged["available_models"] == ["M"]
+    assert merged["repetitions_achieved"] == {"t|b": 3, "t|M": 3} and merged["finished_utc"] == "4"
+    with pytest.raises(hs.SpikeError):
+        hs.merge_runs([([], m1), ([], {**m2, "fixtures": {"t": {"id": "y", "sha256": "z", "limits": {}}}})])
+
+
+def test_checklist_flags_write_in_read_only_task_and_budget_stop():
+    rec = {"model": "M", "task": "review", "status": "ok", "oracle_result": "fail", "tool_calls_valid": 1,
+           "tool_calls_hallucinated": 0, "finish_reasons": ["max_tokens"], "tool_names": {"Edit": 1}}
+    checks = hs.model_checklist([rec], {"long_context": {"status": 400, "type": None}})
+    assert checks["complies with read-only instruction"] == "fail"
+    assert checks["reasoning does not exhaust output budget"] == "fail"
+    assert checks["long context (~60k tokens) accepted"] == "fail"
+    assert checks["recovers after a tool error"] == "unknown"
