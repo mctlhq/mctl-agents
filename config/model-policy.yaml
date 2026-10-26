@@ -22,3 +22,9 @@ tasks:
   # cheap default; routing any task to `cheap` needs a separate evaluation.
   mentor_digest: balanced
   review_findings_normalize: balanced
+  # Scout (#797). The relevance pass is a title+summary yes/no; a miss only
+  # drops an article from a digest, it never acts. Dry-run review before
+  # unsuspending is the evaluation the note above asks for; set to balanced
+  # to fall back without a code change.
+  scout_relevance: cheap
+  scout_scoring: balanced

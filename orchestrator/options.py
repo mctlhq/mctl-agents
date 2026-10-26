@@ -1387,6 +1387,30 @@ def build_authoring_canary_options(agent_dir: Path, model: str) -> ClaudeAgentOp
     ))
 
 
+SCOUT_BUDGET_USD = float(os.getenv("SCOUT_BUDGET_USD", "1.00"))
+
+
+def build_scout_options(
+    agent_dir: Path,
+    model: str,
+    output_schema: dict[str, Any] | None = None,
+) -> ClaudeAgentOptions:
+    """Options for the scout (#797): no tools, no MCP, no hooks, structured output only."""
+    return _scrubbed(ClaudeAgentOptions(
+        cwd=str(agent_dir),
+        model=model,
+        tools=[],
+        allowed_tools=[],
+        mcp_servers={},
+        setting_sources=[],
+        output_format=(
+            {"type": "json_schema", "schema": output_schema} if output_schema else None
+        ),
+        max_budget_usd=SCOUT_BUDGET_USD,
+        max_turns=2,
+    ))
+
+
 def build_incident_responder_options(
     agent_dir: Path,
     model: str,
