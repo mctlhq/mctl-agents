@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from xml.parsers import expat
 
 import httpx
@@ -128,6 +129,17 @@ def _atom_link(entry: ET.Element) -> str:
     return fallback
 
 
+def _strip_feed_tracking(link: str) -> str:
+    """Drop Medium's per-feed `source=rss...` tag so the Source URL (and dedupe key)
+    is the article itself, not which feed it came through."""
+    parts = urlsplit(link)
+    if "source=rss" not in parts.query:
+        return link
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if not (k == "source" and v.startswith("rss"))]
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
 def _refuse_dtd(*_args: object) -> None:
     raise ValueError("DOCTYPE/ENTITY not allowed")
 
@@ -170,6 +182,7 @@ def parse_feed(body: bytes, source: str, weight: float = 1.0) -> list[Item]:
         # an empty link is skipped by run_scout.
         if not link.lower().startswith(("https://", "http://")):
             link = ""
+        link = _strip_feed_tracking(link)
         date = _parse_date(_child_text(e, "pubDate", "published", "updated", "date"))
         items.append(Item(
             title=clean_text(_child_text(e, "title"), 300),
