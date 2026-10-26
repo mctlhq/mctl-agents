@@ -342,3 +342,9 @@ def test_effort_is_candidate_only_and_recorded(tmp_path):
     assert {r["effort"] for r in records} == {"medium"} and manifest["candidate_effort"] == "medium"
     text = hs.render_exploratory(records, manifest, {"timestamp_utc": "t", "catalog_ids": ["M"], "selected": {}})
     assert "`medium`" in text and "| `M` |" in text
+    assert hs.main(["bench", "--allow-live", "--arm", "candidate", "--effort", "medium"]) == 2
+    base_manifest = {**manifest, "run_id": "b", "arms": ["baseline"], "candidate_effort": "cli-default"}
+    with pytest.raises(hs.SpikeError, match="exploratory"):
+        hs.merge_runs([([], base_manifest), (records, manifest)])
+    with pytest.raises(hs.SpikeError, match="exploratory"):
+        hs.merge_runs([([], base_manifest), (records, {**manifest, "candidate_effort": "cli-default"})])

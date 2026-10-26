@@ -920,6 +920,8 @@ def bench_models(snap: Mapping[str, Any], requested: Sequence[str]) -> list[str]
 
 def _cmd_bench(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
+    if args.effort and out_dir.resolve() == SPIKE_DIR.resolve():
+        raise SpikeError("--effort runs are exploratory: pass an --out-dir other than the pre-registered run's")
     snap = json.loads(Path(args.snapshot or out_dir / "snapshot-start.json").read_text())
     requested = [m for m in (args.models or "").split(",") if m]
     if args.arm == "baseline" and requested:
@@ -962,11 +964,21 @@ def _cmd_bench(args: argparse.Namespace) -> int:
 _Run = tuple[list[dict[str, Any]], dict[str, Any]]
 
 
+def _refuse_exploratory(records: Sequence[dict[str, Any]], manifests: Sequence[dict[str, Any]]) -> None:
+    """The pre-registered decision only scores runs at the CLI default effort; an `--effort` run is exploratory."""
+    efforts = {m.get("candidate_effort", "cli-default") for m in manifests} | {
+        r.get("effort", "cli-default") for r in records}
+    if efforts != {"cli-default"}:
+        raise SpikeError(f"run has a non-default reasoning effort ({sorted(efforts)}); it is exploratory and "
+                         "never feeds decide(): use report --exploratory")
+
+
 def merge_runs(parts: Sequence[_Run]) -> _Run:
     """Join per-arm bench outputs into one record set and manifest. The arms must share the repo SHA, the
     model policy and the fixtures, so the comparison stays like for like."""
     records = [r for recs, _ in parts for r in recs]
     manifests = [m for _, m in parts]
+    _refuse_exploratory(records, manifests)
     arms = [a for m in manifests for a in m.get("arms", [])]
     if len(arms) != len(set(arms)):
         raise SpikeError(f"arms repeat across parts ({arms}); refusing to merge")
@@ -1063,8 +1075,9 @@ def _cmd_report(args: argparse.Namespace) -> int:
             print(text)
         return 0
     end = d / "snapshot-end.json"
-    text = render_report(_read_records(d / "records.jsonl"), json.loads((d / "snapshot-start.json").read_text()),
-                         json.loads((d / "run-manifest.json").read_text()),
+    records, manifest = _read_records(d / "records.jsonl"), json.loads((d / "run-manifest.json").read_text())
+    _refuse_exploratory(records, [manifest])
+    text = render_report(records, json.loads((d / "snapshot-start.json").read_text()), manifest,
                          json.loads(end.read_text()) if end.exists() else None)
     if args.out:
         write_artifact(Path(args.out), text)
