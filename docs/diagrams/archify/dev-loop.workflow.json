@@ -119,7 +119,7 @@
       "col": 4,
       "type": "external",
       "label": "Review bots",
-      "sublabel": "claude \u00b7 codex",
+      "sublabel": "claude \u00b7 codex \u00b7 CI",
       "tag": "0 open P1/P2",
       "width": 128
     },
@@ -198,7 +198,7 @@
       "type": "backend",
       "label": "issue-investigator",
       "sublabel": "writes the proposal",
-      "tag": "$3 budget",
+      "tag": "$8 budget",
       "width": 128
     },
     {
