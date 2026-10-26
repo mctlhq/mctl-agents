@@ -956,7 +956,7 @@ def merge_runs(parts: Sequence[_Run]) -> _Run:
         raise SpikeError("arms differ in model_policy_version; refusing to merge")
     merged = {**manifests[0], "run_id": "+".join(m["run_id"] for m in manifests),
               "started_utc": min(m["started_utc"] for m in manifests),
-              "finished_utc": max(m.get("finished_utc", m["started_utc"]) for m in manifests),
+              "finished_utc": max(str(m.get("finished_utc") or m["started_utc"]) for m in manifests),
               "arms": [a for m in manifests for a in m.get("arms", [])],
               "available_models": [x for m in manifests for x in m["available_models"]],
               "repetitions_achieved": {k: v for m in manifests for k, v in m["repetitions_achieved"].items()},
