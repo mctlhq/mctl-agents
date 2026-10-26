@@ -57,6 +57,15 @@ def test_doctype_entity_and_size():
     assert (res.status, res.reason) == ("failed", "size")
 
 
+def test_medium_feed_tracking_param_is_stripped():
+    # Medium appends ?source=rss----<id>---4 per feed; left in, the Source URL and the
+    # dedupe key would depend on which feed carried the article.
+    body = ATOM.replace("https://x.test/t", "https://itnext.io/post-d5a8?source=rss----5b30---4")
+    assert feeds.parse_feed(body.encode(), "s")[0].link == "https://itnext.io/post-d5a8"
+    keep = ATOM.replace("https://x.test/t", "https://x.test/t?id=1&amp;source=news")
+    assert feeds.parse_feed(keep.encode(), "s")[0].link == "https://x.test/t?id=1&source=news"
+
+
 def test_parse_rss_atom_and_disabled():
     r = _fetch(lambda req: httpx.Response(200, text=RSS.format(date="Mon, 26 Oct 2026 05:00:00 GMT")))
     assert r.status == "ok" and r.items[0].title == "A & B" and r.items[0].summary == "hello"

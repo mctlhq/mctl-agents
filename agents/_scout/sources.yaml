@@ -12,6 +12,10 @@ sources:
   - {name: Cloudflare Blog, url: "https://blog.cloudflare.com/rss/", weight: 1.0}
   - {name: GitHub Blog, url: "https://github.blog/feed/", weight: 1.0}
   - {name: GitHub Changelog, url: "https://github.blog/changelog/feed/", weight: 1.0}
+  # Medium: publication feeds only. Tag feeds (medium.com/feed/tag/<t>) return the
+  # latest 10 posts, which on busy tags is the last hour, so a daily run would see a
+  # random slice; they are also mostly mixed-language beginner content.
+  - {name: ITNEXT (Medium), url: "https://itnext.io/feed", weight: 0.8}
   - name: Anthropic News
     url: "https://www.anthropic.com/news"
     enabled: false
