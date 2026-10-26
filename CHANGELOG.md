@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.101.0](https://github.com/mctlhq/mctl-agents/compare/1.100.0...1.101.0) (2026-10-26)
+
+
+### Features
+
+* **agents:** issue-791-spike-models-benchmark-hetzner-experimen ([b0f943d](https://github.com/mctlhq/mctl-agents/commit/b0f943de5e50febd962ff46ebfe75212e6292204))
+* **agents:** issue-791-spike-models-benchmark-hetzner-experimen ([83bd33e](https://github.com/mctlhq/mctl-agents/commit/83bd33e5898b4619c71e6a60670510193f8b795e))
+* **agents:** issue-797-feat-scout-daily-ranked-tech-news-digest ([7192576](https://github.com/mctlhq/mctl-agents/commit/71925767056d7d739ebe864f37300cced3720c81))
+* **agents:** issue-797-feat-scout-daily-ranked-tech-news-digest ([422aab4](https://github.com/mctlhq/mctl-agents/commit/422aab4531a16c416fce3a4152c79f7b6643daee))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-791-spike-models-benchmark-hetzner-experimen ([ae464e6](https://github.com/mctlhq/mctl-agents/commit/ae464e6e6707b518541ccbcd0d4c9bb4744e19a8))
+* **agents:** address P1/P2 codex findings on issue-791-spike-models-benchmark-hetzner-experimen ([c849a77](https://github.com/mctlhq/mctl-agents/commit/c849a77eca786bc191a5b387a54130217fcfd69f))
+* **agents:** address P1/P2 codex findings on issue-791-spike-models-benchmark-hetzner-experimen ([c5c8bbc](https://github.com/mctlhq/mctl-agents/commit/c5c8bbcf202ddd072008e08fd756a1024cf141e9))
+* **agents:** address P1/P2 codex findings on issue-797-feat-scout-daily-ranked-tech-news-digest ([19997cc](https://github.com/mctlhq/mctl-agents/commit/19997ccc9639ed063ec241528e56c1bb16d7426b))
+* **scout:** count the eighth manifest and align overflow drafts ([e71b9fd](https://github.com/mctlhq/mctl-agents/commit/e71b9fd6c7e6bb7651b936f03def8222e102fa53))
+* **scout:** drop non-http(s) feed links before rendering ([a12c646](https://github.com/mctlhq/mctl-agents/commit/a12c646423203c147287797165473b6a749bce1e))
+* **scout:** map scout-default catalog profile to the scout agent ([7867377](https://github.com/mctlhq/mctl-agents/commit/7867377436d1d0507555f4b6fde4a49a56f08506))
+
 ## [1.100.0](https://github.com/mctlhq/mctl-agents/compare/1.99.0...1.100.0) (2026-10-24)
 
 
