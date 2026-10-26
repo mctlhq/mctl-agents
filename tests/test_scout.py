@@ -46,6 +46,13 @@ def test_failures_are_not_ok_zero():
 def test_doctype_entity_and_size():
     assert _fetch(lambda r: httpx.Response(200, text="<!DOCTYPE x><rss/>")).status == "malformed"
     assert _fetch(lambda r: httpx.Response(200, text='<!ENTITY a "b"><rss/>')).status == "malformed"
+    lol = b'<?xml version="1.0"?><!DOCTYPE r [<!ENTITY a "aaaa"><!ENTITY b "&a;&a;&a;">]><rss>&b;</rss>'
+    with pytest.raises(ValueError, match="DOCTYPE/ENTITY"):
+        feeds.parse_feed(lol, "s")
+    # GitHub's feeds quote an HTML DOCTYPE inside CDATA; that is text, not a declaration.
+    cdata = RSS.format(date="Mon, 26 Oct 2026 05:00:00 GMT").replace(
+        "<description>", "<description><![CDATA[<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.0//EN\"><!ENTITY x>]]>", 1)
+    assert _fetch(lambda r: httpx.Response(200, text=cdata)).status == "ok"
     res = _fetch(lambda r: httpx.Response(200, content=b"x" * (feeds.MAX_BYTES + 10)))
     assert (res.status, res.reason) == ("failed", "size")
 

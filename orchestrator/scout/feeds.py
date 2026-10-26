@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Literal
+from xml.parsers import expat
 
 import httpx
 import yaml
@@ -127,11 +128,30 @@ def _atom_link(entry: ET.Element) -> str:
     return fallback
 
 
+def _refuse_dtd(*_args: object) -> None:
+    raise ValueError("DOCTYPE/ENTITY not allowed")
+
+
+def _reject_dtd(body: bytes) -> None:
+    """Refuse a document that declares a DTD or an entity.
+
+    Expat's declaration handlers fire only on real declarations, so markup
+    quoted inside CDATA (GitHub's feeds embed `<!DOCTYPE html>` in
+    content:encoded) is not mistaken for one, as a byte search would. The
+    handler raises before any declared entity can be expanded.
+    """
+    p = expat.ParserCreate()
+    p.StartDoctypeDeclHandler = _refuse_dtd
+    p.EntityDeclHandler = _refuse_dtd
+    try:
+        p.Parse(body, True)
+    except expat.ExpatError as exc:
+        raise ValueError(f"not well-formed XML: {exc}") from exc
+
+
 def parse_feed(body: bytes, source: str, weight: float = 1.0) -> list[Item]:
     """Parse RSS 2.0 or Atom. Raises ValueError (malformed) on anything else."""
-    head = body[:4096].upper()
-    if b"<!DOCTYPE" in head or b"<!ENTITY" in body.upper():
-        raise ValueError("DOCTYPE/ENTITY not allowed")
+    _reject_dtd(body)
     try:
         root = ET.fromstring(body)  # noqa: S314 -- DOCTYPE/ENTITY rejected above
     except ET.ParseError as exc:
