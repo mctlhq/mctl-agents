@@ -1,0 +1,7 @@
+fixture: packaged-app
+facts:
+  - {id: P1, kind: observed, statement: "Flag resolution order is override (o:) first, then environment (e:), then built-in defaults."}
+  - {id: P2, kind: observed, statement: "The first layer that contains the flag wins, even when its value is false."}
+  - {id: P3, kind: observed, statement: "Built-in defaults are beta=false and compact=true."}
+  - {id: P4, kind: observed, statement: "A flag absent from every layer resolves to false."}
+  - {id: P5, kind: inferable, statement: "Values are parsed with Boolean.parseBoolean, so any string other than 'true' is false."}
