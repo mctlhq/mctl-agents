@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.102.0](https://github.com/mctlhq/mctl-agents/compare/1.101.1...1.102.0) (2026-10-26)
+
+
+### Features
+
+* **agents:** issue-796-spike-devloop-evaluate-rea-as-investigat ([c898d65](https://github.com/mctlhq/mctl-agents/commit/c898d659db23c021833b8e5468a86fa65edec734))
+* **agents:** issue-799-feat-directives-mctl-investigate-starts ([c689614](https://github.com/mctlhq/mctl-agents/commit/c689614a094f64d82426e4f39a237e5d029e76e1))
+* **agents:** issue-809-feat-agents-securityfinding-remediation ([6c4f67f](https://github.com/mctlhq/mctl-agents/commit/6c4f67fef12b2d37858c8ec62c00d7633d9b4bc8))
+* **agents:** issue-809-feat-agents-securityfinding-remediation ([a05cbe7](https://github.com/mctlhq/mctl-agents/commit/a05cbe7494469a9d270b248daadd9c566819c33a))
+* **agents:** issue-813-fix-security-harden-landed-binding-corre ([5147eb7](https://github.com/mctlhq/mctl-agents/commit/5147eb774e5c417146146820066723136effe47e))
+* **agents:** issue-815-feat-spike-add-operator-workflow-to-exec ([53d0ff4](https://github.com/mctlhq/mctl-agents/commit/53d0ff47138629675e24d0f6b865098312457387))
+* **agents:** issue-815-feat-spike-add-operator-workflow-to-exec ([4f0cdd9](https://github.com/mctlhq/mctl-agents/commit/4f0cdd921e50e797305d1be45dc22f8c43791d3c))
+* **scout:** add ITNEXT (Medium) source, strip Medium feed tracking ([7e398a5](https://github.com/mctlhq/mctl-agents/commit/7e398a5a6e7a887fc0d709601b36959b270fe31b))
+* **scout:** add ITNEXT (Medium) source, strip Medium feed tracking ([a04c569](https://github.com/mctlhq/mctl-agents/commit/a04c5696a1be4e3f8b5cb0656269d839432a3815))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-815-feat-spike-add-operator-workflow-to-exec ([01aa73c](https://github.com/mctlhq/mctl-agents/commit/01aa73cd18b5ba0f7046f7e2344cd56981de0481))
+* **agents:** address P1/P2 codex findings on issue-815-feat-spike-add-operator-workflow-to-exec ([3ad0a7e](https://github.com/mctlhq/mctl-agents/commit/3ad0a7e9bab82bfe4db024f4b9a78313b019ccc2))
+* **agents:** address P1/P2 codex findings on issue-815-feat-spike-add-operator-workflow-to-exec ([dfd5b2d](https://github.com/mctlhq/mctl-agents/commit/dfd5b2d5b7c835fb407ad6dc5cc84fa0dfa43a8b))
+* **agents:** address P1/P2 codex findings on issue-815-feat-spike-add-operator-workflow-to-exec ([77409fc](https://github.com/mctlhq/mctl-agents/commit/77409fc0356ce0106f502c7529cbe5d527e1bf7b))
+* **agents:** address P1/P2 codex findings on issue-815-feat-spike-add-operator-workflow-to-exec ([e48a67b](https://github.com/mctlhq/mctl-agents/commit/e48a67bdddf44e54478306f308128ca44425c6ed))
+* **agents:** issue-813-fix-security-harden-landed-binding-corre ([07a9432](https://github.com/mctlhq/mctl-agents/commit/07a94321811c295f39788fbd1d0b500800eac538))
+
 ## [1.101.1](https://github.com/mctlhq/mctl-agents/compare/1.101.0...1.101.1) (2026-10-26)
 
 
