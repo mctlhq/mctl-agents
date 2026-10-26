@@ -632,7 +632,9 @@ async def sdk_session(options: Any, prompt: str, max_turns: int, max_budget: flo
     return obs
 
 
-def make_sdk_runner(fixtures: Mapping[str, Mapping[str, Any]], *, base_url: str, token: str) -> CellRunner:
+def make_sdk_runner(fixtures: Mapping[str, Mapping[str, Any]], *, base_url: str, token: str,
+                    effort: str | None = None) -> CellRunner:
+    """`effort` (candidate cells only) passes `--effort` to the CLI; None keeps the CLI default."""
     async def run(task: str, model: str, provider: str, rep: int, workspace: Path) -> dict[str, Any]:
         fx = fixtures[task]
         transform = None
@@ -640,6 +642,8 @@ def make_sdk_runner(fixtures: Mapping[str, Mapping[str, Any]], *, base_url: str,
             def transform(env: Mapping[str, str], _m: str = model) -> dict[str, str]:
                 return hetzner_session_env(env, base_url=base_url, token=token, model=_m)
         options = cell_options(task, model, workspace, transform)
+        if provider == CANDIDATE_PROVIDER and effort is not None:
+            options.effort = effort
         run.last_allowed = list(options.allowed_tools or [])  # type: ignore[attr-defined]
         return await sdk_session(options, fx["prompt"], fx["limits"]["max_turns"], fx["limits"]["budget_usd"])
     run.last_allowed = []  # type: ignore[attr-defined]
@@ -650,7 +654,8 @@ async def run_bench(runner: CellRunner, fixtures: Mapping[str, Mapping[str, Any]
                     *, reps: int = DEFAULT_REPS, baseline: Mapping[str, Any] | None = None,
                     allowed_tools: Sequence[str] = ("*",), protocol_path: str = "messages",
                     run_id: str | None = None, include_baseline: bool = True,
-                    preregistered: Sequence[str] = SELECTED_MODELS) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                    preregistered: Sequence[str] = SELECTED_MODELS,
+                    effort: str | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """The matrix: baseline plus each available model, every task, `reps` repetitions. A failed
     cell stays failed: no cell is retried on another model. `include_baseline=False` / `available=[]`
     run one arm alone (the two arms may need different hosts); `merge` joins them."""
@@ -673,11 +678,13 @@ async def run_bench(runner: CellRunner, fixtures: Mapping[str, Mapping[str, Any]
                     base = {"run_id": run_id, "task": task, "fixture_id": fx["id"], "fixture_sha256": fx["sha256"],
                             "repo_sha": repo_sha, "model_policy_version": baseline["model_policy_version"],
                             "provider": provider, "model": model, "protocol_path": path, "repetition": rep,
-                            "preregistered": provider == BASELINE_PROVIDER or model in preregistered}
+                            "preregistered": provider == BASELINE_PROVIDER or model in preregistered,
+                            "effort": effort if provider == CANDIDATE_PROVIDER and effort else "cli-default"}
                     records.append(finalize_cell(base, obs, fx, allowed, ws))
     manifest = {"schema": "hetzner-run-manifest/v1", "run_id": run_id, "repo_sha": repo_sha,
                 "started_utc": started_utc, "finished_utc": _utc_now(), "baseline": dict(baseline),
                 "candidate_isolation": dict(CANDIDATE_ISOLATION),
+                "candidate_effort": effort or "cli-default",
                 "available_models": list(available), "arms": (["baseline"] if include_baseline else [])
                 + (["candidate"] if available else []),
                 "repetitions_requested": reps,
@@ -918,6 +925,8 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     if args.arm == "baseline" and requested:
         raise SpikeError("--models has no effect with --arm baseline")
     available = [] if args.arm == "baseline" else bench_models(snap, requested)
+    if args.effort and args.arm != "candidate":
+        raise SpikeError("--effort changes candidate cells only; use it with --arm candidate")
     if args.arm == "candidate" and not available:
         raise SpikeError("--arm candidate with no AVAILABLE model: nothing to run")
     # the baseline arm talks only to Anthropic, so it needs neither the Hetzner key nor the endpoint
@@ -931,9 +940,9 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     suffix = "" if args.arm == "all" else f"-{args.arm}"
 
     async def go(url: str, token: str, protocol: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        runner = make_sdk_runner(fixtures, base_url=url, token=token)
+        runner = make_sdk_runner(fixtures, base_url=url, token=token, effort=args.effort)
         return await run_bench(runner, fixtures, available, reps=args.reps, protocol_path=protocol,
-                               include_baseline=include_baseline)
+                               include_baseline=include_baseline, effort=args.effort)
 
     if not available or snap["messages_probe"].get("ok"):
         records, manifest = asyncio.run(go(base, key, "messages"))
@@ -998,8 +1007,61 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     return 0
 
 
+def render_exploratory(records: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any],
+                       snapshot: Mapping[str, Any]) -> str:
+    """Tables for a candidate-only exploratory run. It never feeds `decide()`: the token comes only from
+    the pre-registered run."""
+    models = list(manifest["available_models"])
+    lines = [f"- run: `{manifest['run_id']}`, repo sha `{manifest['repo_sha']}`, window (UTC) "
+             f"{manifest['started_utc']} to {manifest.get('finished_utc', 'n/a')}",
+             f"- candidate reasoning effort: `{manifest.get('candidate_effort', 'cli-default')}`; everything else "
+             "as in the main run (same builders, hooks, fixtures, container isolation)",
+             f"- catalog at start ({snapshot['timestamp_utc']}): "
+             + ", ".join(f"`{i}`" for i in snapshot["catalog_ids"]),
+             "", "| model | " + " | ".join(TASKS) + " |", "|---|" + "---|" * len(TASKS)]
+    for m in models:
+        cells = []
+        for t in TASKS:
+            rs = [r for r in records if r["model"] == m and r["task"] == t]
+            walls = [round(r["wall_ms"] / 1000) for r in rs if r.get("wall_ms") is not None]
+            cells.append(f"{_passes(rs)}/{len(rs)}; {_fmt_ms(walls)}")
+        lines.append(f"| `{m}` | " + " | ".join(cells) + " |")
+    lines += ["", "| model | task | rep | status | oracle | turns | tokens in/out | tools | finish |",
+              "|---|---|---|---|---|---|---|---|---|"]
+    for r in records:
+        tools = ", ".join(f"{k} {v}" for k, v in (r.get("tool_names") or {}).items()) or "none"
+        lines.append(f"| `{r['model']}` | {r['task']} | {r['repetition']} | {r['status']} | {r['oracle_result']} | "
+                     f"{r.get('turns')} | {r.get('input_tokens')}/{r.get('output_tokens')} | {tools} | "
+                     f"{','.join(r.get('finish_reasons') or []) or 'n/a'} |")
+    checks = {m: model_checklist([r for r in records if r["model"] == m], snapshot["selected"].get(m, {}))
+              for m in models}
+    if checks:
+        names = list(next(iter(checks.values())))
+        lines += ["", "| check | " + " | ".join(f"`{m}`" for m in models) + " |", "|---|" + "---|" * len(models)]
+        lines += [f"| {n} | " + " | ".join(checks[m][n] for m in models) + " |" for n in names]
+    lines.append("")
+    for m in models:
+        rs = [r for r in records if r["model"] == m]
+        lines.append(f"- `{m}`: {len(rs)} cells, provider_error {sum(r['status'] == 'provider_error' for r in rs)}, "
+                     f"HTTP 429 {sum(r.get('http_429') or 0 for r in rs)}, "
+                     f"timeouts {sum(r.get('timeouts') or 0 for r in rs)}, "
+                     f"policy bypasses {sum(r.get('policy_bypasses') or 0 for r in rs)}, "
+                     f"policy denials {sum(r.get('policy_denials') or 0 for r in rs)}")
+    return "\n".join(lines) + "\n"
+
+
 def _cmd_report(args: argparse.Namespace) -> int:
     d = Path(args.dir)
+    if args.exploratory:
+        x = Path(args.exploratory)
+        text = render_exploratory(_read_records(x / "records-candidate.jsonl"),
+                                  json.loads((x / "run-manifest-candidate.json").read_text()),
+                                  json.loads((x / "snapshot.json").read_text()))
+        if args.out:
+            write_artifact(Path(args.out), text)
+        else:
+            print(text)
+        return 0
     end = d / "snapshot-end.json"
     text = render_report(_read_records(d / "records.jsonl"), json.loads((d / "snapshot-start.json").read_text()),
                          json.loads((d / "run-manifest.json").read_text()),
@@ -1030,6 +1092,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--arm", choices=("all", "baseline", "candidate"), default="all",
                    help="run one arm alone (writes records-ARM.jsonl / run-manifest-ARM.json); join with `merge`")
     p.add_argument("--run-location", default="unspecified", help="recorded in the manifest")
+    p.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"), default=None,
+                   help="CLI reasoning effort for candidate cells (exploratory runs; default: CLI default)")
     p.set_defaults(func=_cmd_bench)
     p = sub.add_parser("merge", help="join per-arm bench outputs into records.jsonl / run-manifest.json")
     p.add_argument("--dir", default=str(SPIKE_DIR))
@@ -1038,6 +1102,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p = sub.add_parser("report", help="render the report tables from committed records")
     p.add_argument("--dir", default=str(SPIKE_DIR))
     p.add_argument("--out", default=None)
+    p.add_argument("--exploratory", default=None,
+                   help="render a candidate-only exploratory run dir (records-candidate.jsonl, "
+                        "run-manifest-candidate.json, snapshot.json); never used for the decision")
     p.set_defaults(func=_cmd_report)
     args = parser.parse_args(argv)
     try:
