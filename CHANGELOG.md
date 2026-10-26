@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.101.1](https://github.com/mctlhq/mctl-agents/compare/1.101.0...1.101.1) (2026-10-26)
+
+
+### Bug Fixes
+
+* **scout:** detect DTDs with expat handlers, not a byte search ([dac3da4](https://github.com/mctlhq/mctl-agents/commit/dac3da44b613629650c3b38d418865b50f12d81f))
+* **scout:** detect DTDs with expat handlers, not a byte search ([840d177](https://github.com/mctlhq/mctl-agents/commit/840d177d8ce2b154acd90c4b2186994f60ea31c2))
+
 ## [1.101.0](https://github.com/mctlhq/mctl-agents/compare/1.100.0...1.101.0) (2026-10-26)
 
 
