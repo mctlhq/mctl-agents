@@ -100,3 +100,42 @@ def test_help_works_offline() -> None:
         rs.main(["--help"])
     assert exc.value.code == 0
     assert "rea_spike" in sys.modules["tools.rea_spike"].__name__
+
+
+class _Msg:
+    def __init__(self, **kw: object) -> None:
+        self.__dict__.update(kw)
+
+
+async def _stream(*msgs: object):  # type: ignore[no-untyped-def]
+    for m in msgs:
+        yield m
+
+
+def _collect(*msgs: object) -> dict[str, object]:
+    import anyio
+
+    async def go() -> dict[str, object]:
+        return await rs._collect(_stream(*msgs), {"ok": True, "tools_registered": True, "text": ""})
+
+    return anyio.run(go)
+
+
+def test_collect_maps_refusal_stop_reason_to_declined() -> None:
+    sig = _collect(_Msg(content=[_Msg(text="I cannot help")]),
+                   _Msg(is_error=False, num_turns=1, usage={}, stop_reason="refusal"))
+    assert sig["ok"] is False and sig["declined"] is True
+    assert rs.classify(sig) == rs.MODEL_POLICY_REFUSAL
+
+
+def test_collect_maps_tool_error_and_clean_run() -> None:
+    sig = _collect(_Msg(content=[_Msg(is_error=True)]), _Msg(is_error=False, num_turns=1, usage={}))
+    assert sig["ok"] is False and rs.classify(sig) == rs.REA_TOOL_FAILURE
+    ok = _collect(_Msg(content=[_Msg(text="done")]), _Msg(is_error=False, num_turns=1, usage={}))
+    assert ok["ok"] is True and ok["text"] == "done"
+
+
+def test_rea_mcp_without_command_fails_fast(monkeypatch: pytest.MonkeyPatch, tmp_path: object) -> None:
+    monkeypatch.delenv("REA_SPIKE_MCP_CMD", raising=False)
+    sig = rs._live_stage("p", "m", tmp_path, "rea-mcp")  # type: ignore[arg-type]
+    assert sig["ok"] is False and rs.classify(sig) == rs.CLIENT_TOOL_ADMISSION

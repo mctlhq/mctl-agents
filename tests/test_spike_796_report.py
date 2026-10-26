@@ -7,6 +7,7 @@ hold no binaries. A follow-up that adopts or rejects REA deletes this file.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -27,7 +28,10 @@ def test_report_is_draft_or_has_exactly_one_token() -> None:
     text = REPORT.read_text()
     if DRAFT_MARKER in text:
         return
-    found = [t for t in TOKENS if t in text]
+    # The report documents all four tokens, so look only at the STATUS line.
+    m = re.search(r"^STATUS:\s*(\w+)", text, re.MULTILINE)
+    assert m, "report needs a STATUS line"
+    found = [t for t in TOKENS if t == m.group(1)]
     assert len(found) == 1, f"exactly one decision token expected, got {found}"
 
 

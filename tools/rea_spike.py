@@ -252,36 +252,60 @@ def _read_active_model() -> str:
     return model
 
 
+async def _collect(stream: Any, sig: dict[str, Any]) -> dict[str, Any]:
+    """Fold an SDK message stream into the signals `classify` reads. Duck-typed
+    so a stubbed stream can drive it in unit tests."""
+    text: list[str] = []
+    try:
+        async for msg in stream:
+            if hasattr(msg, "is_error") and hasattr(msg, "num_turns"):  # ResultMessage
+                sig["usage"] = getattr(msg, "usage", None)
+                sig["turns"] = msg.num_turns
+                if getattr(msg, "stop_reason", None) == "refusal":
+                    sig["ok"] = False
+                    sig["declined"] = True
+                if msg.is_error:
+                    sig["ok"] = False
+                    sig["transport_error"] = True
+                continue
+            if getattr(msg, "stop_reason", None) == "refusal":
+                sig["ok"] = False
+                sig["declined"] = True
+            content = getattr(msg, "content", None)
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(getattr(block, "text", None), str):
+                    text.append(block.text)
+                elif getattr(block, "is_error", None) is True:  # failed tool result
+                    sig["ok"] = False
+                    sig["tool_error"] = True
+    except Exception as exc:  # noqa: BLE001 - recorded, never retried
+        sig["ok"] = False
+        sig["transport_error"] = True
+        text.append(repr(exc))
+    sig["text"] = "\n".join(text)
+    return sig
+
+
 def _live_stage(prompt: str, model: str, fixture_dir: Path, arm: str) -> dict[str, Any]:  # pragma: no cover
     """One single-attempt Claude session. Returns the signals `classify` reads."""
     import anyio
-    from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, query
+    from claude_agent_sdk import ClaudeAgentOptions, query
 
     mcp_cmd = os.environ.get("REA_SPIKE_MCP_CMD", "")
     parts = mcp_cmd.split()
     servers: Any = {"rea": {"command": parts[0], "args": parts[1:]}} if arm == "rea-mcp" and parts else {}
+    tools_registered = not (arm == "rea-mcp" and not servers)
+    if not tools_registered:
+        # Fail fast: running without the REA tools would be recorded as a baseline success.
+        return {"ok": False, "tools_registered": False, "text": "rea-mcp arm without REA_SPIKE_MCP_CMD"}
     options = ClaudeAgentOptions(model=model, cwd=str(fixture_dir), mcp_servers=servers,
                                  allowed_tools=["Read", "Glob", "Grep", "Bash", *(["mcp__rea__*"] if servers else [])])
 
     async def _go() -> dict[str, Any]:
-        sig: dict[str, Any] = {"ok": True, "tools_registered": not (arm == "rea-mcp" and not servers), "text": ""}
-        text: list[str] = []
-        try:
-            async for msg in query(prompt=prompt, options=options):
-                if isinstance(msg, AssistantMessage):
-                    text += [b.text for b in msg.content if isinstance(b, TextBlock)]
-                elif isinstance(msg, ResultMessage):
-                    sig["usage"] = msg.usage
-                    sig["turns"] = msg.num_turns
-                    if msg.is_error:
-                        sig["ok"] = False
-                        sig["transport_error"] = True
-        except Exception as exc:  # noqa: BLE001 - recorded, never retried
-            sig["ok"] = False
-            sig["transport_error"] = True
-            text.append(repr(exc))
-        sig["text"] = "\n".join(text)
-        return sig
+        return await _collect(query(prompt=prompt, options=options),
+                              {"ok": True, "tools_registered": True, "text": ""})
 
     return anyio.run(_go)
 
@@ -292,9 +316,17 @@ def _cmd_probe(args: argparse.Namespace) -> int:
     model = args.model or _read_active_model()
     fixture_dir = SPIKE_DIR / "fixtures" / args.fixture
 
+    prior: list[tuple[str, str]] = []
+
     def runner(stage: str) -> Mapping[str, Any]:
+        # Each stage is a fresh session; carry earlier stage output forward as context.
         prompt = (SPIKE_DIR / "stages" / f"{stage}.md").read_text() + "\n\n" + (fixture_dir / "task.md").read_text()
-        return _live_stage(prompt, model, fixture_dir, args.arm)
+        if prior:
+            prompt += "\n\n## Output of earlier stages\n\n" + "\n\n".join(f"### {n}\n\n{t}" for n, t in prior)
+        sig = _live_stage(prompt, model, fixture_dir, args.arm)
+        if sig.get("ok"):
+            prior.append((stage, str(sig.get("text", ""))))
+        return sig
 
     result = run_probe(runner, store_text=args.store_text)
     print(json.dumps({"kind": "probe", "fixture": args.fixture, "arm": args.arm, "model": model, "probe": result}))
@@ -342,10 +374,12 @@ def _cmd_schema_bytes(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_score(args: argparse.Namespace) -> int:
-    grading = yaml.safe_load(Path(args.grading).read_text())
-    rows = []
-    for line in Path(args.records).read_text().splitlines():
+def _score_rows(records_path: str, grading_path: str) -> list[dict[str, Any]]:
+    grading = yaml.safe_load(Path(grading_path).read_text())
+    rows: list[dict[str, Any]] = []
+    for line in Path(records_path).read_text().splitlines():
+        if not line.strip():
+            continue
         rec = json.loads(line)
         if rec.get("kind") != "run":
             continue
@@ -354,13 +388,20 @@ def _cmd_score(args: argparse.Namespace) -> int:
             continue
         oracle = load_oracle(SPIKE_DIR / "fixtures" / rec["fixture"] / "oracle.yaml")
         rows.append({"fixture": rec["fixture"], "arm": rec["arm"], **score(rec, oracle, g)})
-    print(metrics_table(rows))
+    return rows
+
+
+def _cmd_score(args: argparse.Namespace) -> int:
+    print(metrics_table(_score_rows(args.records, args.grading)))
     return 0
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
     records = [json.loads(ln) for ln in Path(args.records).read_text().splitlines() if ln.strip()]
-    print(report_markdown(records))
+    rows: list[dict[str, Any]] = []
+    if args.grading:
+        rows = _score_rows(args.records, args.grading)
+    print(report_markdown(records, scored=rows))
     return 0
 
 
@@ -387,6 +428,7 @@ def build_parser() -> argparse.ArgumentParser:
     sc.set_defaults(func=_cmd_score)
     rp = sub.add_parser("report")
     rp.add_argument("records")
+    rp.add_argument("--grading", default="")
     rp.set_defaults(func=_cmd_report)
     return p
 
