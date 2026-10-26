@@ -1572,7 +1572,8 @@ class TestDevLoopWorkflow:
             during = await handle.query(DevLoopWorkflow.investigate_in_flight)
             release.set()
             with anyio.fail_after(10):
-                while await handle.query(DevLoopWorkflow.investigate_in_flight):
+                # A query has no event to await; poll the workflow's answer.
+                while await handle.query(DevLoopWorkflow.investigate_in_flight):  # noqa: ASYNC110
                     await asyncio.sleep(0.05)
             after = await handle.query(DevLoopWorkflow.investigate_in_flight)
             await handle.terminate("test done")
