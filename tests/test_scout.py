@@ -56,6 +56,8 @@ def test_parse_rss_atom_and_disabled():
     assert r.items[0].published == datetime(2026, 10, 26, 5, tzinfo=UTC)
     a = _fetch(lambda req: httpx.Response(200, text=ATOM))
     assert a.items[0].link == "https://x.test/t" and a.items[0].published is not None
+    bad = feeds.parse_feed(ATOM.replace("https://x.test/t", "javascript:alert(1)").encode(), "s")
+    assert bad[0].link == ""
 
     def never(request):
         raise AssertionError("disabled source fetched")

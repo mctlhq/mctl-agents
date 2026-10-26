@@ -146,6 +146,10 @@ def parse_feed(body: bytes, source: str, weight: float = 1.0) -> list[Item]:
     items: list[Item] = []
     for e in entries:
         link = _atom_link(e) if kind == "feed" else _child_text(e, "link")
+        # Telegram rejects the whole HTML message over one non-http(s) href;
+        # an empty link is skipped by run_scout.
+        if not link.lower().startswith(("https://", "http://")):
+            link = ""
         date = _parse_date(_child_text(e, "pubDate", "published", "updated", "date"))
         items.append(Item(
             title=clean_text(_child_text(e, "title"), 300),
