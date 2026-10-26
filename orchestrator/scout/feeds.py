@@ -349,8 +349,9 @@ def _end_of_day(item: Item) -> Item:
     exactly one run: the first after that day ends."""
     if item.published is None:
         return item
-    day = item.published.astimezone(UTC).date()
-    return replace(item, published=datetime.combine(day, time.min, UTC) + timedelta(days=1))
+    # The stamp's own calendar date: converting "00:00 +0100" to UTC first would
+    # land on the previous day.
+    return replace(item, published=datetime.combine(item.published.date(), time(23, 59, 59), UTC))
 
 
 def make_client(transport: httpx.BaseTransport | None = None) -> httpx.Client:

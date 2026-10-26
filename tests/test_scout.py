@@ -168,6 +168,10 @@ def test_sitemap_config_is_validated(tmp_path):
 def test_date_only_source_lands_in_exactly_one_run():
     items = "".join(f"<item><title>{d}</title><link>https://x.test/{d}</link><pubDate>{d} Oct 2026 00:00:00 GMT"
                     f"</pubDate></item>" for d in (24, 25, 26))
+    # Midnight in a positive offset is 23:00 UTC the day before; it is still the 25th.
+    items += ("<item><title>25cet</title><link>https://x.test/c</link>"
+              "<pubDate>25 Oct 2026 00:00:00 +0100</pubDate></item>")
+    items += "<item><title>undated</title><link>https://x.test/u</link></item>"
     body = f'<?xml version="1.0"?><rss version="2.0"><channel>{items}</channel></rss>'
     src = {"name": "H", "url": "https://x.test/rss.xml"}
     with _client(lambda req: httpx.Response(200, text=body)) as c:
@@ -176,7 +180,9 @@ def test_date_only_source_lands_in_exactly_one_run():
     # Without the option a post from yesterday is ~30h old at the 06:40 run and lost.
     assert [i.title for i in feeds.in_window(plain.items, NOW, 26)[0]] == ["26"]
     # With it: yesterday's post is in today's run; today's waits for tomorrow's.
-    assert [i.title for i in feeds.in_window(dated.items, NOW, 26)[0]] == ["25"]
+    kept, undated = feeds.in_window(dated.items, NOW, 26)
+    assert [i.title for i in kept] == ["25", "25cet"] and undated == 1
+    assert kept[1].published == datetime(2026, 10, 25, 23, 59, 59, tzinfo=UTC)
     tomorrow = NOW + timedelta(days=1)
     assert [i.title for i in feeds.in_window(dated.items, tomorrow, 26)[0]] == ["26"]
 
