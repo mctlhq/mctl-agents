@@ -1,0 +1,49 @@
+{
+  "description": "Canonical problem identity and grouping.",
+  "properties": {
+    "aliases": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "id": {
+      "description": "sf_...",
+      "type": "string"
+    },
+    "identity_key": {
+      "description": "e.g. cve:CVE-2024-1234",
+      "type": "string"
+    },
+    "identity_kind": {
+      "enum": [
+        "cve",
+        "ghsa",
+        "rule"
+      ],
+      "type": "string"
+    },
+    "last_observed_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "occurrences": {
+      "items": {
+        "$ref": "#/components/schemas/SecurityOccurrence"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "example": "securityfinding/v1",
+      "type": "string"
+    },
+    "tenant": {
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

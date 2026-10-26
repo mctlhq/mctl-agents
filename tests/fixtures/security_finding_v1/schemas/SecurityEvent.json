@@ -1,0 +1,46 @@
+{
+  "description": "One append-only lifecycle record of an occurrence.",
+  "properties": {
+    "actor_principal": {
+      "type": "string"
+    },
+    "actor_principal_id": {
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "from_state": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "occurrence_id": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "refs": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "seq": {
+      "type": "integer"
+    },
+    "source": {
+      "type": "string"
+    },
+    "to_state": {
+      "type": "string"
+    },
+    "via_principal_id": {
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

@@ -1,0 +1,21 @@
+{
+  "description": "A reference to evidence held elsewhere. The store keeps references, never scanner or code payloads.",
+  "properties": {
+    "digest": {
+      "type": "string"
+    },
+    "kind": {
+      "description": "e.g. assurance_finding, pull_request, scan_report",
+      "type": "string"
+    },
+    "ref": {
+      "maxLength": 512,
+      "type": "string"
+    }
+  },
+  "required": [
+    "kind",
+    "ref"
+  ],
+  "type": "object"
+}

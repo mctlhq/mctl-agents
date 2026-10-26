@@ -1,0 +1,17 @@
+{
+  "ref": "4.124.0",
+  "states": ["open", "triaged", "fixing", "awaiting_verification", "resolved", "reopened", "unverifiable", "dismissed"],
+  "attempt_outcomes": ["resolved", "superseded", "cancelled_dismissed"],
+  "mechanisms": ["deterministic_regression_test", "assurance_replay", "scanner_rerun_exact_revision", "provider_claim", "manual"],
+  "strength_order": ["deterministic_regression_test", "assurance_replay", "scanner_rerun_exact_revision", "provider_claim", "manual"],
+  "default_minimum_strength": "scanner_rerun_exact_revision",
+  "results": ["passed", "failed", "unavailable", "error", "timeout", "unverifiable"],
+  "claimed_actions": ["present", "fixed", "absent", "withdrawn"],
+  "start_states": ["open", "triaged", "reopened", "unverifiable"],
+  "error_codes": [
+    "security_findings_store_unavailable", "not_found", "invalid_request", "invalid_transition",
+    "remediation_attempt_active", "verification_not_bound", "subject_too_weak", "finding_alias_conflict",
+    "idempotency_key_reused", "version_conflict", "work_item_not_found", "work_items_unavailable",
+    "forbidden", "security_provider_route_not_allowed", "internal_error"
+  ]
+}

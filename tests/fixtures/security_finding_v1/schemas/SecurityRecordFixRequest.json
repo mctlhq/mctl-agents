@@ -1,0 +1,27 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "candidate_revision": {
+      "type": "string"
+    },
+    "expected_state_version": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "landed": {
+      "description": "true when the fix has landed; then landed_revision or landed_artifact_digest is required",
+      "type": "boolean"
+    },
+    "landed_artifact_digest": {
+      "type": "string"
+    },
+    "landed_ref": {
+      "description": "e.g. the merged pull request",
+      "type": "string"
+    },
+    "landed_revision": {
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

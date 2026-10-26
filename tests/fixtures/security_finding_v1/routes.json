@@ -1,0 +1,141 @@
+{
+  "ref": "4.124.0",
+  "routes": {
+    "GET /api/v1/security/findings": {
+      "errors": {
+        "404": "The requested tenant is not accessible",
+        "503": "security_findings_store_unavailable"
+      },
+      "idempotency_key": false,
+      "method": "GET",
+      "path": "/api/v1/security/findings",
+      "success": [
+        "200"
+      ]
+    },
+    "GET /api/v1/security/findings/{id}": {
+      "errors": {
+        "404": "not_found (including a finding in a tenant the caller cannot access)",
+        "503": "security_findings_store_unavailable"
+      },
+      "idempotency_key": false,
+      "method": "GET",
+      "path": "/api/v1/security/findings/{id}",
+      "success": [
+        "200"
+      ]
+    },
+    "GET /api/v1/security/occurrences": {
+      "errors": {
+        "404": "The requested tenant is not accessible",
+        "503": "security_findings_store_unavailable"
+      },
+      "idempotency_key": false,
+      "method": "GET",
+      "path": "/api/v1/security/occurrences",
+      "success": [
+        "200"
+      ]
+    },
+    "GET /api/v1/security/occurrences/{id}": {
+      "errors": {
+        "404": "not_found",
+        "503": "security_findings_store_unavailable"
+      },
+      "idempotency_key": false,
+      "method": "GET",
+      "path": "/api/v1/security/occurrences/{id}",
+      "success": [
+        "200"
+      ]
+    },
+    "POST /api/v1/security/observations": {
+      "errors": {
+        "400": "invalid_request",
+        "403": "caller lacks security:ingest",
+        "503": "security_findings_store_unavailable"
+      },
+      "idempotency_key": false,
+      "method": "POST",
+      "path": "/api/v1/security/observations",
+      "success": [
+        "200"
+      ]
+    },
+    "POST /api/v1/security/occurrences/{id}/dismiss": {
+      "errors": {
+        "400": "invalid_request (unsupported reason or missing authority_ref)",
+        "403": "Not a human with the required role",
+        "404": "not_found",
+        "409": "invalid_transition (e.g. a resolved occurrence), version_conflict or idempotency_key_reused",
+        "503": "security_findings_store_unavailable"
+      },
+      "idempotency_key": true,
+      "method": "POST",
+      "path": "/api/v1/security/occurrences/{id}/dismiss",
+      "success": [
+        "200"
+      ]
+    },
+    "POST /api/v1/security/occurrences/{id}/remediation-attempts": {
+      "errors": {
+        "400": "invalid_request",
+        "403": "forbidden",
+        "404": "not_found or work_item_not_found",
+        "409": "remediation_attempt_active, invalid_transition, version_conflict or idempotency_key_reused",
+        "503": "security_findings_store_unavailable or work_items_unavailable"
+      },
+      "idempotency_key": true,
+      "method": "POST",
+      "path": "/api/v1/security/occurrences/{id}/remediation-attempts",
+      "success": [
+        "201"
+      ]
+    },
+    "POST /api/v1/security/occurrences/{id}/triage": {
+      "errors": {
+        "403": "forbidden",
+        "404": "not_found",
+        "409": "invalid_transition, version_conflict or idempotency_key_reused",
+        "503": "security_findings_store_unavailable"
+      },
+      "idempotency_key": true,
+      "method": "POST",
+      "path": "/api/v1/security/occurrences/{id}/triage",
+      "success": [
+        "200"
+      ]
+    },
+    "POST /api/v1/security/remediation-attempts/{id}/fix": {
+      "errors": {
+        "400": "invalid_request",
+        "403": "forbidden",
+        "404": "not_found",
+        "409": "invalid_transition, version_conflict or idempotency_key_reused",
+        "503": "security_findings_store_unavailable"
+      },
+      "idempotency_key": true,
+      "method": "POST",
+      "path": "/api/v1/security/remediation-attempts/{id}/fix",
+      "success": [
+        "200"
+      ]
+    },
+    "POST /api/v1/security/remediation-attempts/{id}/verifications": {
+      "errors": {
+        "400": "invalid_request",
+        "403": "forbidden",
+        "404": "not_found",
+        "409": "invalid_transition, version_conflict or idempotency_key_reused",
+        "422": "verification_not_bound",
+        "503": "security_findings_store_unavailable"
+      },
+      "idempotency_key": true,
+      "method": "POST",
+      "path": "/api/v1/security/remediation-attempts/{id}/verifications",
+      "success": [
+        "201"
+      ]
+    }
+  }
+}

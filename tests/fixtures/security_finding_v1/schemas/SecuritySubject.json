@@ -1,0 +1,32 @@
+{
+  "description": "The concrete thing an occurrence is about. A subject needs a repository\nor resource AND at least one of package_purl, path, location or\nartifact_digest; otherwise the item is rejected as subject_too_weak.\nThe revision is deliberately not part of the subject.\n",
+  "properties": {
+    "artifact_digest": {
+      "description": "algorithm:hex, e.g. sha256:...",
+      "type": "string"
+    },
+    "location": {
+      "type": "string"
+    },
+    "package_purl": {
+      "type": "string"
+    },
+    "path": {
+      "type": "string"
+    },
+    "repository": {
+      "type": "string"
+    },
+    "resource": {
+      "type": "string"
+    },
+    "rule_id": {
+      "description": "Set by the server for rule identities; ignored on input",
+      "type": "string"
+    },
+    "service": {
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

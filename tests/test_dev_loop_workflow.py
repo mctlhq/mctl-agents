@@ -355,6 +355,8 @@ def _fake_activities(
     deploy_target: DeployTarget | None = _SENTINEL_TARGET,
     release: ReleaseInfo | None = _DEFAULT_RELEASE,
     deploy_statuses: list[DeployStatus] | None = None,
+    # mctl-agents#809: calls the security landed-revision hook received.
+    security_landed_log: list[tuple[str, ...]] | None = None,
     release_lookup_bug: bool = False,
     deploy_status_bug: bool = False,
     unpinned: set[str] | None = None,
@@ -798,6 +800,14 @@ def _fake_activities(
             return gate_results.pop(0) if len(gate_results) > 1 else gate_results[0]
         return GatedActionResult(code="merge_gate_disabled")
 
+    @activity.defn(name="security_record_landed")
+    async def fake_security_record_landed(
+        workflow_id: str, target_repo: str, pr_url: str, merge_commit: str
+    ) -> list[dict[str, str]]:
+        if security_landed_log is not None:
+            security_landed_log.append((workflow_id, target_repo, pr_url, merge_commit))
+        return [{"occurrence_id": "soc_1", "attempt_id": "sra_1", "outcome": "bound"}]
+
     @activity.defn(name="read_proposal_status")
     async def fake_read_proposal_status(service: str, slug: str) -> str | None:
         return proposal_status
@@ -829,6 +839,7 @@ def _fake_activities(
         fake_resolve_deploy_target,
         fake_get_release_after,
         fake_get_deploy_status,
+        fake_security_record_landed,
         fake_list_service_incidents,
         fake_lifecycle_ownership,
         fake_mint_execution_context,
@@ -2065,6 +2076,64 @@ class TestDevLoopWorkflow:
         assert result.pr.state == "MERGED"
         assert result.pr.merged is True
         assert result.pr.merge_commit == "cafe1234"
+
+    async def test_merged_pr_binds_the_landed_revision_and_nothing_else(self, env):
+        """mctl-agents#809: a merged PR calls the security hook once with the
+        merge commit; the result carries its answer. The hook is the only
+        security call the loop makes, so a merge records no verification."""
+        landed_log: list[tuple[str, ...]] = []
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[MERGED_PR], security_landed_log=landed_log
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            wid = f"dev-loop-test-{uuid.uuid4()}"
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/78"),
+                id=wid,
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            result = await handle.result()
+
+        assert landed_log == [(wid, "mctl-telegram", MERGED_PR.pr_url, "cafe1234")]
+        assert result.security == [{"occurrence_id": "soc_1", "attempt_id": "sra_1", "outcome": "bound"}]
+
+    async def test_unmerged_pr_does_not_call_the_security_hook(self, env):
+        landed_log: list[tuple[str, ...]] = []
+        closed = PRState(
+            found=True, pr_url="https://github.com/mctlhq/mctl-telegram/pull/9", repo="mctlhq/mctl-telegram",
+            number=9, state="CLOSED",
+        )
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[closed], security_landed_log=landed_log
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/79"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            result = await handle.result()
+
+        assert landed_log == []
+        assert result.security is None
 
     async def test_merged_pr_ends_the_watch_within_one_poll(self, env):
         """Regression guard (mctl-agents#420) for behaviour that already

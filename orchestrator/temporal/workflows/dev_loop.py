@@ -138,6 +138,7 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.pr_state import PRState, get_pr_state
     from orchestrator.temporal.activities.proposals import find_proposal_slug, read_proposal_status
     from orchestrator.temporal.activities.registry import ResolvedRelease, resolve_agent_release
+    from orchestrator.temporal.activities.security_findings import security_record_landed
     from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
     from orchestrator.temporal.constants import (
         EXECUTION_TASK_QUEUE,
@@ -258,6 +259,11 @@ FAST_ACTIVITY_TIMEOUT = timedelta(seconds=30)
 # _record runs, so its own failure must never block workflow progress (see
 # _record's try/except below).
 FAST_ACTIVITY_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
+
+# mctl-agents#809: the security landed-revision bind lists up to 10 pages and
+# reads each candidate, so it gets a longer bound than a single round trip.
+SECURITY_LANDED_TIMEOUT = timedelta(minutes=2)
+SECURITY_LANDED_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 
 # find_proposal_slug hits GitHub, not mctl-api: its worst realistic failure
 # is a rate limit whose reset window is up to an hour. FAST (5 attempts,
@@ -1159,6 +1165,12 @@ class DevLoopResult:
     # #702: typed terminal outcome of a failed approval: "approval_refused",
     # "approval_failed", or "" for every other ending.
     outcome: str = ""
+    # mctl-agents#809: what binding this merge's landed revision to a security
+    # remediation attempt answered, one entry per matched occurrence. None on
+    # histories predating the hook and whenever the PR did not merge. A bind
+    # only moves an occurrence to `awaiting_verification`; it is never a
+    # verification.
+    security: list[dict[str, str]] | None = None
 
 
 async def _resolve(agent: str) -> ResolvedRelease | None:
@@ -4467,6 +4479,18 @@ class DevLoopWorkflow:
         ):
             deploy = await self._observe_deploy(target_repo, pr_state)
 
+        # mctl-agents#809: bind the landed merge commit to the security
+        # remediation attempt this DevLoop owns, if any. Bounded retries, and a
+        # failure only logs: the verifier sweep re-binds from the occurrence side.
+        security: list[dict[str, str]] | None = None
+        if (
+            workflow.patched("security-record-landed")
+            and pr_state is not None
+            and pr_state.merged
+            and pr_state.merge_commit
+        ):
+            security = await self._record_security_landed(target_repo, pr_state)
+
         # Stage 6.4 (ADR-006, #216): only worth asking when something
         # actually rolled out. no-release/no-target mean nothing shipped,
         # so any incident in the window belongs to someone else.
@@ -4487,6 +4511,7 @@ class DevLoopWorkflow:
             deploy=deploy,
             incidents=incidents,
             human_input=human_input_outcome,
+            security=security,
             # mctl-agents#420: an `abandon` signal delivered during the merge
             # watch cuts _watch_pr short (its own `while` condition observes
             # `_abandoned`) rather than raising, so the only place left to
@@ -4502,6 +4527,18 @@ class DevLoopWorkflow:
             # reports.
             ended=(f"{ABANDONED_ENDED_PREFIX}{self._abandon_reason}" if self._abandoned else outcome.ended),
         )
+
+    async def _record_security_landed(self, target_repo: str, pr_state: PRState) -> list[dict[str, str]] | None:
+        try:
+            return await workflow.execute_activity(
+                security_record_landed,
+                args=[workflow.info().workflow_id, target_repo, pr_state.pr_url or "", pr_state.merge_commit or ""],
+                start_to_close_timeout=SECURITY_LANDED_TIMEOUT,
+                retry_policy=SECURITY_LANDED_RETRY_POLICY,
+            )
+        except ActivityError:
+            workflow.logger.warning("security_record_landed failed after retries; the verifier sweep will re-bind")
+            return None
 
     def _launch_correlation(self) -> dict[str, str]:
         """This loop's ids, for a CWFT that declares them (#505).

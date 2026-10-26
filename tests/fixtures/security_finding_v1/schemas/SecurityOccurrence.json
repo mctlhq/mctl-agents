@@ -1,0 +1,96 @@
+{
+  "description": "One concrete affected subject. The only level that owns lifecycle state.",
+  "properties": {
+    "active_attempt_id": {
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "current_affected_artifact": {
+      "description": "Read projection only",
+      "type": "string"
+    },
+    "current_affected_revision": {
+      "description": "Read projection only",
+      "type": "string"
+    },
+    "dismissal_authority_ref": {
+      "type": "string"
+    },
+    "dismissal_reason": {
+      "type": "string"
+    },
+    "dismissed_by": {
+      "type": "string"
+    },
+    "events": {
+      "items": {
+        "$ref": "#/components/schemas/SecurityEvent"
+      },
+      "type": "array"
+    },
+    "finding_id": {
+      "type": "string"
+    },
+    "id": {
+      "description": "soc_...",
+      "type": "string"
+    },
+    "last_observed_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "observations": {
+      "items": {
+        "$ref": "#/components/schemas/SecurityObservation"
+      },
+      "type": "array"
+    },
+    "remediation_attempts": {
+      "items": {
+        "$ref": "#/components/schemas/SecurityAttempt"
+      },
+      "type": "array"
+    },
+    "state": {
+      "enum": [
+        "open",
+        "triaged",
+        "fixing",
+        "awaiting_verification",
+        "resolved",
+        "reopened",
+        "unverifiable",
+        "dismissed"
+      ],
+      "type": "string"
+    },
+    "state_version": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "subject": {
+      "$ref": "#/components/schemas/SecuritySubject"
+    },
+    "subject_fingerprint": {
+      "description": "SHA-256 over the canonical JSON of the normalized subject",
+      "type": "string"
+    },
+    "tenant": {
+      "type": "string"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "verifications": {
+      "items": {
+        "$ref": "#/components/schemas/SecurityVerification"
+      },
+      "type": "array"
+    }
+  },
+  "type": "object"
+}

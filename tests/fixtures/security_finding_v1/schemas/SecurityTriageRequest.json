@@ -1,0 +1,14 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "expected_state_version": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "reason": {
+      "maxLength": 1024,
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

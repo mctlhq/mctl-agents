@@ -1,0 +1,32 @@
+{
+  "description": "Error with a typed code a client can branch on.",
+  "properties": {
+    "code": {
+      "enum": [
+        "security_findings_store_unavailable",
+        "not_found",
+        "invalid_request",
+        "invalid_transition",
+        "remediation_attempt_active",
+        "verification_not_bound",
+        "subject_too_weak",
+        "finding_alias_conflict",
+        "idempotency_key_reused",
+        "version_conflict",
+        "work_item_not_found",
+        "work_items_unavailable",
+        "forbidden",
+        "security_provider_route_not_allowed",
+        "internal_error"
+      ],
+      "type": "string"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "error"
+  ],
+  "type": "object"
+}

@@ -75,6 +75,7 @@ from orchestrator.temporal.activities.pr_merge import merge_pull_request_gated
 from orchestrator.temporal.activities.pr_state import get_pr_state
 from orchestrator.temporal.activities.proposals import find_proposal_slug, read_proposal_status
 from orchestrator.temporal.activities.registry import resolve_agent_release
+from orchestrator.temporal.activities.security_findings import security_record_landed
 from orchestrator.temporal.activities.state import record_execution
 from orchestrator.temporal.activities.stranded import find_stranded_accepted
 from orchestrator.temporal.activities.visibility import VisibilityActivities
@@ -694,6 +695,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         read_proposal_status,
         find_human_input_request,
         get_pr_state,
+        security_record_landed,
         get_issue_state,
         resolve_deploy_target,
         get_release_after,

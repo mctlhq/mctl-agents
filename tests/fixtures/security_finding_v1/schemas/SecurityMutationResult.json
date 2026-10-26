@@ -1,0 +1,32 @@
+{
+  "properties": {
+    "attempt_id": {
+      "type": "string"
+    },
+    "occurrence_id": {
+      "type": "string"
+    },
+    "replayed": {
+      "type": "boolean"
+    },
+    "state": {
+      "type": "string"
+    },
+    "state_version": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "transition": {
+      "type": "string"
+    },
+    "verification_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "occurrence_id",
+    "state",
+    "state_version"
+  ],
+  "type": "object"
+}
