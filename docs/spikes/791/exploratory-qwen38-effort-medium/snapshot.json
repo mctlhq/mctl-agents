@@ -1,0 +1,543 @@
+{
+  "catalog_ids": [
+    "Qwen/Qwen3.6-35B-A3B",
+    "Qwen/Qwen3.6-35B-A3B-FP8",
+    "Qwen/Qwen3.8-27B",
+    "Qwen3.8-27B"
+  ],
+  "endpoint": "https://inference.hetzner.com/api",
+  "messages_probe": {
+    "error": null,
+    "headers": {},
+    "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+    "ok": true,
+    "status": 200
+  },
+  "models_error": null,
+  "models_status": 200,
+  "retries": 0,
+  "schema": "hetzner-snapshot/v1",
+  "selected": {
+    "DeepSeek-V4-Flash-0731": {
+      "availability": "UNAVAILABLE_AT_RUN_TIME",
+      "preregistered": true
+    },
+    "GLM-5.2-NVFP4": {
+      "availability": "UNAVAILABLE_AT_RUN_TIME",
+      "preregistered": true
+    },
+    "Kimi-K2.7-Code": {
+      "availability": "UNAVAILABLE_AT_RUN_TIME",
+      "preregistered": true
+    },
+    "Qwen/Qwen3.6-35B-A3B-FP8": {
+      "availability": "AVAILABLE",
+      "function_call": {
+        "error": null,
+        "finish_reason": "tool_calls",
+        "headers": {},
+        "latency_ms": 1412,
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "status": 200,
+        "tool_call_returned": true,
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"city\": \"Berlin\"}",
+              "name": "get_weather"
+            },
+            "id": "chatcmpl-tool-bd9c686b1845a7cf",
+            "type": "function"
+          }
+        ],
+        "usage": {
+          "completion_tokens": 139,
+          "completion_tokens_details": {
+            "reasoning_tokens": 111
+          },
+          "prompt_tokens": 277,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 416
+        }
+      },
+      "long_context": {
+        "block_types": [
+          "thinking"
+        ],
+        "error": null,
+        "headers": {},
+        "latency_ms": 11009,
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "prompt_chars": 240000,
+        "status": 200,
+        "stop_reason": "max_tokens",
+        "type": "message",
+        "usage": {
+          "cache_creation_input_tokens": 58688,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 778,
+          "output_tokens": 512
+        }
+      },
+      "preregistered": true,
+      "protocols": {
+        "chat_stream_tool_calls": {
+          "content_type": "text/event-stream",
+          "error": null,
+          "event_types": {
+            "[DONE]": 1,
+            "chat.completion.chunk": 1,
+            "chat.completion.chunk:": 1,
+            "chat.completion.chunk:reasoning": 170,
+            "chat.completion.chunk:role": 1,
+            "chat.completion.chunk:tool_calls": 4
+          },
+          "events": 178,
+          "latency_ms": 2083,
+          "status": 200,
+          "time_to_first_event_ms": 215
+        },
+        "messages_stream_text": {
+          "content_type": "text/event-stream",
+          "error": null,
+          "event_types": {
+            "content_block_delta:signature_delta": 1,
+            "content_block_delta:text_delta": 1,
+            "content_block_delta:thinking_delta": 112,
+            "content_block_start": 2,
+            "content_block_stop": 2,
+            "message_delta": 1,
+            "message_start": 1,
+            "message_stop": 1
+          },
+          "events": 121,
+          "latency_ms": 2536,
+          "status": 200,
+          "time_to_first_event_ms": 171
+        },
+        "messages_stream_tool_use": {
+          "content_type": "text/event-stream",
+          "error": null,
+          "event_types": {
+            "content_block_delta:input_json_delta": 3,
+            "content_block_delta:signature_delta": 1,
+            "content_block_delta:thinking_delta": 84,
+            "content_block_start": 2,
+            "content_block_stop": 2,
+            "message_delta": 1,
+            "message_start": 1,
+            "message_stop": 1
+          },
+          "events": 95,
+          "latency_ms": 1410,
+          "status": 200,
+          "time_to_first_event_ms": 204
+        },
+        "messages_tool_result": {
+          "block_types": [
+            "thinking",
+            "text"
+          ],
+          "error": null,
+          "headers": {},
+          "latency_ms": 782,
+          "model": "Qwen/Qwen3.6-35B-A3B",
+          "status": 200,
+          "stop_reason": "end_turn",
+          "type": "message",
+          "usage": {
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "input_tokens": 492,
+            "output_tokens": 50
+          }
+        },
+        "messages_tool_use": {
+          "block_types": [
+            "thinking",
+            "tool_use"
+          ],
+          "error": null,
+          "headers": {},
+          "latency_ms": 2096,
+          "model": "Qwen/Qwen3.6-35B-A3B",
+          "status": 200,
+          "stop_reason": "tool_use",
+          "type": "message",
+          "usage": {
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "input_tokens": 277,
+            "output_tokens": 194
+          }
+        }
+      },
+      "trivial": {
+        "error": null,
+        "finish_reason": "length",
+        "headers": {},
+        "latency_ms": 572,
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "status": 200,
+        "tool_calls": [],
+        "usage": {
+          "completion_tokens": 32,
+          "completion_tokens_details": {
+            "reasoning_tokens": 32
+          },
+          "prompt_tokens": 14,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 46
+        }
+      }
+    },
+    "Qwen/Qwen3.8-27B": {
+      "availability": "AVAILABLE",
+      "function_call": {
+        "error": null,
+        "finish_reason": "tool_calls",
+        "headers": {},
+        "latency_ms": 1662,
+        "model": "Qwen/Qwen3.8-27B",
+        "status": 200,
+        "tool_call_returned": true,
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"city\": \"Berlin\"}",
+              "name": "get_weather"
+            },
+            "id": "chatcmpl-tool-83afee8128fa6d67",
+            "type": "function"
+          }
+        ],
+        "usage": {
+          "completion_tokens": 58,
+          "completion_tokens_details": {
+            "reasoning_tokens": 30
+          },
+          "prompt_tokens": 315,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 373
+        }
+      },
+      "long_context": {
+        "block_types": [
+          "thinking",
+          "text"
+        ],
+        "error": null,
+        "headers": {},
+        "latency_ms": 22394,
+        "model": "Qwen/Qwen3.8-27B",
+        "prompt_chars": 240000,
+        "status": 200,
+        "stop_reason": "end_turn",
+        "type": "message",
+        "usage": {
+          "cache_creation_input_tokens": 57600,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 1908,
+          "output_tokens": 269
+        }
+      },
+      "preregistered": false,
+      "protocols": {
+        "chat_stream_tool_calls": {
+          "content_type": "text/event-stream",
+          "error": null,
+          "event_types": {
+            "[DONE]": 1,
+            "chat.completion.chunk": 1,
+            "chat.completion.chunk:reasoning": 9,
+            "chat.completion.chunk:role": 1,
+            "chat.completion.chunk:tool_calls": 4
+          },
+          "events": 16,
+          "latency_ms": 5452,
+          "status": 200,
+          "time_to_first_event_ms": 2797
+        },
+        "messages_stream_text": {
+          "content_type": "text/event-stream",
+          "error": null,
+          "event_types": {
+            "content_block_delta:signature_delta": 1,
+            "content_block_delta:text_delta": 1,
+            "content_block_delta:thinking_delta": 10,
+            "content_block_start": 2,
+            "content_block_stop": 2,
+            "message_delta": 1,
+            "message_start": 1,
+            "message_stop": 1
+          },
+          "events": 19,
+          "latency_ms": 637,
+          "status": 200,
+          "time_to_first_event_ms": 233
+        },
+        "messages_stream_tool_use": {
+          "content_type": "text/event-stream",
+          "error": null,
+          "event_types": {
+            "content_block_delta:input_json_delta": 2,
+            "content_block_delta:signature_delta": 1,
+            "content_block_delta:thinking_delta": 12,
+            "content_block_start": 2,
+            "content_block_stop": 2,
+            "message_delta": 1,
+            "message_start": 1,
+            "message_stop": 1
+          },
+          "events": 22,
+          "latency_ms": 3737,
+          "status": 200,
+          "time_to_first_event_ms": 937
+        },
+        "messages_tool_result": {
+          "block_types": [
+            "thinking",
+            "text"
+          ],
+          "error": null,
+          "headers": {},
+          "latency_ms": 1573,
+          "model": "Qwen/Qwen3.8-27B",
+          "status": 200,
+          "stop_reason": "end_turn",
+          "type": "message",
+          "usage": {
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "input_tokens": 384,
+            "output_tokens": 46
+          }
+        },
+        "messages_tool_use": {
+          "block_types": [
+            "thinking",
+            "tool_use"
+          ],
+          "error": null,
+          "headers": {},
+          "latency_ms": 2014,
+          "model": "Qwen/Qwen3.8-27B",
+          "status": 200,
+          "stop_reason": "tool_use",
+          "type": "message",
+          "usage": {
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "input_tokens": 315,
+            "output_tokens": 48
+          }
+        }
+      },
+      "trivial": {
+        "error": null,
+        "finish_reason": "stop",
+        "headers": {},
+        "latency_ms": 514,
+        "model": "Qwen/Qwen3.8-27B",
+        "status": 200,
+        "tool_calls": [],
+        "usage": {
+          "completion_tokens": 21,
+          "completion_tokens_details": {
+            "reasoning_tokens": 17
+          },
+          "prompt_tokens": 56,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 77
+        }
+      }
+    },
+    "Qwen3.8-27B": {
+      "availability": "AVAILABLE",
+      "function_call": {
+        "error": null,
+        "finish_reason": "tool_calls",
+        "headers": {},
+        "latency_ms": 2973,
+        "model": "Qwen/Qwen3.8-27B",
+        "status": 200,
+        "tool_call_returned": true,
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"city\": \"Berlin\"}",
+              "name": "get_weather"
+            },
+            "id": "chatcmpl-tool-ae656e3cf14d6280",
+            "type": "function"
+          }
+        ],
+        "usage": {
+          "completion_tokens": 54,
+          "completion_tokens_details": {
+            "reasoning_tokens": 26
+          },
+          "prompt_tokens": 315,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 369
+        }
+      },
+      "long_context": {
+        "block_types": [
+          "thinking",
+          "text"
+        ],
+        "error": null,
+        "headers": {},
+        "latency_ms": 15664,
+        "model": "Qwen/Qwen3.8-27B",
+        "prompt_chars": 240000,
+        "status": 200,
+        "stop_reason": "end_turn",
+        "type": "message",
+        "usage": {
+          "cache_creation_input_tokens": 57600,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 1908,
+          "output_tokens": 166
+        }
+      },
+      "preregistered": false,
+      "protocols": {
+        "chat_stream_tool_calls": {
+          "content_type": "text/event-stream",
+          "error": null,
+          "event_types": {
+            "[DONE]": 1,
+            "chat.completion.chunk": 1,
+            "chat.completion.chunk:": 1,
+            "chat.completion.chunk:reasoning": 10,
+            "chat.completion.chunk:role": 1,
+            "chat.completion.chunk:tool_calls": 3
+          },
+          "events": 17,
+          "latency_ms": 2648,
+          "status": 200,
+          "time_to_first_event_ms": 353
+        },
+        "messages_stream_text": {
+          "content_type": "text/event-stream",
+          "error": null,
+          "event_types": {
+            "content_block_delta:signature_delta": 1,
+            "content_block_delta:text_delta": 1,
+            "content_block_delta:thinking_delta": 9,
+            "content_block_start": 2,
+            "content_block_stop": 2,
+            "message_delta": 1,
+            "message_start": 1,
+            "message_stop": 1
+          },
+          "events": 18,
+          "latency_ms": 766,
+          "status": 200,
+          "time_to_first_event_ms": 243
+        },
+        "messages_stream_tool_use": {
+          "content_type": "text/event-stream",
+          "error": null,
+          "event_types": {
+            "content_block_delta:input_json_delta": 3,
+            "content_block_delta:signature_delta": 1,
+            "content_block_delta:thinking_delta": 7,
+            "content_block_start": 2,
+            "content_block_stop": 2,
+            "message_delta": 1,
+            "message_start": 1,
+            "message_stop": 1
+          },
+          "events": 18,
+          "latency_ms": 1093,
+          "status": 200,
+          "time_to_first_event_ms": 313
+        },
+        "messages_tool_result": {
+          "block_types": [
+            "thinking",
+            "text"
+          ],
+          "error": null,
+          "headers": {},
+          "latency_ms": 2372,
+          "model": "Qwen/Qwen3.8-27B",
+          "status": 200,
+          "stop_reason": "end_turn",
+          "type": "message",
+          "usage": {
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "input_tokens": 411,
+            "output_tokens": 44
+          }
+        },
+        "messages_tool_use": {
+          "block_types": [
+            "thinking",
+            "tool_use"
+          ],
+          "error": null,
+          "headers": {},
+          "latency_ms": 5250,
+          "model": "Qwen/Qwen3.8-27B",
+          "status": 200,
+          "stop_reason": "tool_use",
+          "type": "message",
+          "usage": {
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "input_tokens": 315,
+            "output_tokens": 75
+          }
+        }
+      },
+      "trivial": {
+        "error": null,
+        "finish_reason": "stop",
+        "headers": {},
+        "latency_ms": 969,
+        "model": "Qwen/Qwen3.8-27B",
+        "status": 200,
+        "tool_calls": [],
+        "usage": {
+          "completion_tokens": 21,
+          "completion_tokens_details": {
+            "reasoning_tokens": 17
+          },
+          "prompt_tokens": 56,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 77
+        }
+      }
+    }
+  },
+  "timestamp_utc": "2026-10-26T22:14:58Z"
+}
