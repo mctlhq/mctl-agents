@@ -12,6 +12,10 @@ Scope. Operator-run only, on fixtures MCTL built from its own source under
 and no commit or CI run uses the live subcommands: they exit non-zero without
 `--allow-live`.
 
+`run` prints one JSON record (kind, fixture, arm, model, wall_clock_s, turns,
+tool_calls, usage, final, outcome "ok"|"failed", failure_class, and on failure
+a bounded `failure` {sha256, reason}); exit 0 when ok, 1 when failed.
+
 Refusals are measurements. A stage is attempted exactly once; on a refusal or
 failure the probe records the earliest failing stage and stops. There is no
 retry, rephrase or decomposition path in this module.
@@ -372,7 +376,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         "turns": sig.get("turns", UNOBSERVED), "tool_calls": sig.get("tool_calls", UNOBSERVED),
         "usage": sig.get("usage") or {},
         "final": bounded_summary(str(sig.get("text", ""))),
+        "outcome": "ok" if sig.get("ok") else "failed",
+        "failure_class": None if sig.get("ok") else classify(sig),
     }
+    if not sig.get("ok"):
+        rec["failure"] = failure_text_record(str(sig.get("text", "")), store_text=False)
     print(json.dumps(rec))
     return 0 if sig.get("ok") else 1
 

@@ -173,3 +173,38 @@ def test_collect_counts_tool_calls_and_leaves_broken_stream_unobserved() -> None
         return await rs._collect(broken(), {"ok": True, "text": ""})
 
     assert "tool_calls" not in anyio.run(go)
+
+
+@pytest.mark.parametrize(
+    ("sig", "expected"),
+    [
+        ({"ok": False, "declined": True, "text": "no"}, rs.MODEL_POLICY_REFUSAL),
+        ({"ok": False, "transport_error": True}, rs.PROVIDER_RUNTIME_FAILURE),
+        ({"ok": False, "tool_error": True}, rs.REA_TOOL_FAILURE),
+    ],
+)
+def test_cmd_run_failure_record(
+    sig: dict[str, object], expected: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    monkeypatch.setattr(rs, "_live_stage", lambda *a, **k: sig)
+    rc = rs.main(["run", "--allow-live", "--fixture", "native-codec", "--arm", "baseline", "--model", "m"])
+    rec = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert rec["outcome"] == "failed"
+    assert rec["failure_class"] == expected
+    assert "sha256" in rec["failure"]
+
+
+def test_cmd_run_ok_record_is_bounded(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import json
+
+    monkeypatch.setattr(rs, "_live_stage", lambda *a, **k: {"ok": True, "text": "x" * 10240})
+    rc = rs.main(["run", "--allow-live", "--fixture", "native-codec", "--arm", "baseline", "--model", "m"])
+    rec = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert rec["outcome"] == "ok"
+    assert rec["failure_class"] is None
+    assert "failure" not in rec
+    assert len(json.dumps(rec["final"])) < 10240
