@@ -263,6 +263,10 @@ jobs:
             rm -f "$serr"
           done
 
+          # Remove the answer key, fixture sources and git history from the
+          # workspace before any model call; scoring runs offline elsewhere.
+          rm -rf "$GITHUB_WORKSPACE/docs/spikes/796/fixtures" "$GITHUB_WORKSPACE/.git"
+
           # schema-bytes (REA-dependent)
           if [ "$rea_ok" = true ]; then
             invoke schema-bytes "" "" schema-bytes.json 0 schema-bytes --allow-live

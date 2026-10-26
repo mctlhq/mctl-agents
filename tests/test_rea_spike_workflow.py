@@ -120,7 +120,8 @@ def test_grading_template_entries_top_level(tmp_path: Path) -> None:
     assert _score_rows(str(tmp_path / "r.jsonl"), str(tmp_path / "g.yaml")) == []
     rec = '{"kind": "run", "fixture": "native-codec", "arm": "baseline", "final": "", "outcome": "failed"}'
     (tmp_path / "r.jsonl").write_text(rec + "\n")
-    assert isinstance(_score_rows(str(tmp_path / "r.jsonl"), str(tmp_path / "g.yaml")), list)
+    rows = _score_rows(str(tmp_path / "r.jsonl"), str(tmp_path / "g.yaml"))
+    assert len(rows) == 1
 
 
 def test_rea_identity_bound_to_sha() -> None:
@@ -190,3 +191,12 @@ def test_staged_runtime_fixture_has_no_oracle_or_sources(tmp_path: Path) -> None
             assert "task.md" in names
     finally:
         rea_spike.SPIKE_DIR = orig
+
+
+def test_answer_key_removed_before_first_invoke() -> None:
+    run = _step_run("Measure")
+    rm = run.index('rm -rf "$GITHUB_WORKSPACE/docs/spikes/796/fixtures" "$GITHUB_WORKSPACE/.git"')
+    assert run.index("stage-fixtures") < rm
+    first_call = re.search(r"^\s*invoke (schema-bytes|run|probe-stages) ", run, re.M)
+    assert first_call and rm < first_call.start()
+    assert run.index("schema-bytes --allow-live") > rm
