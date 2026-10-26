@@ -196,7 +196,7 @@ def model_matrix(records: Sequence[Mapping[str, Any]], models: Sequence[str] = M
     """One row per model and stage. A model with no records renders
     `not-run (<reason>)`, never a zero or a pass."""
     out = [_row(("model", *STAGES)), _row(["---"] * (len(STAGES) + 1))]
-    seen = {str(r["model"]) for r in records if r.get("kind") == "probe"}
+    seen = {str(r["model"]) for r in records if r.get("kind") == "probe" and r.get("model")}
     for model in [*sorted(seen), *[m for m in models if m not in seen]]:
         probes = [r for r in records if r.get("kind") == "probe" and r.get("model") == model]
         if not probes:
@@ -269,6 +269,7 @@ async def _collect(stream: Any, sig: dict[str, Any]) -> dict[str, Any]:
     so a stubbed stream can drive it in unit tests."""
     text: list[str] = []
     rea_use_ids: set[str] = set()
+    tool_calls = 0
     try:
         async for msg in stream:
             if hasattr(msg, "is_error") and hasattr(msg, "num_turns"):  # ResultMessage
@@ -290,6 +291,7 @@ async def _collect(stream: Any, sig: dict[str, Any]) -> dict[str, Any]:
             for block in content:
                 use_id = getattr(block, "id", None)
                 if isinstance(use_id, str) and isinstance(getattr(block, "name", None), str):  # ToolUseBlock
+                    tool_calls += 1
                     if _is_rea_tool_use(block):
                         rea_use_ids.add(use_id)
                 if getattr(block, "is_error", None) is True:  # failed tool result
@@ -304,6 +306,8 @@ async def _collect(stream: Any, sig: dict[str, Any]) -> dict[str, Any]:
         sig["ok"] = False
         sig["transport_error"] = True
         text.append(repr(exc))
+    else:  # a broken stream leaves the count unobserved, not short
+        sig["tool_calls"] = tool_calls
     sig["text"] = "\n".join(text)
     return sig
 
@@ -365,7 +369,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     rec = {
         "kind": "run", "fixture": args.fixture, "arm": args.arm, "model": model,
         "wall_clock_s": round(time.monotonic() - started, 1),
-        "turns": sig.get("turns", UNOBSERVED), "usage": sig.get("usage") or {},
+        "turns": sig.get("turns", UNOBSERVED), "tool_calls": sig.get("tool_calls", UNOBSERVED),
+        "usage": sig.get("usage") or {},
         "final": bounded_summary(str(sig.get("text", ""))),
     }
     print(json.dumps(rec))

@@ -153,3 +153,23 @@ def test_rea_mcp_without_command_fails_fast(monkeypatch: pytest.MonkeyPatch, tmp
     monkeypatch.delenv("REA_SPIKE_MCP_CMD", raising=False)
     sig = rs._live_stage("p", "m", tmp_path, "rea-mcp")  # type: ignore[arg-type]
     assert sig["ok"] is False and rs.classify(sig) == rs.CLIENT_TOOL_ADMISSION
+
+
+def test_collect_counts_tool_calls_and_leaves_broken_stream_unobserved() -> None:
+    sig = _collect(
+        _Msg(content=[_Msg(id="t1", name="Bash", input={}), _Msg(text="x")]),
+        _Msg(content=[_Msg(id="t2", name="mcp__rea__query", input={})]),
+        _Msg(is_error=False, num_turns=2, usage={}),
+    )
+    assert sig["tool_calls"] == 2
+
+    async def broken():  # type: ignore[no-untyped-def]
+        yield _Msg(content=[_Msg(id="t1", name="Bash", input={})])
+        raise RuntimeError("stream dropped")
+
+    import anyio
+
+    async def go() -> dict[str, object]:
+        return await rs._collect(broken(), {"ok": True, "text": ""})
+
+    assert "tool_calls" not in anyio.run(go)
