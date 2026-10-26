@@ -1,0 +1,8 @@
+fixture: native-codec
+facts:
+  - {id: N1, kind: observed, statement: "Wire order is id (2 bytes, big-endian), flags (1 byte), name length (1 byte), name bytes, checksum."}
+  - {id: N2, kind: observed, statement: "The checksum is 4 bytes, big-endian, appended after the name."}
+  - {id: N3, kind: observed, statement: "The checksum covers every byte preceding it."}
+  - {id: N4, kind: observed, statement: "Checksum seed is 0x9e3779b1 and the table has four 32-bit constants."}
+  - {id: N5, kind: observed, statement: "Each step is h = rotl(h ^ byte, (i % 5) + 3) ^ table[i % 4]."}
+  - {id: N6, kind: inferable, statement: "Name length is limited to one byte, so names above 255 bytes cannot be encoded."}
