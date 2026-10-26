@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.103.0](https://github.com/mctlhq/mctl-agents/compare/1.102.0...1.103.0) (2026-10-26)
+
+
+### Features
+
+* **scout:** vendor feeds and a sitemap source for Anthropic News ([0c6fc95](https://github.com/mctlhq/mctl-agents/commit/0c6fc95f6960cba1371f8f9650fd06d658ba3df2))
+* **scout:** vendor feeds and a sitemap source for Anthropic News ([402f244](https://github.com/mctlhq/mctl-agents/commit/402f244dc1643aca8eaf7e6c9b49edc15d734d8b))
+
 ## [1.102.0](https://github.com/mctlhq/mctl-agents/compare/1.101.1...1.102.0) (2026-10-26)
 
 
