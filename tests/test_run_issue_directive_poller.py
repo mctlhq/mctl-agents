@@ -1306,7 +1306,7 @@ class _FakeHandle:
         return type("D", (), {"status": st})()
 
     async def query(self, name):
-        if self._c.query_error:
+        if self._c.query_error or self.id in getattr(self._c, "bad_query", ()):
             raise RuntimeError("query failed")
         return self._c.busy.get(self.id, False)
 
@@ -1391,6 +1391,17 @@ def test_investigate_refused_when_another_investigation_in_flight(fresh):
     assert tc.started == []
     body = _bodies(gh, FRESH_URL)[0]
     assert "another investigation" in body and "mctl-directive-ack: c1" in body
+
+
+def test_wedged_loop_query_error_does_not_block_investigate(fresh):
+    gh, tc = fresh
+    wedged, healthy = "dev-loop-mctlhq-mctl-api-1", "dev-loop-mctlhq-mctl-api-2"
+    tc.running, tc.busy = [wedged, healthy], {healthy: False}
+    tc.bad_query = {wedged}
+    gh.add_comment(FRESH_URL, body="@MCTL investigate")
+    result = _run_scan(max_directives=10)
+    assert result.failed == 0
+    assert len(tc.started) == 1
 
 
 def test_only_one_investigate_started_per_tick(fresh):

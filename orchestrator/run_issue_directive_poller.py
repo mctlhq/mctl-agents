@@ -386,13 +386,22 @@ def list_repo_comments(repo: str, since: str) -> list[RepoComment]:
 
 async def investigation_in_flight(client: Client) -> str | None:
     """The workflow id of a running DevLoopWorkflow that reports an
-    investigation in flight, or None. Any listing or query error raises
-    `InFlightUnknown`: unknown is never read as "none"."""
+    investigation in flight, or None. A listing error raises
+    `InFlightUnknown`. A per-workflow query error (wedged run, old worker
+    without the handler) is logged and that loop is treated as not in
+    flight, so one broken loop cannot disable the verb fleet-wide."""
     try:
         async for wf in client.list_workflows(ACTIVE_DEV_LOOPS_QUERY):
             handle = client.get_workflow_handle(wf.id, run_id=wf.run_id)
-            if await handle.query("investigate_in_flight"):
-                return str(wf.id)
+            try:
+                if await handle.query("investigate_in_flight"):
+                    return str(wf.id)
+            except Exception as qe:
+                print(
+                    f"investigate_in_flight query failed for {wf.id}: "
+                    f"{type(qe).__name__}: {qe}; treating as not in flight",
+                    file=sys.stderr,
+                )
     except Exception as e:
         raise InFlightUnknown(f"{type(e).__name__}: {e}") from e
     return None
