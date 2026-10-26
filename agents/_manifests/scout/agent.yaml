@@ -1,0 +1,28 @@
+# AgentManifest for scout (mctlhq/mctl-agents#797). Tool-free model calls,
+# Telegram sendMessage only, read-only GitHub.
+apiVersion: agents.mctl.ai/v1alpha1
+kind: Agent
+metadata:
+  name: scout
+  owner: mctl-agents
+spec:
+  runtime:
+    type: claude-agent-sdk
+    entrypoint: orchestrator.run_scout:run_scout
+    optionsBuilder: orchestrator.options:build_scout_options
+  prompt:
+    sources:
+      - inline: orchestrator/run_scout.py:RELEVANCE_PROMPT
+      - inline: orchestrator/run_scout.py:SCORING_PROMPT
+      - file: agents/_scout/PLATFORM.md
+      - file: agents/_scout/sources.yaml
+  triggers: [cron mctl-agents-scout]   # informational
+  modelPolicy:
+    task: scout_scoring
+  toolPolicy:
+    allow: []
+  execution:
+    budgetUsd: 1.00     # SCOUT_BUDGET_USD
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-scout

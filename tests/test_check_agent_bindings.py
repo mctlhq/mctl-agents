@@ -161,8 +161,8 @@ def _add_manifest(manifests: Path, name: str) -> bytes:
 # ---------------------------------------------------------------------------
 # Green on a converged input
 # ---------------------------------------------------------------------------
-def test_seven_manifests_are_what_this_suite_covers():
-    assert len(_AGENTS) == 7
+def test_eight_manifests_are_what_this_suite_covers():
+    assert len(_AGENTS) == 8
     assert _V2 in _AGENTS
 
 
@@ -459,7 +459,7 @@ def test_each_agent_is_reported_before_the_next_is_read(manifests, tmp_path, mon
     done = [a for a in _AGENTS if a < "mentor"]
     assert len(done) == 4
     out = capsys.readouterr().out
-    assert "7 manifest(s)" in out
+    assert "8 manifest(s)" in out
     assert _status(out) == {tool.RESOLVER_CHECK_LABEL: "match", **dict.fromkeys(done, "match")}
     text = summary.read_text()
     for agent in done:
@@ -476,7 +476,7 @@ def test_the_job_timeouts_cover_the_retry_budget_of_every_read():
     manifest or raising the retry budget has to move the timeouts too."""
     reads = 2 + 2 * len(_AGENTS)
     budget_minutes = reads * (gate.FETCH_ATTEMPTS - 1) * gate.RETRY_AFTER_MAX_S / 60
-    assert budget_minutes == 32
+    assert budget_minutes == 36
     workflows = _REPO_ROOT / ".github" / "workflows"
     pr_job = yaml.safe_load((workflows / "pr-validation.yml").read_text())["jobs"]["binding-hash"]
     gate_job = yaml.safe_load((workflows / "release-please.yml").read_text())["jobs"]["binding-gate"]
