@@ -82,6 +82,89 @@ def test_parse_rss_atom_and_disabled():
     assert d.status == "disabled"
 
 
+SITEMAP = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<url><loc>https://www.x.test/news</loc><lastmod>2026-10-26T05:00:00Z</lastmod></url>
+<url><loc>https://www.x.test/news/</loc></url>
+<url><loc>https://www.x.test/news/new-model-launch</loc><lastmod>2026-10-26T05:00:00Z</lastmod></url>
+<url><loc>https://www.x.test/news/old-post</loc><lastmod>2026-01-02T00:00:00Z</lastmod></url>
+<url><loc>https://www.x.test/news/undated</loc></url>
+<url><loc>https://www.x.test/newsletter/x</loc><lastmod>2026-10-26T05:00:00Z</lastmod></url>
+<url><loc>https://www.x.test/careers</loc><lastmod>2026-10-26T05:00:00Z</lastmod></url>
+<url><loc>https://evil.test/news/phish</loc><lastmod>2026-10-26T05:00:00Z</lastmod></url>
+<url><loc>javascript:alert(1)</loc></url>
+</urlset>"""
+SITEMAP_SRC = {"name": "A", "url": "https://www.x.test/sitemap.xml", "type": "sitemap", "path_prefix": "/news/"}
+
+
+def test_parse_sitemap_keeps_only_own_host_under_prefix():
+    items = feeds.parse_sitemap(SITEMAP.encode(), "A", SITEMAP_SRC["url"], "/news")
+    assert [i.link for i in items] == [
+        "https://www.x.test/news/new-model-launch", "https://www.x.test/news/old-post",
+        "https://www.x.test/news/undated"]
+    assert items[0].title == "New model launch" and items[0].summary == ""
+    assert items[0].published == datetime(2026, 10, 26, 5, tzinfo=UTC) and items[2].published is None
+    index = b'<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"/>'
+    with pytest.raises(ValueError, match="not a sitemap urlset"):
+        feeds.parse_sitemap(index, "A", SITEMAP_SRC["url"], "/news/")
+    with pytest.raises(ValueError, match="DOCTYPE/ENTITY"):
+        feeds.parse_sitemap(b'<!DOCTYPE u><urlset/>', "A", SITEMAP_SRC["url"], "/news/")
+
+
+def test_sitemap_source_describes_only_recent_pages():
+    fetched = []
+    page = ('<html><head><title>Fallback</title><meta content="Launch day" property="og:title">'
+            '<meta name="description" content="We &amp; you"></head></html>')
+
+    def handler(req):
+        fetched.append(req.url.path)
+        if req.url.path == "/sitemap.xml":
+            return httpx.Response(200, text=SITEMAP)
+        return httpx.Response(200, text=page)
+    with _client(handler) as c:
+        r = feeds.fetch_source(c, SITEMAP_SRC, NOW)
+    assert r.status == "ok"
+    by = {i.link.rsplit("/", 1)[-1]: i for i in r.items}
+    assert (by["new-model-launch"].title, by["new-model-launch"].summary) == ("Launch day", "We & you")
+    # Old and undated pages are never fetched: they cannot reach the window.
+    assert fetched == ["/sitemap.xml", "/news/new-model-launch"]
+    assert by["old-post"].title == "Old post"
+
+
+def test_sitemap_page_failure_keeps_slug_title_and_caps_fetches():
+    many = "".join(f"<url><loc>https://www.x.test/news/p{n}</loc><lastmod>2026-10-26T0{n}:00:00Z</lastmod></url>"
+                   for n in range(8))
+    many += "<url><loc>https://www.x.test/news/later</loc><lastmod>2026-10-26T09:00:00Z</lastmod></url>"
+    body = f'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{many}</urlset>'
+    pages = []
+
+    def handler(req):
+        if req.url.path == "/sitemap.xml":
+            return httpx.Response(200, text=body)
+        pages.append(req.url.path)
+        return httpx.Response(500)
+    with _client(handler) as c:
+        r = feeds.fetch_source(c, SITEMAP_SRC, NOW)
+    assert r.status == "ok" and len(r.items) == 9
+    # Newest first and capped; p7 is inside the window's +1h tolerance, "later" is not.
+    assert pages == [f"/news/p{n}" for n in (7, 6, 5, 4, 3)]
+    assert {i.title for i in r.items} == {f"P{n}" for n in range(8)} | {"Later"}
+
+
+def test_sitemap_config_is_validated(tmp_path):
+    base = ("window_hours: 26\ndedupe_days: 90\n"
+            "ranking: {top_n: 10, weights: {impact: 1, novelty: 1, urgency: 1, cost: 1}}\n")
+    cfg = tmp_path / "s.yaml"
+    cfg.write_text(base + "sources:\n  - {name: A, url: https://x.test/s.xml, type: sitemap}\n")
+    with pytest.raises(feeds.ConfigError, match="path_prefix"):
+        feeds.load_sources(cfg)
+    cfg.write_text(base + "sources:\n  - {name: A, url: https://x.test/s.xml, type: html}\n")
+    with pytest.raises(feeds.ConfigError, match="type must be"):
+        feeds.load_sources(cfg)
+    cfg.write_text(base + "sources:\n  - {name: A, url: https://x.test/s.xml, type: sitemap, path_prefix: /news/}\n")
+    assert feeds.load_sources(cfg).sources[0]["path_prefix"] == "/news/"
+
+
 def test_window():
     def it(h):
         return feeds.Item("t", "l", "", None if h is None else NOW - timedelta(hours=h), "s")

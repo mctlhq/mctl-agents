@@ -1,6 +1,5 @@
 # Scout feed list and ranking config (mctlhq/mctl-agents#797).
-# Feed URLs were not verified from the authoring environment (no network);
-# verify with `python -m orchestrator.run_scout --dry-run` before unsuspending.
+# Check new URLs with `python -m orchestrator.run_scout --dry-run` before adding.
 window_hours: 26
 dedupe_days: 90
 ranking:
@@ -16,11 +15,49 @@ sources:
   # latest 10 posts, which on busy tags is the last hour, so a daily run would see a
   # random slice; they are also mostly mixed-language beginner content.
   - {name: ITNEXT (Medium), url: "https://itnext.io/feed", weight: 0.8}
-  - name: Anthropic News
-    url: "https://www.anthropic.com/news"
-    enabled: false
-    note: no official RSS/Atom feed known; HTML scraping is out of scope
+  # Vendors of tools mctl runs. Company engineering blogs are down-weighted: broad
+  # topics, only some of it relevant.
+  - {name: Backstage, url: "https://backstage.io/blog/rss.xml", weight: 1.0}
+  - {name: Spotify Engineering, url: "https://engineering.atspotify.com/feed", weight: 0.8}
+  - {name: Temporal, url: "https://temporal.io/blog/feed.xml", weight: 1.0}
+  - {name: Argo, url: "https://blog.argoproj.io/feed", weight: 1.0}
+  - {name: Kubernetes, url: "https://kubernetes.io/feed.xml", weight: 1.0}
+  - {name: HashiCorp, url: "https://www.hashicorp.com/blog/feed.xml", weight: 1.0}
+  - {name: CloudNativePG, url: "https://cloudnative-pg.io/blog/index.xml", weight: 1.0}
+  - {name: Grafana, url: "https://grafana.com/blog/index.xml", weight: 1.0}
+  - {name: OpenTelemetry, url: "https://opentelemetry.io/blog/index.xml", weight: 1.0}
+  # Site-wide feed (docs pages too); undated entries drop out of the window.
+  - {name: VictoriaMetrics, url: "https://victoriametrics.com/index.xml", weight: 0.8}
+  - {name: Forgejo, url: "https://forgejo.org/rss.xml", weight: 1.0}
+  - {name: Valkey, url: "https://valkey.io/atom.xml", weight: 1.0}
+  - {name: OpenTofu, url: "https://opentofu.org/blog/rss.xml", weight: 1.0}
+  - {name: Go Blog, url: "https://go.dev/blog/feed.atom", weight: 1.0}
+  - {name: Planet PostgreSQL, url: "https://planet.postgresql.org/rss20.xml", weight: 0.6}
+  - {name: MCP Blog, url: "https://blog.modelcontextprotocol.io/index.xml", weight: 1.0}
+  - {name: Claude API release notes, url: "https://platform.claude.com/docs/en/release-notes/feed.xml", weight: 1.0}
+  - {name: Netflix TechBlog, url: "https://netflixtechblog.com/feed", weight: 0.8}
+  # Release feeds for tools with no usable blog feed (ZITADEL, cert-manager) or
+  # whose releases are the news. Releases are noisy, hence the low weight.
+  - {name: ZITADEL releases, url: "https://github.com/zitadel/zitadel/releases.atom", weight: 0.6}
+  - {name: cert-manager releases, url: "https://github.com/cert-manager/cert-manager/releases.atom", weight: 0.6}
+  - {name: k3s releases, url: "https://github.com/k3s-io/k3s/releases.atom", weight: 0.6}
+  - {name: External Secrets releases, url: "https://github.com/external-secrets/external-secrets/releases.atom", weight: 0.6}
+  - {name: Coolify releases, url: "https://github.com/coollabsio/coolify/releases.atom", weight: 0.6}
+  - {name: Traefik releases, url: "https://github.com/traefik/traefik/releases.atom", weight: 0.6}
+  - {name: Claude Code releases, url: "https://github.com/anthropics/claude-code/releases.atom", weight: 0.6}
+  # No RSS on anthropic.com; its sitemap lists every /news/ post. lastmod is the
+  # last edit, not the publish date, so an edited old post can resurface once
+  # (URL dedupe stops repeats).
+  - {name: Anthropic News, url: "https://www.anthropic.com/sitemap.xml", type: sitemap, path_prefix: /news/, weight: 1.0}
   - name: claude.com Blog
     url: "https://claude.com/blog"
     enabled: false
     note: no official RSS/Atom feed known; HTML scraping is out of scope
+  - name: CNCF
+    url: "https://www.cncf.io/feed/"
+    enabled: false
+    note: 403 to the scout's HTTP client (curl gets 200); bot filtering
+  - name: Traefik Blog
+    url: "https://traefik.io/rss.xml"
+    enabled: false
+    note: full-text feed is 2.5 MB, over MAX_BYTES; the release feed above covers it
