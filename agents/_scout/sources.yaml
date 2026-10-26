@@ -35,6 +35,8 @@ sources:
   - {name: Planet PostgreSQL, url: "https://planet.postgresql.org/rss20.xml", weight: 0.6}
   - {name: MCP Blog, url: "https://blog.modelcontextprotocol.io/index.xml", weight: 1.0}
   - {name: Claude API release notes, url: "https://platform.claude.com/docs/en/release-notes/feed.xml", weight: 1.0}
+  # pubDate is the day only (00:00 GMT); date_only keeps posts from falling between runs.
+  - {name: Hetzner Blog, url: "https://www.hetzner.com/blog/rss.xml", weight: 1.0, date_only: true}
   - {name: Netflix TechBlog, url: "https://netflixtechblog.com/feed", weight: 0.8}
   # Release feeds for tools with no usable blog feed (ZITADEL, cert-manager) or
   # whose releases are the news. Releases are noisy, hence the low weight.
