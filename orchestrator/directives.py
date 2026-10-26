@@ -38,7 +38,7 @@ MENTION_TOKENS = ("@mctl-agents[bot]", "@mctl-agents", "@mctl")
 # `mctl_trigger_implementer`), and leaving them out of this set is what
 # keeps them refused (`verb=None`, an `unrecognised` reply) instead of
 # silently half-supported.
-VERBS = frozenset({"reinvestigate"})
+VERBS = frozenset({"investigate", "reinvestigate"})
 
 # Comments authored by these logins are never directives — see the module
 # docstring's ack-loop rationale. This is also the TRUSTED-author set for

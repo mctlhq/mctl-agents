@@ -53,7 +53,9 @@ async def connect() -> Client:
     return await Client.connect(address, namespace=namespace)
 
 
-async def start_dev_loop_workflow(issue_url: str, client: Client | None = None) -> WorkflowHandle:
+async def start_dev_loop_workflow(
+    issue_url: str, client: Client | None = None, *, requested_by: str | None = None
+) -> WorkflowHandle:
     """Start (or attach to) the DevLoopWorkflow for ``issue_url``.
 
     Connects fresh when ``client`` is None — the single-shot cli.py case.
@@ -88,13 +90,17 @@ async def start_dev_loop_workflow(issue_url: str, client: Client | None = None) 
     """
     if client is None:
         client = await connect()
+    # `requested_by` (mctl-agents#799) is the commenter of an `@MCTL
+    # investigate` directive; recorded on the IssueRef and the start memo.
+    memo = {"requested_by": requested_by, "requested_via": "directive"} if requested_by else None
     return await client.start_workflow(
         DevLoopWorkflow.run,
-        IssueRef(issue_url=issue_url),
+        IssueRef(issue_url=issue_url, requested_by=requested_by),
         id=workflow_id_for(issue_url),
         task_queue=TASK_QUEUE,
         id_reuse_policy=DEV_LOOP_ID_REUSE_POLICY,
         id_conflict_policy=DEV_LOOP_ID_CONFLICT_POLICY,
+        memo=memo,
     )
 
 

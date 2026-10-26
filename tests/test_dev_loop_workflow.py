@@ -1536,6 +1536,62 @@ class TestDevLoopWorkflow:
         assert "mctl-agents-shepherd" not in calls
         assert owned is False
 
+    async def test_investigate_in_flight_is_true_only_while_investigate_runs(self, env):
+        """The `@MCTL investigate` gate (#799) asks every running loop
+        whether it is awaiting `mctl-agents-investigate`. The query must
+        answer True while that CWFT is pending and False once it returned,
+        or a loop parked at approval would block every new investigate.
+        """
+        activities, _calls, _investigate_ran, _ownership_ops = _fake_activities(released=True)
+        inner = next(
+            fn for fn in activities
+            if getattr(fn, "__temporal_activity_definition").name == "submit_and_wait"
+        )
+        entered = anyio.Event()
+        release = anyio.Event()
+
+        @activity.defn(name="submit_and_wait")
+        async def gated_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+            if input.operation == "mctl-agents-investigate":
+                entered.set()
+                await release.wait()
+            return await inner(input)
+
+        activities = [gated_submit_and_wait if fn is inner else fn for fn in activities]
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/799"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await entered.wait()
+            during = await handle.query(DevLoopWorkflow.investigate_in_flight)
+            release.set()
+            with anyio.fail_after(10):
+                # A query has no event to await; poll the workflow's answer.
+                while await handle.query(DevLoopWorkflow.investigate_in_flight):  # noqa: ASYNC110
+                    await asyncio.sleep(0.05)
+            after = await handle.query(DevLoopWorkflow.investigate_in_flight)
+            await handle.terminate("test done")
+
+        assert during is True
+        assert after is False
+
+    def test_issue_ref_without_requested_by_deserializes(self):
+        """Histories recorded before #799 carry no `requested_by`; the
+        defaulted field must let them decode, as replays depend on it."""
+        from temporalio.converter import DataConverter
+
+        converter = DataConverter.default.payload_converter
+        payloads = converter.to_payloads([{"issue_url": "https://github.com/mctlhq/mctl-telegram/issues/1"}])
+        (ref,) = converter.from_payloads(payloads, [IssueRef])
+        assert ref == IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1")
+        assert ref.requested_by is None
+
     async def test_persistent_record_execution_failure_does_not_fail_workflow(self, env):
         """record_execution is an audit-trail write, not the real work — a
         persistent failure there (e.g. mctl-api's executions endpoint down)

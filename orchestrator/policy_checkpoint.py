@@ -391,6 +391,8 @@ BUILTIN_POLICY = Policy(
         Rule("github-run-rerun-failed", GITHUB_RUN_RERUN, "rerun:failed", ALLOW),
         Rule("github-issue-label-remove", GITHUB_ISSUE_LABEL, "remove", ALLOW),
         Rule("mctl-investigate", MCTL_OPERATION_EXECUTE, "execute:mctl-agents-investigate", ALLOW),
+        # `@MCTL investigate` starting the issue's DevLoopWorkflow (mctl-agents#799).
+        Rule("dev-loop-start-directive", MCTL_OPERATION_EXECUTE, "execute:dev-loop-start", ALLOW),
         # Sealing this execution's context snapshot (mctlhq/mctl-agents#431):
         # insert-only on the store side, so it can never overwrite anything.
         Rule("mctl-seal-context-snapshot", MCTL_WORK_ITEM_WRITE, "seal:context-snapshot", ALLOW),
