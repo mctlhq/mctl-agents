@@ -14,13 +14,44 @@ TOKENS = ("NO_CHANGE", "HARDEN_IN_PLACE", "DEDICATED_AGENT_NAMESPACE", "SANDBOX_
 GUARDED = ("orchestrator", "config", "agents/_manifests")
 
 
+def decision_errors(text: str) -> list[str]:
+    """Empty when the report is DRAFT, or names exactly one decision token in its Decision section."""
+    statuses = re.findall(r"^STATUS:\s*(\w+)", text, re.MULTILINE)
+    if not statuses:
+        return ["report needs a STATUS line"]
+    if len(set(statuses)) != 1:
+        return [f"STATUS lines disagree: {statuses}"]
+    if "## Decision" not in text:
+        return ["report needs a ## Decision section"]
+    section = text.split("## Decision", 1)[1].split("\n## ", 1)[0]
+    sec_status = re.findall(r"^STATUS:\s*(\w+)", section, re.MULTILINE)
+    if not sec_status:
+        return ["Decision section needs a STATUS line"]
+    if statuses[0] == "DRAFT":
+        return []
+    named = sorted({t for t in TOKENS if re.search(rf"\b{t}\b", section)})
+    if statuses[0] not in TOKENS:
+        return [f"unknown decision token {statuses[0]!r}"]
+    if named != [statuses[0]]:
+        return [f"Decision section must name exactly one token, found {named}"]
+    return []
+
+
 def test_report_is_draft_or_has_exactly_one_token() -> None:
-    text = REPORT.read_text()
-    m = re.search(r"^STATUS:\s*(\w+)", text, re.MULTILINE)
-    assert m, "report needs a STATUS line"
-    if "STATUS: DRAFT" in text:
-        return
-    assert m.group(1) in TOKENS, f"unknown decision token {m.group(1)!r}"
+    assert decision_errors(REPORT.read_text()) == []
+
+
+@pytest.mark.parametrize(("text", "ok"), [
+    ("STATUS: DRAFT\n## Decision\nSTATUS: DRAFT. Proposed: `HARDEN_IN_PLACE`, later `NO_CHANGE`.\n", True),
+    ("STATUS: HARDEN_IN_PLACE\n## Decision\nSTATUS: HARDEN_IN_PLACE\n", True),
+    ("STATUS: HARDEN_IN_PLACE\n## Decision\nSTATUS: NO_CHANGE\n", False),
+    ("STATUS: HARDEN_IN_PLACE\n## Decision\nSTATUS: HARDEN_IN_PLACE, then NO_CHANGE\n", False),
+    ("STATUS: DRAFT\n## Decision\nSTATUS: NO_CHANGE\n", False),
+    ("STATUS: BOGUS\n## Decision\nSTATUS: BOGUS\n", False),
+    ("STATUS: NO_CHANGE\n## Decision\nnothing here\n", False),
+])
+def test_decision_guard_cases(text: str, ok: bool) -> None:
+    assert (decision_errors(text) == []) is ok
 
 
 def test_no_runtime_path_changed() -> None:
