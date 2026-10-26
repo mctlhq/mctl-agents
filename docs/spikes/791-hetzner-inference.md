@@ -59,7 +59,9 @@ on write. Sections "Environment" to "Rule outcome" below are the output of
 - **Harness additions in this PR** (spike code only, nothing under `orchestrator/`): `snapshot --deep` (Messages
   tool round trip, streaming framing, ~60k-token long-context probe), `snapshot --models` for owner-added exact
   IDs, `bench --arm/--models/--snapshot/--run-location`, `merge`, a record field `tool_names`, and the richer
-  `report`. All were committed before the bench started; the start snapshot was taken with them.
+  `report`. All were committed (`49712bc`) before the bench started, and the start snapshot was taken with
+  them. The only later harness change is a typing-only fix in `merge` (a `str()` around the finish timestamp,
+  for mypy), which `merge` ran after.
 - **Baseline tool-use 0/3 is an oracle artifact.** The tool-use oracle requires `Glob`, `Read` and `Bash`. The
   baseline found the script with `Grep` instead of `Glob` in all three cells, which fails the oracle whatever the
   answer was. Raw transcripts were not recorded, so the final answers cannot be re-scored. The verdict does not
