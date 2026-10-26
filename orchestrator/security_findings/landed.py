@@ -10,9 +10,15 @@ the documented `repository` filter format (normalised `host/owner/repo`) is
 not something this client should guess at. So the listing is by state only
 and the repository is matched here, on the normalised suffix, before each
 candidate is read in full and matched on `devloop_workflow_id` exactly.
+
+Invariant: a `LandedOutcome` carries an occurrence id only after that
+occurrence was read and its active attempt proved to belong to `workflow_id`.
+An unreadable candidate is logged to stderr and skipped (the verifier sweep
+recovers it); only a failed listing yields the unscoped `LandedOutcome("")`.
 """
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 
 from orchestrator.security_findings import contract
@@ -23,6 +29,33 @@ from orchestrator.security_findings.client import (
     SecurityFindingsClient,
     idempotency_key,
 )
+
+SUPPORTED_OWNER = "mctlhq"
+
+
+def mctlhq_repo_name(subject_repository: str) -> str:
+    """`github.com/mctlhq/<repo>` or `mctlhq/<repo>` -> `<repo>`, else `""`."""
+    have = subject_repository.strip().lower().rstrip("/").removesuffix(".git").rstrip("/")
+    parts = have.split("/")
+    if len(parts) == 3 and parts[0] == "github.com":
+        parts = parts[1:]
+    if len(parts) != 2 or parts[0] != SUPPORTED_OWNER:
+        return ""
+    repo = parts[1]
+    if not repo or not all(c.isascii() and (c.isalnum() or c in "_.-") for c in repo):
+        return ""
+    return repo
+
+
+def issue_number_for(workflow_id: str, repo: str) -> str:
+    """Issue number of `dev-loop-mctlhq-<repo>-<N>`, verified by exact prefix; else `""`."""
+    if not repo:
+        return ""
+    prefix = f"dev-loop-{SUPPORTED_OWNER}-{repo}-"
+    if not workflow_id.startswith(prefix):
+        return ""
+    number = workflow_id[len(prefix):]
+    return number if number and number.isascii() and number.isdigit() else ""
 
 
 @dataclass(frozen=True)
@@ -61,7 +94,11 @@ def bind_landed(
             continue
         read = client.get_occurrence(summary.id)
         if read.verdict != OK or read.occurrence is None:
-            out.append(LandedOutcome(summary.id, UNKNOWN))
+            print(
+                f"warn: security landed binding skipped unread candidate {summary.id} "
+                f"({read.verdict}/{read.code}) for {workflow_id}; the verifier sweep will recover it",
+                file=sys.stderr,
+            )
             continue
         occ = read.occurrence
         attempt = occ.active_attempt

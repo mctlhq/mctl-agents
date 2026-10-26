@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -30,23 +29,22 @@ from orchestrator.security_findings.client import (
     SecurityFindingsClient,
     idempotency_key,
 )
+from orchestrator.security_findings.landed import issue_number_for, mctlhq_repo_name
 
 SWEEP_CAP = 50
-_DEV_LOOP_ID_RE = re.compile(r"^dev-loop-[A-Za-z0-9_.-]+?-([A-Za-z0-9_.-]+)-(\d+)$")
 
-#: `workflow_id -> (pr_url, merge_commit)` of a finished DevLoop whose PR merged, else None.
-MergedLookup = Callable[[SecurityFindingsClient, str], "tuple[str, str] | None"]
+#: `(workflow_id, repo) -> (pr_url, merge_commit)` of a finished DevLoop whose PR merged, else None.
+MergedLookup = Callable[[SecurityFindingsClient, str, str], "tuple[str, str] | None"]
 
 
 def _emit(**fields: object) -> None:
     print(json.dumps(fields, sort_keys=True), flush=True)
 
 
-def default_merged_lookup(client: SecurityFindingsClient, workflow_id: str) -> tuple[str, str] | None:
-    m = _DEV_LOOP_ID_RE.match(workflow_id)
-    if not m:
+def default_merged_lookup(client: SecurityFindingsClient, workflow_id: str, repo: str) -> tuple[str, str] | None:
+    number = issue_number_for(workflow_id, repo)
+    if not repo or not number:
         return None
-    repo, number = m.group(1), m.group(2)
     loop = client.get_dev_loop(workflow_id)
     if loop.verdict != "exists" or loop.status == "Running":
         return None
@@ -141,7 +139,11 @@ def _bind_missed(client: SecurityFindingsClient, merged_lookup: MergedLookup) ->
             continue
         if not attempt.devloop_workflow_id:
             continue
-        merged = merged_lookup(client, attempt.devloop_workflow_id)
+        repo = mctlhq_repo_name(occ.repository or summary.repository)
+        if not repo:
+            _emit(occurrence_id=occ.id, skipped="repository_unsupported")
+            continue
+        merged = merged_lookup(client, attempt.devloop_workflow_id, repo)
         if merged is None:
             continue
         pr_url, merge_commit = merged

@@ -57,7 +57,7 @@ def to_awaiting(store: FakeStore, oid: str = "soc_1", sha: str = SHA_A, wid: str
 
 
 def run_sweep(client: SecurityFindingsClient, verifiers: list[Any], capsys: pytest.CaptureFixture[str]) -> list[dict[str, Any]]:
-    sweep_mod.sweep(client, verifiers, now=NOW, merged_lookup=lambda c, w: None)
+    sweep_mod.sweep(client, verifiers, now=NOW, merged_lookup=lambda *_: None)
     out = capsys.readouterr().out
     return [json.loads(line) for line in out.splitlines() if line.strip()]
 
@@ -717,7 +717,7 @@ def test_sweep_fallback_binds_a_missed_merge(store: FakeStore, capsys: pytest.Ca
     store.seed()
     c = SecurityFindingsClient()
     remediation.start(c, FakeWorkItems(), occurrence_id="soc_1", issue_url=ISSUE, tenant="admins")
-    sweep_mod.sweep(c, [], now=NOW, merged_lookup=lambda client, wid: ("https://github.com/mctlhq/svc/pull/8", SHA_A))
+    sweep_mod.sweep(c, [], now=NOW, merged_lookup=lambda client, wid, repo: ("https://github.com/mctlhq/svc/pull/8", SHA_A))
     capsys.readouterr()
     assert store.occ["soc_1"]["state"] == "awaiting_verification"
     assert store.occ["soc_1"]["remediation_attempts"][0]["landed_revision"] == SHA_A
@@ -748,3 +748,80 @@ def test_cli_start_prints_one_json_line(store: FakeStore, capsys: pytest.Capture
 
 def test_asyncio_import_ok() -> None:
     assert asyncio.iscoroutinefunction(activity_mod.security_record_landed)
+
+
+def test_issue_number_and_repo_name_are_exact() -> None:
+    assert landed.issue_number_for("dev-loop-mctlhq-svc-7", "svc") == "7"
+    assert landed.issue_number_for("dev-loop-mctlhq-my-repo-42", "my-repo") == "42"
+    assert landed.issue_number_for("dev-loop-my-org-my-repo-42", "org-my-repo") == ""
+    assert landed.issue_number_for("dev-loop-mctlhq-svc-7x", "svc") == ""
+    for good in ("github.com/mctlhq/svc", "mctlhq/svc.git/"):
+        assert landed.mctlhq_repo_name(good) == "svc"
+    for bad in ("github.com/my-org/my-repo", "gitlab.com/mctlhq/svc", "svc", ""):
+        assert landed.mctlhq_repo_name(bad) == ""
+
+
+def _fixing_with_wid(store: FakeStore, repo: str, wid: str, oid: str = "soc_1") -> SecurityFindingsClient:
+    store.seed(oid, repo=repo, state="fixing")
+    store.occ[oid]["remediation_attempts"] = [{
+        "id": f"sra_{oid}", "seq": 1, "state": "active", "devloop_workflow_id": wid, "issue_url": ISSUE,
+    }]
+    return SecurityFindingsClient()
+
+
+def test_sweep_fallback_uses_occurrence_repo_for_hyphenated_name(
+    store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from orchestrator.temporal.activities import pr_state, proposals
+
+    wid = "dev-loop-mctlhq-my-repo-42"
+    c = _fixing_with_wid(store, "github.com/mctlhq/my-repo", wid)
+    store.dev_loops[wid] = "Completed"
+    calls: list[tuple[str, str]] = []
+
+    async def slug(repo: str, number: str) -> str:
+        calls.append((repo, number))
+        return "p"
+
+    async def pr(repo: str, s: str) -> Any:
+        return SimpleNamespace(merged=True, merge_commit=SHA_A, pr_url="https://github.com/mctlhq/my-repo/pull/1")
+
+    monkeypatch.setattr(proposals, "find_proposal_slug", slug)
+    monkeypatch.setattr(pr_state, "get_pr_state", pr)
+    sweep_mod.sweep(c, [], now=NOW)
+    assert calls == [("my-repo", "42")]
+    assert store.occ["soc_1"]["state"] == "awaiting_verification"
+
+
+def test_sweep_fallback_skips_foreign_owner_workflow_id(store: FakeStore, capsys: pytest.CaptureFixture[str]) -> None:
+    wid = "dev-loop-my-org-my-repo-42"
+    c = _fixing_with_wid(store, "github.com/my-org/my-repo", wid)
+    seen: list[str] = []
+    sweep_mod.sweep(c, [], now=NOW, merged_lookup=lambda client, w, repo: seen.append(repo) or None)
+    out = capsys.readouterr().out
+    assert seen == [] and "repository_unsupported" in out
+    assert store.occ["soc_1"]["state"] == "fixing"
+    # a mctlhq repo whose id does not match: the default lookup never guesses from the id
+    assert sweep_mod.default_merged_lookup(c, wid, "my-repo") is None
+    assert sweep_mod.default_merged_lookup(c, wid, "org-my-repo") is None
+
+
+def test_unread_candidate_is_never_attributed(store: FakeStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    from orchestrator.security_findings.client import HTTPResult
+
+    mine = _fixing_with_wid(store, "github.com/mctlhq/svc", WID, "soc_1")
+    _fixing_with_wid(store, "github.com/mctlhq/svc", "dev-loop-mctlhq-svc-99", "soc_2")
+    orig = SecurityFindingsClient._request
+
+    def flaky(self_: SecurityFindingsClient, method: str, path: str, *a: Any, **k: Any) -> HTTPResult:
+        if method == "GET" and path.endswith("/occurrences/soc_2"):
+            return HTTPResult(503, {})
+        return orig(self_, method, path, *a, **k)
+
+    monkeypatch.setattr(SecurityFindingsClient, "_request", flaky)
+    res = landed.bind_landed(mine, workflow_id=WID, target_repo="svc", pr_url="u", merge_commit=SHA_A)
+    assert [(r.occurrence_id, r.outcome) for r in res] == [("soc_1", "bound")]
+    only = landed.bind_landed(mine, workflow_id="dev-loop-mctlhq-svc-5", target_repo="svc", pr_url="u", merge_commit=SHA_B)
+    assert only == []
