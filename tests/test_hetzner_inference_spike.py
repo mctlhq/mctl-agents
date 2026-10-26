@@ -323,3 +323,28 @@ def test_bench_arm_misuse_is_refused(tmp_path):
     common = ["bench", "--allow-live", "--out-dir", str(tmp_path)]
     assert hs.main([*common, "--arm", "baseline", "--models", "M"]) == 2
     assert hs.main([*common, "--arm", "candidate"]) == 2
+
+
+def test_effort_is_candidate_only_and_recorded(tmp_path):
+    snap = {"selected": {"M": {"availability": hs.AVAILABLE}}, "messages_probe": {"ok": True}}
+    (tmp_path / "snapshot-start.json").write_text(json.dumps(snap))
+    common = ["bench", "--allow-live", "--out-dir", str(tmp_path), "--effort", "medium"]
+    assert hs.main([*common, "--arm", "baseline"]) == 2
+    assert hs.main([*common, "--arm", "all"]) == 2
+    fixtures = hs.load_fixtures()
+
+    async def runner(task, model, provider, rep, ws):
+        return {"tool_calls": [], "final_text": "", "usage_models": [model], "http_errors": 0, "timeouts": 0}
+
+    base = {"model": "claude-test", "model_policy_version": 1}
+    records, manifest = anyio.run(lambda: hs.run_bench(runner, fixtures, ["M"], reps=1, baseline=base,
+                                                       include_baseline=False, effort="medium"))
+    assert {r["effort"] for r in records} == {"medium"} and manifest["candidate_effort"] == "medium"
+    text = hs.render_exploratory(records, manifest, {"timestamp_utc": "t", "catalog_ids": ["M"], "selected": {}})
+    assert "`medium`" in text and "| `M` |" in text
+    assert hs.main(["bench", "--allow-live", "--arm", "candidate", "--effort", "medium"]) == 2
+    base_manifest = {**manifest, "run_id": "b", "arms": ["baseline"], "candidate_effort": "cli-default"}
+    with pytest.raises(hs.SpikeError, match="exploratory"):
+        hs.merge_runs([([], base_manifest), (records, manifest)])
+    with pytest.raises(hs.SpikeError, match="exploratory"):
+        hs.merge_runs([([], base_manifest), (records, {**manifest, "candidate_effort": "cli-default"})])
