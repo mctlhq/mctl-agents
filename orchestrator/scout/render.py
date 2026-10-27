@@ -126,7 +126,11 @@ def render_digest(
             f"{html.escape(it.pitch_ru)}" + (f"\n{html.escape(rel)}" if rel else "")
         )
         blocks.append(block)
-        rows.append([{"text": f"Draft spike {n}", "url": url}])
+        # mctl-agent's scout:create:N callback reads the draft back from the URL
+        # button in the same row (mctl-agent internal/scoutspike), so both must
+        # stay together and keep these exact texts.
+        rows.append([{"text": f"Draft spike {n}", "url": url},
+                     {"text": f"Create spike {n}", "callback_data": f"scout:create:{n}"}])
         if full:
             fallbacks.append((n, f"Draft {n}:\n{html.escape(full)}"))
     tail = "\n\n" + footer
