@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.107.0](https://github.com/mctlhq/mctl-agents/compare/1.106.0...1.107.0) (2026-10-27)
+
+
+### Features
+
+* **agents:** issue-826-fix-usage-record-provider-and-price-sour ([41eaec1](https://github.com/mctlhq/mctl-agents/commit/41eaec1833c74b5d4364926ed143e39edc1315e3))
+
+
+### Bug Fixes
+
+* **agents:** fail price_source closed in the collector ([92dcf3d](https://github.com/mctlhq/mctl-agents/commit/92dcf3d8c87c262d31a006ab543c325470589830))
+* **agents:** fail price_source closed in the collector ([ea25ccd](https://github.com/mctlhq/mctl-agents/commit/ea25ccdcee4ce291fde2120025c96a831883dc11)), closes [#826](https://github.com/mctlhq/mctl-agents/issues/826)
+
 ## [1.106.0](https://github.com/mctlhq/mctl-agents/compare/1.105.1...1.106.0) (2026-10-27)
 
 
