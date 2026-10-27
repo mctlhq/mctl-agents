@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.106.0](https://github.com/mctlhq/mctl-agents/compare/1.105.1...1.106.0) (2026-10-27)
+
+
+### Features
+
+* **agents:** issue-824-feat-policy-provider-seam-for-non-anthro ([f8dc34c](https://github.com/mctlhq/mctl-agents/commit/f8dc34c52e80fb3bd448ff5902cb92867ffa6d27))
+* **agents:** issue-825-feat-sessions-per-provider-model-reasoni ([87e0781](https://github.com/mctlhq/mctl-agents/commit/87e078166d3a4a5b5f193e47879b27daadffaad5))
+* **agents:** issue-825-feat-sessions-per-provider-model-reasoni ([69db459](https://github.com/mctlhq/mctl-agents/commit/69db459ab4b5235e579b3767bbc37ce610c8a231))
+* **scout:** add Create spike callback button next to each draft ([9191537](https://github.com/mctlhq/mctl-agents/commit/919153738ddb219604ab2b2de6563f6af3fdc895))
+* **scout:** add Create spike callback button next to each draft ([a794c17](https://github.com/mctlhq/mctl-agents/commit/a794c172326a9446e3227d7aa8623a1cb68b2b45))
+
+
+### Bug Fixes
+
+* **ci:** fix failing required checks on issue-825-feat-sessions-per-provider-model-reasoni ([6ad1923](https://github.com/mctlhq/mctl-agents/commit/6ad192396987f17ffbf3e0fc44b2eda282c02316))
+
 ## [1.105.1](https://github.com/mctlhq/mctl-agents/compare/1.105.0...1.105.1) (2026-10-27)
 
 
