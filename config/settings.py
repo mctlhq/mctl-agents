@@ -83,6 +83,12 @@ AGENTS_DIR = REPO_ROOT / "agents"
 # issues. Same shape as `mctl-claude-remote`: no `agents/mctl-alice/`
 # scaffold, so it must NOT enter ROTATING_SERVICES; the generic implementer
 # covers it and its PRs stay shepherd-owned.
+#
+# `mctl-support` (tenant support agent over A2A, epic mctlhq/.github#243;
+# private Python/uv repo) is issue-driven only, registered for its S1
+# slices starting with mctlhq/mctl-support#2. Same shape as `mctl-alice`:
+# no `agents/mctl-support/` scaffold, so it must NOT enter ROTATING_SERVICES;
+# the generic implementer covers it and its PRs stay shepherd-owned.
 SERVICES = [
     "mctl-web",
     "mctl-docs",
@@ -101,6 +107,7 @@ SERVICES = [
     "newton-mcp-gateway",
     "mctl-claude-remote",
     "mctl-alice",
+    "mctl-support",
     # "upwork-mcp",
 ]
 
@@ -134,6 +141,7 @@ SERVICE_TENANTS = {
     "newton-mcp-gateway": PLATFORM_TENANT,
     "mctl-claude-remote": PLATFORM_TENANT,
     "mctl-alice": PLATFORM_TENANT,
+    "mctl-support": PLATFORM_TENANT,
 }
 
 
@@ -156,6 +164,7 @@ NON_ROTATING_SERVICES = {
     "newton-mcp-gateway",
     "mctl-claude-remote",
     "mctl-alice",
+    "mctl-support",
 }
 
 # Subset of SERVICES that the proactive R&D rotation analyzes via
