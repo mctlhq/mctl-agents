@@ -809,7 +809,8 @@ def test_default_session_record_is_unchanged(monkeypatch):
     assert "price_source" not in record
 
 
-def test_undeclared_override_fails_closed_with_one_warning(caplog):
+def test_undeclared_override_fails_closed_with_one_warning(caplog, monkeypatch):
+    monkeypatch.setattr(usage_ledger, "_WARNED_OVERRIDE_HOSTS", set())
     env = {usage_ledger.TOKEN_ENV: TOKEN, "ANTHROPIC_BASE_URL": HETZNER_URL}
     api = FakeApi()
     with caplog.at_level("WARNING", logger=usage_ledger.logger.name):
@@ -875,3 +876,13 @@ def test_third_party_cache_creation_deltas():
     rec.observe(_result("u1", {"qwen": {"inputTokens": 12, "cacheCreationInputTokens": 26199}}, num_turns=1))
     rec.observe(_result("u2", {"qwen": {"inputTokens": 20, "cacheCreationInputTokens": 34487}}, num_turns=2))
     assert [r["cache_write_tokens"] for r in api.records] == [26199, 8288]
+
+
+def test_undeclared_override_warns_once_per_host(caplog, monkeypatch):
+    monkeypatch.setattr(usage_ledger, "_WARNED_OVERRIDE_HOSTS", set())
+    with caplog.at_level("WARNING", logger=usage_ledger.logger.name):
+        for _ in range(3):
+            usage_ledger.provenance_for_env({"ANTHROPIC_BASE_URL": HETZNER_URL})
+        usage_ledger.provenance_for_env({"ANTHROPIC_BASE_URL": "https://other.example/v1"})
+    hosts = [r.args[1] for r in caplog.records if "no provenance was declared" in r.getMessage()]
+    assert hosts == ["inference.hetzner.com", "other.example"]
