@@ -1,8 +1,9 @@
 # Spike #670: decision-context explainer before human approval
 
-STATUS: DRAFT -- no operator measurement run backs this report yet, so it
-carries no decision token. The contract, validator, fixtures and guards are
-delivered; measurements come from an operator run. Refs mctlhq/mctl-agents#670.
+STATUS: LIMITED_GO
+
+Accepted by the issue owner on 2026-10-27, on one measured run on #702 (see
+Measurements). Refs mctlhq/mctl-agents#670.
 
 Allowed decision tokens, one of which replaces this marker when finalized:
 `GO`, `LIMITED_GO`, `NO_GO`. The issue owner records the verdict.
@@ -76,24 +77,84 @@ Experimental: the same plus a grounded artifact. Reviewer time: unobserved.
 
 ## Measurements
 
-| subject | latency | in tokens | out tokens | cost | bytes | files inspected | reviewer time current | reviewer time experimental | risks surfaced | pointers matched PR | post-merge accuracy |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| #702 (high) | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved |
-| low-risk merged | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved |
+One run, 2026-10-27, on the high-risk subject. The artifact is
+`docs/spikes/670/runs/702-decision-context.md`; raw values are in
+`docs/spikes/670/runs/702-measurements.json`. The explainer was a read-only
+Claude Code subagent given only the #702 proposal triplet and the repository
+at `a42c3e7` (the first parent of the #709 merge). It had no git or network
+access, so it could not see the implementation.
 
-Polished-but-wrong instances: unobserved. The shipped #702 example is
-hand-authored and bound to the base SHA at spike time, not the
-pre-implementation commit of #702 (`a42c3e7c6160671cb8b4a052ab57092d8901ab7e`,
-the first parent of the #709 merge), so it is a contract demonstration, not a
-measurement. The operator run generates the #702 artifact at that commit.
+| subject | latency | tokens (in+out) | cost | bytes | files inspected | reviewer time current | reviewer time experimental | risks surfaced | pointers matched PR | post-merge accuracy |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| #702 (high) | 108 s | 122,934 (split unobserved) | unobserved (subscription) | 13,347 | 7 | unobserved | unobserved | 2 gaps in the proposal, 4 required failure modes | 3 of 4 inside changed code; 4 of 4 relevant | 0 contradictions found in the pointer and behaviour claims checked |
+| low-risk merged | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved |
+
+Validator: 0 violations with a resolver that checks every `repo:` path and
+line range at `a42c3e7`. `freshness()` reports `fresh` at `a42c3e7` and
+`stale` at the #709 merge `56b9224`.
+
+Ground truth is the #709 diff. It changed `DevLoopResult` and the ended
+prefixes, `_delegated_approve` (old L2271-L2299), the `run()` exit (old
+L3380), the canonical approve branch in `_run_loop` (old L3921-L3969),
+`start.restart_if_abandoned` (L101-L145) and `cli.start`.
+
+Pointers against that diff:
+
+- Canonical approve branch, L3922-L3969: changed. Hit.
+- `_ensure_fresh_grant` exits, L2234-L2260: not edited, but the explainer
+  said the tasks did not cover these exits. The implementer's first commit
+  (`776050f`) routes them through `_approval_ended` at the call site, so the
+  gap was real.
+- Restart predicate, `start.py` L127-L143: changed. Hit.
+- `_delegated_approve` classification, L2271-L2298: changed. The explainer
+  flagged the "proposal changed since requested" refusal as a stale
+  condition that the design ends terminally. Claude review raised the same
+  defect as a P2 on #709's first head (`776050f`), and the fix-up
+  (`e1863ce`) added the `stale-slug` code. The explainer found it from the
+  proposal alone, before any code existed.
+
+Polished-but-wrong instances: none found in the four pointers and the
+behaviour claims checked against the merged code. This was a spot check, not
+an exhaustive audit of all 32 claims.
+
+Limits: one subject (n = 1), no low-risk arm, no human reviewer timing, and
+no token split or dollar cost. `run_explainer.sh` is still a stub, so the
+operator path was not exercised; a subagent stood in for it.
 
 ## GO criteria checklist
 
-- [ ] Pointers matched the merged change with acceptable recall/precision
-- [ ] No contradicted high-scrutiny claim
-- [ ] Reviewer time to decision not worse than the current path
-- [ ] Cost within the investigator envelope
+- [x] Pointers matched the merged change with acceptable recall/precision (3 of 4 inside changed code, 4 of 4 relevant, n = 1)
+- [x] No contradicted high-scrutiny claim (spot check)
+- [ ] Reviewer time to decision not worse than the current path (unobserved)
+- [x] Cost within the investigator envelope (108 s, about 123k tokens; an investigate is budgeted at $3.00)
 
 On GO or LIMITED_GO, follow-ups: proposal-time explainer activity, grant
 correlation in mctl-api, post-implementation drift check, on-demand slice
 explainer.
+
+## Verdict: LIMITED_GO
+
+The artifact did more than summarise. From the proposal alone it found a
+defect that review only caught after the code was written, it named a gap in
+the tasks, and it pointed at the code that later changed. It stayed bound to
+the state it describes, and it touches no gate. Two things are missing for a
+full GO: the reviewer-effort measurement, which needs a human, and more than
+one subject.
+
+LIMITED_GO means:
+
+- An opt-in, proposal-time explainer for `risk: high` proposals only.
+- It is advisory. It sits next to the proposal and stays outside
+  `PROPOSAL_DIGEST_FILES`.
+- Its digest is recorded beside the proposal digest in the approval grant.
+- It is regenerated, never reused, when `freshness()` is not `fresh`.
+
+Follow-ups:
+
+1. mctlhq/mctl-agents#846: wire `run_explainer.sh` to a real read-only Agent
+   SDK call that records the token split and cost.
+2. mctlhq/mctl-agents#847: add a proposal-time explainer activity in DevLoop,
+   behind a flag, for high-risk proposals.
+3. mctlhq/mctl-api#840: correlate the artifact digest with the `aar_` grant.
+4. mctlhq/mctl-agents#848: time the owner on two or three high-risk approvals
+   with and without the artifact, and decide on a full GO from that data.

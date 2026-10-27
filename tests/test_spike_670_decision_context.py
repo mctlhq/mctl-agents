@@ -22,6 +22,9 @@ SLUG = "issue-702-fix-devloop-a-failed-approval-must-not-p"
 TOKENS = ("GO", "LIMITED_GO", "NO_GO")
 GUARDED = ("orchestrator", "config", "agents/_manifests")
 MAX_FILE_BYTES = 256 * 1024
+# A real token is a prefix at a word start followed by a long opaque run;
+# words such as `risk-` or `restart_if` must not match.
+TOKEN_SHAPE = re.compile(rb"\b(?:ghp_|art_|sk-)[A-Za-z0-9_-]{20,}")
 
 _spec = importlib.util.spec_from_file_location("decision_context_670", SPIKE / "decision_context.py")
 assert _spec is not None and _spec.loader is not None
@@ -122,6 +125,20 @@ def test_no_runtime_path_changed() -> None:
     assert diff.stdout.strip() == "", diff.stdout
 
 
+@pytest.mark.parametrize(
+    "text,hit",
+    [
+        (b"ghp_" + b"a" * 36, True),
+        (b"key sk-" + b"Z9" * 12, True),
+        (b"art_" + b"0" * 24, True),
+        (b"restart_if_restartable and high-risk-review", False),
+        (b"task-pattern", False),
+    ],
+)
+def test_token_shape(text: bytes, hit: bool) -> None:
+    assert bool(TOKEN_SHAPE.search(text)) is hit
+
+
 def test_fixtures_small_and_free_of_tokens() -> None:
     for path in SPIKE.rglob("*"):
         if not path.is_file() or path.suffix == ".pyc":
@@ -130,4 +147,4 @@ def test_fixtures_small_and_free_of_tokens() -> None:
         assert len(data) < MAX_FILE_BYTES, path
         if path.name == "decision_context.py":
             continue
-        assert not re.search(rb"ghp_|art_|sk-", data), path
+        assert not TOKEN_SHAPE.search(data), path
