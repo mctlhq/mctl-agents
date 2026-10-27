@@ -147,7 +147,16 @@ def provider_session_env(
             f"{provider.credential_env} is unset or empty"
         )
     anthropic_names = [k for k in env if _is_anthropic_credential_name(k)]
-    originals = {env[k] for k in anthropic_names if env[k]}
+    # Only secret-bearing names count as credentials: ANTHROPIC_BASE_URL, model
+    # slots and boolean flags are non-secret and may legitimately recur in out.
+    originals = {
+        env[k]
+        for k in anthropic_names
+        if env[k]
+        and k != "ANTHROPIC_BASE_URL"
+        and k not in MODEL_SLOTS
+        and any(t in k for t in ("KEY", "TOKEN", "SECRET", "CREDENTIAL", "PASSWORD"))
+    }
     out = dict(env)
     for key in anthropic_names:
         out[key] = ""

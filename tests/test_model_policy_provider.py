@@ -199,10 +199,10 @@ def test_policy_version_tracks_loaded_file_and_log_dict(
 ) -> None:
     monkeypatch.delenv("MODEL_POLICY_PATH", raising=False)
     default = resolver._model_policy_version()
-    _doc_, default_hash = resolver._read_yaml_and_hash(model_policy.DEFAULT_POLICY_PATH)
+    _, default_hash = resolver._read_yaml_and_hash(model_policy.DEFAULT_POLICY_PATH)
     assert default.endswith(default_hash)
     monkeypatch.setenv("MODEL_POLICY_PATH", str(FIXTURE))
-    _doc_, fixture_hash = resolver._read_yaml_and_hash(FIXTURE)
+    _, fixture_hash = resolver._read_yaml_and_hash(FIXTURE)
     assert resolver._model_policy_version().endswith(fixture_hash)
     assert fixture_hash != default_hash
 
