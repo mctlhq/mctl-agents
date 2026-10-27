@@ -113,13 +113,31 @@ jobs:
               && "$RUNNER_TEMP/rea-prefix/node_modules/.bin/rea" --help >/dev/null 2>&1 \
               || REASON="rea-install-failed"
           fi
+          PROVCOMMIT=""
           if [ -z "$REASON" ]; then
-            # Bind the installed npm artifact to the resolved SHA.
-            NPMVIEW=$(npm view "rea-agents@$VERSION" gitHead dist.integrity --json 2>/dev/null || echo "{}")
-            GITHEAD=$(printf '%s' "$NPMVIEW" | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(d.get("gitHead") or "")' 2>/dev/null || echo "")
-            INTEGRITY=$(printf '%s' "$NPMVIEW" | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(d.get("dist.integrity") or "")' 2>/dev/null || echo "")
-            if [ -z "$GITHEAD" ] || [ "$GITHEAD" != "$SHA" ]; then
+            # Bind the installed npm artifact to the resolved SHA. rea-agents is
+            # published by GitHub Actions through npm OIDC, which records no
+            # gitHead (6.8.0: absent) but attaches SLSA provenance naming the
+            # source commit. The binding is: registry signatures and provenance
+            # verify (`npm audit signatures`), the installed tarball has the
+            # registry's dist.integrity, and the provenance for that tarball
+            # names exactly the resolved SHA. Any unreadable step fails closed.
+            GITHEAD=$(npm view "rea-agents@$VERSION" gitHead 2>/dev/null || echo "")
+            INTEGRITY=$(npm view "rea-agents@$VERSION" dist.integrity 2>/dev/null || echo "")
+            LOCKED=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["packages"]["node_modules/rea-agents"]["integrity"])' \
+              "$RUNNER_TEMP/rea-prefix/package-lock.json" 2>/dev/null || echo "")
+            if [ -z "$INTEGRITY" ] || [ "$LOCKED" != "$INTEGRITY" ]; then
               REASON="rea-identity-mismatch"
+            elif ! npm audit signatures --prefix "$RUNNER_TEMP/rea-prefix" >"$RUNNER_TEMP/rea-audit.log" 2>&1; then
+              REASON="rea-signatures-unverified"
+            elif ! curl -fsS "https://registry.npmjs.org/-/npm/v1/attestations/rea-agents@$VERSION" -o "$RUNNER_TEMP/rea-attestations.json"; then
+              REASON="rea-provenance-unreadable"
+            else
+              PROVCOMMIT=$(uv run --locked python tools/rea_spike.py npm-provenance "$RUNNER_TEMP/rea-attestations.json" \
+                --integrity "$INTEGRITY" --repo "$REPO" 2>>"$RUNNER_TEMP/rea-install.log" || echo "")
+              if [ -z "$PROVCOMMIT" ] || [ "$PROVCOMMIT" != "$SHA" ]; then
+                REASON="rea-identity-mismatch"
+              fi
             fi
           fi
           if [ -z "$REASON" ]; then
@@ -131,7 +149,7 @@ jobs:
               "$GITHUB_WORKSPACE" "$RUNNER_TEMP" > "$RUNNER_TEMP/rea-bin/rea"
             chmod +x "$RUNNER_TEMP/rea-bin/rea"
           fi
-          REA_SHA="$SHA" REA_VERSION="$VERSION" REA_REASON="$REASON" REA_INSTALL="$INSTALL" REA_GITHEAD="$GITHEAD" REA_INTEGRITY="$INTEGRITY" REPO="$REPO" \
+          REA_SHA="$SHA" REA_VERSION="$VERSION" REA_REASON="$REASON" REA_INSTALL="$INSTALL" REA_GITHEAD="$GITHEAD" REA_INTEGRITY="$INTEGRITY" REA_PROVCOMMIT="$PROVCOMMIT" REPO="$REPO" \
             python3 -I - <<'PY' > "$BUNDLE/rea-metadata.json"
           import datetime, json, os
           e = os.environ
@@ -140,10 +158,11 @@ jobs:
               "input_ref": e["REA_REF"],
               "resolved_sha": e["REA_SHA"] or "unobserved",
               "package_version": e["REA_VERSION"],
-              "install_method": "npm-registry-package-at-resolved-sha-version",
+              "install_method": "npm-registry-package-bound-to-resolved-sha-by-slsa-provenance",
               "install_command": e["REA_INSTALL"],
               "npm_git_head": e["REA_GITHEAD"] or "unobserved",
               "npm_dist_integrity": e["REA_INTEGRITY"] or "unobserved",
+              "npm_provenance_git_commit": e["REA_PROVCOMMIT"] or "unobserved",
               "cli_entrypoint": "rea (node_modules/.bin/rea, via rea-env.sh shim)",
               "mcp_entrypoint": "rea mcp (via rea-env.sh)",
               "install_failure_reason": e["REA_REASON"] or None,
