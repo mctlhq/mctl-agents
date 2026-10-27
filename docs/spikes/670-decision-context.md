@@ -38,6 +38,8 @@ Refs: `repo:<path>@<sha>#L<a>-L<b>`, `proposal:<file>`, `evidence:<id>`.
 - `review_pointers` need a `repo:` ref and a `why`.
 - `risk.level: high` requires failure modes `retry`, `timeout_partial`,
   `wrong_identity`, `state_after_approval`.
+- A `subject`, `binding`, `risk` or `sections` block that is present but not
+  a mapping is rejected (`BAD_BLOCK`), never skipped.
 - Unknown keys are rejected; `skip_review`, `auto_approve`, `satisfies_gate`
   and `waive_*` are rejected at any depth (the explainer is not authority).
 - `freshness(artifact, current_digest, current_sha)` returns `fresh`, `stale`
@@ -80,8 +82,10 @@ Experimental: the same plus a grounded artifact. Reviewer time: unobserved.
 | low-risk merged | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved | unobserved |
 
 Polished-but-wrong instances: unobserved. The shipped #702 example is
-hand-authored and bound to the base SHA at spike time, not the PR merge-base
-(unobserved), so it is a contract demonstration, not a measurement.
+hand-authored and bound to the base SHA at spike time, not the
+pre-implementation commit of #702 (`a42c3e7c6160671cb8b4a052ab57092d8901ab7e`,
+the first parent of the #709 merge), so it is a contract demonstration, not a
+measurement. The operator run generates the #702 artifact at that commit.
 
 ## GO criteria checklist
 

@@ -1,9 +1,10 @@
 # Decision context: mctl-agents#702 (HAND-AUTHORED example, not model output)
 
 Illustrates `decision-context/v0` for a high-risk approval-semantics proposal.
-`target_repo_sha` is the base-branch commit at spike time, NOT the #702 PR
-merge-base (that value is `unobserved`; the operator run replaces it). Line
-ranges were read at that SHA.
+`target_repo_sha` is the base-branch commit at spike time, NOT the
+pre-implementation commit of #702. That commit is
+`a42c3e7c6160671cb8b4a052ab57092d8901ab7e`, the first parent of the #709 merge;
+the operator run binds there. Line ranges were read at the spike-time SHA.
 
 ```yaml
 schema: decision-context/v0

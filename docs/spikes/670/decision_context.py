@@ -142,6 +142,12 @@ def validate(artifact: Mapping[str, Any], ref_resolver: RefResolver | None = Non
     if artifact.get("schema") != SCHEMA:
         out.append(violation("BAD_SCHEMA", "schema"))
 
+    # A block that is present but is not a mapping is malformed, not absent:
+    # skipping its checks would let e.g. `risk: high` waive the failure modes.
+    for k in ("subject", "binding", "risk", "sections"):
+        if k in artifact and not isinstance(artifact[k], dict):
+            out.append(violation("BAD_BLOCK", k))
+
     subject = artifact.get("subject")
     if isinstance(subject, dict):
         _unknown(subject, SUBJECT_KEYS, "subject", out)

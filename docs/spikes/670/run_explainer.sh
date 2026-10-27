@@ -20,10 +20,10 @@ focus=${5:-}
 here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$out"
 git -C "$clone" checkout --detach "$sha"
-start=$(date +%s)
 # Replace with the operator's Agent SDK invocation; prompt is "$here/explain.md".
+# Until it is replaced nothing is generated, so nothing is measured: every
+# value below stays `unobserved` rather than timing this placeholder.
 echo "invoke the explainer with prompt $here/explain.md, focus='${focus}', cwd=$clone, proposal=$proposal_dir" >&2
-end=$(date +%s)
 cat > "$out/measurements.json" <<JSON
-{"latency_s": $((end - start)), "input_tokens": "unobserved", "output_tokens": "unobserved", "cost_usd": "unobserved", "files_read": "unobserved"}
+{"latency_s": "unobserved", "input_tokens": "unobserved", "output_tokens": "unobserved", "cost_usd": "unobserved", "files_read": "unobserved"}
 JSON

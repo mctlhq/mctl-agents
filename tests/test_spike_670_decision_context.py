@@ -79,6 +79,21 @@ def test_example_digest_matches_gitops_copy() -> None:
     assert dc.proposal_digest(d) == _load(EXAMPLE)["binding"]["proposal_content_digest"]
 
 
+@pytest.mark.parametrize("block", ["subject", "binding", "risk", "sections"])
+def test_non_mapping_block_is_rejected(block: str) -> None:
+    art = _load(EXAMPLE)
+    art[block] = "high"
+    assert "BAD_BLOCK" in dc.codes(dc.validate(art))
+
+
+def test_string_risk_does_not_waive_failure_modes() -> None:
+    art = _load(EXAMPLE)
+    art["risk"] = "high"
+    modes = art["sections"]["failure_modes"]
+    art["sections"]["failure_modes"] = [c for c in modes if c.get("mode") != "state_after_approval"]
+    assert dc.validate(art) != []
+
+
 @pytest.mark.parametrize("key", ["auto_approve", "skip_review", "satisfies_gate", "waive_ci"])
 def test_gate_waiver_keys_rejected_at_depth(key: str) -> None:
     art = _load(EXAMPLE)
