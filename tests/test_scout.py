@@ -341,6 +341,24 @@ def test_render_variants():
     assert "no relevant items were found" in text
 
 
+def test_footer_counts_ok_and_lists_only_the_rest():
+    results = [feeds.SourceResult(f"ok{i}", "ok", items=[]) for i in range(30)]
+    results += [feeds.SourceResult("Slow", "failed", "timeout"), feeds.SourceResult("Bad", "malformed", "xml"),
+                feeds.SourceResult("Off", "disabled", "a long reason " * 5)]
+    footer = render.render_footer(results, render.Counts())
+    lines = footer.splitlines()
+    assert lines[:4] == ["sources: 30 ok, 1 disabled", "Slow: failed(timeout)", "Bad: malformed(xml)",
+                         "disabled: Off"]
+    assert "ok0" not in footer and "long reason" not in footer
+
+
+def test_compact_footer_keeps_all_items_with_many_sources():
+    results = [feeds.SourceResult(f"Source number {i}", "ok", items=[]) for i in range(40)]
+    items = [_scored(id=f"a{i}", title="t" * 80, pitch_ru="p" * 180) for i in range(10)]
+    _text, markup, _ = render.render_digest(items, results, render.Counts(), "r")
+    assert len(markup["inline_keyboard"]) == 10
+
+
 def test_send_message():
     calls = []
 
