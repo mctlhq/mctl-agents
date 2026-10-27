@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.105.1](https://github.com/mctlhq/mctl-agents/compare/1.105.0...1.105.1) (2026-10-27)
+
+
+### Bug Fixes
+
+* **scout:** count healthy sources in the footer instead of listing them ([2ead75b](https://github.com/mctlhq/mctl-agents/commit/2ead75b5a16a3d8c1e8aaf6dbb891a73979fdf6a))
+* **scout:** count healthy sources in the footer instead of listing them ([6e53cb5](https://github.com/mctlhq/mctl-agents/commit/6e53cb5f6dd022236018e9fe57c80e4f3e99d323))
+
 ## [1.105.0](https://github.com/mctlhq/mctl-agents/compare/1.104.0...1.105.0) (2026-10-27)
 
 
