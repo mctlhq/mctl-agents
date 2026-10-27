@@ -546,8 +546,10 @@ hir-95c5323867a3b06b).
 **Server contract.** mctl-api must accept and persist `price_source`, and must
 not apply catalog prices when it is not `mctl_catalog`: for `provider_free`
 it stores a zero or null cost under its own `pricing_version`, for `unknown`
-null. Until it does, no lane may declare third-party provenance. The mctl-api
-issue for this is still to be filed (TODO: link it here).
+null. Until it does, no lane may declare third-party provenance. Tracked in
+mctlhq/mctl-api#827, a prerequisite for enabling any #824 provider lane. Until
+then the ingest silently discards `price_source`, and its wildcard rate card
+could still price a third-party row from the catalog.
 
 Added invariants:
 
