@@ -1,0 +1,29 @@
+version: 1
+
+profiles:
+  cheap:
+    model: claude-haiku-5-5
+    model_env: CLAUDE_CHEAP_MODEL
+
+  balanced:
+    model: claude-sonnet-5-5
+    model_env: CLAUDE_BALANCED_MODEL
+
+  experimental_hetzner:
+    model: Qwen/Qwen3.6-35B-A3B-FP8
+    provider:
+      name: hetzner
+      api: anthropic-messages
+      base_url: https://inference.hetzner.com/api
+      credential_env: HETZNER_INFERENCE_API_KEY
+      pin_model_slots: true
+      fallback: none
+
+tasks:
+  service_agent: balanced
+  mentor_digest: balanced
+  review_findings_normalize: balanced
+  scout_relevance: cheap
+  scout_scoring: balanced
+  # Test-only task routed to the provider profile.
+  provider_test_task: experimental_hetzner
