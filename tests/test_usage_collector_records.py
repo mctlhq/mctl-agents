@@ -209,3 +209,16 @@ def test_no_correlation_added_from_this_processs_own_environment(monkeypatch):
     assert "temporal_workflow_id" not in sanitised
     assert "work_item_id" not in sanitised
     assert "execution_id" not in sanitised
+
+
+def test_valid_price_source_is_forwarded():
+    sanitised = sanitise({**_fixture_records()[0], "price_source": "provider_free"})
+    assert sanitised is not None
+    assert sanitised["price_source"] == "provider_free"
+
+
+def test_invalid_price_source_is_dropped_with_a_warning(capsys):
+    sanitised = sanitise({**_fixture_records()[0], "price_source": "free"})
+    assert sanitised is not None
+    assert "price_source" not in sanitised
+    assert "price_source" in capsys.readouterr().out

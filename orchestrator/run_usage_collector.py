@@ -78,6 +78,7 @@ from orchestrator.usage_ledger import (
     DEFAULT_BASE_URL,
     DEVLOOP_STAGES,
     INGEST_PATH,
+    PRICE_SOURCES,
     SCHEMA_VERSION,
     TARGET_REPO_RE,
     TOKEN_ENV,
@@ -109,7 +110,7 @@ _ALLOWED_FIELDS = frozenset({
     "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
     "reasoning_tokens", "web_search_requests",
     "outcome", "api_error_status", "stop_reason", "terminal_reason",
-    "num_turns", "duration_api_ms", "retry_attempt", "recorded_at",
+    "num_turns", "duration_api_ms", "retry_attempt", "recorded_at", "price_source",
 })
 
 # The two shapes `_ALLOWED_FIELDS` (minus session_id/model_key/schema_version,
@@ -122,6 +123,7 @@ _STRING_FIELDS = frozenset({
     "result_uuid", "canonical_model", "provider", "agent", "devloop_stage",
     "target_repo", "work_item_id", "trace_id", "span_id",
     "outcome", "api_error_status", "stop_reason", "terminal_reason", "recorded_at",
+    "price_source",
 })
 _INT_FIELDS = frozenset({
     "issue_number", "pr_number",
@@ -403,6 +405,14 @@ def sanitise(raw: dict[str, Any]) -> dict[str, Any] | None:
             f"{session_id!r}/{model_key!r} — not in the devloop_stage vocabulary"
         )
         del sanitised["devloop_stage"]
+
+    price_source = sanitised.get("price_source")
+    if price_source is not None and price_source not in PRICE_SOURCES:
+        print(
+            f"WARN: dropping field 'price_source'={price_source!r} of record "
+            f"{session_id!r}/{model_key!r} — not in the price_source vocabulary"
+        )
+        del sanitised["price_source"]
 
     repo = sanitised.get("target_repo")
     if repo is not None and not TARGET_REPO_RE.match(repo):

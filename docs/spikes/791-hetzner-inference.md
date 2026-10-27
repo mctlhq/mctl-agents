@@ -400,4 +400,5 @@ Findings:
 3. **Usage ledger would record fake cost and partial tokens for third-party models.** For Hetzner models the
    CLI reports a non-zero `total_cost_usd` (its own price estimate) while the provider charges $0, and
    `input_tokens` excludes `cache_creation_input_tokens`. Before any lane writes usage, record provider and
-   price source, and count cache-creation tokens.
+   price source, and count cache-creation tokens. Addressed by the ADR-012 amendment 2026-10-27
+   (`docs/adr/012-model-usage-cost-attribution-contract.md`, mctlhq/mctl-agents#826).

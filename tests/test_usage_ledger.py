@@ -763,3 +763,115 @@ def test_devloop_stage_precedence_explicit_over_scope_over_default():
 def test_the_devloop_stage_vocabulary_is_closed_and_covers_every_default():
     assert usage_ledger.DEVLOOP_STAGES == frozenset({"investigator", "implementer", "reviewer", "shepherd"})
     assert set(usage_ledger._AGENT_STAGES.values()) <= usage_ledger.DEVLOOP_STAGES
+
+
+# ---------------------------------------------------------------------------
+# Provider and price source (mctlhq/mctl-agents#826)
+# ---------------------------------------------------------------------------
+
+HETZNER = usage_ledger.ModelProvenance("hetzner", "provider_free", True)
+HETZNER_URL = "https://inference.hetzner.com/api"
+_COST_FIELDS = ("calculated_cost", "provider_reported_cost", "pricing_version", "invoice_reconciled_cost",
+                "costUSD", "total_cost_usd", "cost_usd")
+
+
+def _third_party_recorder(api: FakeApi) -> usage_ledger.UsageRecorder:
+    return usage_ledger.UsageRecorder(
+        "implementer", token=TOKEN, base_url="https://api.example.test/", post=api,
+        sleep=lambda _s: None, submit=lambda job: job(), provenance=HETZNER,
+    )
+
+
+def test_third_party_record_names_provider_and_price_source_and_no_cost():
+    api = FakeApi()
+    bucket = {"inputTokens": 12, "cacheCreationInputTokens": 58000, "outputTokens": 300, "costUSD": 0.9,
+              "provider": "firstParty"}
+    with usage_ledger.attribute_model(HETZNER):
+        rec = usage_ledger.UsageRecorder.from_env("implementer", {usage_ledger.TOKEN_ENV: TOKEN})
+    rec._post, rec._submit = api, lambda job: job()
+    rec.observe(_result("u1", {"qwen": bucket}))
+    (record,) = api.records
+    assert record["provider"] == "hetzner"
+    assert record["price_source"] == "provider_free"
+    assert record["input_tokens"] == 12
+    assert record["cache_write_tokens"] == 58000
+    assert not any(f in record for f in _COST_FIELDS)
+
+
+def test_default_session_record_is_unchanged(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    api = FakeApi()
+    rec = usage_ledger.UsageRecorder.from_env("implementer", {usage_ledger.TOKEN_ENV: TOKEN})
+    rec._post, rec._submit = api, lambda job: job()
+    rec.observe(_result("u1", {OPUS: _usage(1, 2, provider="firstParty")}))
+    (record,) = api.records
+    assert record["provider"] == "firstParty"
+    assert "price_source" not in record
+
+
+def test_undeclared_override_fails_closed_with_one_warning(caplog):
+    env = {usage_ledger.TOKEN_ENV: TOKEN, "ANTHROPIC_BASE_URL": HETZNER_URL}
+    api = FakeApi()
+    with caplog.at_level("WARNING", logger=usage_ledger.logger.name):
+        rec = usage_ledger.UsageRecorder.from_env("implementer", env)
+    rec._post, rec._submit = api, lambda job: job()
+    rec.observe(_result("u1", {OPUS: _usage(1, 2, provider="firstParty")}))
+    (record,) = api.records
+    assert (record["provider"], record["price_source"]) == ("unknown", "unknown")
+    assert len([r for r in caplog.records if "no provenance was declared" in r.getMessage()]) == 1
+
+
+def test_anthropic_base_url_is_the_default():
+    prov = usage_ledger.provenance_for_env({"ANTHROPIC_BASE_URL": "https://api.anthropic.com/"})
+    assert not prov.third_party
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        usage_ledger.ModelProvenance("hetzner", "mctl_catalog", True),
+        usage_ledger.ModelProvenance("hetzner", "free-ish", True),
+        usage_ledger.ModelProvenance("Het zner", "provider_free", True),
+        usage_ledger.ModelProvenance(None, "provider_free", True),
+    ],
+)
+def test_bad_declaration_raises(declared):
+    with pytest.raises(ValueError):
+        usage_ledger.provenance_for_env({}, declared=declared)
+    with pytest.raises(ValueError), usage_ledger.attribute_model(declared):
+        pass
+
+
+def test_third_party_bucket_without_cache_creation_leaves_it_absent():
+    api = FakeApi()
+    _third_party_recorder(api).observe(_result("u1", {"qwen": {"inputTokens": 5, "outputTokens": 2}}))
+    (record,) = api.records
+    assert "cache_write_tokens" not in record
+
+
+def test_scoped_provenance_does_not_leak():
+    with usage_ledger.attribute_model(HETZNER):
+        pass
+    rec = usage_ledger.UsageRecorder.from_env("implementer", {usage_ledger.TOKEN_ENV: TOKEN})
+    assert not rec.provenance.third_party
+
+
+def test_session_env_override_is_detected_and_beats_process_env(monkeypatch):
+    environ = {usage_ledger.TOKEN_ENV: TOKEN}
+    rec = usage_ledger.UsageRecorder.from_env("implementer", environ, session_env={"ANTHROPIC_BASE_URL": HETZNER_URL})
+    assert (rec.provenance.provider, rec.provenance.price_source) == ("unknown", "unknown")
+    polluted = {**environ, "ANTHROPIC_BASE_URL": HETZNER_URL}
+    rec = usage_ledger.UsageRecorder.from_env(
+        "implementer", polluted, session_env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
+    )
+    assert not rec.provenance.third_party
+    rec = usage_ledger.UsageRecorder.from_env("implementer", environ, session_env={"OTHER": "x"})
+    assert not rec.provenance.third_party
+
+
+def test_third_party_cache_creation_deltas():
+    api = FakeApi()
+    rec = _third_party_recorder(api)
+    rec.observe(_result("u1", {"qwen": {"inputTokens": 12, "cacheCreationInputTokens": 26199}}, num_turns=1))
+    rec.observe(_result("u2", {"qwen": {"inputTokens": 20, "cacheCreationInputTokens": 34487}}, num_turns=2))
+    assert [r["cache_write_tokens"] for r in api.records] == [26199, 8288]
