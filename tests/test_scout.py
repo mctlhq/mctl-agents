@@ -359,6 +359,19 @@ def test_compact_footer_keeps_all_items_with_many_sources():
     assert len(markup["inline_keyboard"]) == 10
 
 
+def test_each_row_pairs_draft_url_with_create_callback():
+    # Contract with mctl-agent internal/scoutspike: callback "scout:create:N" finds
+    # the single "Draft spike N" URL button and replaces that whole row.
+    ok = feeds.SourceResult("s", "ok", items=[])
+    items = [_scored(id=f"a{i}", link=f"https://x.test/{i}") for i in range(3)]
+    _text, markup, _ = render.render_digest(items, [ok], render.Counts(), "r")
+    for n, row in enumerate(markup["inline_keyboard"], 1):
+        draft, create = row
+        assert draft["text"] == f"Draft spike {n}" and draft["url"].startswith("https://github.com/mctlhq/")
+        assert create == {"text": f"Create spike {n}", "callback_data": f"scout:create:{n}"}
+        assert len(create["callback_data"].encode()) <= 64
+
+
 def test_send_message():
     calls = []
 

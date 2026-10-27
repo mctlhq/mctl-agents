@@ -122,7 +122,7 @@ async def run_scout(
         print(text)
         for row in (markup or {}).get("inline_keyboard", []):
             for b in row:
-                print(f"[{b['text']}] {b['url']}")
+                print(f"[{b['text']}] {b.get('url') or b.get('callback_data')}")
         for o in overflow:
             print(o)
     else:
