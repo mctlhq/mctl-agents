@@ -173,14 +173,17 @@ def run_probe(run_stage: StageRunner, stages: Sequence[str] = STAGES, store_text
             continue
         sig = dict(run_stage(stage))
         interruptions = sig.get("classifier_interruptions", UNOBSERVED)
+        rea_calls = sig.get("rea_tool_calls", UNOBSERVED)
         if sig.get("ok"):
-            results.append({"stage": stage, "outcome": "ok", "classifier_interruptions": interruptions})
+            results.append({"stage": stage, "outcome": "ok", "classifier_interruptions": interruptions,
+                            "rea_tool_calls": rea_calls})
             continue
         failed = {
             "stage": stage,
             "outcome": "failed",
             "class": classify(sig),
             "classifier_interruptions": interruptions,
+            "rea_tool_calls": rea_calls,
             "text": failure_text_record(str(sig.get("text", "")), store_text),
         }
         results.append(failed)
@@ -297,6 +300,16 @@ def _read_active_model() -> str:
     return model
 
 
+def rea_operation(name: str, tool_input: Mapping[str, Any] | None) -> str:
+    """Bounded label of one REA call: the MCP tool name, or `cli:<subcommand>`
+    for a Bash call to the REA CLI. Never arguments or results."""
+    if name.startswith("mcp__rea__"):
+        return name.removeprefix("mcp__rea__")
+    command = str((tool_input or {}).get("command", ""))
+    m = re.search(r"(?:^|[\s;&|/])rea\s+([A-Za-z][\w-]*)", command)
+    return f"cli:{m.group(1)}" if m else "cli"
+
+
 def _is_rea_tool_use(block: Any) -> bool:
     """True for an MCP REA tool call, or a Bash call that invokes the REA CLI."""
     name = block.name
@@ -313,6 +326,7 @@ async def _collect(stream: Any, sig: dict[str, Any]) -> dict[str, Any]:
     so a stubbed stream can drive it in unit tests."""
     text: list[str] = []
     rea_use_ids: set[str] = set()
+    rea_ops: list[str] = []
     tool_calls = 0
     try:
         async for msg in stream:
@@ -338,6 +352,7 @@ async def _collect(stream: Any, sig: dict[str, Any]) -> dict[str, Any]:
                     tool_calls += 1
                     if _is_rea_tool_use(block):
                         rea_use_ids.add(use_id)
+                        rea_ops.append(rea_operation(block.name, getattr(block, "input", None)))
                 if getattr(block, "is_error", None) is True:  # failed tool result
                     if getattr(block, "tool_use_id", None) in rea_use_ids:
                         sig["ok"] = False
@@ -352,6 +367,8 @@ async def _collect(stream: Any, sig: dict[str, Any]) -> dict[str, Any]:
         text.append(repr(exc))
     else:  # a broken stream leaves the counts unobserved, not short
         sig["tool_calls"] = tool_calls
+        sig["rea_tool_calls"] = len(rea_ops)
+        sig["rea_operations"] = sorted(set(rea_ops))
         sig["classifier_interruptions"] = sum(t.count(CLASSIFIER_NOTICE) for t in text)
     sig["text"] = "\n".join(text)
     return sig
@@ -452,6 +469,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         "wall_clock_s": round(time.monotonic() - started, 1),
         "turns": sig.get("turns", UNOBSERVED), "tool_calls": sig.get("tool_calls", UNOBSERVED),
         "classifier_interruptions": sig.get("classifier_interruptions", UNOBSERVED),
+        "rea_tool_calls": sig.get("rea_tool_calls", UNOBSERVED),
+        "rea_operations": sig.get("rea_operations", UNOBSERVED),
         "usage": sig.get("usage") or {},
         "final": bounded_summary(str(sig.get("text", ""))),
         "outcome": "ok" if sig.get("ok") else "failed",
