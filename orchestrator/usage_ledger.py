@@ -215,6 +215,9 @@ _DEFAULT_PROVENANCE = ModelProvenance(None, PRICE_SOURCE_DEFAULT, False)
 
 _PROVENANCE: contextvars.ContextVar[ModelProvenance] = contextvars.ContextVar("usage_ledger_provenance")
 
+# Hosts already warned about by provenance_for_env.
+_WARNED_OVERRIDE_HOSTS: set[str] = set()
+
 
 def provenance_for_env(
     env: Mapping[str, str], *, declared: ModelProvenance | None = None
@@ -237,11 +240,16 @@ def provenance_for_env(
         host = ""
     if host in _ANTHROPIC_HOSTS:
         return _DEFAULT_PROVENANCE
-    logger.warning(
-        "usage ledger: %s points at %r and no provenance was declared; "
-        "recording provider=unknown, price_source=unknown",
-        BASE_URL_OVERRIDE_ENV, host or "<unparseable>",
-    )
+    shown = host or "<unparseable>"
+    # Once per host per process: from_env runs on every agent_run, and a
+    # long-lived worker would otherwise repeat the same line every session.
+    if shown not in _WARNED_OVERRIDE_HOSTS:
+        _WARNED_OVERRIDE_HOSTS.add(shown)
+        logger.warning(
+            "usage ledger: %s points at %r and no provenance was declared; "
+            "recording provider=unknown, price_source=unknown",
+            BASE_URL_OVERRIDE_ENV, shown,
+        )
     return ModelProvenance("unknown", "unknown", True)
 
 

@@ -351,7 +351,9 @@ def sanitise(raw: dict[str, Any]) -> dict[str, Any] | None:
     pattern `orchestrator.usage_ledger._checked_correlation` enforces for
     the other producer), or an `issue_number`/`pr_number` that is not a
     positive number or has no accompanying `target_repo` to be read
-    against. In every one of those cases the single offending field is
+    against. The one exception is `price_source`: a value outside
+    `PRICE_SOURCES` is rewritten to `unknown`, never dropped, because its
+    absence means `mctl_catalog`. In every other case the single offending field is
     dropped, with a warning, rather than forwarded — the artifact is
     untrusted input, and the ingest is one transaction, so one malformed
     field would otherwise fail every record chunked into the same batch,
@@ -406,13 +408,17 @@ def sanitise(raw: dict[str, Any]) -> dict[str, Any] | None:
         )
         del sanitised["devloop_stage"]
 
-    price_source = sanitised.get("price_source")
-    if price_source is not None and price_source not in PRICE_SOURCES:
+    # price_source fails closed instead of being dropped: absent on the wire
+    # means mctl_catalog, so dropping a malformed value would get a
+    # third-party record priced from the catalog. Any value the producer did
+    # write but that is not in the vocabulary (including one the type check
+    # above already dropped) is forwarded as `unknown`.
+    if "price_source" in raw and sanitised.get("price_source") not in PRICE_SOURCES:
         print(
-            f"WARN: dropping field 'price_source'={price_source!r} of record "
-            f"{session_id!r}/{model_key!r} — not in the price_source vocabulary"
+            f"WARN: rewriting field 'price_source'={raw['price_source']!r} of record "
+            f"{session_id!r}/{model_key!r} to 'unknown' — not in the price_source vocabulary"
         )
-        del sanitised["price_source"]
+        sanitised["price_source"] = "unknown"
 
     repo = sanitised.get("target_repo")
     if repo is not None and not TARGET_REPO_RE.match(repo):
