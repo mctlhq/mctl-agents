@@ -75,7 +75,15 @@ def draft_url(item: Scored, run_id: str) -> tuple[str, str | None]:
 
 
 def render_footer(results: list[SourceResult], c: Counts) -> str:
-    lines = [f"{html.escape(r.name)}: {html.escape(r.label())}" for r in results]
+    # One line per source outgrew the 4096-char message and pushed items out, so
+    # healthy sources are a count and only the ones needing attention are listed.
+    ok = sum(r.status == "ok" for r in results)
+    disabled = [r.name for r in results if r.status == "disabled"]
+    lines = [f"sources: {ok} ok" + (f", {len(disabled)} disabled" if disabled else "")]
+    lines += [f"{html.escape(r.name)}: {html.escape(r.label())}" for r in results
+              if r.status not in ("ok", "disabled")]
+    if disabled:
+        lines.append("disabled: " + html.escape(", ".join(disabled)))
     lines.append(
         f"fetched {c.fetched} | in window {c.in_window} | deduped {c.deduped} | relevant {c.relevant} "
         f"| scored {c.scored} | unscored {c.unscored}"
