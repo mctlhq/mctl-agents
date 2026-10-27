@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.105.0](https://github.com/mctlhq/mctl-agents/compare/1.104.0...1.105.0) (2026-10-27)
+
+
+### Features
+
+* **agents:** register mctl-support as an issue-driven service ([009f3b6](https://github.com/mctlhq/mctl-agents/commit/009f3b6546ce4563f51507fb542534370af1dbfa))
+* **agents:** register mctl-support as an issue-driven service ([73888f0](https://github.com/mctlhq/mctl-agents/commit/73888f0cc7d914c3e9e16a79f3ac4e5ad5d16f0c))
+* **spike-791:** opt-in candidate reasoning effort and exploratory report ([cc674ce](https://github.com/mctlhq/mctl-agents/commit/cc674ce73b1ac81c16e94c3ac138df8d3ce3f4d0))
+
+
+### Bug Fixes
+
+* **spike-791:** address review P3s on rule inputs, merge and arm misuse ([7c234e3](https://github.com/mctlhq/mctl-agents/commit/7c234e33c2de7f64a9b9d11ee292743a02dfa1e4))
+* **spike-791:** keep effort runs out of merge, decide and the pre-registered dir ([1a528c0](https://github.com/mctlhq/mctl-agents/commit/1a528c08c1ca1526cefb7bb06e44dc13b6a08ca9))
+
 ## [1.104.0](https://github.com/mctlhq/mctl-agents/compare/1.103.0...1.104.0) (2026-10-26)
 
 
