@@ -1,8 +1,9 @@
 # Spike #670: decision-context explainer before human approval
 
-STATUS: DRAFT -- one measured run on #702 backs this report (see
-Measurements). The recommended verdict is LIMITED_GO; the issue owner decides,
-and this line becomes the token when they do. Refs mctlhq/mctl-agents#670.
+STATUS: LIMITED_GO
+
+Accepted by the issue owner on 2026-10-27, on one measured run on #702 (see
+Measurements). Refs mctlhq/mctl-agents#670.
 
 Allowed decision tokens, one of which replaces this marker when finalized:
 `GO`, `LIMITED_GO`, `NO_GO`. The issue owner records the verdict.
@@ -131,7 +132,7 @@ On GO or LIMITED_GO, follow-ups: proposal-time explainer activity, grant
 correlation in mctl-api, post-implementation drift check, on-demand slice
 explainer.
 
-## Recommendation: LIMITED_GO
+## Verdict: LIMITED_GO
 
 The artifact did more than summarise. From the proposal alone it found a
 defect that review only caught after the code was written, it named a gap in
@@ -150,10 +151,10 @@ LIMITED_GO means:
 
 Follow-ups:
 
-1. Wire `run_explainer.sh` to a real read-only Agent SDK call that records the
-   token split and cost.
-2. Add a proposal-time explainer activity in DevLoop, behind a flag, for
-   high-risk proposals.
-3. Correlate the artifact digest with the `aar_` grant in mctl-api.
-4. Time the owner on two or three high-risk approvals with and without the
-   artifact, and decide on a full GO from that data.
+1. mctlhq/mctl-agents#846: wire `run_explainer.sh` to a real read-only Agent
+   SDK call that records the token split and cost.
+2. mctlhq/mctl-agents#847: add a proposal-time explainer activity in DevLoop,
+   behind a flag, for high-risk proposals.
+3. mctlhq/mctl-api#840: correlate the artifact digest with the `aar_` grant.
+4. mctlhq/mctl-agents#848: time the owner on two or three high-risk approvals
+   with and without the artifact, and decide on a full GO from that data.
