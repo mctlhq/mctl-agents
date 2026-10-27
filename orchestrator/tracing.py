@@ -969,8 +969,11 @@ class AgentRunObserver:
     starts. Without a seed the first chat span of a scope would be zero-length.
     """
 
-    def __init__(self, root: SpanHandle, model: str | None, usage: Any = None) -> None:
+    def __init__(
+        self, root: SpanHandle, model: str | None, usage: Any = None, provider: str = PROVIDER
+    ) -> None:
         self._root = root
+        self._provider = provider
         self._model = model
         # The usage producer (orchestrator/usage_ledger.UsageRecorder) or
         # None. It sees every message whether this span records or not:
@@ -1054,7 +1057,7 @@ class AgentRunObserver:
             model = _bounded(getattr(message, "model", None), 128)
             attributes: dict[str, Any] = {
                 "gen_ai.operation.name": "chat",
-                "gen_ai.provider.name": PROVIDER,
+                "gen_ai.provider.name": self._provider,
             }
             if self._model:
                 attributes["gen_ai.request.model"] = self._model
@@ -1162,8 +1165,9 @@ class agent_run:
     built when the span opens (`__enter__`, not `__init__`), so it can carry
     the `invoke_agent` span's trace and span ids."""
 
-    def __init__(self, agent: str, model: str | None) -> None:
+    def __init__(self, agent: str, model: str | None, *, session_env: Mapping[str, str] | None = None) -> None:
         self._agent = agent
+        self._session_env = session_env
         self._model = model
         self._span_cm: Any = None
         self._usage: Any = None
@@ -1178,11 +1182,18 @@ class agent_run:
 
             ids = current_trace_ids()
             if ids is not None:
-                return usage_ledger.UsageRecorder.from_env(self._agent, trace_id=ids[0], span_id=ids[1])
-            return usage_ledger.UsageRecorder.from_env(self._agent)
+                return usage_ledger.UsageRecorder.from_env(
+                    self._agent, session_env=self._session_env, trace_id=ids[0], span_id=ids[1]
+                )
+            return usage_ledger.UsageRecorder.from_env(self._agent, session_env=self._session_env)
         except Exception as exc:  # noqa: BLE001
             _warn_once("usage", "usage recording unavailable for this run (%s)", type(exc).__name__)
             return None
+
+    def _provider_name(self) -> str:
+        prov = getattr(self._usage, "provenance", None)
+        name = getattr(prov, "provider", None) if getattr(prov, "third_party", False) else None
+        return name if isinstance(name, str) and name else PROVIDER
 
     def __enter__(self) -> AgentRunObserver:
         if not _state.enabled:
@@ -1200,7 +1211,10 @@ class agent_run:
         self._span_cm = span(f"invoke_agent {self._agent}", attributes, kind="client")
         handle = self._span_cm.__enter__()
         self._usage = self._build_recorder()  # the invoke_agent span is current here
-        self._observer = AgentRunObserver(handle, self._model, self._usage)
+        provider = self._provider_name()
+        if provider != PROVIDER:
+            handle.set_attributes({"gen_ai.provider.name": provider})
+        self._observer = AgentRunObserver(handle, self._model, self._usage, provider)
         return self._observer
 
     def __exit__(self, exc_type: Any, exc: BaseException | None, tb: Any) -> None:

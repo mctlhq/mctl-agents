@@ -516,6 +516,48 @@ producer rule, not a migration. Dedupe stays by `(session_id, result_uuid,
 model_key)` as described in "Idempotency and dedupe". The rows of a session
 still sum to its reported total, since a skipped row contributed 0.
 
+## Amendment 2026-10-27 — provider and price source (mctlhq/mctl-agents#826)
+
+Spike mctlhq/mctl-agents#791 showed that a third-party endpoint set through
+`ANTHROPIC_BASE_URL` would be recorded as a first-party row: the CLI's
+`ModelUsage.provider` describes its transport, not who served the tokens, and
+its `costUSD` is a list-price estimate for a model it does not know.
+
+**`price_source`.** A record may carry `price_source`, from the closed
+vocabulary `mctl_catalog`, `provider_free`, `unknown`. Absent means
+`mctl_catalog`, so every Anthropic record stays as it was.
+
+**`provider` is declared, not reported.** A lane with a third-party provider
+declares it (`usage_ledger.attribute_model`); the record then carries that
+provider and its declared `price_source`, never `ModelUsage.provider`. A
+third-party declaration may not claim `mctl_catalog`, and a malformed
+declaration is refused before the lane runs.
+
+**Fail closed.** If `ANTHROPIC_BASE_URL` (the session env over `os.environ`)
+names a host other than `api.anthropic.com` and nothing was declared, the
+record carries `provider=unknown` and `price_source=unknown`, with one warning.
+
+**Input tokens.** `cache_write_tokens` carries `cacheCreationInputTokens` for
+every provider. The total input count is
+`input_tokens + cache_read_tokens + cache_write_tokens`; `input_tokens` is
+the non-cache count on every row (author's decision, clarification request
+hir-95c5323867a3b06b).
+
+**Server contract.** mctl-api must accept and persist `price_source`, and must
+not apply catalog prices when it is not `mctl_catalog`: for `provider_free`
+it stores a zero or null cost under its own `pricing_version`, for `unknown`
+null. Until it does, no lane may declare third-party provenance. The mctl-api
+issue for this is still to be filed (TODO: link it here).
+
+Added invariants:
+
+13. A third-party record carries `provider` and `price_source`.
+14. No producer record carries a cost field (`calculated_cost`,
+    `provider_reported_cost`, `pricing_version`, `invoice_reconciled_cost`,
+    or an SDK cost value).
+15. `cache_write_tokens` is present whenever the bucket reported
+    `cacheCreationInputTokens`.
+
 ## Non-goals
 
 Dashboards. Hard budget enforcement. Replacing provider invoices. Selecting

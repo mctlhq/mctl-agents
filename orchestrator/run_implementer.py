@@ -2707,7 +2707,9 @@ async def _run_implementer_agent(
             async with (
                 # Model/tool spans (mctl-agents#195): names, ids and usage
                 # counters only — see orchestrator/tracing.AgentRunObserver.
-                tracing.agent_run("implementer", getattr(options, "model", None)) as trace_run,
+                tracing.agent_run(
+                    "implementer", getattr(options, "model", None), session_env=getattr(options, "env", None)
+                ) as trace_run,
                 ClaudeSDKClient(options=options) as client,
             ):
                 if mcp_configured:
