@@ -294,3 +294,37 @@ def test_npm_provenance_cli(tmp_path: object, capsys: pytest.CaptureFixture[str]
     bad.write_text("not json")
     assert rs.main(["npm-provenance", str(bad), "--integrity", _integrity(b"tgz"), "--repo", REA_REPO]) == 1
     assert capsys.readouterr().out == ""
+
+
+def test_collect_records_rea_operations_without_arguments() -> None:
+    sig = _collect(
+        _Msg(content=[_Msg(id="t1", name="mcp__rea__inspect_binary", input={"path": "codec"})]),
+        _Msg(content=[_Msg(id="t2", name="Bash", input={"command": "cd /x && rea disasm codec --json"})]),
+        _Msg(content=[_Msg(id="t3", name="Bash", input={"command": "objdump -d codec"})]),
+        _Msg(content=[_Msg(id="t4", name="mcp__rea__inspect_binary", input={"path": "codec"})]),
+        _Msg(is_error=False, num_turns=4, usage={}),
+    )
+    assert sig["tool_calls"] == 4
+    assert sig["rea_tool_calls"] == 3
+    assert sig["rea_operations"] == ["cli:disasm", "inspect_binary"]
+    none = _collect(_Msg(content=[_Msg(id="t1", name="Bash", input={"command": "javap -c X"})]),
+                    _Msg(is_error=False, num_turns=1, usage={}))
+    assert none["rea_tool_calls"] == 0 and none["rea_operations"] == []
+
+
+def test_rea_operations_reach_run_and_probe_records(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    monkeypatch.setattr(rs, "_live_stage",
+                        lambda *a, **k: {"ok": True, "text": "x", "rea_tool_calls": 2, "rea_operations": ["a"]})
+    rs.main(["run", "--allow-live", "--fixture", "native-codec", "--arm", "rea-mcp", "--model", "m"])
+    rec = json.loads(capsys.readouterr().out)
+    assert rec["rea_tool_calls"] == 2 and rec["rea_operations"] == ["a"]
+    monkeypatch.setattr(rs, "_live_stage", lambda *a, **k: {"ok": True, "text": "x"})
+    rs.main(["run", "--allow-live", "--fixture", "native-codec", "--arm", "rea-mcp", "--model", "m"])
+    rec = json.loads(capsys.readouterr().out)
+    assert rec["rea_tool_calls"] == rs.UNOBSERVED and rec["rea_operations"] == rs.UNOBSERVED
+    probe = rs.run_probe(lambda stage: {"ok": True, "rea_tool_calls": 0}, stages=("a",))
+    assert probe["stages"][0]["rea_tool_calls"] == 0
