@@ -71,6 +71,13 @@ MAX_SUMMARY_BYTES = 4096
 
 UNOBSERVED = "unobserved"
 
+#: Claude Code injects this notice when its safety classifier withholds part
+#: of a response. The session may go on afterwards, so it is not by itself a
+#: failed stage, but it must never disappear into an "ok" record.
+CLASSIFIER_NOTICE = "stopped by a safety classifier"
+
+SLSA_PROVENANCE_V1 = "https://slsa.dev/provenance/v1"
+
 
 # ---------------------------------------------------------------------------
 # Pure functions
@@ -120,6 +127,37 @@ def failure_text_record(text: str, store_text: bool) -> dict[str, Any]:
     return rec
 
 
+def npm_provenance_commit(attestations: Mapping[str, Any], integrity: str, repo: str) -> str:
+    """Source commit an npm package was built from, read from its registry
+    SLSA provenance attestation.
+
+    The statement must name the tarball whose `dist.integrity` is `integrity`
+    and a `git+<repo>@...` dependency with a full commit SHA. Anything missing,
+    malformed or pointing elsewhere raises ValueError: an unreadable binding is
+    never treated as a match. Signature verification is `npm audit signatures`.
+    """
+    import base64
+
+    algo, _, b64 = integrity.partition("-")
+    if algo != "sha512" or not b64:
+        raise ValueError(f"unsupported integrity {integrity!r}")
+    want = base64.b64decode(b64).hex()
+    commits: set[str] = set()
+    for att in attestations.get("attestations") or []:
+        if att.get("predicateType") != SLSA_PROVENANCE_V1:
+            continue
+        statement = json.loads(base64.b64decode(att["bundle"]["dsseEnvelope"]["payload"]))
+        if not any((s.get("digest") or {}).get("sha512") == want for s in statement.get("subject") or []):
+            raise ValueError("provenance subject does not match dist.integrity")
+        for dep in (statement.get("predicate") or {}).get("buildDefinition", {}).get("resolvedDependencies") or []:
+            commit = (dep.get("digest") or {}).get("gitCommit", "")
+            if str(dep.get("uri", "")).startswith(f"git+{repo}@") and re.fullmatch(r"[0-9a-f]{40}", commit):
+                commits.add(commit)
+    if len(commits) != 1:
+        raise ValueError(f"expected one source commit for {repo}, found {sorted(commits)}")
+    return commits.pop()
+
+
 StageRunner = Callable[[str], Mapping[str, Any]]
 
 
@@ -134,13 +172,15 @@ def run_probe(run_stage: StageRunner, stages: Sequence[str] = STAGES, store_text
             results.append({"stage": stage, "outcome": "not-run", "reason": f"earlier stage {failed['stage']} failed"})
             continue
         sig = dict(run_stage(stage))
+        interruptions = sig.get("classifier_interruptions", UNOBSERVED)
         if sig.get("ok"):
-            results.append({"stage": stage, "outcome": "ok"})
+            results.append({"stage": stage, "outcome": "ok", "classifier_interruptions": interruptions})
             continue
         failed = {
             "stage": stage,
             "outcome": "failed",
             "class": classify(sig),
+            "classifier_interruptions": interruptions,
             "text": failure_text_record(str(sig.get("text", "")), store_text),
         }
         results.append(failed)
@@ -310,8 +350,9 @@ async def _collect(stream: Any, sig: dict[str, Any]) -> dict[str, Any]:
         sig["ok"] = False
         sig["transport_error"] = True
         text.append(repr(exc))
-    else:  # a broken stream leaves the count unobserved, not short
+    else:  # a broken stream leaves the counts unobserved, not short
         sig["tool_calls"] = tool_calls
+        sig["classifier_interruptions"] = sum(t.count(CLASSIFIER_NOTICE) for t in text)
     sig["text"] = "\n".join(text)
     return sig
 
@@ -410,6 +451,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         "kind": "run", "fixture": args.fixture, "arm": args.arm, "model": model,
         "wall_clock_s": round(time.monotonic() - started, 1),
         "turns": sig.get("turns", UNOBSERVED), "tool_calls": sig.get("tool_calls", UNOBSERVED),
+        "classifier_interruptions": sig.get("classifier_interruptions", UNOBSERVED),
         "usage": sig.get("usage") or {},
         "final": bounded_summary(str(sig.get("text", ""))),
         "outcome": "ok" if sig.get("ok") else "failed",
@@ -474,6 +516,16 @@ def _cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_npm_provenance(args: argparse.Namespace) -> int:
+    try:
+        commit = npm_provenance_commit(json.loads(Path(args.attestations).read_text()), args.integrity, args.repo)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        print(f"npm-provenance: {exc}", file=sys.stderr)
+        return 1
+    print(commit)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0] if __doc__ else None)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -500,6 +552,11 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("records")
     sc.add_argument("grading")
     sc.set_defaults(func=_cmd_score)
+    np_ = sub.add_parser("npm-provenance", help="print the source commit from a saved npm attestations response")
+    np_.add_argument("attestations")
+    np_.add_argument("--integrity", required=True)
+    np_.add_argument("--repo", required=True)
+    np_.set_defaults(func=_cmd_npm_provenance)
     rp = sub.add_parser("report")
     rp.add_argument("records")
     rp.add_argument("--grading", default="")

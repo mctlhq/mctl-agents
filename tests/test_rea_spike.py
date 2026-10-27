@@ -208,3 +208,89 @@ def test_cmd_run_ok_record_is_bounded(monkeypatch: pytest.MonkeyPatch, capsys: p
     assert rec["failure_class"] is None
     assert "failure" not in rec
     assert len(json.dumps(rec["final"])) < 10240
+
+
+def test_collect_counts_classifier_interruptions() -> None:
+    notice = "Your response above was " + rs.CLASSIFIER_NOTICE + " - this is not a tool or API error."
+    sig = _collect(_Msg(content=[_Msg(text="reading main")]), _Msg(content=[_Msg(text=notice)]),
+                   _Msg(content=[_Msg(text="final answer")]), _Msg(is_error=False, num_turns=3, usage={}))
+    assert sig["ok"] is True and sig["classifier_interruptions"] == 1
+    clean = _collect(_Msg(content=[_Msg(text="done")]), _Msg(is_error=False, num_turns=1, usage={}))
+    assert clean["classifier_interruptions"] == 0
+
+
+def test_classifier_interruptions_reach_run_and_probe_records(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    monkeypatch.setattr(rs, "_live_stage", lambda *a, **k: {"ok": True, "text": "x", "classifier_interruptions": 2})
+    rs.main(["run", "--allow-live", "--fixture", "native-codec", "--arm", "baseline", "--model", "m"])
+    assert json.loads(capsys.readouterr().out)["classifier_interruptions"] == 2
+    monkeypatch.setattr(rs, "_live_stage", lambda *a, **k: {"ok": True, "text": "x"})
+    rs.main(["run", "--allow-live", "--fixture", "native-codec", "--arm", "baseline", "--model", "m"])
+    assert json.loads(capsys.readouterr().out)["classifier_interruptions"] == rs.UNOBSERVED
+    probe = rs.run_probe(lambda stage: {"ok": True, "classifier_interruptions": 1}, stages=("a",))
+    assert probe["stages"][0]["classifier_interruptions"] == 1
+
+
+REA_REPO = "https://github.com/morluto/rea"
+SHA = "160d821ac9a0310afcb8d1fc427862dd6508add5"
+
+
+def _attestations(tarball: bytes, commit: str = SHA, uri: str = f"git+{REA_REPO}@refs/heads/main") -> dict[str, object]:
+    import base64
+    import hashlib
+    import json
+
+    statement = {
+        "subject": [{"name": "pkg:npm/rea-agents@6.8.0", "digest": {"sha512": hashlib.sha512(tarball).hexdigest()}}],
+        "predicate": {"buildDefinition": {"resolvedDependencies": [{"uri": uri, "digest": {"gitCommit": commit}}]}},
+    }
+    payload = base64.b64encode(json.dumps(statement).encode()).decode()
+    return {"attestations": [
+        {"predicateType": "https://github.com/npm/attestation/tree/main/specs/publish/v0.1",
+         "bundle": {"dsseEnvelope": {"payload": payload}}},
+        {"predicateType": rs.SLSA_PROVENANCE_V1, "bundle": {"dsseEnvelope": {"payload": payload}}},
+    ]}
+
+
+def _integrity(tarball: bytes) -> str:
+    import base64
+    import hashlib
+
+    return "sha512-" + base64.b64encode(hashlib.sha512(tarball).digest()).decode()
+
+
+def test_npm_provenance_commit_matches() -> None:
+    assert rs.npm_provenance_commit(_attestations(b"tgz"), _integrity(b"tgz"), REA_REPO) == SHA
+
+
+@pytest.mark.parametrize(
+    ("attestations", "integrity"),
+    [
+        (_attestations(b"other"), _integrity(b"tgz")),  # provenance is for a different tarball
+        (_attestations(b"tgz", uri="git+https://github.com/evil/rea@refs/heads/main"), _integrity(b"tgz")),
+        (_attestations(b"tgz", commit="short"), _integrity(b"tgz")),
+        ({"attestations": []}, _integrity(b"tgz")),  # no provenance is not a match
+        ({}, _integrity(b"tgz")),
+        (_attestations(b"tgz"), "sha1-abc"),
+    ],
+)
+def test_npm_provenance_commit_fails_closed(attestations: dict[str, object], integrity: str) -> None:
+    with pytest.raises(ValueError):
+        rs.npm_provenance_commit(attestations, integrity, REA_REPO)
+
+
+def test_npm_provenance_cli(tmp_path: object, capsys: pytest.CaptureFixture[str]) -> None:
+    import json
+    from pathlib import Path
+
+    good = Path(str(tmp_path)) / "a.json"
+    good.write_text(json.dumps(_attestations(b"tgz")))
+    assert rs.main(["npm-provenance", str(good), "--integrity", _integrity(b"tgz"), "--repo", REA_REPO]) == 0
+    assert capsys.readouterr().out.strip() == SHA
+    bad = Path(str(tmp_path)) / "b.json"
+    bad.write_text("not json")
+    assert rs.main(["npm-provenance", str(bad), "--integrity", _integrity(b"tgz"), "--repo", REA_REPO]) == 1
+    assert capsys.readouterr().out == ""

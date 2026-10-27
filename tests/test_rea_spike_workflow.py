@@ -126,10 +126,14 @@ def test_grading_template_entries_top_level(tmp_path: Path) -> None:
 
 def test_rea_identity_bound_to_sha() -> None:
     run = _step_run("Resolve and install REA")
-    assert 'npm view "rea-agents@$VERSION" gitHead dist.integrity --json' in run
     assert "rea-identity-mismatch" in run
-    assert '"$GITHEAD" != "$SHA"' in run
-    assert "npm_git_head" in run and "npm_dist_integrity" in run
+    assert '[ "$LOCKED" != "$INTEGRITY" ]' in run
+    assert "npm audit signatures --prefix" in run
+    assert "tools/rea_spike.py npm-provenance" in run
+    assert '[ -z "$PROVCOMMIT" ] || [ "$PROVCOMMIT" != "$SHA" ]' in run
+    # rea_ok is set only after every binding check left REASON empty.
+    assert run.index('"$PROVCOMMIT" != "$SHA"') < run.index('echo "rea_ok=true"')
+    assert "npm_git_head" in run and "npm_dist_integrity" in run and "npm_provenance_git_commit" in run
 
 
 def test_rea_bin_on_path_only_for_rea_cli() -> None:
