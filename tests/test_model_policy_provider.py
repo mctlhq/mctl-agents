@@ -123,6 +123,7 @@ def test_provider_session_has_no_anthropic_credential(
         tools=("Read", "Grep"),
         budget_usd=1.0,
         provider=provider,
+        effort=None,
     )
     built = options.build_issue_investigator_options_from_plan(
         cast(Any, plan), tmp_path, tmp_path / "proposal"
@@ -222,3 +223,47 @@ def test_execution_plan_log_dict_includes_provider() -> None:
         "name": "hetzner",
         "base_url": "https://inference.hetzner.com/api",
     }
+
+
+def test_provider_profile_with_effort_resolves_it_and_committed_policy_has_none() -> None:
+    doc = _doc()
+    doc["profiles"]["experimental_hetzner"]["effort"] = "medium"
+    assert ModelPolicy(doc).resolve(TASK, log=False).effort == "medium"
+    committed = ModelPolicy.load(model_policy.DEFAULT_POLICY_PATH)
+    raw = yaml.safe_load(model_policy.DEFAULT_POLICY_PATH.read_text())
+    for task in raw["tasks"]:
+        assert committed.resolve(task, log=False).effort is None
+
+
+def test_settings_import_fails_closed_for_effort_routed_string_only_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import config.settings
+
+    doc = _doc()
+    doc["profiles"]["balanced"]["effort"] = "medium"
+    path = tmp_path / "policy.yaml"
+    path.write_text(yaml.safe_dump(doc))
+    monkeypatch.setenv("MODEL_POLICY_PATH", str(path))
+    monkeypatch.delenv("SERVICE_AGENT_MODEL", raising=False)
+    try:
+        with pytest.raises(ModelPolicyError, match="effort"):
+            importlib.reload(config.settings)
+    finally:
+        monkeypatch.delenv("MODEL_POLICY_PATH")
+        importlib.reload(config.settings)
+
+
+def test_execution_plan_carries_and_logs_effort() -> None:
+    fields = {f: None for f in resolver.ExecutionPlan.__dataclass_fields__}
+    plan = SimpleNamespace(**fields)
+    plan.effort = "medium"
+    plan.permissions = {}
+    plan.approval = {}
+    plan.service_skills = ()
+    plan.capability_providers = ()
+    for name in ("prompt_hashes", "skill_hashes", "tools", "evidence"):
+        setattr(plan, name, ())
+    assert resolver.ExecutionPlan.to_log_dict(cast(Any, plan))["effort"] == "medium"
+    real = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    assert real.effort is None and real.to_log_dict()["effort"] is None

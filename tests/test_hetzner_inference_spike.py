@@ -348,3 +348,77 @@ def test_effort_is_candidate_only_and_recorded(tmp_path):
         hs.merge_runs([([], base_manifest), (records, manifest)])
     with pytest.raises(hs.SpikeError, match="exploratory"):
         hs.merge_runs([([], base_manifest), (records, {**manifest, "candidate_effort": "cli-default"})])
+
+
+def _policy_bench_setup(tmp_path, monkeypatch, *, available=True, base_url="https://inference.hetzner.com/api"):
+    snap = {"selected": {"Qwen/Qwen3.8-27B": {"availability": hs.AVAILABLE if available else hs.UNAVAILABLE}},
+            "messages_probe": {"ok": True}}
+    (tmp_path / "snapshot-start.json").write_text(json.dumps(snap))
+    monkeypatch.setenv("HETZNER_INFERENCE_BASE_URL", base_url)
+    monkeypatch.setenv("HETZNER_INFERENCE_API_KEY", "k")
+    policy = str(ROOT / "docs" / "spikes" / "825" / "model-policy-qwen38.yaml")
+    return ["bench", "--allow-live", "--out-dir", str(tmp_path), "--arm", "candidate",
+            "--model-policy", policy, "--policy-task", "bench_candidate"]
+
+
+def test_committed_825_bench_policy_resolves_to_qwen38_medium_hetzner():
+    from config.model_policy import ModelPolicy
+
+    sel = ModelPolicy.load(ROOT / "docs" / "spikes" / "825" / "model-policy-qwen38.yaml").resolve(
+        "bench_candidate", log=False)
+    assert (sel.model, sel.effort) == ("Qwen/Qwen3.8-27B", "medium")
+    assert sel.provider is not None and sel.provider.name == "hetzner"
+
+
+def test_policy_bench_refusals_happen_before_any_live_call(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("live call attempted")
+
+    monkeypatch.setattr(hs, "make_sdk_runner", boom)
+    monkeypatch.setattr(hs, "HetznerClient", boom)
+    args = _policy_bench_setup(tmp_path, monkeypatch)
+
+    def swap(flag, value):
+        out = list(args)
+        out[out.index(flag) + 1] = value
+        return out
+
+    assert hs.main([*args, "--effort", "medium"]) == 2
+    assert hs.main(swap("--arm", "all")) == 2
+    assert hs.main(args[:-2]) == 2  # --policy-task missing
+    assert hs.main([*args, "--models", "other"]) == 2
+    assert hs.main(swap("--out-dir", str(hs.SPIKE_DIR))) == 2
+    monkeypatch.setenv("HETZNER_INFERENCE_BASE_URL", "https://elsewhere.example")
+    assert hs.main(args) == 2
+    args = _policy_bench_setup(tmp_path, monkeypatch, available=False)
+    assert hs.main(args) == 2
+    # a policy task that resolves to no provider
+    args = _policy_bench_setup(tmp_path, monkeypatch)
+    assert hs.main(swap("--policy-task", "service_agent")) == 2
+
+
+def test_policy_bench_records_effort_source_and_stays_exploratory(tmp_path, monkeypatch):
+    args = _policy_bench_setup(tmp_path, monkeypatch)
+    ns = hs.argparse.Namespace(model_policy=args[args.index("--model-policy") + 1], policy_task="bench_candidate",
+                               effort=None, arm="candidate")
+    snap = json.loads((tmp_path / "snapshot-start.json").read_text())
+    model, effort, info = hs._policy_candidate(ns, snap)
+    assert (model, effort) == ("Qwen/Qwen3.8-27B", "medium") and len(info["model_policy_sha256"]) == 64
+    fixtures = hs.load_fixtures()
+
+    async def runner(task, m, provider, rep, ws):
+        return {"tool_calls": [], "final_text": "", "usage_models": [m], "http_errors": 0, "timeouts": 0}
+
+    base = {"model": "claude-test", "model_policy_version": 1}
+    records, manifest = anyio.run(lambda: hs.run_bench(
+        runner, fixtures, [model], reps=1, baseline=base, include_baseline=False, effort=effort,
+        effort_source="policy", policy_info=info))
+    assert {(r["effort"], r["effort_source"]) for r in records} == {("medium", "policy")}
+    assert manifest["candidate_effort_source"] == "policy" and manifest["model_policy_sha256"]
+    with pytest.raises(hs.SpikeError, match="exploratory"):
+        hs._refuse_exploratory(records, [manifest])
+
+
+def test_count_http_400():
+    recs = [{"error": "api_error_status=400"}, {"error": "api_error_status=429"}, {"error": None}, {}]
+    assert hs.count_http_400(recs) == 1

@@ -33,6 +33,9 @@ MODEL_SLOTS = (
     "CLAUDE_CODE_SUBAGENT_MODEL",
 )
 
+#: Reasoning efforts the SDK/CLI accept (pinned to the SDK by a test).
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
 _PROVIDER_KEYS = frozenset(
     {"name", "api", "base_url", "credential_env", "pin_model_slots", "fallback"}
 )
@@ -69,9 +72,12 @@ class ModelSelection:
     model: str
     source: str
     provider: ProviderSpec | None = None
+    effort: str | None = None
 
     def log(self) -> None:
         suffix = f" provider={self.provider.name}" if self.provider else ""
+        if self.effort is not None:
+            suffix += f" effort={self.effort}"
         print(
             "[model-policy] "
             f"task={self.task} profile={self.profile} model={self.model} "
@@ -228,6 +234,13 @@ class ModelPolicy:
                 raise ModelPolicyError(
                     f"profile {name!r} model_env must be a non-empty string"
                 )
+            if "effort" in profile:
+                effort = profile["effort"]
+                if not isinstance(effort, str) or effort not in EFFORT_LEVELS:
+                    raise ModelPolicyError(
+                        f"profile {name!r} effort must be one of "
+                        f"{list(EFFORT_LEVELS)}"
+                    )
             if "provider" in profile:
                 self._providers[name] = _validate_provider(name, profile)
 
@@ -284,6 +297,7 @@ class ModelPolicy:
             model=model,
             source=source,
             provider=provider,
+            effort=profile.get("effort"),
         )
         if log:
             selection.log()

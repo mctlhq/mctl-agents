@@ -787,7 +787,8 @@ def _check_capability_discovery_matches_gateway_allowlist(
         plan = cast(
             "Any",
             SimpleNamespace(
-                tools=tuple(declared_tools), model="dummy-model", budget_usd=1.0, provider=None
+                tools=tuple(declared_tools), model="dummy-model", budget_usd=1.0, provider=None,
+                effort=None,
             ),
         )
         try:

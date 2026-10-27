@@ -1842,3 +1842,37 @@ def test_non_object_input_is_refused_before_the_checkpoint(monkeypatch, tool_inp
     out = _call_hook(hook, "mcp__mctl__mctl_deploy_service", tool_input)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert seen == []
+
+
+def test_apply_effort_and_scrubbed_effort():
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    opts = ClaudeAgentOptions()
+    options.apply_effort(opts, None)
+    assert opts.effort is None
+    options.apply_effort(opts, "medium")
+    assert opts.effort == "medium"
+    options.apply_effort(opts, "medium")  # same value is not a conflict
+    with pytest.raises(ValueError, match="conflicting effort"):
+        options.apply_effort(opts, "low")
+    scrubbed = options._scrubbed(ClaudeAgentOptions(), effort="low")
+    assert scrubbed.effort == "low"
+    with pytest.raises(ValueError):
+        options._scrubbed(ClaudeAgentOptions(effort="high"), effort="low")
+    assert options._scrubbed(ClaudeAgentOptions()).effort is None
+
+
+@pytest.mark.parametrize("gateway", [None, "fake"])
+def test_investigator_options_from_plan_carry_the_plans_effort(tmp_path, monkeypatch, gateway):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+    gw = _FakeGateway() if gateway else None
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    assert plan.effort is None
+    built = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir, gateway=gw)
+    assert built.effort is None
+    with_effort = dataclasses.replace(plan, effort="medium")
+    built = options.build_issue_investigator_options_from_plan(with_effort, repo_dir, proposal_dir, gateway=gw)
+    assert built.effort == "medium"

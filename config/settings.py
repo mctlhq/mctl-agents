@@ -212,6 +212,12 @@ for _selection in (
             f"task {_selection.task!r} resolves to provider profile "
             f"{_selection.profile!r}, which string-only model paths cannot carry"
         )
+    if _selection.effort is not None:
+        raise ModelPolicyError(
+            f"task {_selection.task!r} resolves to profile "
+            f"{_selection.profile!r} with effort {_selection.effort!r}, "
+            "which string-only model paths cannot carry"
+        )
 
 SERVICE_AGENT_MODEL = SERVICE_AGENT_SELECTION.model
 MENTOR_MODEL = MENTOR_SELECTION.model

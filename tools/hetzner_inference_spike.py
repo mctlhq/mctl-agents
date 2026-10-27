@@ -633,8 +633,10 @@ async def sdk_session(options: Any, prompt: str, max_turns: int, max_budget: flo
 
 
 def make_sdk_runner(fixtures: Mapping[str, Mapping[str, Any]], *, base_url: str, token: str,
-                    effort: str | None = None) -> CellRunner:
-    """`effort` (candidate cells only) passes `--effort` to the CLI; None keeps the CLI default."""
+                    effort: str | None = None, effort_source: str = "flag") -> CellRunner:
+    """`effort` (candidate cells only) passes `--effort` to the CLI; None keeps the CLI default.
+    From a model policy (`effort_source == "policy"`) it is applied through the public
+    `orchestrator.options.apply_effort`, the function `_scrubbed` uses."""
     async def run(task: str, model: str, provider: str, rep: int, workspace: Path) -> dict[str, Any]:
         fx = fixtures[task]
         transform = None
@@ -643,7 +645,11 @@ def make_sdk_runner(fixtures: Mapping[str, Mapping[str, Any]], *, base_url: str,
                 return hetzner_session_env(env, base_url=base_url, token=token, model=_m)
         options = cell_options(task, model, workspace, transform)
         if provider == CANDIDATE_PROVIDER and effort is not None:
-            options.effort = effort
+            if effort_source == "policy":
+                from orchestrator.options import apply_effort
+                apply_effort(options, effort)
+            else:
+                options.effort = effort
         run.last_allowed = list(options.allowed_tools or [])  # type: ignore[attr-defined]
         return await sdk_session(options, fx["prompt"], fx["limits"]["max_turns"], fx["limits"]["budget_usd"])
     run.last_allowed = []  # type: ignore[attr-defined]
@@ -655,7 +661,8 @@ async def run_bench(runner: CellRunner, fixtures: Mapping[str, Mapping[str, Any]
                     allowed_tools: Sequence[str] = ("*",), protocol_path: str = "messages",
                     run_id: str | None = None, include_baseline: bool = True,
                     preregistered: Sequence[str] = SELECTED_MODELS,
-                    effort: str | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                    effort: str | None = None, effort_source: str = "flag",
+                    policy_info: Mapping[str, Any] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """The matrix: baseline plus each available model, every task, `reps` repetitions. A failed
     cell stays failed: no cell is retried on another model. `include_baseline=False` / `available=[]`
     run one arm alone (the two arms may need different hosts); `merge` joins them."""
@@ -680,11 +687,15 @@ async def run_bench(runner: CellRunner, fixtures: Mapping[str, Mapping[str, Any]
                             "provider": provider, "model": model, "protocol_path": path, "repetition": rep,
                             "preregistered": provider == BASELINE_PROVIDER or model in preregistered,
                             "effort": effort if provider == CANDIDATE_PROVIDER and effort else "cli-default"}
+                    if provider == CANDIDATE_PROVIDER and effort:
+                        base["effort_source"] = effort_source
                     records.append(finalize_cell(base, obs, fx, allowed, ws))
     manifest = {"schema": "hetzner-run-manifest/v1", "run_id": run_id, "repo_sha": repo_sha,
                 "started_utc": started_utc, "finished_utc": _utc_now(), "baseline": dict(baseline),
                 "candidate_isolation": dict(CANDIDATE_ISOLATION),
                 "candidate_effort": effort or "cli-default",
+                **({"candidate_effort_source": effort_source} if effort else {}),
+                **(dict(policy_info) if policy_info else {}),
                 "available_models": list(available), "arms": (["baseline"] if include_baseline else [])
                 + (["candidate"] if available else []),
                 "repetitions_requested": reps,
@@ -918,12 +929,55 @@ def bench_models(snap: Mapping[str, Any], requested: Sequence[str]) -> list[str]
     return list(requested)
 
 
+def count_http_400(records: Sequence[Mapping[str, Any]]) -> int:
+    """Cells whose recorded error is an HTTP 400 (the #825 acceptance metric)."""
+    return sum(1 for r in records if "api_error_status=400" in str(r.get("error") or ""))
+
+
+def _policy_candidate(args: argparse.Namespace, snap: Mapping[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    """Model, effort and manifest info from `--model-policy`/`--policy-task`; refuses before any live call."""
+    from config.model_policy import ModelPolicy, ModelPolicyError
+
+    if not args.model_policy or not args.policy_task:
+        raise SpikeError("--model-policy and --policy-task must be given together")
+    if args.effort:
+        raise SpikeError("--model-policy takes the effort from the policy: do not combine it with --effort")
+    if args.arm != "candidate":
+        raise SpikeError("--model-policy applies to candidate cells only; use it with --arm candidate")
+    path = Path(args.model_policy)
+    try:
+        selection = ModelPolicy.load(path).resolve(args.policy_task, log=False)
+    except ModelPolicyError as exc:
+        raise SpikeError(f"model policy: {exc}") from exc
+    provider = selection.provider
+    if provider is None:
+        raise SpikeError(f"task {args.policy_task!r} resolves to no provider profile")
+    if provider.name != CANDIDATE_PROVIDER:
+        raise SpikeError(f"provider {provider.name!r} is not {CANDIDATE_PROVIDER!r}")
+    env_url = os.environ.get("HETZNER_INFERENCE_BASE_URL", "").rstrip("/")
+    if provider.base_url.rstrip("/") != env_url:
+        raise SpikeError("policy provider base_url differs from HETZNER_INFERENCE_BASE_URL")
+    if selection.model not in bench_models(snap, []):
+        raise SpikeError(f"not AVAILABLE in the snapshot (no substitution): {selection.model}")
+    if selection.effort is None:
+        raise SpikeError(f"task {args.policy_task!r} declares no effort; a policy bench needs one")
+    info = {"model_policy_path": str(path), "model_policy_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    return selection.model, selection.effort, info
+
+
 def _cmd_bench(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
-    if args.effort and out_dir.resolve() == SPIKE_DIR.resolve():
+    if (args.effort or args.model_policy) and out_dir.resolve() == SPIKE_DIR.resolve():
         raise SpikeError("--effort runs are exploratory: pass an --out-dir other than the pre-registered run's")
     snap = json.loads(Path(args.snapshot or out_dir / "snapshot-start.json").read_text())
     requested = [m for m in (args.models or "").split(",") if m]
+    effort, effort_source, policy_info = args.effort, "flag", None
+    if args.model_policy or args.policy_task:
+        policy_model, effort, policy_info = _policy_candidate(args, snap)
+        effort_source = "policy"
+        if requested and requested != [policy_model]:
+            raise SpikeError("--models disagrees with the model policy's model")
+        requested = [policy_model]
     if args.arm == "baseline" and requested:
         raise SpikeError("--models has no effect with --arm baseline")
     available = [] if args.arm == "baseline" else bench_models(snap, requested)
@@ -942,9 +996,11 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     suffix = "" if args.arm == "all" else f"-{args.arm}"
 
     async def go(url: str, token: str, protocol: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        runner = make_sdk_runner(fixtures, base_url=url, token=token, effort=args.effort)
+        runner = make_sdk_runner(fixtures, base_url=url, token=token, effort=effort,
+                                 effort_source=effort_source)
         return await run_bench(runner, fixtures, available, reps=args.reps, protocol_path=protocol,
-                               include_baseline=include_baseline, effort=args.effort)
+                               include_baseline=include_baseline, effort=effort,
+                               effort_source=effort_source, policy_info=policy_info)
 
     if not available or snap["messages_probe"].get("ok"):
         records, manifest = asyncio.run(go(base, key, "messages"))
@@ -1026,7 +1082,8 @@ def render_exploratory(records: Sequence[Mapping[str, Any]], manifest: Mapping[s
     models = list(manifest["available_models"])
     lines = [f"- run: `{manifest['run_id']}`, repo sha `{manifest['repo_sha']}`, window (UTC) "
              f"{manifest['started_utc']} to {manifest.get('finished_utc', 'n/a')}",
-             f"- candidate reasoning effort: `{manifest.get('candidate_effort', 'cli-default')}`; everything else "
+             f"- candidate reasoning effort: `{manifest.get('candidate_effort', 'cli-default')}` "
+             f"(source: `{manifest.get('candidate_effort_source', 'cli-default')}`); everything else "
              "as in the main run (same builders, hooks, fixtures, container isolation)",
              f"- catalog at start ({snapshot['timestamp_utc']}): "
              + ", ".join(f"`{i}`" for i in snapshot["catalog_ids"]),
@@ -1058,7 +1115,8 @@ def render_exploratory(records: Sequence[Mapping[str, Any]], manifest: Mapping[s
                      f"HTTP 429 {sum(r.get('http_429') or 0 for r in rs)}, "
                      f"timeouts {sum(r.get('timeouts') or 0 for r in rs)}, "
                      f"policy bypasses {sum(r.get('policy_bypasses') or 0 for r in rs)}, "
-                     f"policy denials {sum(r.get('policy_denials') or 0 for r in rs)}")
+                     f"policy denials {sum(r.get('policy_denials') or 0 for r in rs)}, "
+                     f"HTTP 400 {count_http_400(rs)}")
     return "\n".join(lines) + "\n"
 
 
@@ -1107,6 +1165,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--run-location", default="unspecified", help="recorded in the manifest")
     p.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"), default=None,
                    help="CLI reasoning effort for candidate cells (exploratory runs; default: CLI default)")
+    p.add_argument("--model-policy", default=None,
+                   help="model policy file; takes the candidate model and effort from --policy-task")
+    p.add_argument("--policy-task", default=None, help="task in --model-policy routed to the candidate profile")
     p.set_defaults(func=_cmd_bench)
     p = sub.add_parser("merge", help="join per-arm bench outputs into records.jsonl / run-manifest.json")
     p.add_argument("--dir", default=str(SPIKE_DIR))

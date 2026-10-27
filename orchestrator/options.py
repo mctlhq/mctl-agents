@@ -1241,8 +1241,25 @@ def agent_env_without_mctl_token(env: Mapping[str, str]) -> dict[str, str]:
     return {**env, MCTL_TOKEN_ENV: ""}
 
 
+def apply_effort(options: ClaudeAgentOptions, effort: str | None) -> None:
+    """Set ``options.effort`` from the model policy. ``None`` is a no-op.
+
+    Raises ``ValueError`` if the options already hold a different effort.
+    """
+    if effort is None:
+        return
+    if options.effort is not None and options.effort != effort:
+        raise ValueError(
+            f"conflicting effort: options hold {options.effort!r}, policy {effort!r}"
+        )
+    options.effort = effort  # type: ignore[assignment]
+
+
 def _scrubbed(
-    options: ClaudeAgentOptions, *, provider: ProviderSpec | None = None
+    options: ClaudeAgentOptions,
+    *,
+    provider: ProviderSpec | None = None,
+    effort: str | None = None,
 ) -> ClaudeAgentOptions:
     """Every SDK session's options in this module pass through here.
 
@@ -1262,7 +1279,11 @@ def _scrubbed(
     EFFECTIVE env (process env overlaid with the builder's), every Anthropic
     credential is blanked, and the CLI gets an empty config dir so a stored
     login cannot reach the third party. No fallback model is allowed.
+
+    ``effort`` (model policy): reasoning effort for the session; see
+    ``apply_effort``. ``None`` leaves the CLI default.
     """
+    apply_effort(options, effort)
     options.env = agent_env_without_mctl_token(
         agent_env_without_evidence_token(agent_env_without_writer_token(options.env or os.environ))
     )
@@ -1599,7 +1620,7 @@ def build_issue_investigator_options_from_plan(
             hooks=_compose_hooks(
                 _command_audit_hooks(), _policy_hooks(allowed_tools), _read_only_dirs_hooks(gitops_dirs),
             ),
-        ), provider=plan.provider)
+        ), provider=plan.provider, effort=plan.effort)
     # gateway is not None: the capability gateway's own SDK server replaces
     # the remote mctl connection entirely — the model never sees
     # mcp__mctl__* directly, only mcp__capability__* (capability_search/
@@ -1623,7 +1644,7 @@ def build_issue_investigator_options_from_plan(
             _read_only_dirs_hooks(gitops_dirs),
         ),
         strict_mcp_config=True,
-    ), provider=plan.provider)
+    ), provider=plan.provider, effort=plan.effort)
 
 
 #: SDK-visible prefix of the capability gateway's own tools

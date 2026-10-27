@@ -309,6 +309,8 @@ class ExecutionPlan:
     capability_providers: tuple[ProviderRef, ...] = ()
     # Non-Anthropic model endpoint from the model policy, or None.
     provider: ProviderSpec | None = None
+    # Reasoning effort from the model policy profile, or None (CLI default).
+    effort: str | None = None
 
     def to_log_dict(self) -> dict[str, Any]:
         """JSON-serializable snapshot for structured logging (mctlhq/mctl-agents#227
@@ -322,6 +324,7 @@ class ExecutionPlan:
             }
         return {
             **provider_log,
+            "effort": self.effort,
             "agent": self.agent,
             "definition_version": self.definition_version,
             "definition_content_hash": self.definition_content_hash,
@@ -1150,6 +1153,7 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
         model=model_selection.model,
         model_policy_version=_model_policy_version(),
         provider=model_selection.provider,
+        effort=model_selection.effort,
         prompt_hashes=tuple(_hash_prompt_source(s) for s in definition.prompt_sources),
         skill_hashes=tuple(hashlib.sha256(skill.encode()).hexdigest() for skill in profile.skills),
         tools=profile.tools,

@@ -1,0 +1,30 @@
+# Bench-only policy for the #825 Qwen3.8-27B re-bench. Not the production policy.
+version: 1
+
+profiles:
+  cheap:
+    model: claude-haiku-5-5
+    model_env: CLAUDE_CHEAP_MODEL
+
+  balanced:
+    model: claude-sonnet-5-5
+    model_env: CLAUDE_BALANCED_MODEL
+
+  experimental_hetzner_qwen38:
+    model: Qwen/Qwen3.8-27B
+    effort: medium
+    provider:
+      name: hetzner
+      api: anthropic-messages
+      base_url: https://inference.hetzner.com/api
+      credential_env: HETZNER_INFERENCE_API_KEY
+      pin_model_slots: true
+      fallback: none
+
+tasks:
+  service_agent: balanced
+  mentor_digest: balanced
+  review_findings_normalize: balanced
+  scout_relevance: cheap
+  scout_scoring: balanced
+  bench_candidate: experimental_hetzner_qwen38

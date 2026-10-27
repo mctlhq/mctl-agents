@@ -128,3 +128,49 @@ def test_committed_cheap_rollback_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert selection.model == "claude-haiku-4-5"
     assert selection.source == "CLAUDE_CHEAP_MODEL"
+
+
+def _effort_policy(effort: object) -> ModelPolicy:
+    return ModelPolicy(
+        {
+            "version": 1,
+            "profiles": {
+                "p": {"model": "m", "model_env": "EFFORT_TEST_MODEL", "effort": effort},
+            },
+            "tasks": {"t": "p"},
+        }
+    )
+
+
+def test_effort_levels_match_the_sdk() -> None:
+    import typing
+
+    from claude_agent_sdk.types import EffortLevel
+
+    from config.model_policy import EFFORT_LEVELS
+
+    assert EFFORT_LEVELS == typing.get_args(EffortLevel)
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+def test_valid_effort_resolves(effort: str) -> None:
+    assert _effort_policy(effort).resolve("t", log=False).effort == effort
+
+
+@pytest.mark.parametrize("bad", ["HIGH", "none", 3, ""])
+def test_invalid_effort_is_rejected_naming_the_profile(bad: object) -> None:
+    with pytest.raises(ModelPolicyError, match="'p'"):
+        _effort_policy(bad)
+
+
+def test_profile_without_effort_resolves_none_and_env_does_not_change_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _policy().resolve("service_agent", log=False).effort is None
+    monkeypatch.setenv("EFFORT_TEST_MODEL", "other")
+    monkeypatch.setenv("EFFORT_LEGACY_MODEL", "legacy")
+    policy = _effort_policy("medium")
+    sel = policy.resolve("t", log=False)
+    assert sel.model == "other" and sel.effort == "medium"
+    sel = policy.resolve("t", legacy_model_env="EFFORT_LEGACY_MODEL", log=False)
+    assert sel.model == "legacy" and sel.effort == "medium"
