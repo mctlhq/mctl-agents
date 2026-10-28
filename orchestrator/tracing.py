@@ -47,6 +47,8 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
+from orchestrator import classifier_notice
+
 logger = logging.getLogger(__name__)
 
 # W3C trace context, as carried across the Temporal -> Argo -> pod boundary.
@@ -99,6 +101,9 @@ ISSUE_NUMBER = "mctl.issue.number"
 PR_NUMBER = "mctl.pr.number"
 TOOL_NAME = "mctl.tool.name"
 TOOL_STATUS = "mctl.tool.status"
+# Claude Code safety-classifier notices in one agent run: an int, or
+# "unobserved" when the stream was not seen whole (mctl-agents#849).
+CLASSIFIER_INTERRUPTIONS = "mctl.agent.classifier_interruptions"
 ERROR_TYPE = "error.type"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -950,7 +955,9 @@ class AgentRunObserver:
     never imports `claude_agent_sdk` (the worker must not). Reads only:
     model names, message ids, usage counters, stop/error codes, tool names,
     tool-use ids and the `is_error` flag. Never a content block's text, a
-    tool's `input`, or a tool result's `content`.
+    tool's `input`, or a tool result's `content` -- with one exception:
+    `classifier_notice.InterruptionCounter` scans them for the fixed safety-
+    classifier notice and keeps only a count (mctl-agents#849).
 
     Span shape, per agent run:
 
@@ -987,6 +994,9 @@ class AgentRunObserver:
         # Per-attribute usage summed over result frames; a key is present only
         # if some frame reported it (cache counters are never fabricated as 0).
         self._usage_totals: dict[str, int] = {}
+        # Fed whether this span records or not, like the usage producer.
+        self._interruptions = classifier_notice.InterruptionCounter()
+        self.classifier_interruptions: int | str = classifier_notice.UNOBSERVED
 
     # -- public -----------------------------------------------------------
 
@@ -1004,6 +1014,7 @@ class AgentRunObserver:
         try:
             if self._usage is not None:
                 self._usage.observe(message)
+            self._interruptions.observe(message)
             if not self._root.recording:
                 return
             kind = type(message).__name__
@@ -1017,7 +1028,9 @@ class AgentRunObserver:
             _warn_once("observe", "could not trace an SDK message (%s)", type(exc).__name__)
 
     def close(self, error: BaseException | None = None) -> None:
+        self.classifier_interruptions = self._interruptions.result(error)
         try:
+            self._root.set_attributes({CLASSIFIER_INTERRUPTIONS: self.classifier_interruptions})
             for scope in list(self._chats):
                 self._end_chat(scope)
             for handle in self._tools.values():
@@ -1148,7 +1161,7 @@ class _NoopObserver(AgentRunObserver):
         super().__init__(NOOP, None, usage)
 
     def close(self, error: BaseException | None = None) -> None:
-        return None
+        self.classifier_interruptions = self._interruptions.result(error)
 
 
 class agent_run:
@@ -1219,6 +1232,9 @@ class agent_run:
 
     def __exit__(self, exc_type: Any, exc: BaseException | None, tb: Any) -> None:
         self._observer.close(exc)
+        # Always printed, tracing on or off, so the run's log carries it;
+        # 0 and "unobserved" included (mctl-agents#849).
+        print(f"info: {self._agent} classifier_interruptions={self._observer.classifier_interruptions}")
         if self._span_cm is not None:
             # span() re-raises the block's exception itself; returning its
             # result (None/False) keeps it propagating exactly once.
