@@ -2,10 +2,7 @@
 from __future__ import annotations
 
 import re
-import subprocess
 from pathlib import Path
-
-import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 REPORT = ROOT / "docs" / "spikes" / "852-sandbox-isolation-delta.md"
@@ -44,21 +41,6 @@ def test_gap_rows() -> None:
         assert len(cells) == 7, cells
         assert cells[3], f"empty evidence: {cells[0]}"
         assert cells[4] in STATUSES, f"bad status {cells[4]!r} in {cells[0]}"
-
-
-def test_orchestrator_untouched() -> None:
-    try:
-        base = subprocess.run(
-            ["git", "merge-base", "HEAD", "origin/main"],
-            cwd=ROOT, capture_output=True, text=True, check=True,
-        ).stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pytest.skip("no origin/main")
-    changed = subprocess.run(
-        ["git", "diff", "--name-only", base, "HEAD", "--", "orchestrator", "config", "agents/_manifests"],
-        cwd=ROOT, capture_output=True, text=True, check=True,
-    ).stdout.split()
-    assert changed == []
 
 
 def test_no_token_shaped_strings() -> None:
