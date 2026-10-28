@@ -233,4 +233,6 @@ Follow-ups:
 - Investigator: detect and record Claude Code safety-classifier interruptions
   instead of treating the turn as a normal answer (#849).
 - Remove the spike workflow `rea-spike-796.yml`, `tools/rea_spike.py` and this
-  spike's guard test once the verdict is recorded (#850).
+  spike's guard test once the verdict is recorded (#850). Done: the verdict
+  was recorded in mctlhq/.github#268 and the harness removed. To re-run it,
+  check out `3ea66bd`, the last commit that has it.
