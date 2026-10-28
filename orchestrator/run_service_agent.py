@@ -13,6 +13,7 @@ import anyio
 from claude_agent_sdk import ClaudeSDKClient, ResultMessage
 
 from config.settings import AGENTS_DIR, SERVICE_AGENT_MODEL, SERVICES
+from orchestrator import classifier_notice
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import (
@@ -124,6 +125,27 @@ async def run_service_agent(service: str) -> None:
     mcp_configured = bool(options.mcp_servers)
     print(f"\n=== Running agent {service} ({SERVICE_AGENT_MODEL}) ===\n")
 
+    # This runner has no tracing.agent_run, so it counts classifier notices
+    # itself (mctl-agents#849); the line is printed on every exit path.
+    interruptions = classifier_notice.InterruptionCounter()
+    error: BaseException | None = None
+    try:
+        await _run_session(options, mcp_configured, interruptions)
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        print(f"info: service-agent {service} classifier_interruptions={interruptions.result(error)}")
+
+
+async def _run_session(
+    options: Any, mcp_configured: bool, interruptions: classifier_notice.InterruptionCounter
+) -> None:
+    def _note(message: Any) -> None:
+        # Stream messages. Could be prettier-formatted; just print for now.
+        print(message)
+        interruptions.observe(message)
+
     async with ClaudeSDKClient(options=options) as client:
         if mcp_configured:
             # fatal=False: mctl tools are a bonus here (service status
@@ -148,8 +170,7 @@ async def run_service_agent(service: str) -> None:
         stream = cast("AsyncGenerator[Any, None]", client.receive_messages())
         async with aclosing(stream):
             async for message in stream:
-                # Stream messages. Could be prettier-formatted; just print for now.
-                print(message)
+                _note(message)
                 ledger.observe(message)
                 # Also stop on stream exhaustion (the `async for` ending on its
                 # own): that means the CLI exited.
@@ -162,7 +183,7 @@ async def run_service_agent(service: str) -> None:
                 )
                 try:
                     await drain_until_settled(
-                        stream, ledger, timeout_s=SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS
+                        stream, ledger, timeout_s=SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS, on_message=_note
                     )
                 except OrphanedSubagentError as exc:
                     raise ServiceAgentOrphanedSubagent(

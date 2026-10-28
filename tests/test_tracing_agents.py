@@ -603,3 +603,14 @@ def test_provider_name_follows_the_provenance(exported, monkeypatch):
     assert _provider_of_run(exported, override) == ("unknown", "unknown")
     exported.clear()
     assert _provider_of_run(exported, None) == ("anthropic", "anthropic")
+
+
+def test_classifier_interruptions_reach_the_root_span_without_the_notice_text(exported, tmp_path, monkeypatch):
+    """mctl-agents#849: the investigator's root span carries the count of
+    safety-classifier notices, and never the notice text itself."""
+    notice = "Your response above was stopped by a safety classifier -- this is not a tool or API error."
+    messages = [_assistant("m1", [TextBlock(text=notice)]), *_stream()]
+    _run_investigator_agent(tmp_path, monkeypatch, messages)
+    root = _spans(exported)["invoke_agent issue-investigator"]
+    assert root.attributes[tracing.CLASSIFIER_INTERRUPTIONS] == 1
+    _assert_no_payload(exported, "safety classifier")
