@@ -1,6 +1,6 @@
 # Spike #830: runtime observability and egress controls that detect an agent escaping its sandbox
 
-STATUS: DRAFT
+STATUS: ADOPT_PLAN
 
 ## 1. Source and limits
 
@@ -94,12 +94,13 @@ Ordered by the proxy rollout stages in `docs/runbooks/mctl-agents-egress.md` (mc
 
 ## 4. Decision
 
-STATUS stays `DRAFT` until the owner records a token. Recommended token: `ADOPT_PLAN` (allowed:
-`ADOPT_PLAN`, `ADOPT_SUBSET`, `RESEARCH_ONLY`). This PR changes no runtime, gitops or profile state
-and files no issues.
+Owner decision recorded 2026-10-28: `ADOPT_PLAN` (allowed: `ADOPT_PLAN`, `ADOPT_SUBSET`,
+`RESEARCH_ONLY`). Follow-ups F1 to F6 below are filed; each heading carries its tracking issue. The
+report itself changes no runtime, gitops or profile state.
 
 ### F1 Squid log counters and silence alerts
 
+- Tracked: mctlhq/mctl-gitops#2232
 - Repo: mctl-gitops
 - Priority: P1
 - Dependency: stage A2 live
@@ -108,6 +109,7 @@ and files no issues.
 
 ### F2 Run attribution in the Squid log
 
+- Tracked: mctlhq/mctl-gitops#2233
 - Repo: mctl-gitops
 - Priority: P1
 - Dependency: F1
@@ -117,6 +119,7 @@ and files no issues.
 
 ### F3 Bash audit command classifier
 
+- Tracked: mctlhq/mctl-agents#865
 - Repo: mctl-agents
 - Priority: P2
 - Dependency: none
@@ -126,6 +129,7 @@ and files no issues.
 
 ### F4 Denied-request counter and alert
 
+- Tracked: mctlhq/mctl-gitops#2234
 - Repo: mctl-gitops
 - Priority: P1
 - Dependency: stage B
@@ -135,6 +139,7 @@ and files no issues.
 
 ### F5 Egress detector canary
 
+- Tracked: mctlhq/mctl-gitops#2235
 - Repo: mctl-gitops
 - Priority: P2
 - Dependency: stage C, F4
@@ -144,6 +149,7 @@ and files no issues.
 
 ### F6 DNS visibility
 
+- Tracked: mctlhq/mctl-gitops#2236
 - Repo: mctl-gitops
 - Priority: P3
 - Dependency: stage C
