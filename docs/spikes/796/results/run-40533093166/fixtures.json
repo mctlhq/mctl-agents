@@ -1,0 +1,24 @@
+{
+  "fixtures": [
+    {
+      "name": "native-codec",
+      "kind": "elf",
+      "sha256": "11768b4fdae8cd33b53aa0b44d593265137aab9c2ebfd1da6a0e1beff6ccb480",
+      "build_rc": 0
+    },
+    {
+      "name": "packaged-app",
+      "kind": "jar-jvm-fallback",
+      "sha256": "561f511ea30f75056f76c1932c612aa53531c9c5dafc05a1b7d8ccf02b7137a4",
+      "build_rc": 0
+    }
+  ],
+  "toolchain": {
+    "cc": "cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "make": "GNU Make 4.3",
+    "strip": "GNU strip (GNU Binutils for Ubuntu) 2.42",
+    "javac": "javac 17.0.21",
+    "jar": "jar 17.0.21",
+    "uname": "Linux runnervm48cm3 7.0.0-1017-azure #17~24.04.1-Ubuntu SMP PREEMPT Thu Sep 24 18:46:57 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux"
+  }
+}

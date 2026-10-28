@@ -1,0 +1,123 @@
+# Human grading of run 40533093166 (claude-opus-5-5, REA rea-agents-6.8.0 @ 160d821).
+# Grader: Claude Code operator session for mashkovd, 2026-10-27, from the bounded 4 KiB
+# final summaries in records.jsonl against docs/spikes/796/fixtures/*/oracle.yaml.
+# n=1 per arm. cites_rea is false everywhere: no final claim references a REA result,
+# and rea_tool_calls is 0 in all six runs.
+entries:
+  - fixture: native-codec
+    arm: baseline
+    claims:
+      - label: "oracle:N1"
+        statement: "header 00 07 01 <len>, then payload, then checksum (N1 order recovered; 00 07 read as a constant or 16-bit type, not named id)"
+        cites_rea: false
+      - label: "oracle:N2"
+        statement: "4-byte big-endian checksum appended after the payload"
+        cites_rea: false
+      - label: "oracle:N5"
+        statement: "h = rotl32(h ^ rec[i], (i % 5) + 3) ^ K[i & 3]"
+        cites_rea: false
+      - label: "oracle:N6"
+        statement: "length is one byte (len & 0xff); wraps at 256"
+        cites_rea: false
+    actionable: true
+    grader: "claude-code-operator-session (for mashkovd)"
+    note: "N3 and N4 are stated in the compiler-folded form: seed 0x6f8cb43d with byte 0 skipped. 0x6f8cb43d == rotl32(0x9e3779b1 ^ 0, 3) ^ 0x9e3779b1, so the model is byte-identical to the oracle for every input codec can emit (byte 0 is the constant 0x00), and the answer says it verified this by differential runs. Graded strictly as not recovered, identically in every arm."
+  - fixture: native-codec
+    arm: rea-mcp
+    claims:
+      - label: "oracle:N1"
+        statement: "header 00 07 01 <len>, then payload, then checksum (N1 order recovered; 00 07 read as a constant or 16-bit type, not named id)"
+        cites_rea: false
+      - label: "oracle:N2"
+        statement: "4-byte big-endian checksum appended after the payload"
+        cites_rea: false
+      - label: "oracle:N5"
+        statement: "h = rotl32(h ^ rec[i], (i % 5) + 3) ^ K[i & 3]"
+        cites_rea: false
+      - label: "oracle:N6"
+        statement: "length is one byte (len & 0xff); wraps at 256"
+        cites_rea: false
+    actionable: true
+    grader: "claude-code-operator-session (for mashkovd)"
+    note: "N3 and N4 are stated in the compiler-folded form: seed 0x6f8cb43d with byte 0 skipped. 0x6f8cb43d == rotl32(0x9e3779b1 ^ 0, 3) ^ 0x9e3779b1, so the model is byte-identical to the oracle for every input codec can emit (byte 0 is the constant 0x00), and the answer says it verified this by differential runs. Graded strictly as not recovered, identically in every arm."
+  - fixture: native-codec
+    arm: rea-cli
+    claims:
+      - label: "oracle:N1"
+        statement: "header 00 07 01 <len>, then payload, then checksum (N1 order recovered; 00 07 read as a constant or 16-bit type, not named id)"
+        cites_rea: false
+      - label: "oracle:N2"
+        statement: "4-byte big-endian checksum appended after the payload"
+        cites_rea: false
+      - label: "oracle:N5"
+        statement: "h = rotl32(h ^ rec[i], (i % 5) + 3) ^ K[i & 3]"
+        cites_rea: false
+      - label: "oracle:N6"
+        statement: "length is one byte (len & 0xff); wraps at 256"
+        cites_rea: false
+    actionable: true
+    grader: "claude-code-operator-session (for mashkovd)"
+    note: "N3 and N4 are stated in the compiler-folded form: seed 0x6f8cb43d with byte 0 skipped. 0x6f8cb43d == rotl32(0x9e3779b1 ^ 0, 3) ^ 0x9e3779b1, so the model is byte-identical to the oracle for every input codec can emit (byte 0 is the constant 0x00), and the answer says it verified this by differential runs. Graded strictly as not recovered, identically in every arm."
+  - fixture: packaged-app
+    arm: baseline
+    claims:
+      - label: "oracle:P1"
+        statement: "o: then e: then built-in defaults"
+        cites_rea: false
+      - label: "oracle:P2"
+        statement: "first layer containing the key wins, including an explicit false"
+        cites_rea: false
+      - label: "oracle:P3"
+        statement: "defaults beta=false, compact=true"
+        cites_rea: false
+      - label: "oracle:P4"
+        statement: "absent from every layer resolves to false"
+        cites_rea: false
+      - label: "oracle:P5"
+        statement: "values go through Boolean.parseBoolean"
+        cites_rea: false
+    actionable: true
+    grader: "claude-code-operator-session (for mashkovd)"
+    note: "All five oracle facts in every arm; extra claims are labelled inferred."
+  - fixture: packaged-app
+    arm: rea-mcp
+    claims:
+      - label: "oracle:P1"
+        statement: "o: then e: then built-in defaults"
+        cites_rea: false
+      - label: "oracle:P2"
+        statement: "first layer containing the key wins, including an explicit false"
+        cites_rea: false
+      - label: "oracle:P3"
+        statement: "defaults beta=false, compact=true"
+        cites_rea: false
+      - label: "oracle:P4"
+        statement: "absent from every layer resolves to false"
+        cites_rea: false
+      - label: "oracle:P5"
+        statement: "values go through Boolean.parseBoolean"
+        cites_rea: false
+    actionable: true
+    grader: "claude-code-operator-session (for mashkovd)"
+    note: "All five oracle facts in every arm; extra claims are labelled inferred."
+  - fixture: packaged-app
+    arm: rea-cli
+    claims:
+      - label: "oracle:P1"
+        statement: "o: then e: then built-in defaults"
+        cites_rea: false
+      - label: "oracle:P2"
+        statement: "first layer containing the key wins, including an explicit false"
+        cites_rea: false
+      - label: "oracle:P3"
+        statement: "defaults beta=false, compact=true"
+        cites_rea: false
+      - label: "oracle:P4"
+        statement: "absent from every layer resolves to false"
+        cites_rea: false
+      - label: "oracle:P5"
+        statement: "values go through Boolean.parseBoolean"
+        cites_rea: false
+    actionable: true
+    grader: "claude-code-operator-session (for mashkovd)"
+    note: "All five oracle facts in every arm; extra claims are labelled inferred."

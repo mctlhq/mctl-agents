@@ -1,0 +1,39 @@
+# Human grading of the Qwen row (Qwen/Qwen3.6-35B-A3B-FP8 on Hetzner inference,
+# REA rea-agents-6.8.0 @ 160d821). Grader: Claude Code operator session for mashkovd,
+# 2026-10-28, from the bounded final summaries in records.jsonl against
+# docs/spikes/796/fixtures/packaged-app/oracle.yaml. n=1 per arm. cites_rea is false
+# everywhere and rea_tool_calls is 0 in all three packaged-app runs. native-codec has
+# no answer to grade: every cell hit the 1200 s limit.
+entries:
+  - fixture: packaged-app
+    arm: baseline
+    claims:
+      - {label: "oracle:P1", statement: "lookup order o: map, then e: map, then built-ins", cites_rea: false}
+      - {label: "oracle:P2", statement: "o:beta=false e:beta=true resolves beta=false (first layer with the key wins)", cites_rea: false}
+      - {label: "oracle:P3", statement: "built-ins beta=false, compact=true", cites_rea: false}
+      - {label: "oracle:P4", statement: "key in no map returns false", cites_rea: false}
+      - {label: "oracle:P5", statement: "Boolean.parseBoolean: only the literal \"true\" is true", cites_rea: false}
+      - {label: "unsupported", statement: "layer() parses key=value entries and strips o:/e: prefixes (that is main's loop; layer() takes key/value pairs)", cites_rea: false}
+    actionable: true
+    grader: "claude-code-operator-session (for mashkovd)"
+  - fixture: packaged-app
+    arm: rea-mcp
+    claims:
+      - {label: "oracle:P1", statement: "overridden (o:), then environmental (e:), then defaults", cites_rea: false}
+      - {label: "oracle:P2", statement: "first layer whose get() is non-null wins", cites_rea: false}
+      - {label: "oracle:P3", statement: "defaults beta=false, compact=true", cites_rea: false}
+      - {label: "oracle:P4", statement: "falls through to return false", cites_rea: false}
+      - {label: "oracle:P5", statement: "values parsed with Boolean.parseBoolean", cites_rea: false}
+    actionable: true
+    grader: "claude-code-operator-session (for mashkovd)"
+  - fixture: packaged-app
+    arm: rea-cli
+    claims:
+      - {label: "oracle:P1", statement: "opts (o:) -> env (e:) -> defaults", cites_rea: false}
+      - {label: "oracle:P2", statement: "o:beta=false e:beta=true prints beta=false", cites_rea: false}
+      - {label: "oracle:P3", statement: "built-ins beta=false, compact=true", cites_rea: false}
+      - {label: "oracle:P4", statement: "all three null falls through to iconst_0 (false)", cites_rea: false}
+      - {label: "oracle:P5", statement: "Boolean.parseBoolean, only exact \"true\" is true", cites_rea: false}
+      - {label: "unsupported", statement: "opts and env both contain the built-in defaults plus user values (contradicts its own three-layer description)", cites_rea: false}
+    actionable: true
+    grader: "claude-code-operator-session (for mashkovd)"
