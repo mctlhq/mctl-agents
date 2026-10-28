@@ -1115,6 +1115,21 @@ async def test_an_advance_before_the_fulfil_creates_nothing_and_the_fulfil_still
     assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Running")]
 
 
+async def test_an_advance_of_a_fulfilled_execution_lands_its_phase(api):
+    """The guard reads the ledger the store answered (mctl-api's `engine_ref`
+    parsed into `temporal_workflow_id`): an execution the fulfil minted is
+    found and advanced, not reported `NOT_ATTACHED`."""
+    rid = api.create_request("start")
+    ref = request_engine_ref(workflow_id_for(URL), rid)
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+    assert outcome.action == dx.FULFILLED
+
+    answer = await advance_dispatched_execution(AdvanceInput(work_item_id=WID, engine_ref=ref, phase="Succeeded"))
+
+    assert not answer.startswith(NOT_ATTACHED) and outcome.execution_id in answer
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Succeeded")]
+
+
 async def test_an_advance_that_cannot_read_the_ledger_raises_and_attaches_nothing(api):
     """Could not observe is not observed absent: an unreadable ledger is a
     retry, never `NOT_ATTACHED`, and never an attach."""
