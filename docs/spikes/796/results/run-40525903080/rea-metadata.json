@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/morluto/rea",
+  "input_ref": "rea-agents-6.8.0",
+  "resolved_sha": "160d821ac9a0310afcb8d1fc427862dd6508add5",
+  "package_version": "6.8.0",
+  "install_method": "npm-registry-package-at-resolved-sha-version",
+  "install_command": "npm install --ignore-scripts --prefix $RUNNER_TEMP/rea-prefix rea-agents@6.8.0",
+  "npm_git_head": "unobserved",
+  "npm_dist_integrity": "unobserved",
+  "cli_entrypoint": "rea (node_modules/.bin/rea, via rea-env.sh shim)",
+  "mcp_entrypoint": "rea mcp (via rea-env.sh)",
+  "install_failure_reason": "rea-identity-mismatch",
+  "date_utc": "2026-10-27T14:56:23.582545+00:00"
+}

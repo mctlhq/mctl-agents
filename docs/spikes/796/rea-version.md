@@ -1,20 +1,18 @@
 # REA upstream snapshot (issue #796)
 
-STATUS: DRAFT -- to be filled by the operator at the start of the live run.
-
 | Field | Value |
 | --- | --- |
 | Repository | https://github.com/morluto/rea |
-| Commit SHA | unobserved (operator: record the exact SHA before any run) |
-| Package / release version | unobserved |
-| Install method | unobserved |
-| Test date | unobserved |
+| Commit SHA | `160d821ac9a0310afcb8d1fc427862dd6508add5` (`refs/tags/rea-agents-6.8.0`) |
+| Package / release version | `rea-agents` 6.8.0 (npm), `dist.integrity` `sha512-9QDeRnGqEDzABZyr04eLnBXBv/c6I9/TWu/6M0MD4pEfkySI/BIgwTODIbAReX3C1x6hjw9+Jlx4A2yUSPZ9ww==` |
+| Install method | `npm install --ignore-scripts --prefix <tmp> rea-agents@6.8.0`, bound to the SHA by npm SLSA provenance (`npm_provenance_git_commit` = SHA) and `npm audit signatures`; npm records no `gitHead` for this OIDC-published package |
+| Entrypoints | CLI `rea`, MCP `rea mcp`, both through `docs/spikes/796/rea-env.sh` |
+| Test date | 2026-10-27 (runs 40525903080, 40529056591, 40533093166; Qwen row on a workstation container the same day) |
 
-Local dependencies are listed only for fixtures actually used:
+Local dependencies, only for the fixtures used:
 
-- `native-codec`: a C compiler (`cc`), `make`, `strip`, `sha256sum`.
-- `packaged-app`: a JDK (`javac`, `jar`). An Android SDK/Gradle APK build is
-  used instead only if that toolchain is present; the report must say which.
+- `native-codec`: `cc` (GCC 13.3.0), GNU Make 4.3, GNU strip 2.42, `sha256sum`.
+- `packaged-app`: JDK 17 (`javac`, `jar` 17.0.20.1). No Android SDK was used; the artefact is the JVM jar fallback.
 
 ## How to run
 
