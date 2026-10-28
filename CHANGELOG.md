@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.109.0](https://github.com/mctlhq/mctl-agents/compare/1.108.0...1.109.0) (2026-10-28)
+
+
+### Features
+
+* **scout:** open spike drafts in the spike issue form ([d9b0598](https://github.com/mctlhq/mctl-agents/commit/d9b05983d46a2e0232de482a625c866726d0a38a))
+* **scout:** open spike drafts in the spike issue form ([79a0369](https://github.com/mctlhq/mctl-agents/commit/79a0369cb19b699d267a1180d2a1ace189069aba))
+
 ## [1.108.0](https://github.com/mctlhq/mctl-agents/compare/1.107.0...1.108.0) (2026-10-28)
 
 
