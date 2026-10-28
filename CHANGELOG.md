@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.110.0](https://github.com/mctlhq/mctl-agents/compare/1.109.0...1.110.0) (2026-10-28)
+
+
+### Features
+
+* **agents:** issue-830-spike-what-runtime-observability-and-egr ([5a0ee5e](https://github.com/mctlhq/mctl-agents/commit/5a0ee5eff58ac5f32f397afb310f808651b7921b))
+
 ## [1.109.0](https://github.com/mctlhq/mctl-agents/compare/1.108.0...1.109.0) (2026-10-28)
 
 
