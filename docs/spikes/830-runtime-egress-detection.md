@@ -9,13 +9,22 @@ STATUS: DRAFT
   the taxonomy rests on that public description plus repository and gitops evidence.
 - Not observed: live cluster state. Nothing below was confirmed against a running pod, Loki or Squid.
 - Evidence re-checked at implementation time: `orchestrator/options.py` `_audit_pre_tool_use` (line 566)
-  and `_command_audit_hooks` (line 614) and `_policy_hooks` (line 1071) match the proposal. The gitops
-  worktree available to the implementer contained `docs/runbooks/mctl-agents-egress.md` but not
-  `infra-components/mctl-platform/mctl-agents-egress-proxy/`, so the Squid `access_log` and
-  `http_access` lines, the `HTTPS_PROXY` counts per `cwft-mctl-agents-*.yaml`, and the open/merged state of
-  mctl-gitops#2161 and #2163 are cited from the proposal and must be re-checked before merge.
+  and `_command_audit_hooks` (line 614) and `_policy_hooks` (line 1071) match the proposal.
+- Gitops evidence re-checked on mctl-gitops `main` on 2026-10-28 (paths under `platform-gitops/`):
+  - mctl-gitops#2161 (stage A1, proxy) merged 2026-10-26; #2163 (stage A2, routing) merged
+    2026-10-26 and re-landed with a wait-for-proxy guard in #2165. The stage table in
+    `docs/runbooks/mctl-agents-egress.md` still lists A2 as "#2163 (draft)"; that row is stale.
+    Stages B and C are "not started".
+  - `infra-components/mctl-platform/mctl-agents-egress-proxy/proxy.yaml`: `access_log stdio:/dev/stdout
+    squid` (native format, no `%un`) and `http_access allow all` after the `Safe_ports`, `CONNECT`,
+    link-local and loopback denies.
+  - `HTTPS_PROXY` occurrences per `argo-workflows/cluster-templates/cwft-mctl-agents-*.yaml`: approve 4,
+    daily 0, implement 5, investigate 5, reconcile 5, run 5, scout 2, shepherd 6, usage-collector 2.
+    The daily template does not route through the proxy, so its egress falls under X2 even in stage A.
+  - `argo-workflows/config/` has `networkpolicy.yaml` (ingress) and no
+    `networkpolicy-agents-egress.yaml`, consistent with stage C not started.
 - #810 head SHA the preventive-primitive coverage was built against:
-  `7b1c9267f5cf80d738e3b2f3134415740402d764` (open at proposal time; re-check before merge).
+  `7b1c9267f5cf80d738e3b2f3134415740402d764`; re-checked 2026-10-28, PR still open (draft) at that head.
 - Related reports: `docs/spikes/852-sandbox-isolation-delta.md` assigns pod egress detection to this
   spike (row N1) and notes provider-side search is invisible to pod controls (D1-WebSearch,
   D1-WebFetch). `docs/spikes/854-agent-observability-gaps.md` has no egress gap. #807 G1 (no egress
@@ -31,7 +40,8 @@ Each of these is unknown, not absent:
 - the CoreDNS `log` plugin;
 - Argo `init`/`wait` executor egress;
 - the discrepancy between `mctl_get_workflow_logs` and Promtail `argo-workflows` ingestion;
-- the state of mctl-gitops#2163 and the live pod environment (`HTTPS_PROXY` present or not).
+- the live pod environment (`HTTPS_PROXY` present or not); the gitops templates are merged, the
+  running pods were not inspected.
 
 ## 2. Escape-path matrix
 
