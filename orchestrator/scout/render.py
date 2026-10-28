@@ -57,7 +57,9 @@ def draft_body(item: Scored, run_id: str) -> str:
 
 
 def _url(repo: str, title: str, body: str) -> str:
-    q = urlencode({"title": title, "body": body, "labels": "spike:scout"})
+    # spike.yml is the issue form in each target repo (and the org default); it adds
+    # agents:intake, and its field id "body" is what the body parameter prefills.
+    q = urlencode({"template": "spike.yml", "title": title, "body": body, "labels": "spike:scout"})
     return f"https://github.com/mctlhq/{repo}/issues/new?{q}"
 
 

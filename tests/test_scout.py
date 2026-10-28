@@ -310,6 +310,7 @@ def test_draft_url_short_and_long():
     assert sp.path == "/mctlhq/mctl-api/issues/new" and full is None
     q = parse_qs(sp.query)
     assert q["labels"] == ["spike:scout"] and "Lifecycle: proposed" in q["body"][0] and "run1" in q["body"][0]
+    assert q["template"] == ["spike.yml"]
     url2, full2 = render.draft_url(_scored(why_en="w" * 190, question="q" * 240, outcomes="o" * 60,
                                            link="https://x.test/" + "a" * 1500), "run1")
     assert len(url2) <= render.MAX_BUTTON_URL_CHARS and full2 and "Lifecycle: proposed" in full2
