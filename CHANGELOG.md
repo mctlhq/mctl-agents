@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.108.0](https://github.com/mctlhq/mctl-agents/compare/1.107.0...1.108.0) (2026-10-28)
+
+
+### Features
+
+* **agents:** issue-670-spike-devloop-add-decision-context-expla ([d25d7b7](https://github.com/mctlhq/mctl-agents/commit/d25d7b7889af73c1fd3b0133b6158ffd93ea8cb9))
+* **agents:** issue-670-spike-devloop-add-decision-context-expla ([14efbce](https://github.com/mctlhq/mctl-agents/commit/14efbce7599bb9c3ea6cac00c675919e3f851e34))
+* **agents:** issue-852-spike-do-the-sandbox-isolation-gaps-desc ([1a13472](https://github.com/mctlhq/mctl-agents/commit/1a134728f1844b15b034e44f5284121e290aa8fa))
+* **agents:** issue-852-spike-do-the-sandbox-isolation-gaps-desc ([27e34b7](https://github.com/mctlhq/mctl-agents/commit/27e34b781c0695163590445ac99c095de72d8278))
+* **agents:** issue-854-spike-what-agent-observability-signals-t ([8788dd6](https://github.com/mctlhq/mctl-agents/commit/8788dd676e4dd71fea3188457311002d7efa75ba))
+* **agents:** issue-854-spike-what-agent-observability-signals-t ([94ef153](https://github.com/mctlhq/mctl-agents/commit/94ef1537db1dccefcbada5c44a6d00cdeff3d5b8))
+* **orchestrator:** count Claude Code safety-classifier interruptions ([6929dd0](https://github.com/mctlhq/mctl-agents/commit/6929dd09949d5a8bdf5db11dd3a94944b8fda72b))
+* **orchestrator:** count Claude Code safety-classifier interruptions ([edbf9b8](https://github.com/mctlhq/mctl-agents/commit/edbf9b8352ac0ef5c6849e419c4ee099b7a92b21)), closes [#849](https://github.com/mctlhq/mctl-agents/issues/849)
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-852-spike-do-the-sandbox-isolation-gaps-desc ([9ecf525](https://github.com/mctlhq/mctl-agents/commit/9ecf52558cebd2722abf74234d730039ad3b7724))
+* **agents:** address P1/P2 codex findings on issue-852-spike-do-the-sandbox-isolation-gaps-desc ([e9d1f1e](https://github.com/mctlhq/mctl-agents/commit/e9d1f1e7de7cf5f8aba751aa60b69fdf909a72f0))
+* **devloop:** never mint a dispatched execution from an advance ([be64500](https://github.com/mctlhq/mctl-agents/commit/be64500450035e4876634ce754b837604a3f3d6d))
+* **devloop:** never mint a dispatched execution from an advance ([2d3e927](https://github.com/mctlhq/mctl-agents/commit/2d3e9277750d977efe088538e48aba0493331d63)), closes [#858](https://github.com/mctlhq/mctl-agents/issues/858)
+* **spike-670:** reject non-mapping blocks and stop timing a no-op ([44faeef](https://github.com/mctlhq/mctl-agents/commit/44faeefcc931b92768dccbda4d72163701e3c745))
+* **spike-796:** bind REA by npm provenance, count classifier stops ([c1d540b](https://github.com/mctlhq/mctl-agents/commit/c1d540b4919a3d4b6a1b89ff72eab87cff0aa336))
+* **spike-796:** bind REA by npm provenance, count classifier stops ([62837ca](https://github.com/mctlhq/mctl-agents/commit/62837cab1ff0977726d5956dc10732cc8bd627b9))
+* **spike-796:** record which REA operations a run invoked ([7afb04b](https://github.com/mctlhq/mctl-agents/commit/7afb04b561358bbf46e6a666d011d130a0b75aab))
+* **spike-796:** record which REA operations a run invoked ([b221567](https://github.com/mctlhq/mctl-agents/commit/b2215676c888c0f43c85aa7ee3884e02800a89de))
+* **spike-796:** remove the REA harness after the REJECT verdict ([4460df2](https://github.com/mctlhq/mctl-agents/commit/4460df2692ce9973d2e8fd1bc990c55313e36684))
+* **spike-796:** remove the REA harness after the REJECT verdict ([72b9d17](https://github.com/mctlhq/mctl-agents/commit/72b9d17ee47834a45b1f3585f625ae15dbc75a8e)), closes [#850](https://github.com/mctlhq/mctl-agents/issues/850)
+
 ## [1.107.0](https://github.com/mctlhq/mctl-agents/compare/1.106.0...1.107.0) (2026-10-27)
 
 
