@@ -260,6 +260,8 @@ editing a list in values that a reviewer can see.
 
 Both hooks swallow their own errors. A log line never depends on the tracing pipeline, and neither does a run.
 
+Known gaps in what is emitted (evaluation results, agent metrics, run outcome attributes, runner coverage) are inventoried in [`docs/spikes/854-agent-observability-gaps.md`](../spikes/854-agent-observability-gaps.md).
+
 ## Follow-ups outside this repo
 
 The rollout order is fail-closed: gitops first, then mctl-api, then the flag in this
