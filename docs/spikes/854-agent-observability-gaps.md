@@ -2,12 +2,13 @@
 
 STATUS: ADOPT_SUBSET
 
-`ADOPT_SUBSET` is the recommended token. Allowed tokens were `ADOPT_FOLLOW_UPS`,
-`ADOPT_SUBSET`, `RESEARCH_ONLY` and `REJECT`. Fund G1 to G3 first (P1), and the
-rest as capacity allows. The issue owner records the verdict. Refs
-mctlhq/mctl-agents#854. Related: mctlhq/mctl-agents#830 (not readable from this
-run: any follow-up below that #830 already covers must be merged into it) and
-mctlhq/mctl-agents#60 (final-output evaluation, no producer in this repo).
+Owner decision recorded 2026-10-28: `ADOPT_SUBSET` (allowed: `ADOPT_FOLLOW_UPS`,
+`ADOPT_SUBSET`, `RESEARCH_ONLY`, `REJECT`). The adopted subset is F0 and F1 to F3
+(G1 to G3), filed now. F4 to F7 (G4 to G7) are deferred and not filed. Refs
+mctlhq/mctl-agents#854. Related: mctlhq/mctl-agents#830 has since merged
+(`docs/spikes/830-runtime-egress-detection.md`); it covers network egress only
+and overlaps none of G1 to G7. mctlhq/mctl-agents#60 (LLM-as-judge evals, open)
+would be another producer of the G1 event and should reuse its shape.
 
 This spike does not propose "add tracing". mctl-agents#195 already ships one
 OpenTelemetry trace per DevLoop run. This report inventories what that pipeline
@@ -92,6 +93,7 @@ vocabularies and carry no ids.
 Order: the mctl-docs reservation (F0) comes before any emitting change.
 
 ### F0. Reserve proposed telemetry names in the catalog
+- Tracked: mctlhq/mctl-docs#178.
 - Repo: mctl-docs. Priority: P1. Depends on: none.
 - Scope: add the G1 to G4, G6 and G7 names to
   `docs/reference/telemetry-attributes.md` with types, closed vocabularies and
@@ -100,7 +102,8 @@ Order: the mctl-docs reservation (F0) comes before any emitting change.
   metrics). Record the redaction constraint for each name.
 
 ### F1 (G1). Emit evaluation results as span events
-- Repo: mctl-agents. Priority: P1. Depends on: F0, and #830/#60 overlap check.
+- Tracked: mctlhq/mctl-agents#871.
+- Repo: mctl-agents. Priority: P1. Depends on: F0. Overlap check done: none with #830; #60 reuses this event.
 - Scope: add a `mctl.eval.result` span event with `mctl.eval.name` (closed
   vocabulary: `context.retrieval`, `proposal.decision`, `pr.review_rounds`,
   `pr.outcome`, `ci.result`), and `mctl.eval.score` and/or `mctl.eval.label`
@@ -113,6 +116,7 @@ Order: the mctl-docs reservation (F0) comes before any emitting change.
   redaction guard keeps every attribute.
 
 ### F2 (G2). Run outcome attributes on `invoke_agent`
+- Tracked: mctlhq/mctl-agents#872.
 - Repo: mctl-agents. Priority: P1. Depends on: F0.
 - Scope: in `AgentRunObserver._result`, set `mctl.agent.stop_reason`,
   `mctl.agent.terminal_reason` (bounded closed strings, unknown values map to
@@ -120,6 +124,7 @@ Order: the mctl-docs reservation (F0) comes before any emitting change.
   reads from `ResultMessage`. Extend `tests/test_tracing_agents.py`.
 
 ### F3 (G3). Agent RED metrics
+- Tracked: mctlhq/mctl-agents#873.
 - Repo: mctl-agents. Priority: P1. Depends on: F0.
 - Scope: add a `mctl.agents` meter next to `commerce_metrics.py` with
   `mctl.agent.invocations` (agent, outcome, model), `mctl.agent.invocation.duration`
@@ -129,12 +134,14 @@ Order: the mctl-docs reservation (F0) comes before any emitting change.
   workflow type (metrics carry no ids), unlike `MCTL_TRACE_WORKFLOW_TYPES`.
 
 ### F4 (G4). Budget and provider-pressure signals
+- Deferred by the owner decision of 2026-10-28; not filed.
 - Repo: mctl-agents. Priority: P2. Depends on: F0.
 - Scope: emit exec-budget threshold and denial events from
   `orchestrator/exec_budget.py`, and `http_429`/retry counts on `chat` spans.
   No monetary amounts.
 
 ### F5 (G5). Trace the remaining agent runners
+- Deferred by the owner decision of 2026-10-28; not filed.
 - Repo: mctl-agents and mctl-gitops. Priority: P2. Depends on: none.
 - Scope: wrap the agent run in `tracing.agent_run` in the runners the registry
   below marks `agent_call: yes, traced: no`, then widen
@@ -143,11 +150,13 @@ Order: the mctl-docs reservation (F0) comes before any emitting change.
   the same PR.
 
 ### F6 (G6). Context strategy fields on spans
+- Deferred by the owner decision of 2026-10-28; not filed.
 - Repo: mctl-agents. Priority: P2. Depends on: F0.
 - Scope: move the log-only `mctl.context.*` fields onto the pod root span, the
   item `execution-traces.md` already names as outstanding.
 
 ### F7 (G7). Approval and human-input wait durations
+- Deferred by the owner decision of 2026-10-28; not filed.
 - Repo: mctl-agents. Priority: P3. Depends on: F0.
 - Scope: record wait durations as events from activities only (not workflow
   code), so replay stays deterministic, as `traceparent` already is.

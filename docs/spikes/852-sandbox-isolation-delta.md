@@ -1,6 +1,6 @@
 # Spike #852: sandbox isolation delta beyond #807 and #830
 
-STATUS: DRAFT
+STATUS: NEW_GAPS_FOLLOW_UP
 
 ## 1. Source and limits
 
@@ -47,18 +47,25 @@ STATUS: DRAFT
 
 ## 4. Decision
 
-Recommended token: `NEW_GAPS_FOLLOW_UP` (D1-WebSearch, D2 and D3 are `new`). The report merges as
-`STATUS: DRAFT` until the owner records one of `NO_NEW_GAPS`, `NEW_GAPS_FOLLOW_UP`, `FOLD_INTO_807`.
-Whether to close #852 as a duplicate is the owner's call.
+Owner decision recorded 2026-10-28: `NEW_GAPS_FOLLOW_UP` (allowed: `NO_NEW_GAPS`,
+`NEW_GAPS_FOLLOW_UP`, `FOLD_INTO_807`). D1-WebSearch, D2 and D3 are `new`; their follow-ups are filed
+below. #852 is closed as decided, not as a duplicate (the duplicate was #853).
 
-## 5. Follow-ups (draft issue bodies, not filed)
+Scope correction for D3, checked on main at 131c653: of the builders listed in the D3 evidence, only
+`build_implementer_agent_options`, `build_issue_investigator_options` and
+`build_issue_investigator_options_from_plan` run with `cwd` in a target-repository clone. The service
+agent, mentor and incident-responder builders use image-shipped agent directories, which are trusted
+content. The implementer currently relies on the `project` source to load the `implementer.md` persona
+that `run_implementer.py` copies into the clone, so the fix must load it another way.
+
+## 5. Follow-ups (filed 2026-10-28)
 
 1. **Remove provider-side WebSearch from profiles that do not need it** (mctl-gitops profiles and
    mctl-agents `options.py`). Control: drop the grant, or mediate via an MCP tool. Rollback: restore the
-   tool in the profile.
+   tool in the profile. Tracked: mctlhq/mctl-agents#870.
 2. **Policy-mediated, credential-separated Bash** (mctl-agents). Control: scrubbed env for model shell,
    credentialed operations behind a mediated helper under the policy checkpoint; deny-list only as defence
-   in depth. Rollback: revert the builder change.
+   in depth. Rollback: revert the builder change. Tracked: mctlhq/mctl-agents#869.
 3. **Stop loading project settings from target-repository clones** (mctl-agents). Control:
    `setting_sources=[]` for target clones with personas shipped in the image. Rollback: revert to
-   `["project"]`.
+   `["project"]`. Tracked: mctlhq/mctl-agents#868 (P1).
