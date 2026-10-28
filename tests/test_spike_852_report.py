@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 REPORT = ROOT / "docs" / "spikes" / "852-sandbox-isolation-delta.md"
@@ -52,3 +55,17 @@ def test_810_sha_and_web_tool_rows() -> None:
     assert re.search(r"#810.*\b[0-9a-f]{40}\b", text, re.S)
     ids = {r[0] for r in _gap_rows()}
     assert {"D1-WebSearch", "D1-WebFetch"} <= ids
+
+
+def test_no_runtime_paths_changed() -> None:
+    """T3: the spike PR must not touch runtime code, config or manifests."""
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True)
+
+    base = git("merge-base", "HEAD", "origin/main")
+    if base.returncode != 0:
+        pytest.skip("origin/main not available")
+    diff = git("diff", "--name-only", base.stdout.strip(), "HEAD", "--",
+               "orchestrator", "config", "agents/_manifests")
+    assert diff.returncode == 0, diff.stderr
+    assert diff.stdout.strip() == "", f"runtime paths changed: {diff.stdout.split()}"
