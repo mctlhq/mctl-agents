@@ -10,6 +10,11 @@ Report: `docs/spikes/881-pod-sandbox-runtime.md`.
 - `Dockerfile.fixture`: spike-only layer adding a wheelhouse to the agent image for the offline uv op.
 - `dispatch.sh`: submits N alternating runc/gVisor fixture passes plus a cancellation pass each, waits for
   any terminal phase and records Argo executor, log collection, cancellation and startup per pass.
+  A preflight starts one pod per runtime first and fails the job with diagnostics if its main
+  container does not start within `START_LIMIT` (600 s); a pass that does not start in that time is
+  recorded as `not-started:<reason>` instead of waiting out `PASS_LIMIT`. One progress line per pass
+  goes to stdout, and every pass that does not succeed leaves pod, event, node and disk state in
+  `measurements/diag/`.
 - `collect.py`: JSON lines to `measurements/*.json`, a scorecard that keeps every pass
   (`fail:<k>/<N>` when any pass failed or left no record) and a per-op median/overhead table
   (`python -I collect.py --out DIR --runs N runc=a.log gvisor=b.log`).

@@ -34,6 +34,15 @@ jobs:
           set -euo pipefail
           [[ "$RUNS" =~ ^[0-9]+$ ]] && [ "$RUNS" -ge 1 ] && [ "$RUNS" -le 20 ] || { echo "runs must be 1-20, got: $RUNS" >&2; exit 1; }
           echo "RUNS=$RUNS" >> "$GITHUB_ENV"
+      # The agent image ends up twice on disk (docker and containerd); without
+      # this the root fs can cross the kubelet eviction threshold and leave
+      # every pod Pending under DiskPressure.
+      - name: Free runner disk
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       # The .sha512 files come from the same bucket as the binaries: this checks
       # integrity, not authenticity.
       - name: Install gVisor (checksum verified)
@@ -86,6 +95,13 @@ jobs:
           docker build -t agent-881:local --build-arg BASE=agent-881:base -f "$E/Dockerfile.fixture" "$E"
           # Stream on stdin (sudo closes extra fds) into the CRI namespace k8s.io.
           docker save agent-881:local | sudo k3s ctr -n k8s.io images import -
+          # The pods use IfNotPresent: an image the CRI cannot see would be
+          # pulled from Docker Hub and never start. Fail here instead.
+          sudo k3s crictl images | grep -E '(^|/)agent-881 +local ' || { sudo k3s crictl images; exit 1; }
+          docker image rm agent-881:local agent-881:base >/dev/null
+          docker builder prune -af >/dev/null
+          df -h /
+          kubectl describe node | sed -n '/^Conditions:/,/^Addresses:/p;/^Taints:/p'
       - name: Run alternating passes
         run: bash "$E/dispatch.sh" "$RUNS" measurements agent-881:local
       - name: Runner info and scorecard
@@ -94,7 +110,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p measurements
-          { echo "kvm_on_runner: $(stat -c '%A %n' /dev/kvm 2>&1)"; uname -r; echo "head_sha: $GITHUB_SHA"; echo "run_id: $GITHUB_RUN_ID"; } > measurements/runner-info.txt
+          { echo "kvm_on_runner: $(stat -c '%A %n' /dev/kvm 2>&1)"; uname -r; echo "head_sha: $GITHUB_SHA"; echo "run_id: $GITHUB_RUN_ID"; echo "ref: $GITHUB_REF"; df -h / || true; kubectl describe node 2>&1 | sed -n '/^Conditions:/,/^Addresses:/p;/^Taints:/p' || true; } > measurements/runner-info.txt 2>&1
           python3 -I "$E/collect.py" --out measurements --runs "$RUNS" runc=measurements/runc.log gvisor=measurements/gvisor.log
       - uses: actions/upload-artifact@v4
         if: always()

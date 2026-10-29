@@ -13,13 +13,69 @@
 #   - {"metric":"startup"}: seconds from Workflow creation to the main container start.
 # Each pass's phase goes to OUT_DIR/phases.tsv, so a failed or timed-out pass
 # is visible as such rather than as a short log.
+#
+# A preflight first starts one pod per runtime and exits non-zero, with
+# diagnostics, if its main container does not start within START_LIMIT: a
+# harness that cannot start a pod must fail in minutes, not burn the job
+# timeout on passes that measure nothing. A pass whose main container does not
+# start within START_LIMIT is recorded as not-started:<reason> and stopped.
+# Every pass prints one progress line to stdout; every pass that does not
+# succeed leaves pod, event, node and disk diagnostics in OUT_DIR/diag/.
 set -euo pipefail
 RUNS="$1"; OUT="$2"; IMAGE="$3"
 NS=spike881
 PASS_LIMIT=${PASS_LIMIT:-1800}
 CANCEL_LIMIT=${CANCEL_LIMIT:-300}
-mkdir -p "$OUT"
+START_LIMIT=${START_LIMIT:-600}
+mkdir -p "$OUT/diag"
 printf 'pass\truntime\tmode\tworkflow\tphase\n' >"$OUT/phases.tsv"
+
+progress() { # pass runtime mode workflow result seconds
+  printf '[%s] pass %s %s %s %s -> %s (%ss)\n' "$(date -u +%H:%M:%S)" "$1" "$2" "$3" "${4:-none}" "$5" "$6"
+}
+
+diag() { # workflow label: pod, events, node and disk state, for a pass that did not succeed
+  local f="$OUT/diag/$2-${1:-none}.txt" pod
+  pod=""
+  [ -n "$1" ] && pod="$(pod_of "$1")"
+  {
+    echo "== workflow $1"; kubectl -n "$NS" get workflow "$1" -o yaml 2>&1 | sed -n '/^status:/,$p'
+    echo "== pod ${pod:-none}"; [ -n "$pod" ] && kubectl -n "$NS" describe pod "$pod" 2>&1
+    echo "== events"; kubectl -n "$NS" get events --sort-by=.lastTimestamp 2>&1 | tail -40
+    echo "== node"; kubectl describe node 2>&1 | sed -n '/^Conditions:/,/^Addresses:/p;/^Taints:/p;/^Allocated resources:/,/^Events:/p'
+    echo "== disk"; df -h / 2>&1
+  } >"$f" 2>&1 || true
+}
+
+main_started() { # pod -> non-empty once the main container has started
+  kubectl -n "$NS" get pod "$1" -o jsonpath='{.status.containerStatuses[?(@.name=="main")].state.running.startedAt}{.status.containerStatuses[?(@.name=="main")].state.terminated.startedAt}' 2>/dev/null || true
+}
+
+not_started_reason() { # pod -> why the main container is not running yet
+  [ -n "$1" ] || { echo no-pod; return 0; }
+  local r
+  r="$(kubectl -n "$NS" get pod "$1" -o jsonpath='{.status.initContainerStatuses[*].state.waiting.reason} {.status.containerStatuses[?(@.name=="main")].state.waiting.reason} {.status.conditions[?(@.status=="False")].reason}' 2>/dev/null || true)"
+  r="$(echo "$r" | xargs)"
+  echo "${r:-$(kubectl -n "$NS" get pod "$1" -o jsonpath='{.status.phase}' 2>/dev/null || echo unknown)}"
+}
+
+wait_started() { # workflow limit -> "started", a terminal phase, or "not-started:<reason>"
+  local deadline=$((SECONDS + $2)) pod="" p
+  [ -n "$1" ] || { echo submit-failed; return 0; }
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    pod="$(pod_of "$1")"
+    if [ -n "$pod" ] && [ -n "$(main_started "$pod")" ]; then echo started; return 0; fi
+    p="$(phase "$1")"
+    case "$p" in Succeeded|Failed|Error) echo "$p"; return 0 ;; esac
+    sleep 3
+  done
+  echo "not-started:$(not_started_reason "$pod" | tr ' ' ',')"
+}
+
+stop() { # workflow
+  [ -n "$1" ] || return 0
+  kubectl -n "$NS" patch workflow "$1" --type merge -p '{"spec":{"shutdown":"Terminate"}}' >/dev/null 2>&1 || true
+}
 
 emit() { # runtime json
   printf '%s\n' "$2" >>"$OUT/$1.log"
@@ -81,8 +137,14 @@ fixture_pass() { # i runtime
   local wf p pod t0 logs s
   t0=$SECONDS
   wf="$(submit "$2" fixture)" || wf=""
-  p="$(wait_terminal "$wf" "$PASS_LIMIT")"
+  p="$(wait_started "$wf" "$START_LIMIT")"
+  case "$p" in
+    started) p="$(wait_terminal "$wf" "$PASS_LIMIT")" ;;
+    not-started:*) stop "$wf" ;;
+  esac
   printf '%s\t%s\tfixture\t%s\t%s\n' "$1" "$2" "$wf" "$p" >>"$OUT/phases.tsv"
+  progress "$1" "$2" fixture "$wf" "$p" "$((SECONDS - t0))"
+  [ "$p" = Succeeded ] || diag "$wf" "pass$1-$2-fixture"
   op "$2" argo_executor "$([ "$p" = Succeeded ] && echo true || echo false)" "$((SECONDS - t0))" "workflow phase: $p"
   pod=""
   [ -n "$wf" ] && pod="$(pod_of "$wf")"
@@ -98,9 +160,9 @@ fixture_pass() { # i runtime
 }
 
 cancel_pass() { # i runtime
-  local wf deadline pod p t0 ok=false started=false
+  local wf deadline pod p t0 ok=false started=false t_start=$SECONDS why=""
   wf="$(submit "$2" cancel)" || wf=""
-  deadline=$((SECONDS + PASS_LIMIT))
+  deadline=$((SECONDS + START_LIMIT))
   pod=""
   while [ -n "$wf" ] && [ "$SECONDS" -lt "$deadline" ]; do
     pod="$(pod_of "$wf")"
@@ -111,8 +173,9 @@ cancel_pass() { # i runtime
     case "$(phase "$wf")" in Succeeded|Failed|Error) break ;; esac
     sleep 2
   done
+  [ "$started" = true ] || why="; not started: $(not_started_reason "$pod" | tr ' ' ',')"
   t0=$SECONDS
-  [ -n "$wf" ] && kubectl -n "$NS" patch workflow "$wf" --type merge -p '{"spec":{"shutdown":"Terminate"}}' >/dev/null || true
+  stop "$wf"
   p="$(wait_terminal "$wf" "$CANCEL_LIMIT")"
   # Cancelled means the Workflow went terminal AND its pod stopped running
   # (Argo keeps finished pods, so "stopped" is a non-running phase or no pod).
@@ -128,9 +191,33 @@ cancel_pass() { # i runtime
     done
   fi
   printf '%s\t%s\tcancel\t%s\t%s\n' "$1" "$2" "$wf" "$p" >>"$OUT/phases.tsv"
-  op "$2" cancellation "$ok" "$((SECONDS - t0))" "main started: $started; phase after terminate: $p"
+  op "$2" cancellation "$ok" "$((SECONDS - t0))" "main started: $started; phase after terminate: $p$why"
+  progress "$1" "$2" cancel "$wf" "cancelled=$ok started=$started$why" "$((SECONDS - t_start))"
+  [ "$ok" = true ] || diag "$wf" "pass$1-$2-cancel"
   kubectl -n "$NS" delete workflow "$wf" --wait=true >/dev/null 2>&1 || true
 }
+
+preflight() { # runtime: one pod must reach a started main container
+  local wf r t0=$SECONDS
+  wf="$(submit "$1" cancel)" || wf=""
+  r="$(wait_started "$wf" "$START_LIMIT")"
+  printf 'preflight\t%s\tcancel\t%s\t%s\n' "$1" "$wf" "$r" >>"$OUT/phases.tsv"
+  progress preflight "$1" cancel "$wf" "$r" "$((SECONDS - t0))"
+  if [ "$r" != started ]; then
+    diag "$wf" "preflight-$1"
+    echo "preflight failed for $1: $r; see $OUT/diag/preflight-$1-$wf.txt" >&2
+    # Pod events first: the reason is there, not in the long workflow status.
+    sed -n '/^Events:/,/^== node/p' "$OUT/diag/preflight-$1-${wf:-none}.txt" >&2 || true
+    stop "$wf"
+    return 1
+  fi
+  stop "$wf"
+  wait_terminal "$wf" "$CANCEL_LIMIT" >/dev/null
+  kubectl -n "$NS" delete workflow "$wf" --wait=true >/dev/null 2>&1 || true
+}
+
+preflight runc
+preflight gvisor
 
 for i in $(seq 1 "$RUNS"); do
   for rt in runc gvisor; do
