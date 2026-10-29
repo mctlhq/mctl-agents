@@ -1,0 +1,9 @@
+--- a/config.toml.tmpl
++++ b/config.toml.tmpl
+@@ -0,0 +1,6 @@
++{{ template "base" . }}
++
++# gVisor (runsc) handler, systrap platform (no KVM needed).
++[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runsc]
++  runtime_type = "io.containerd.runsc.v1"
++

@@ -1,0 +1,87 @@
+name: spike-881 sandbox runtime (manual)
+# Manual only. Compares hardened runc with gVisor on a disposable k3s cluster.
+# Holds no secrets and never touches MCTL production. See
+# experiments/sandbox-runtime-881/README.md; dispatch from main (Phase B).
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Passes per runtime (alternating)"
+        default: "10"
+permissions:
+  contents: read
+env:
+  K3S_VERSION: v1.34.1+k3s1
+  GVISOR_RELEASE: "20251020.0"
+  ARGO_CHART_VERSION: 0.47.5
+  E: experiments/sandbox-runtime-881
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install gVisor (checksum verified)
+        run: |
+          set -euo pipefail
+          base="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64"
+          cd "$(mktemp -d)"
+          for f in runsc containerd-shim-runsc-v1; do
+            curl -fsSLO "$base/$f"
+            curl -fsSLO "$base/$f.sha512"
+            sha512sum -c "$f.sha512"
+            sudo install -m 0755 "$f" /usr/local/bin/
+          done
+      - name: Install k3s with the runsc handler
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /var/lib/rancher/k3s/agent/etc/containerd
+          sudo tee /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl >/dev/null <<'TOML'
+          {{ template "base" . }}
+
+          [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runsc]
+            runtime_type = "io.containerd.runsc.v1"
+          TOML
+          curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" sh -s - --write-kubeconfig-mode 644
+          echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> "$GITHUB_ENV"
+          kubectl wait --for=condition=Ready node --all --timeout=180s
+      - name: Install Argo Workflows and the proxy
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm repo add argo https://argoproj.github.io/argo-helm
+          helm install argo argo/argo-workflows --version "$ARGO_CHART_VERSION" -n argo --create-namespace --wait
+          kubectl create namespace spike881
+          kubectl apply -f "$E/k8s/runtimeclass-gvisor.yaml" -f "$E/k8s/squid.yaml"
+          tar czf /tmp/fixture.tgz -C "$E" fixture
+          kubectl -n spike881 create configmap fixture-881 --from-file=fixture.tgz=/tmp/fixture.tgz
+      - name: Build agent image
+        run: |
+          set -euo pipefail
+          docker build -t agent-881:local .
+          sudo k3s ctr images import <(docker save agent-881:local)
+      - name: Run alternating passes
+        run: |
+          set -euo pipefail
+          mkdir -p measurements
+          for i in $(seq 1 "${{ inputs.runs }}"); do
+            for rc in "" gvisor; do
+              name="${rc:-runc}"
+              kubectl -n spike881 delete workflow --all --wait=true || true
+              kubectl -n spike881 create -f - -o name <<<"$(sed "s|value: \"\"|value: \"$rc\"|; s|- name: agent_image|- name: agent_image\n        value: agent-881:local|" "$E/k8s/fixture-workflow.yaml")" > wf.txt
+              wf="$(cut -d/ -f2 wf.txt)"
+              kubectl -n spike881 wait --for=jsonpath='{.status.phase}'=Succeeded "workflow/$wf" --timeout=30m || true
+              kubectl -n spike881 logs -l "workflows.argoproj.io/workflow=$wf" -c main --tail=-1 >> "measurements/$name.log" || true
+            done
+          done
+      - name: Probes and scorecard
+        run: |
+          set -euo pipefail
+          { echo "kvm_on_runner: $(ls -l /dev/kvm 2>&1 | head -1)"; uname -r; } > measurements/runner-info.txt
+          python3 -I "$E/collect.py" --out measurements runc=measurements/runc.log gvisor=measurements/gvisor.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spike-881-measurements
+          path: measurements/

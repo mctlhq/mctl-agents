@@ -1,0 +1,21 @@
+# Minimal forward proxy for the proxy-path op (mirrors the #830 Squid role).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: squid
+  namespace: spike881
+  labels: {app: squid}
+spec:
+  containers:
+    - name: squid
+      image: ubuntu/squid:6.6-24.04_edge
+      ports: [{containerPort: 3128}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: squid
+  namespace: spike881
+spec:
+  selector: {app: squid}
+  ports: [{port: 3128, targetPort: 3128}]
