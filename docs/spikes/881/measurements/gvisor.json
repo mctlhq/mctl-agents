@@ -1,0 +1,1436 @@
+{
+  "argo_executor": [
+    {
+      "ok": true,
+      "op": "argo_executor",
+      "seconds": 55.0,
+      "stderr_tail": "workflow phase: Succeeded"
+    },
+    {
+      "ok": true,
+      "op": "argo_executor",
+      "seconds": 55.0,
+      "stderr_tail": "workflow phase: Succeeded"
+    },
+    {
+      "ok": true,
+      "op": "argo_executor",
+      "seconds": 55.0,
+      "stderr_tail": "workflow phase: Succeeded"
+    },
+    {
+      "ok": true,
+      "op": "argo_executor",
+      "seconds": 56.0,
+      "stderr_tail": "workflow phase: Succeeded"
+    },
+    {
+      "ok": true,
+      "op": "argo_executor",
+      "seconds": 56.0,
+      "stderr_tail": "workflow phase: Succeeded"
+    },
+    {
+      "ok": true,
+      "op": "argo_executor",
+      "seconds": 55.0,
+      "stderr_tail": "workflow phase: Succeeded"
+    },
+    {
+      "ok": true,
+      "op": "argo_executor",
+      "seconds": 55.0,
+      "stderr_tail": "workflow phase: Succeeded"
+    },
+    {
+      "ok": true,
+      "op": "argo_executor",
+      "seconds": 55.0,
+      "stderr_tail": "workflow phase: Succeeded"
+    },
+    {
+      "ok": true,
+      "op": "argo_executor",
+      "seconds": 56.0,
+      "stderr_tail": "workflow phase: Succeeded"
+    },
+    {
+      "ok": true,
+      "op": "argo_executor",
+      "seconds": 56.0,
+      "stderr_tail": "workflow phase: Succeeded"
+    }
+  ],
+  "c_compile": [
+    {
+      "ok": true,
+      "op": "c_compile",
+      "seconds": 0.109,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "c_compile",
+      "seconds": 0.103,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "c_compile",
+      "seconds": 0.103,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "c_compile",
+      "seconds": 0.101,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "c_compile",
+      "seconds": 0.101,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "c_compile",
+      "seconds": 0.105,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "c_compile",
+      "seconds": 0.101,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "c_compile",
+      "seconds": 0.106,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "c_compile",
+      "seconds": 0.107,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "c_compile",
+      "seconds": 0.123,
+      "stderr_tail": ""
+    }
+  ],
+  "cancellation": [
+    {
+      "ok": true,
+      "op": "cancellation",
+      "seconds": 4.0,
+      "stderr_tail": "main started: true; phase after terminate: Failed"
+    },
+    {
+      "ok": true,
+      "op": "cancellation",
+      "seconds": 5.0,
+      "stderr_tail": "main started: true; phase after terminate: Failed"
+    },
+    {
+      "ok": true,
+      "op": "cancellation",
+      "seconds": 10.0,
+      "stderr_tail": "main started: true; phase after terminate: Failed"
+    },
+    {
+      "ok": true,
+      "op": "cancellation",
+      "seconds": 5.0,
+      "stderr_tail": "main started: true; phase after terminate: Failed"
+    },
+    {
+      "ok": true,
+      "op": "cancellation",
+      "seconds": 6.0,
+      "stderr_tail": "main started: true; phase after terminate: Failed"
+    },
+    {
+      "ok": true,
+      "op": "cancellation",
+      "seconds": 4.0,
+      "stderr_tail": "main started: true; phase after terminate: Failed"
+    },
+    {
+      "ok": true,
+      "op": "cancellation",
+      "seconds": 4.0,
+      "stderr_tail": "main started: true; phase after terminate: Failed"
+    },
+    {
+      "ok": true,
+      "op": "cancellation",
+      "seconds": 4.0,
+      "stderr_tail": "main started: true; phase after terminate: Failed"
+    },
+    {
+      "ok": true,
+      "op": "cancellation",
+      "seconds": 5.0,
+      "stderr_tail": "main started: true; phase after terminate: Failed"
+    },
+    {
+      "ok": true,
+      "op": "cancellation",
+      "seconds": 5.0,
+      "stderr_tail": "main started: true; phase after terminate: Failed"
+    }
+  ],
+  "dns": [
+    {
+      "ok": true,
+      "op": "dns",
+      "seconds": 0.028,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "dns",
+      "seconds": 0.033,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "dns",
+      "seconds": 0.028,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "dns",
+      "seconds": 0.027,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "dns",
+      "seconds": 0.027,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "dns",
+      "seconds": 0.029,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "dns",
+      "seconds": 0.035,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "dns",
+      "seconds": 0.053,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "dns",
+      "seconds": 0.029,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "dns",
+      "seconds": 0.025,
+      "stderr_tail": ""
+    }
+  ],
+  "emptydir_io": [
+    {
+      "ok": true,
+      "op": "emptydir_io",
+      "seconds": 0.543,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "emptydir_io",
+      "seconds": 0.517,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "emptydir_io",
+      "seconds": 0.531,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "emptydir_io",
+      "seconds": 0.51,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "emptydir_io",
+      "seconds": 0.532,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "emptydir_io",
+      "seconds": 0.539,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "emptydir_io",
+      "seconds": 0.516,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "emptydir_io",
+      "seconds": 0.525,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "emptydir_io",
+      "seconds": 0.532,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "emptydir_io",
+      "seconds": 0.563,
+      "stderr_tail": ""
+    }
+  ],
+  "gh_version": [
+    {
+      "ok": true,
+      "op": "gh_version",
+      "seconds": 0.069,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "gh_version",
+      "seconds": 0.066,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "gh_version",
+      "seconds": 0.065,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "gh_version",
+      "seconds": 0.066,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "gh_version",
+      "seconds": 0.077,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "gh_version",
+      "seconds": 0.066,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "gh_version",
+      "seconds": 0.064,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "gh_version",
+      "seconds": 0.068,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "gh_version",
+      "seconds": 0.066,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "gh_version",
+      "seconds": 0.066,
+      "stderr_tail": ""
+    }
+  ],
+  "git_clone_local": [
+    {
+      "ok": true,
+      "op": "git_clone_local",
+      "seconds": 0.118,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "git_clone_local",
+      "seconds": 0.115,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "git_clone_local",
+      "seconds": 0.134,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "git_clone_local",
+      "seconds": 0.119,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "git_clone_local",
+      "seconds": 0.119,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "git_clone_local",
+      "seconds": 0.123,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "git_clone_local",
+      "seconds": 0.115,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "git_clone_local",
+      "seconds": 0.117,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "git_clone_local",
+      "seconds": 0.126,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "git_clone_local",
+      "seconds": 0.115,
+      "stderr_tail": ""
+    }
+  ],
+  "go_test": [
+    {
+      "ok": true,
+      "op": "go_test",
+      "seconds": 14.578,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test",
+      "seconds": 13.933,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test",
+      "seconds": 13.971,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test",
+      "seconds": 13.82,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test",
+      "seconds": 13.773,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test",
+      "seconds": 13.822,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test",
+      "seconds": 13.895,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test",
+      "seconds": 13.749,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test",
+      "seconds": 13.716,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test",
+      "seconds": 13.667,
+      "stderr_tail": ""
+    }
+  ],
+  "go_test_race": [
+    {
+      "ok": true,
+      "op": "go_test_race",
+      "seconds": 18.213,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test_race",
+      "seconds": 18.024,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test_race",
+      "seconds": 18.246,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test_race",
+      "seconds": 18.147,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test_race",
+      "seconds": 18.45,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test_race",
+      "seconds": 18.742,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test_race",
+      "seconds": 18.516,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test_race",
+      "seconds": 18.552,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test_race",
+      "seconds": 18.499,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "go_test_race",
+      "seconds": 17.929,
+      "stderr_tail": ""
+    }
+  ],
+  "https_direct": [
+    {
+      "ok": true,
+      "op": "https_direct",
+      "seconds": 0.409,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_direct",
+      "seconds": 0.39,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_direct",
+      "seconds": 0.365,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_direct",
+      "seconds": 0.383,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_direct",
+      "seconds": 0.414,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_direct",
+      "seconds": 0.453,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_direct",
+      "seconds": 0.392,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_direct",
+      "seconds": 0.429,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_direct",
+      "seconds": 0.427,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_direct",
+      "seconds": 0.383,
+      "stderr_tail": ""
+    }
+  ],
+  "https_proxy": [
+    {
+      "ok": true,
+      "op": "https_proxy",
+      "seconds": 0.4,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_proxy",
+      "seconds": 0.393,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_proxy",
+      "seconds": 0.413,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_proxy",
+      "seconds": 0.397,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_proxy",
+      "seconds": 0.358,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_proxy",
+      "seconds": 0.392,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_proxy",
+      "seconds": 0.404,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_proxy",
+      "seconds": 0.449,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_proxy",
+      "seconds": 0.454,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "https_proxy",
+      "seconds": 0.453,
+      "stderr_tail": ""
+    }
+  ],
+  "log_collection": [
+    {
+      "ok": true,
+      "op": "log_collection",
+      "seconds": 0.0,
+      "stderr_tail": "pod fixture-881-v874v"
+    },
+    {
+      "ok": true,
+      "op": "log_collection",
+      "seconds": 0.0,
+      "stderr_tail": "pod fixture-881-zhjvl"
+    },
+    {
+      "ok": true,
+      "op": "log_collection",
+      "seconds": 0.0,
+      "stderr_tail": "pod fixture-881-dkklw"
+    },
+    {
+      "ok": true,
+      "op": "log_collection",
+      "seconds": 0.0,
+      "stderr_tail": "pod fixture-881-qfzdc"
+    },
+    {
+      "ok": true,
+      "op": "log_collection",
+      "seconds": 0.0,
+      "stderr_tail": "pod fixture-881-22rvx"
+    },
+    {
+      "ok": true,
+      "op": "log_collection",
+      "seconds": 0.0,
+      "stderr_tail": "pod fixture-881-vkt2z"
+    },
+    {
+      "ok": true,
+      "op": "log_collection",
+      "seconds": 0.0,
+      "stderr_tail": "pod fixture-881-tjglr"
+    },
+    {
+      "ok": true,
+      "op": "log_collection",
+      "seconds": 0.0,
+      "stderr_tail": "pod fixture-881-fdwck"
+    },
+    {
+      "ok": true,
+      "op": "log_collection",
+      "seconds": 0.0,
+      "stderr_tail": "pod fixture-881-hzdth"
+    },
+    {
+      "ok": true,
+      "op": "log_collection",
+      "seconds": 0.0,
+      "stderr_tail": "pod fixture-881-xkxzp"
+    }
+  ],
+  "metric:cgroup": [
+    {
+      "cpu_stat": "unavailable",
+      "io_stat": "unavailable",
+      "memory_peak": "unavailable",
+      "metric": "cgroup"
+    },
+    {
+      "cpu_stat": "unavailable",
+      "io_stat": "unavailable",
+      "memory_peak": "unavailable",
+      "metric": "cgroup"
+    },
+    {
+      "cpu_stat": "unavailable",
+      "io_stat": "unavailable",
+      "memory_peak": "unavailable",
+      "metric": "cgroup"
+    },
+    {
+      "cpu_stat": "unavailable",
+      "io_stat": "unavailable",
+      "memory_peak": "unavailable",
+      "metric": "cgroup"
+    },
+    {
+      "cpu_stat": "unavailable",
+      "io_stat": "unavailable",
+      "memory_peak": "unavailable",
+      "metric": "cgroup"
+    },
+    {
+      "cpu_stat": "unavailable",
+      "io_stat": "unavailable",
+      "memory_peak": "unavailable",
+      "metric": "cgroup"
+    },
+    {
+      "cpu_stat": "unavailable",
+      "io_stat": "unavailable",
+      "memory_peak": "unavailable",
+      "metric": "cgroup"
+    },
+    {
+      "cpu_stat": "unavailable",
+      "io_stat": "unavailable",
+      "memory_peak": "unavailable",
+      "metric": "cgroup"
+    },
+    {
+      "cpu_stat": "unavailable",
+      "io_stat": "unavailable",
+      "memory_peak": "unavailable",
+      "metric": "cgroup"
+    },
+    {
+      "cpu_stat": "unavailable",
+      "io_stat": "unavailable",
+      "memory_peak": "unavailable",
+      "metric": "cgroup"
+    }
+  ],
+  "metric:startup": [
+    {
+      "metric": "startup",
+      "seconds": 2.0
+    },
+    {
+      "metric": "startup",
+      "seconds": 2.0
+    },
+    {
+      "metric": "startup",
+      "seconds": 2.0
+    },
+    {
+      "metric": "startup",
+      "seconds": 2.0
+    },
+    {
+      "metric": "startup",
+      "seconds": 2.0
+    },
+    {
+      "metric": "startup",
+      "seconds": 2.0
+    },
+    {
+      "metric": "startup",
+      "seconds": 2.0
+    },
+    {
+      "metric": "startup",
+      "seconds": 1.0
+    },
+    {
+      "metric": "startup",
+      "seconds": 2.0
+    },
+    {
+      "metric": "startup",
+      "seconds": 1.0
+    }
+  ],
+  "npm_ci": [
+    {
+      "ok": true,
+      "op": "npm_ci",
+      "seconds": 0.803,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "npm_ci",
+      "seconds": 0.857,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "npm_ci",
+      "seconds": 0.818,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "npm_ci",
+      "seconds": 1.022,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "npm_ci",
+      "seconds": 0.846,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "npm_ci",
+      "seconds": 0.794,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "npm_ci",
+      "seconds": 0.863,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "npm_ci",
+      "seconds": 0.803,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "npm_ci",
+      "seconds": 0.868,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "npm_ci",
+      "seconds": 0.831,
+      "stderr_tail": ""
+    }
+  ],
+  "probe:cpu_vmx_svm": [
+    {
+      "probe": "cpu_vmx_svm",
+      "value": "4"
+    },
+    {
+      "probe": "cpu_vmx_svm",
+      "value": "4"
+    },
+    {
+      "probe": "cpu_vmx_svm",
+      "value": "4"
+    },
+    {
+      "probe": "cpu_vmx_svm",
+      "value": "4"
+    },
+    {
+      "probe": "cpu_vmx_svm",
+      "value": "4"
+    },
+    {
+      "probe": "cpu_vmx_svm",
+      "value": "4"
+    },
+    {
+      "probe": "cpu_vmx_svm",
+      "value": "4"
+    },
+    {
+      "probe": "cpu_vmx_svm",
+      "value": "4"
+    },
+    {
+      "probe": "cpu_vmx_svm",
+      "value": "4"
+    },
+    {
+      "probe": "cpu_vmx_svm",
+      "value": "4"
+    }
+  ],
+  "probe:dev_kvm": [
+    {
+      "probe": "dev_kvm",
+      "value": "ls: cannot access '/dev/kvm': No such file or directory"
+    },
+    {
+      "probe": "dev_kvm",
+      "value": "ls: cannot access '/dev/kvm': No such file or directory"
+    },
+    {
+      "probe": "dev_kvm",
+      "value": "ls: cannot access '/dev/kvm': No such file or directory"
+    },
+    {
+      "probe": "dev_kvm",
+      "value": "ls: cannot access '/dev/kvm': No such file or directory"
+    },
+    {
+      "probe": "dev_kvm",
+      "value": "ls: cannot access '/dev/kvm': No such file or directory"
+    },
+    {
+      "probe": "dev_kvm",
+      "value": "ls: cannot access '/dev/kvm': No such file or directory"
+    },
+    {
+      "probe": "dev_kvm",
+      "value": "ls: cannot access '/dev/kvm': No such file or directory"
+    },
+    {
+      "probe": "dev_kvm",
+      "value": "ls: cannot access '/dev/kvm': No such file or directory"
+    },
+    {
+      "probe": "dev_kvm",
+      "value": "ls: cannot access '/dev/kvm': No such file or directory"
+    },
+    {
+      "probe": "dev_kvm",
+      "value": "ls: cannot access '/dev/kvm': No such file or directory"
+    }
+  ],
+  "probe:dev_listing": [
+    {
+      "probe": "dev_listing",
+      "value": "fd full fuse net null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "
+    },
+    {
+      "probe": "dev_listing",
+      "value": "fd full fuse net null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "
+    },
+    {
+      "probe": "dev_listing",
+      "value": "fd full fuse net null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "
+    },
+    {
+      "probe": "dev_listing",
+      "value": "fd full fuse net null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "
+    },
+    {
+      "probe": "dev_listing",
+      "value": "fd full fuse net null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "
+    },
+    {
+      "probe": "dev_listing",
+      "value": "fd full fuse net null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "
+    },
+    {
+      "probe": "dev_listing",
+      "value": "fd full fuse net null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "
+    },
+    {
+      "probe": "dev_listing",
+      "value": "fd full fuse net null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "
+    },
+    {
+      "probe": "dev_listing",
+      "value": "fd full fuse net null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "
+    },
+    {
+      "probe": "dev_listing",
+      "value": "fd full fuse net null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "
+    }
+  ],
+  "probe:entries:/sys/firmware": [
+    {
+      "probe": "entries:/sys/firmware",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/firmware",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/firmware",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/firmware",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/firmware",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/firmware",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/firmware",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/firmware",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/firmware",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/firmware",
+      "value": "0"
+    }
+  ],
+  "probe:entries:/sys/kernel": [
+    {
+      "probe": "entries:/sys/kernel",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/kernel",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/kernel",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/kernel",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/kernel",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/kernel",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/kernel",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/kernel",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/kernel",
+      "value": "0"
+    },
+    {
+      "probe": "entries:/sys/kernel",
+      "value": "0"
+    }
+  ],
+  "probe:kernel_release": [
+    {
+      "probe": "kernel_release",
+      "value": "4.4.0"
+    },
+    {
+      "probe": "kernel_release",
+      "value": "4.4.0"
+    },
+    {
+      "probe": "kernel_release",
+      "value": "4.4.0"
+    },
+    {
+      "probe": "kernel_release",
+      "value": "4.4.0"
+    },
+    {
+      "probe": "kernel_release",
+      "value": "4.4.0"
+    },
+    {
+      "probe": "kernel_release",
+      "value": "4.4.0"
+    },
+    {
+      "probe": "kernel_release",
+      "value": "4.4.0"
+    },
+    {
+      "probe": "kernel_release",
+      "value": "4.4.0"
+    },
+    {
+      "probe": "kernel_release",
+      "value": "4.4.0"
+    },
+    {
+      "probe": "kernel_release",
+      "value": "4.4.0"
+    }
+  ],
+  "probe:mountinfo_lines": [
+    {
+      "probe": "mountinfo_lines",
+      "value": "21"
+    },
+    {
+      "probe": "mountinfo_lines",
+      "value": "21"
+    },
+    {
+      "probe": "mountinfo_lines",
+      "value": "21"
+    },
+    {
+      "probe": "mountinfo_lines",
+      "value": "21"
+    },
+    {
+      "probe": "mountinfo_lines",
+      "value": "21"
+    },
+    {
+      "probe": "mountinfo_lines",
+      "value": "21"
+    },
+    {
+      "probe": "mountinfo_lines",
+      "value": "21"
+    },
+    {
+      "probe": "mountinfo_lines",
+      "value": "21"
+    },
+    {
+      "probe": "mountinfo_lines",
+      "value": "21"
+    },
+    {
+      "probe": "mountinfo_lines",
+      "value": "21"
+    }
+  ],
+  "probe:pid1_cgroup": [
+    {
+      "probe": "pid1_cgroup",
+      "value": "7:pids:/20fe487180215b050f7395f5db01c4327f39631e8f7681fd3a2335b43d317d9e"
+    },
+    {
+      "probe": "pid1_cgroup",
+      "value": "7:pids:/fbdcb1f3c73fb312c1d5cc2a92f3980d08a55dd2ef67f50653f5bfe0923916bf"
+    },
+    {
+      "probe": "pid1_cgroup",
+      "value": "7:pids:/8284151a1dcc1c966b357e19e20126241d03459fa64a34a3b45422bcced0cc04"
+    },
+    {
+      "probe": "pid1_cgroup",
+      "value": "7:pids:/65712a28c1e6809a274b84572cf76a0740eac6be1bf852b25227eeccbf07d6a5"
+    },
+    {
+      "probe": "pid1_cgroup",
+      "value": "7:pids:/4ad6f828eda9ab2f9ee11ae098d344489a3456f1cbf156b877328eda0ea0bfcf"
+    },
+    {
+      "probe": "pid1_cgroup",
+      "value": "7:pids:/20429a0ac63dd57051e40fbd4c24c90ff75b15e9bb2049e1a2719494b4b73a1f"
+    },
+    {
+      "probe": "pid1_cgroup",
+      "value": "7:pids:/2a4a61752d2a5b7d6e05c17dd3b225906aef6c43d2a3fe4243d4b4c36eb281d6"
+    },
+    {
+      "probe": "pid1_cgroup",
+      "value": "7:pids:/3946424716a4519ec151dee8efdef9b11b99f9cd4bc23dd13a74be63c6ad684b"
+    },
+    {
+      "probe": "pid1_cgroup",
+      "value": "7:pids:/9224e2ee5cad7ab2882a5370eb9e79dd2d6d429030aa8d7fc76d98e393d8f659"
+    },
+    {
+      "probe": "pid1_cgroup",
+      "value": "7:pids:/c204be3477b847ab58e7f8a82c7f3ce6e3c74f1f237bafd367cd5182f10450a9"
+    }
+  ],
+  "probe:readable:/proc/kallsyms": [
+    {
+      "probe": "readable:/proc/kallsyms",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/kallsyms",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/kallsyms",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/kallsyms",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/kallsyms",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/kallsyms",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/kallsyms",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/kallsyms",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/kallsyms",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/kallsyms",
+      "value": "no"
+    }
+  ],
+  "probe:readable:/proc/modules": [
+    {
+      "probe": "readable:/proc/modules",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/modules",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/modules",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/modules",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/modules",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/modules",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/modules",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/modules",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/modules",
+      "value": "no"
+    },
+    {
+      "probe": "readable:/proc/modules",
+      "value": "no"
+    }
+  ],
+  "probe:readable:/proc/version": [
+    {
+      "probe": "readable:/proc/version",
+      "value": "yes"
+    },
+    {
+      "probe": "readable:/proc/version",
+      "value": "yes"
+    },
+    {
+      "probe": "readable:/proc/version",
+      "value": "yes"
+    },
+    {
+      "probe": "readable:/proc/version",
+      "value": "yes"
+    },
+    {
+      "probe": "readable:/proc/version",
+      "value": "yes"
+    },
+    {
+      "probe": "readable:/proc/version",
+      "value": "yes"
+    },
+    {
+      "probe": "readable:/proc/version",
+      "value": "yes"
+    },
+    {
+      "probe": "readable:/proc/version",
+      "value": "yes"
+    },
+    {
+      "probe": "readable:/proc/version",
+      "value": "yes"
+    },
+    {
+      "probe": "readable:/proc/version",
+      "value": "yes"
+    }
+  ],
+  "uv_pytest_mypy_ruff": [
+    {
+      "ok": true,
+      "op": "uv_pytest_mypy_ruff",
+      "seconds": 5.449,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "uv_pytest_mypy_ruff",
+      "seconds": 5.543,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "uv_pytest_mypy_ruff",
+      "seconds": 5.542,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "uv_pytest_mypy_ruff",
+      "seconds": 5.578,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "uv_pytest_mypy_ruff",
+      "seconds": 5.651,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "uv_pytest_mypy_ruff",
+      "seconds": 5.452,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "uv_pytest_mypy_ruff",
+      "seconds": 5.499,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "uv_pytest_mypy_ruff",
+      "seconds": 5.505,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "uv_pytest_mypy_ruff",
+      "seconds": 5.445,
+      "stderr_tail": ""
+    },
+    {
+      "ok": true,
+      "op": "uv_pytest_mypy_ruff",
+      "seconds": 5.467,
+      "stderr_tail": ""
+    }
+  ]
+}
