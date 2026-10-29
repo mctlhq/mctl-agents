@@ -1,0 +1,16 @@
+kvm_on_runner: crw-rw---- /dev/kvm
+7.0.0-1017-azure
+head_sha: a4ffd4a84194f271e1fb4f4160d10c30184ea154
+run_id: 40951481981
+ref: refs/heads/main
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   44G  102G  31% /
+Taints:             <none>
+Conditions:
+  Type             Status  LastHeartbeatTime                 LastTransitionTime                Reason                       Message
+  ----             ------  -----------------                 ------------------                ------                       -------
+  MemoryPressure   False   Thu, 29 Oct 2026 21:05:02 +0000   Thu, 29 Oct 2026 20:45:07 +0000   KubeletHasSufficientMemory   kubelet has sufficient memory available
+  DiskPressure     False   Thu, 29 Oct 2026 21:05:02 +0000   Thu, 29 Oct 2026 20:45:07 +0000   KubeletHasNoDiskPressure     kubelet has no disk pressure
+  PIDPressure      False   Thu, 29 Oct 2026 21:05:02 +0000   Thu, 29 Oct 2026 20:45:07 +0000   KubeletHasSufficientPID      kubelet has sufficient PID available
+  Ready            True    Thu, 29 Oct 2026 21:05:02 +0000   Thu, 29 Oct 2026 20:45:07 +0000   KubeletReady                 kubelet is posting ready status
+Addresses:
