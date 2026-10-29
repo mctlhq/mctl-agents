@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.111.1](https://github.com/mctlhq/mctl-agents/compare/1.111.0...1.111.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* **spike-881:** executor token Secret and fail-fast harness preflight ([a4ffd4a](https://github.com/mctlhq/mctl-agents/commit/a4ffd4a84194f271e1fb4f4160d10c30184ea154))
+
 ## [1.111.0](https://github.com/mctlhq/mctl-agents/compare/1.110.0...1.111.0) (2026-10-29)
 
 
