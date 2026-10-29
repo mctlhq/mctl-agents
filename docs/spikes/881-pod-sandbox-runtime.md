@@ -49,24 +49,30 @@ is therefore required before any adoption decision. A sandbox is defence in dept
 
 ## 4. Compatibility scorecard
 
-DRAFT: not measured in Phase A. Cells are filled from the Phase B run.
+DRAFT: not measured in Phase A. Cells are filled from the Phase B run. VM runtimes are out of scope
+(owner amendment), so only runc and gVisor are scored. Argo executor, artifact/log collection and
+cancellation are recorded by `experiments/sandbox-runtime-881/dispatch.sh`, the other ops by
+`fixture/run-fixture.sh`. A cell is `pass` only when all N passes succeeded; a pass that failed or
+produced no record makes it `fail:<k>/<N> ...`.
 
-| op | runc | gvisor | kata | firecracker | notes |
-|---|---|---|---|---|---|
-| git/gh | not-exercised | not-exercised | not-exercised | not-exercised | VM runtimes out of scope |
-| uv/pytest/mypy/ruff | not-exercised | not-exercised | not-exercised | not-exercised | |
-| npm | not-exercised | not-exercised | not-exercised | not-exercised | |
-| go test | not-exercised | not-exercised | not-exercised | not-exercised | |
-| go test -race | not-exercised | not-exercised | not-exercised | not-exercised | needs cgo and ptrace-free shadow memory |
-| C compile | not-exercised | not-exercised | not-exercised | not-exercised | |
-| DNS/HTTPS/proxy | not-exercised | not-exercised | not-exercised | not-exercised | |
-| Argo executor | not-exercised | not-exercised | not-exercised | not-exercised | init/wait/emissary |
-| artifact/log collection | not-exercised | not-exercised | not-exercised | not-exercised | |
-| cancellation | not-exercised | not-exercised | not-exercised | not-exercised | |
+| op | runc | gvisor | notes |
+|---|---|---|---|
+| git/gh | not-exercised | not-exercised | |
+| uv/pytest/mypy/ruff | not-exercised | not-exercised | |
+| npm | not-exercised | not-exercised | |
+| go test | not-exercised | not-exercised | |
+| go test -race | not-exercised | not-exercised | needs cgo and ptrace-free shadow memory |
+| C compile | not-exercised | not-exercised | |
+| DNS/HTTPS/proxy | not-exercised | not-exercised | |
+| Argo executor | not-exercised | not-exercised | init/wait/emissary |
+| artifact/log collection | not-exercised | not-exercised | |
+| cancellation | not-exercised | not-exercised | |
 
 ## 5. Performance
 
-Not measured in Phase A. Phase B reports startup p50/p95, fixture wall-clock, CPU, peak RSS and I/O deltas
+Not measured in Phase A. Phase B reports startup p50/p95 (Workflow creation to main container start),
+per-op median wall-clock with overhead versus runc (`performance.md` from `collect.py`), and CPU, peak
+memory and I/O from the pod's cgroup v2 files (`unavailable` where the runtime does not expose them),
 for runc versus gVisor with N=10 alternating passes, run id and head SHA. Adoption gates (all required):
 
 - every critical operation in section 4 passes under gVisor;
@@ -80,7 +86,8 @@ from a cx43 in CPU and kernel, so figures are relative deltas, not production ti
 ## 6. Negative probes
 
 Probe script: `experiments/sandbox-runtime-881/probes/negative-probes.sh` (kernel version, /dev, /proc and
-/sys visibility, mounts, cgroup, /dev/kvm). Read-only, no exploit code. Expected: gVisor reports its own
+/sys visibility, mounts, cgroup, /dev/kvm). It runs inside every fixture pod after the ops. Read-only,
+no exploit code. Expected: gVisor reports its own
 kernel release and a reduced /dev, /proc and /sys view. Observed: not-exercised (Phase B).
 
 ## 7. Cost and operations delta

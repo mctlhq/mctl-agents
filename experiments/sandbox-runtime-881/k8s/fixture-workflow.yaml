@@ -1,23 +1,33 @@
 # Mirrors the implement template's pod posture (securityContext, emptyDir,
-# limits, proxy env). runtimeClassName is parameterised: "" means runc.
-# ConfigMap fixture-881 holds fixture.tgz (the fixture/ directory, created by the workflow).
-# Submit: argo submit -n spike881 fixture-workflow.yaml -p runtime_class=gvisor -p agent_image=<image>
+# limits, proxy env, runner/executor ServiceAccount split).
+# ConfigMap fixture-881 holds fixture.tgz (fixture/ plus probes/, created by the workflow).
+# pod_spec_patch selects the runtime: '{}' keeps the default runc handler (an
+# empty runtimeClassName is rejected by the API server, so runc never sets the
+# field); '{"runtimeClassName":"gvisor"}' selects gVisor.
+# mode=fixture runs the compatibility ops and the probes; mode=cancel only
+# sleeps, so the dispatcher can stop the workflow and time the cancellation.
+# Applied as a WorkflowTemplate; dispatch.sh submits one Workflow per pass that
+# references it and passes the parameters.
 apiVersion: argoproj.io/v1alpha1
-kind: Workflow
+kind: WorkflowTemplate
 metadata:
-  generateName: fixture-881-
+  name: fixture-881
   namespace: spike881
 spec:
   entrypoint: fixture
   activeDeadlineSeconds: 1800
+  serviceAccountName: spike881-runner
   automountServiceAccountToken: false
+  executor:
+    serviceAccountName: spike881-executor
   arguments:
     parameters:
       - name: agent_image
-      - name: runtime_class
-        value: ""
-  podSpecPatch: |
-    runtimeClassName: "{{workflow.parameters.runtime_class}}"
+      - name: pod_spec_patch
+        value: "{}"
+      - name: mode
+        value: fixture
+  podSpecPatch: "{{workflow.parameters.pod_spec_patch}}"
   volumes:
     - name: work
       emptyDir: {}
@@ -33,9 +43,16 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       container:
         image: "{{workflow.parameters.agent_image}}"
-        command: [bash, -c, "tar xzf /fixture/fixture.tgz -C /work && bash /work/fixture/run-fixture.sh"]
+        imagePullPolicy: IfNotPresent
+        command: [bash, -c]
+        args:
+          - |
+            tar xzf /fixture/fixture.tgz -C /work
+            if [ "{{workflow.parameters.mode}}" = cancel ]; then exec sleep 600; fi
+            bash /work/fixture/run-fixture.sh
+            bash /work/probes/negative-probes.sh
         env:
-          - {name: WORKDIR, value: /work}
+          - {name: WORKDIR, value: /work/run}
           - {name: HTTPS_PROXY, value: "http://squid.spike881.svc:3128"}
           - {name: https_proxy, value: "http://squid.spike881.svc:3128"}
         securityContext:

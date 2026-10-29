@@ -1,19 +1,28 @@
-"""Parse fixture JSON lines into a per-runtime JSON file and a markdown table.
+"""Parse fixture JSON lines into per-runtime JSON files and markdown tables.
 
-Usage: python -I collect.py --out DIR runc=runc.log gvisor=gvisor.log [...]
-Each log holds the fixture's JSON lines (other lines are ignored). Repeated
-runs of one op use the last record. Cells are pass, fail:<stderr tail> or
-not-exercised, matching the spike #881 report's scorecard grammar.
+Usage: python -I collect.py --out DIR --runs N runc=runc.log gvisor=gvisor.log [...]
+Each log holds the JSON lines of all N passes of one runtime (other lines are
+ignored): fixture ops ({"op", "ok", "seconds", "stderr_tail"}), probes
+({"probe", "value"}) and metrics ({"metric", ...}). Every record is kept, so a
+failure in any pass survives later passes.
+
+Scorecard cells follow the spike #881 report grammar: pass (all N passes ok),
+fail:<k>/<N> <stderr tail> (k passes failed or produced no record), or
+not-exercised (no record at all). A missing record is a failure, never a pass:
+a pass that crashed before reporting must not shrink the denominator.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
+import statistics
 from pathlib import Path
 
 
-def parse_lines(text: str) -> dict[str, dict]:
-    ops: dict[str, dict] = {}
+def parse_lines(text: str) -> dict[str, list[dict]]:
+    """Group every record by key: op name, "probe:<name>" or "metric:<name>"."""
+    out: dict[str, list[dict]] = {}
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -22,43 +31,93 @@ def parse_lines(text: str) -> dict[str, dict]:
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(rec, dict) and "op" in rec and "ok" in rec:
-            ops[str(rec["op"])] = rec
-    return ops
+        if not isinstance(rec, dict):
+            continue
+        if "op" in rec and "ok" in rec:
+            key = str(rec["op"])
+        elif "probe" in rec:
+            key = f"probe:{rec['probe']}"
+        elif "metric" in rec:
+            key = f"metric:{rec['metric']}"
+        else:
+            continue
+        out.setdefault(key, []).append(rec)
+    return out
 
 
-def cell(rec: dict | None) -> str:
-    if rec is None:
+def _ops(records: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    return {k: v for k, v in records.items() if ":" not in k}
+
+
+def cell(recs: list[dict] | None, runs: int) -> str:
+    if not recs:
         return "not-exercised"
-    if rec["ok"]:
+    failed = [r for r in recs if not r.get("ok")]
+    missing = max(runs - len(recs), 0)
+    if not failed and not missing:
         return "pass"
-    tail = " ".join(str(rec.get("stderr_tail", "")).split()).replace("|", "/")
-    return f"fail:{tail or 'no stderr'}"
+    tail = ""
+    if failed:
+        tail = " ".join(str(failed[-1].get("stderr_tail", "")).split()).replace("|", "/")
+    elif missing:
+        tail = "no record from the pass"
+    return f"fail:{len(failed) + missing}/{max(runs, len(recs))} {tail or 'no stderr'}"
 
 
-def markdown(results: dict[str, dict[str, dict]]) -> str:
+def median_seconds(recs: list[dict] | None) -> float | None:
+    vals = [float(r["seconds"]) for r in recs or [] if r.get("ok") and "seconds" in r]
+    return statistics.median(vals) if vals else None
+
+
+def markdown(results: dict[str, dict[str, list[dict]]], runs: int) -> str:
     runtimes = list(results)
-    ops = sorted({op for r in results.values() for op in r})
+    ops = sorted({op for r in results.values() for op in _ops(r)})
     lines = ["| op | " + " | ".join(runtimes) + " |", "|---|" + "---|" * len(runtimes)]
     for op in ops:
-        lines.append(f"| {op} | " + " | ".join(cell(results[r].get(op)) for r in runtimes) + " |")
+        lines.append(f"| {op} | " + " | ".join(cell(results[r].get(op), runs) for r in runtimes) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def performance(results: dict[str, dict[str, list[dict]]], base: str = "runc") -> str:
+    """Median seconds of passing records per op, plus overhead versus base."""
+    runtimes = list(results)
+    ops = sorted({op for r in results.values() for op in _ops(r)})
+    head = ["op"] + [f"{r} median s" for r in runtimes] + [f"{r} vs {base}" for r in runtimes if r != base]
+    lines = ["| " + " | ".join(head) + " |", "|---|" + "---|" * (len(head) - 1)]
+    for op in ops:
+        meds = {r: median_seconds(results[r].get(op)) for r in runtimes}
+        row = [op] + ["n/a" if meds[r] is None else f"{meds[r]:.3f}" for r in runtimes]
+        for r in runtimes:
+            if r == base:
+                continue
+            b, v = meds.get(base), meds[r]
+            row.append("n/a" if not b or v is None else f"{(v - b) / b * 100:+.1f}%")
+        lines.append("| " + " | ".join(row) + " |")
     return "\n".join(lines) + "\n"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--runs", type=int, required=True, help="passes dispatched per runtime")
     ap.add_argument("logs", nargs="+", help="runtime=path")
     args = ap.parse_args()
-    results: dict[str, dict[str, dict]] = {}
+    results: dict[str, dict[str, list[dict]]] = {}
     for spec in args.logs:
         name, _, path = spec.partition("=")
-        results[name] = parse_lines(Path(path).read_text(encoding="utf-8"))
+        p = Path(path)
+        # A runtime whose log was never written is reported as not-exercised.
+        text = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+        results[name] = parse_lines(text)
     args.out.mkdir(parents=True, exist_ok=True)
-    for name, ops in results.items():
-        (args.out / f"{name}.json").write_text(json.dumps(ops, indent=2, sort_keys=True), encoding="utf-8")
-    (args.out / "scorecard.md").write_text(markdown(results), encoding="utf-8")
-    print(markdown(results))
+    for name, recs in results.items():
+        (args.out / f"{name}.json").write_text(json.dumps(recs, indent=2, sort_keys=True), encoding="utf-8")
+    score = markdown(results, args.runs)
+    perf = performance(results)
+    (args.out / "scorecard.md").write_text(score, encoding="utf-8")
+    (args.out / "performance.md").write_text(perf, encoding="utf-8")
+    print(score)
+    print(perf)
     return 0
 
 

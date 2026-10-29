@@ -1,7 +1,9 @@
 """Guard for the #881 pod sandbox runtime spike report and its collect.py."""
+
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 from pathlib import Path
 
@@ -59,8 +61,8 @@ def test_scorecard_cells() -> None:
     rows = _rows("## 4. Compatibility scorecard")
     assert rows
     for cells in rows:
-        assert len(cells) == 6, cells
-        for c in cells[1:5]:
+        assert len(cells) == 4, cells
+        for c in cells[1:3]:
             assert CELL.fullmatch(c), c
 
 
@@ -68,14 +70,53 @@ def test_no_token_shaped_strings() -> None:
     assert not re.search(r"ghp_|gho_|github_pat_|sk-ant-|-----BEGIN", _text())
 
 
-def test_collect_canned_output() -> None:
+def _collect():
     spec = importlib.util.spec_from_file_location("collect881", COLLECT)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    runc = mod.parse_lines('noise\n{"op":"go_test","ok":true,"seconds":1.0,"stderr_tail":""}\n')
-    gv = mod.parse_lines('{"op":"go_test","ok":false,"seconds":2.0,"stderr_tail":"ptrace: not permitted"}\n')
-    assert runc["go_test"]["ok"] is True
-    table = mod.markdown({"runc": runc, "gvisor": gv})
-    assert "| go_test | pass | fail:ptrace: not permitted |" in table
-    assert mod.cell(None) == "not-exercised"
+    return mod
+
+
+def _rec(op: str, ok: bool, seconds: float, tail: str = "") -> str:
+    return json.dumps({"op": op, "ok": ok, "seconds": seconds, "stderr_tail": tail})
+
+
+def test_collect_canned_output() -> None:
+    mod = _collect()
+    runc = mod.parse_lines("noise\n" + _rec("go_test", True, 1.0) + "\n")
+    gv = mod.parse_lines(_rec("go_test", False, 2.0, "ptrace: not permitted") + "\n")
+    assert runc["go_test"][0]["ok"] is True
+    table = mod.markdown({"runc": runc, "gvisor": gv}, runs=1)
+    assert "| go_test | pass | fail:1/1 ptrace: not permitted |" in table
+    assert mod.cell(None, 1) == "not-exercised"
+
+
+def test_collect_keeps_every_pass() -> None:
+    # A failure in pass 1 must survive nine later passing passes.
+    mod = _collect()
+    lines = [_rec("npm_ci", False, 3.0, "EACCES")] + [_rec("npm_ci", True, 1.0)] * 9
+    recs = mod.parse_lines("\n".join(lines))
+    assert len(recs["npm_ci"]) == 10
+    assert mod.cell(recs["npm_ci"], 10) == "fail:1/10 EACCES"
+
+
+def test_collect_missing_pass_is_a_failure() -> None:
+    mod = _collect()
+    recs = mod.parse_lines("\n".join([_rec("c_compile", True, 1.0)] * 7))
+    assert mod.cell(recs["c_compile"], 10) == "fail:3/10 no record from the pass"
+
+
+def test_collect_performance_medians_and_probes() -> None:
+    mod = _collect()
+    runc = mod.parse_lines("\n".join(_rec("go_test", True, s) for s in (1.0, 2.0, 3.0)))
+    gv = mod.parse_lines(
+        "\n".join(
+            [_rec("go_test", True, s) for s in (2.0, 2.5, 9.0)] + ['{"probe": "kernel_release", "value": "4.4.0"}']
+        )
+    )
+    assert gv["probe:kernel_release"][0]["value"] == "4.4.0"
+    perf = mod.performance({"runc": runc, "gvisor": gv})
+    assert "| go_test | 2.000 | 2.500 | +25.0% |" in perf
+    # Probe and metric records never appear as scorecard ops.
+    assert "kernel_release" not in mod.markdown({"runc": runc, "gvisor": gv}, runs=3)

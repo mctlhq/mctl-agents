@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Safe, read-only probes for spike #881. No exploit code, no escape attempts.
-# Prints "probe<TAB>observation" lines.
+# Prints one JSON line per probe: {"probe": ..., "value": ...}.
 set -u
-p() { printf '%s\t%s\n' "$1" "$2"; }
+p() { python3 -I -c 'import json, sys; print(json.dumps({"probe": sys.argv[1], "value": sys.argv[2]}))' "$1" "$2"; }
 p kernel_release "$(uname -r)"
 p dev_listing "$(ls /dev 2>&1 | tr '\n' ' ')"
 p dev_kvm "$(ls -l /dev/kvm 2>&1 | head -1)"
