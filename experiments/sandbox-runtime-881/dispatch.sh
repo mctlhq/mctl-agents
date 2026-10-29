@@ -206,7 +206,8 @@ preflight() { # runtime: one pod must reach a started main container
   if [ "$r" != started ]; then
     diag "$wf" "preflight-$1"
     echo "preflight failed for $1: $r; see $OUT/diag/preflight-$1-$wf.txt" >&2
-    sed -n '1,200p' "$OUT/diag/preflight-$1-${wf:-none}.txt" >&2 || true
+    # Pod events first: the reason is there, not in the long workflow status.
+    sed -n '/^Events:/,/^== node/p' "$OUT/diag/preflight-$1-${wf:-none}.txt" >&2 || true
     stop "$wf"
     return 1
   fi
