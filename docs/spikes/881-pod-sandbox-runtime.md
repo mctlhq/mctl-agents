@@ -176,4 +176,8 @@ Conditions (all required before any agent pod runs under gVisor):
 
 Nothing is rolled out by this spike: no node, CWFT or RuntimeClass in the cluster was changed.
 
+Owner decision 2026-10-29: `runsc` will not be installed on our workers. Condition 1 is therefore not
+scheduled, no follow-up is opened, and agent pods stay on hardened runc. `ADOPT_GVISOR` records what the
+measurement supports; acting on it needs a new owner decision.
+
 Phase B tracking issue: #883. Harness fix that made the measurement possible: #886.
