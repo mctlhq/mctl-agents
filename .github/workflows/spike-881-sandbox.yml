@@ -1,0 +1,103 @@
+name: spike-881 sandbox runtime (manual)
+# Manual only. Compares hardened runc with gVisor on a disposable k3s cluster.
+# Holds no secrets and never touches MCTL production. See
+# experiments/sandbox-runtime-881/README.md; dispatch from main (Phase B).
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Passes per runtime (alternating), 1-20"
+        default: "10"
+permissions:
+  contents: read
+env:
+  K3S_VERSION: v1.34.1+k3s1
+  # sha256 of install.sh at the K3S_VERSION tag.
+  K3S_INSTALL_SHA256: 48fe6ec10517263cc69e1c924cf6b283c59a2b942b9b46186fc7c8d29e6f243a
+  GVISOR_RELEASE: "20251020.0"
+  HELM_VERSION: v3.19.0
+  HELM_SHA256: a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
+  ARGO_CHART_VERSION: 0.47.5
+  E: experiments/sandbox-runtime-881
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate inputs
+        env:
+          RUNS: ${{ inputs.runs }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNS" =~ ^[0-9]+$ ]] && [ "$RUNS" -ge 1 ] && [ "$RUNS" -le 20 ] || { echo "runs must be 1-20, got: $RUNS" >&2; exit 1; }
+          echo "RUNS=$RUNS" >> "$GITHUB_ENV"
+      # The .sha512 files come from the same bucket as the binaries: this checks
+      # integrity, not authenticity.
+      - name: Install gVisor (checksum verified)
+        run: |
+          set -euo pipefail
+          base="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64"
+          cd "$(mktemp -d)"
+          for f in runsc containerd-shim-runsc-v1; do
+            curl -fsSLO "$base/$f"
+            curl -fsSLO "$base/$f.sha512"
+            sha512sum -c "$f.sha512"
+            sudo install -m 0755 "$f" /usr/local/bin/
+          done
+      - name: Install k3s with the runsc handler
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /var/lib/rancher/k3s/agent/etc/containerd
+          # The committed patch is the single source of the template stanza.
+          grep '^+' "$E/k8s/containerd-config.toml.tmpl.patch" | grep -v '^+++' | sed 's/^+//' \
+            | sudo tee /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl >/dev/null
+          curl -fsSL -o /tmp/k3s-install.sh "https://raw.githubusercontent.com/k3s-io/k3s/${K3S_VERSION/+/%2B}/install.sh"
+          echo "${K3S_INSTALL_SHA256}  /tmp/k3s-install.sh" | sha256sum -c -
+          INSTALL_K3S_VERSION="$K3S_VERSION" sh /tmp/k3s-install.sh --write-kubeconfig-mode 644
+          echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> "$GITHUB_ENV"
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl wait --for=condition=Ready node --all --timeout=180s
+      - name: Install Helm (checksum verified)
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"
+          curl -fsSLO "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm-${HELM_VERSION}-linux-amd64.tar.gz" | sha256sum -c -
+          tar xzf "helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+      - name: Install Argo Workflows, RBAC, the proxy and the fixture
+        run: |
+          set -euo pipefail
+          helm repo add argo https://argoproj.github.io/argo-helm
+          helm install argo argo/argo-workflows --version "$ARGO_CHART_VERSION" -n argo --create-namespace --wait
+          kubectl create namespace spike881
+          kubectl apply -f "$E/k8s/rbac.yaml" -f "$E/k8s/runtimeclass-gvisor.yaml" -f "$E/k8s/squid.yaml"
+          kubectl -n spike881 wait --for=condition=Ready pod/squid --timeout=300s
+          tar czf /tmp/fixture.tgz -C "$E" fixture probes
+          kubectl -n spike881 create configmap fixture-881 --from-file=fixture.tgz=/tmp/fixture.tgz
+          kubectl apply -f "$E/k8s/fixture-workflow.yaml"
+      - name: Build agent image with the fixture wheelhouse
+        run: |
+          set -euo pipefail
+          docker build -t agent-881:base .
+          docker build -t agent-881:local --build-arg BASE=agent-881:base -f "$E/Dockerfile.fixture" "$E"
+          # Stream on stdin (sudo closes extra fds) into the CRI namespace k8s.io.
+          docker save agent-881:local | sudo k3s ctr -n k8s.io images import -
+      - name: Run alternating passes
+        run: bash "$E/dispatch.sh" "$RUNS" measurements agent-881:local
+      - name: Runner info and scorecard
+        # Not after a rejected input: RUNS is unset then and the real error is above.
+        if: always() && env.RUNS != ''
+        run: |
+          set -euo pipefail
+          mkdir -p measurements
+          { echo "kvm_on_runner: $(stat -c '%A %n' /dev/kvm 2>&1)"; uname -r; echo "head_sha: $GITHUB_SHA"; echo "run_id: $GITHUB_RUN_ID"; } > measurements/runner-info.txt
+          python3 -I "$E/collect.py" --out measurements --runs "$RUNS" runc=measurements/runc.log gvisor=measurements/gvisor.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spike-881-measurements
+          path: measurements/

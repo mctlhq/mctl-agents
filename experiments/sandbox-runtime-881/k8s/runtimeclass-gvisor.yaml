@@ -1,0 +1,6 @@
+# Disposable-cluster only. Never applied to MCTL production by this spike.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
