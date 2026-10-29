@@ -98,13 +98,14 @@ fixture_pass() { # i runtime
 }
 
 cancel_pass() { # i runtime
-  local wf deadline pod p t0 ok=false
+  local wf deadline pod p t0 ok=false started=false
   wf="$(submit "$2" cancel)" || wf=""
   deadline=$((SECONDS + PASS_LIMIT))
   pod=""
   while [ -n "$wf" ] && [ "$SECONDS" -lt "$deadline" ]; do
     pod="$(pod_of "$wf")"
     if [ -n "$pod" ] && [ "$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.containerStatuses[?(@.name=="main")].state.running.startedAt}' 2>/dev/null)" != "" ]; then
+      started=true
       break
     fi
     case "$(phase "$wf")" in Succeeded|Failed|Error) break ;; esac
@@ -115,8 +116,10 @@ cancel_pass() { # i runtime
   p="$(wait_terminal "$wf" "$CANCEL_LIMIT")"
   # Cancelled means the Workflow went terminal AND its pod stopped running
   # (Argo keeps finished pods, so "stopped" is a non-running phase or no pod).
-  # A pod that never started measures nothing and counts as a failure.
-  if [ -n "$pod" ] && [ "$p" != timeout ]; then
+  # Only a pass whose main container was seen Running can pass: a pod that
+  # never started (e.g. stuck in ContainerCreating until the deadline failed
+  # it) measures nothing and counts as a failure.
+  if [ "$started" = true ] && [ "$p" != timeout ]; then
     while [ $((SECONDS - t0)) -lt "$CANCEL_LIMIT" ]; do
       case "$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || echo gone)" in
         Running|Pending) sleep 2 ;;
@@ -125,7 +128,7 @@ cancel_pass() { # i runtime
     done
   fi
   printf '%s\t%s\tcancel\t%s\t%s\n' "$1" "$2" "$wf" "$p" >>"$OUT/phases.tsv"
-  op "$2" cancellation "$ok" "$((SECONDS - t0))" "phase after terminate: $p"
+  op "$2" cancellation "$ok" "$((SECONDS - t0))" "main started: $started; phase after terminate: $p"
   kubectl -n "$NS" delete workflow "$wf" --wait=true >/dev/null 2>&1 || true
 }
 

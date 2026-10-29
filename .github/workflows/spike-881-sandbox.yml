@@ -89,7 +89,8 @@ jobs:
       - name: Run alternating passes
         run: bash "$E/dispatch.sh" "$RUNS" measurements agent-881:local
       - name: Runner info and scorecard
-        if: always()
+        # Not after a rejected input: RUNS is unset then and the real error is above.
+        if: always() && env.RUNS != ''
         run: |
           set -euo pipefail
           mkdir -p measurements

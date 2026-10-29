@@ -96,6 +96,59 @@ def performance(results: dict[str, dict[str, list[dict]]], base: str = "runc") -
     return "\n".join(lines) + "\n"
 
 
+def _percentile(vals: list[float], q: int) -> float:
+    """Nearest-rank percentile, so a p95 of 10 samples is an observed value."""
+    s = sorted(vals)
+    rank = -(-len(s) * q // 100)  # ceil(n * q / 100)
+    return s[max(0, min(len(s) - 1, rank - 1))]
+
+
+def _stat(text: str, key: str) -> float | None:
+    """Sum of `key=value` (io.stat) or `key value` (cpu.stat) fields in a cgroup file dump."""
+    toks = str(text).replace("=", " ").split()
+    vals = [float(toks[i + 1]) for i, t in enumerate(toks[:-1]) if t == key and toks[i + 1].isdigit()]
+    return sum(vals) if vals else None
+
+
+def resources(results: dict[str, dict[str, list[dict]]]) -> str:
+    """Startup p50/p95 and median cgroup CPU, peak memory and I/O per runtime.
+
+    Reported next to the wall-clock gate, never instead of it. A value the
+    runtime did not expose is n/a, not zero.
+    """
+    head = ["runtime", "startup p50 s", "startup p95 s", "cpu usage s", "memory peak MiB", "io bytes MiB"]
+    lines = ["| " + " | ".join(head) + " |", "|---|" + "---|" * (len(head) - 1)]
+
+    def med(vals: list[float], scale: float) -> str:
+        return f"{statistics.median(vals) / scale:.1f}" if vals else "n/a"
+
+    for name, recs in results.items():
+        starts = [float(r["seconds"]) for r in recs.get("metric:startup", []) if "seconds" in r]
+        cg = recs.get("metric:cgroup", [])
+        cpu = [v for r in cg if (v := _stat(r.get("cpu_stat", ""), "usage_usec")) is not None]
+        mem = [float(m) for r in cg if (m := str(r.get("memory_peak", "")).strip()).isdigit()]
+        io = []
+        for r in cg:
+            rb, wb = _stat(r.get("io_stat", ""), "rbytes"), _stat(r.get("io_stat", ""), "wbytes")
+            if rb is not None or wb is not None:
+                io.append((rb or 0) + (wb or 0))
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    name,
+                    f"{_percentile(starts, 50):.1f}" if starts else "n/a",
+                    f"{_percentile(starts, 95):.1f}" if starts else "n/a",
+                    med(cpu, 1e6),
+                    med(mem, 2**20),
+                    med(io, 2**20),
+                ]
+            )
+            + " |"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, required=True)
@@ -113,7 +166,7 @@ def main() -> int:
     for name, recs in results.items():
         (args.out / f"{name}.json").write_text(json.dumps(recs, indent=2, sort_keys=True), encoding="utf-8")
     score = markdown(results, args.runs)
-    perf = performance(results)
+    perf = performance(results) + "\n" + resources(results)
     (args.out / "scorecard.md").write_text(score, encoding="utf-8")
     (args.out / "performance.md").write_text(perf, encoding="utf-8")
     print(score)

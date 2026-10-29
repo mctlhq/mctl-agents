@@ -120,3 +120,24 @@ def test_collect_performance_medians_and_probes() -> None:
     assert "| go_test | 2.000 | 2.500 | +25.0% |" in perf
     # Probe and metric records never appear as scorecard ops.
     assert "kernel_release" not in mod.markdown({"runc": runc, "gvisor": gv}, runs=3)
+
+
+def test_collect_resources_summary() -> None:
+    mod = _collect()
+    lines = [json.dumps({"metric": "startup", "seconds": s}) for s in range(1, 11)]
+    lines.append(
+        json.dumps(
+            {
+                "metric": "cgroup",
+                "cpu_stat": "usage_usec 3000000 user_usec 2000000 ",
+                "memory_peak": str(64 * 2**20),
+                "io_stat": "8:0 rbytes=1048576 wbytes=1048576 rios=1 ",
+            }
+        )
+    )
+    gv = mod.parse_lines("\n".join(lines))
+    # A runtime that exposes no cgroup files reports n/a, never zero.
+    bare = mod.parse_lines(json.dumps({"metric": "cgroup", "cpu_stat": "unavailable", "memory_peak": "unavailable"}))
+    table = mod.resources({"gvisor": gv, "runc": bare})
+    assert "| gvisor | 5.0 | 10.0 | 3.0 | 64.0 | 2.0 |" in table
+    assert "| runc | n/a | n/a | n/a | n/a | n/a |" in table
