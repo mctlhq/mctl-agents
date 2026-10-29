@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.111.0](https://github.com/mctlhq/mctl-agents/compare/1.110.0...1.111.0) (2026-10-29)
+
+
+### Features
+
+* **agents:** issue-875-spike-how-do-github-agentic-workflows-sa ([4134b71](https://github.com/mctlhq/mctl-agents/commit/4134b71c7bad17ee815f8cd169d6bf37343c92ea))
+* **agents:** issue-876-feat-scout-generate-structured-spike-dra ([d129488](https://github.com/mctlhq/mctl-agents/commit/d129488fa8c4b8895ebcf37a30f40f370c564d6a))
+* **agents:** issue-876-feat-scout-generate-structured-spike-dra ([097c2b5](https://github.com/mctlhq/mctl-agents/commit/097c2b59deb6fbf6efa5c79e16e9c70749071f15))
+* **agents:** issue-881-spike-does-mctl-need-a-stronger-pod-sand ([ef030af](https://github.com/mctlhq/mctl-agents/commit/ef030af8938c1a4dfa3f05815bed7504bf3b72a3))
+* **agents:** issue-881-spike-does-mctl-need-a-stronger-pod-sand ([95b6f69](https://github.com/mctlhq/mctl-agents/commit/95b6f691dafb288750e2682ce8b3f6a9267a08f0))
+
+
+### Bug Fixes
+
+* **spike-881:** cancellation needs a started container; summarise resources ([232eebc](https://github.com/mctlhq/mctl-agents/commit/232eebc85bf89a277f3b5715a2fee7ea8f392800))
+* **spike-881:** make the Phase B harness produce usable data ([82c3e6d](https://github.com/mctlhq/mctl-agents/commit/82c3e6dc94bffcf88f54407a508dfaf5af4039f3))
+
 ## [1.110.0](https://github.com/mctlhq/mctl-agents/compare/1.109.0...1.110.0) (2026-10-28)
 
 
