@@ -917,7 +917,8 @@ def test_loader_does_no_io_beyond_the_single_file_read(tmp_path, monkeypatch):
 
 def test_every_tool_documented_in_the_repo_owned_mcp_tool_inventory_is_classified():
     """docs/diagrams/archify/facts.yaml's mcp_tools list (generated from
-    mctl-api's server.go by tools/diagram_facts.py) is the checked-in
+    every NewTool definition in mctl-api's internal/mcp/ by
+    tools/diagram_facts.py) is the checked-in
     source of truth for the advertised tool set this table classifies."""
     import yaml
 

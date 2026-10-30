@@ -326,7 +326,21 @@ def configured_approvals() -> ApprovalLookup:
 # make on their own. Tool names appear both as `mctl_<verb>_...` (mctl-api's
 # own naming) and as a bare `<verb>_...`, so both spellings are listed.
 _READ_VERBS = ("get_", "list_", "read_", "search_", "describe_")
-_READ_TOOLS = ("whoami", "incident_summary", "resolve_agent")
+#: Reads whose name carries no read verb. Each is annotated
+#: `ReadOnlyHint(true)` in mctl-api; the last five were added on the owner's
+#: decision on mctlhq/mctl-agents#888 (2026-10-30): a static analysis of a
+#: pinned commit, the evidence for a lifecycle recovery decision, a wave plan
+#: that starts nothing, and ERPact's two site reads.
+_READ_TOOLS = (
+    "whoami",
+    "incident_summary",
+    "resolve_agent",
+    "deploy_analyze",
+    "inspect_lifecycle_conflict",
+    "plan_epic_wave",
+    "erpact_list_sites",
+    "erpact_site_status",
+)
 #: Mutations an agent performs by design: the incident responder resolves
 #: and acknowledges incidents. Nothing here deploys, deletes, grants,
 #: approves or starts a run: `trigger_issue` starts a paid investigator

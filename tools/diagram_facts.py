@@ -109,6 +109,46 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+# A tool is defined by `mcplib.NewTool("mctl_<name>", ...)` and registered by
+# `srv.AddTool(...)`. Anchoring on NewTool, not on any "mctl_*" string
+# literal, keeps tool names quoted in descriptions out of the inventory.
+_MCP_TOOL_DEF_RE = re.compile(r'\bNewTool\(\s*"(mctl_[a-z0-9_]+)"')
+_MCP_TOOL_ADD_RE = re.compile(r"\bsrv\.AddTool\(")
+
+
+def mcp_tools_from_api(api: Path) -> tuple[list[str], int]:
+    """mctl-api's MCP tool inventory: (sorted tool names, AddTool call count).
+
+    Both are read from the same file set: every non-test Go file under
+    internal/mcp/. Reading server.go alone missed every tool defined in a
+    sibling file (commerce.go, lifecycle*.go, roadmap*.go, signup.go,
+    support.go, usage.go, workitems.go) while the AddTool count still saw
+    them, so the two disagreed (mctlhq/mctl-agents#888). They stay two
+    separate counts on purpose: a tool defined but never registered, or
+    registered twice, shows up as a mismatch instead of being hidden.
+
+    A tree with no Go files or no tool definitions is a failed read, never
+    an empty inventory: it raises instead of recording zero tools.
+    """
+    mcp_dir = api / "internal" / "mcp"
+    sources = sorted(
+        p
+        for p in mcp_dir.rglob("*.go")
+        if not p.name.endswith("_test.go") and "testdata" not in p.relative_to(mcp_dir).parts
+    )
+    if not sources:
+        raise FileNotFoundError(f"no Go sources under {mcp_dir}")
+    names: set[str] = set()
+    count = 0
+    for path in sources:
+        text = _read(path)
+        names.update(_MCP_TOOL_DEF_RE.findall(text))
+        count += len(_MCP_TOOL_ADD_RE.findall(text))
+    if not names:
+        raise ValueError(f'no NewTool("mctl_*") definitions under {mcp_dir}')
+    return sorted(names), count
+
+
 def facts_from_code(gitops: Path | None, api: Path | None, repo_root: Path = REPO_ROOT) -> dict[str, Any]:
     facts: dict[str, Any] = {}
 
@@ -171,9 +211,7 @@ def facts_from_code(gitops: Path | None, api: Path | None, repo_root: Path = REP
             facts["policy_ceilings"] = {k: spec.get(k) for k in ("maxBudgetUsd", "maxTimeoutSeconds") if k in spec}
 
     if api is not None:
-        server = _read(api / "internal" / "mcp" / "server.go")
-        facts["mcp_tool_count"] = len(re.findall(r"srv\.AddTool\(", server))
-        facts["mcp_tools"] = sorted(set(re.findall(r'"(mctl_[a-z_]+)"', server)))
+        facts["mcp_tools"], facts["mcp_tool_count"] = mcp_tools_from_api(api)
         registry = _read(api / "internal" / "operations" / "registry.go")
         facts["operations"] = sorted(set(re.findall(r'^\s*Name:\s*"([a-z-]+)",\s*$', registry, re.M)))
         types_go = _read(api / "internal" / "agentregistry" / "types.go")
