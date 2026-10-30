@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.112.0](https://github.com/mctlhq/mctl-agents/compare/1.111.2...1.112.0) (2026-10-30)
+
+
+### Features
+
+* **agents:** issue-807-spike-which-kubernetes-primitives-rbac-n ([779d3f4](https://github.com/mctlhq/mctl-agents/commit/779d3f4250f0fc5852afd4922cf38e3a5b99ff77))
+* **scout:** send header-only drafts, mctl-agent adds the scaffold ([8a85a9f](https://github.com/mctlhq/mctl-agents/commit/8a85a9fa2f0ac21404ef26e3505dcd972a225217))
+* **scout:** send header-only drafts, mctl-agent adds the scaffold ([dbfd15e](https://github.com/mctlhq/mctl-agents/commit/dbfd15e07b43c759540807b7bdbda5c5a0a1dadb))
+
 ## [1.111.2](https://github.com/mctlhq/mctl-agents/compare/1.111.1...1.111.2) (2026-10-30)
 
 
