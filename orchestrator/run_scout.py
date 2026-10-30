@@ -128,6 +128,18 @@ async def run_scout(
     else:
         try:
             mid = send_message(token, chat_id, text, markup)
+        except TelegramError as exc:
+            print(f"scout: {exc}", file=sys.stderr)
+            if not markup or "reply markup" not in str(exc):
+                return 1
+            # The keyboard budget is a guess at an undocumented limit: if Telegram
+            # still refuses the keyboard, deliver the digest bare and stay red.
+            try:
+                send_message(token, chat_id, text, None)
+            except TelegramError as exc2:
+                print(f"scout: {exc2}", file=sys.stderr)
+            return 1
+        try:
             for o in overflow:
                 send_message(token, chat_id, o, None, reply_to=mid)
         except TelegramError as exc:

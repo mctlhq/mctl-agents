@@ -510,3 +510,59 @@ def test_session_failure_still_renders_digest(monkeypatch, tmp_path, capsys):
     rc = asyncio.run(run_scout.run_scout(True, None, cfg, client_factory=boom, http_transport=tr, now=NOW))
     cap = capsys.readouterr()
     assert rc == 0 and "RuntimeError" in cap.err and "fetched 1" in cap.out
+
+
+def _worst(i):
+    return _scored(id=f"a{i}", repo="mctl-agents", link=f"https://x.test/{i}/" + "a" * 85, question="q" * 240,
+                   outcomes="o" * 60, why_en="w" * 200, related=["mctlhq/mctl-agents#123"] * 3)
+
+
+def _bodies(markup):
+    return [parse_qs(urlsplit(row[0]["url"]).query)["body"][0] for row in markup["inline_keyboard"]]
+
+
+def test_keyboard_fits_markup_budget_at_top_n():
+    # 2026-10-30: ten full structured drafts made Telegram reject the whole digest
+    # with "reply markup is too long".
+    ok = feeds.SourceResult("s", "ok", items=[])
+    items = [_worst(i) for i in range(10)]
+    _text, markup, overflow = render.render_digest(items, [ok], render.Counts(), "run-20261030")
+    rows = markup["inline_keyboard"]
+    assert len(json.dumps(markup)) <= render.MAX_MARKUP_CHARS
+    assert [r[1]["callback_data"] for r in rows] == [f"scout:create:{n}" for n in range(1, len(rows) + 1)]
+    bodies = _bodies(markup)
+    assert all(h in bodies[0] for h in _HEADINGS)
+    assert all(dedupe._SOURCE_RE.search(b) for b in bodies)
+    assert overflow == []
+
+
+def test_keyboard_keeps_full_drafts_under_budget():
+    ok = feeds.SourceResult("s", "ok", items=[])
+    items = [_scored(id=f"a{i}", link=f"https://x.test/{i}") for i in range(3)]
+    _text, markup, _ = render.render_digest(items, [ok], render.Counts(), "r")
+    assert all(all(h in b for h in _HEADINGS) for b in _bodies(markup))
+
+
+def test_markup_rejection_resends_digest_without_keyboard(monkeypatch, tmp_path):
+    cfg = _env_feed(monkeypatch, tmp_path)
+    monkeypatch.setenv("SCOUT_TELEGRAM_BOT_TOKEN", "TOK")
+    monkeypatch.setenv("SCOUT_TELEGRAM_CHAT_ID", "1")
+    date = NOW.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    tr = httpx.MockTransport(lambda r: httpx.Response(200, text=RSS.format(date=date)))
+
+    def responder(prompt):
+        if "<platform>" in prompt:
+            return _Msg({"items": [_row("a0")]}, 0.1)
+        return _Msg({"items": [{"id": "a0", "relevant": True, "why": "w"}]}, 0.1)
+    monkeypatch.setattr(run_scout.backlog_mod, "collect_backlog", lambda: [])
+    sent = []
+
+    def send(token, chat_id, text, markup=None, reply_to=None):
+        sent.append(markup)
+        if markup:
+            raise telegram.TelegramError("sendMessage failed: HTTP 400 Bad Request: reply markup is too long")
+        return 1
+    monkeypatch.setattr(run_scout, "send_message", send)
+    rc = asyncio.run(run_scout.run_scout(False, None, cfg, client_factory=_factory(responder, []),
+                                         http_transport=tr, now=NOW))
+    assert rc == 1 and len(sent) == 2 and sent[0] and sent[1] is None
