@@ -17,8 +17,9 @@ MAX_MESSAGE_CHARS = 4096
 MAX_MARKUP_CHARS = 9000
 
 
-# Static, compact scaffold: the button URL carries the body, so prose size is budgeted
-# (see tests/test_scout.py::test_draft_url_worst_case_fields_fit).
+# Static scaffold. It is NOT sent in the button URL: mctl-agent internal/scoutspike
+# inserts the same text (pinned byte for byte against draft_body) when "Create spike"
+# builds the issue, so ten URLs stay under Telegram's reply-markup limit.
 SPIKE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Existing / duplicate check",
      ("Verify Related against current issues/code; reuse an existing owner, no parity-only capability.",)),
@@ -91,14 +92,16 @@ def _url(repo: str, title: str, body: str) -> str:
     return f"https://github.com/mctlhq/{repo}/issues/new?{q}"
 
 
-def draft_url(item: Scored, run_id: str, scaffold: bool = True) -> tuple[str, str | None]:
-    """Return (url, full_body_if_fallback). Fallback uses the short body."""
+def draft_url(item: Scored, run_id: str) -> tuple[str, str | None]:
+    """Return (url, full_body_if_fallback).
+
+    The URL carries the header-only body; the fallback is the full structured body.
+    """
     title = f"spike: {item.question}"
-    body = draft_body(item, run_id, scaffold)
-    url = _url(item.repo, title, body)
+    url = _url(item.repo, title, draft_body(item, run_id, scaffold=False))
     if len(url) <= MAX_BUTTON_URL_CHARS:
         return url, None
-    return source_only_url(item), body
+    return source_only_url(item), draft_body(item, run_id)
 
 
 def source_only_url(item: Scored) -> str:
@@ -124,9 +127,9 @@ def markup_size(rows: list[list[dict[str, str]]]) -> int:
 def build_keyboard(items: list[Scored], run_id: str) -> tuple[list[list[dict[str, str]]], list[tuple[int, str]]]:
     """Rows for items within MAX_MARKUP_CHARS, plus (n, full_body) for drafts cut by the URL cap.
 
-    Higher-ranked items keep the richest draft that still leaves room for every
-    later item at its smallest (Source-only) form. A draft dropped only for the
-    keyboard budget gets no reply: "Create spike" builds the issue from the URL.
+    Higher-ranked items keep the header-only draft while it still leaves room for
+    every later item at its smallest (Source-only) form. A draft dropped only for
+    the keyboard budget gets no reply; "Create spike" still adds the scaffold.
     """
     floor = [_row(n, source_only_url(it)) for n, it in enumerate(items, 1)]
     rows: list[list[dict[str, str]]] = []
@@ -134,13 +137,11 @@ def build_keyboard(items: list[Scored], run_id: str) -> tuple[list[list[dict[str
     for n, it in enumerate(items, 1):
         rest = floor[n:]
         chosen = floor[n - 1]
-        for scaffold in (True, False):
-            url, full = draft_url(it, run_id, scaffold)
-            if markup_size([*rows, _row(n, url), *rest]) <= MAX_MARKUP_CHARS:
-                chosen = _row(n, url)
-                if full and scaffold:
-                    fallbacks.append((n, f"Draft {n}:\n{html.escape(full)}"))
-                break
+        url, full = draft_url(it, run_id)
+        if markup_size([*rows, _row(n, url), *rest]) <= MAX_MARKUP_CHARS:
+            chosen = _row(n, url)
+            if full:
+                fallbacks.append((n, f"Draft {n}:\n{html.escape(full)}"))
         rows.append(chosen)
     return rows, fallbacks
 
