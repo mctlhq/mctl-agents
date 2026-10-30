@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.111.2](https://github.com/mctlhq/mctl-agents/compare/1.111.1...1.111.2) (2026-10-30)
+
+
+### Bug Fixes
+
+* **scout:** budget the digest keyboard under Telegram's markup limit ([36d65f7](https://github.com/mctlhq/mctl-agents/commit/36d65f72026c9f05bfe66ca90ede276288741e14))
+* **scout:** budget the digest keyboard under Telegram's markup limit ([e28d78f](https://github.com/mctlhq/mctl-agents/commit/e28d78fb0aa9d50abf149efd3dd8372478c06f85))
+
 ## [1.111.1](https://github.com/mctlhq/mctl-agents/compare/1.111.0...1.111.1) (2026-10-29)
 
 
