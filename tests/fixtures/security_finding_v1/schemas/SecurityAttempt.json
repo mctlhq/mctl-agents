@@ -1,0 +1,70 @@
+{
+  "description": "One remediation cycle of an occurrence.",
+  "properties": {
+    "affected_revisions": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "candidate_revision": {
+      "type": "string"
+    },
+    "devloop_workflow_id": {
+      "type": "string"
+    },
+    "ended_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "execution_id": {
+      "type": "string"
+    },
+    "id": {
+      "description": "sra_...",
+      "type": "string"
+    },
+    "landed_artifact_digest": {
+      "type": "string"
+    },
+    "landed_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "landed_ref": {
+      "type": "string"
+    },
+    "landed_revision": {
+      "type": "string"
+    },
+    "occurrence_id": {
+      "type": "string"
+    },
+    "outcome": {
+      "description": "Absent while the attempt is active",
+      "enum": [
+        "resolved",
+        "superseded",
+        "cancelled_dismissed"
+      ],
+      "type": "string"
+    },
+    "seq": {
+      "type": "integer"
+    },
+    "start_source": {
+      "type": "string"
+    },
+    "started_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "started_by": {
+      "type": "string"
+    },
+    "work_item_id": {
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

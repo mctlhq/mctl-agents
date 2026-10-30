@@ -1,0 +1,10 @@
+# Spike-only layer on top of the agent image: a wheelhouse for the offline
+# uv/pytest/mypy/ruff op. Without it that op fails under runc and gVisor alike,
+# for a reason unrelated to the runtime, and the gVisor gate could never pass.
+ARG BASE=agent-881:base
+FROM ${BASE}
+USER root
+RUN /usr/local/bin/python3 -m pip download --no-cache-dir --only-binary=:all: --dest /wheels \
+        pytest==9.2.0 mypy==2.4.1 ruff==0.17.3 \
+    && chmod -R a+rX /wheels
+USER app:app

@@ -1,0 +1,26 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "devloop_workflow_id": {
+      "type": "string"
+    },
+    "execution_id": {
+      "type": "string"
+    },
+    "expected_state_version": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "start_source": {
+      "type": "string"
+    },
+    "work_item_id": {
+      "description": "An existing WorkItem (wi_...) in the occurrence's tenant",
+      "type": "string"
+    }
+  },
+  "required": [
+    "work_item_id"
+  ],
+  "type": "object"
+}

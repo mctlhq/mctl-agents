@@ -1,0 +1,42 @@
+{
+  "properties": {
+    "code": {
+      "enum": [
+        "subject_too_weak",
+        "finding_alias_conflict",
+        "invalid_request",
+        "tenant_not_allowed",
+        "internal_error"
+      ],
+      "type": "string"
+    },
+    "finding_id": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    },
+    "observation_id": {
+      "type": "string"
+    },
+    "occurrence_id": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "created",
+        "duplicate",
+        "rejected"
+      ],
+      "type": "string"
+    },
+    "transition": {
+      "description": "The state the occurrence entered because of this observation, when it changed",
+      "type": "string"
+    }
+  },
+  "required": [
+    "status"
+  ],
+  "type": "object"
+}

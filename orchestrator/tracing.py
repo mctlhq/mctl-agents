@@ -47,6 +47,8 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
+from orchestrator import classifier_notice
+
 logger = logging.getLogger(__name__)
 
 # W3C trace context, as carried across the Temporal -> Argo -> pod boundary.
@@ -99,6 +101,9 @@ ISSUE_NUMBER = "mctl.issue.number"
 PR_NUMBER = "mctl.pr.number"
 TOOL_NAME = "mctl.tool.name"
 TOOL_STATUS = "mctl.tool.status"
+# Claude Code safety-classifier notices in one agent run: an int, or
+# "unobserved" when the stream was not seen whole (mctl-agents#849).
+CLASSIFIER_INTERRUPTIONS = "mctl.agent.classifier_interruptions"
 ERROR_TYPE = "error.type"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -950,7 +955,9 @@ class AgentRunObserver:
     never imports `claude_agent_sdk` (the worker must not). Reads only:
     model names, message ids, usage counters, stop/error codes, tool names,
     tool-use ids and the `is_error` flag. Never a content block's text, a
-    tool's `input`, or a tool result's `content`.
+    tool's `input`, or a tool result's `content` -- with one exception:
+    `classifier_notice.InterruptionCounter` scans them for the fixed safety-
+    classifier notice and keeps only a count (mctl-agents#849).
 
     Span shape, per agent run:
 
@@ -969,8 +976,11 @@ class AgentRunObserver:
     starts. Without a seed the first chat span of a scope would be zero-length.
     """
 
-    def __init__(self, root: SpanHandle, model: str | None, usage: Any = None) -> None:
+    def __init__(
+        self, root: SpanHandle, model: str | None, usage: Any = None, provider: str = PROVIDER
+    ) -> None:
         self._root = root
+        self._provider = provider
         self._model = model
         # The usage producer (orchestrator/usage_ledger.UsageRecorder) or
         # None. It sees every message whether this span records or not:
@@ -984,6 +994,9 @@ class AgentRunObserver:
         # Per-attribute usage summed over result frames; a key is present only
         # if some frame reported it (cache counters are never fabricated as 0).
         self._usage_totals: dict[str, int] = {}
+        # Fed whether this span records or not, like the usage producer.
+        self._interruptions = classifier_notice.InterruptionCounter()
+        self.classifier_interruptions: int | str = classifier_notice.UNOBSERVED
 
     # -- public -----------------------------------------------------------
 
@@ -1001,6 +1014,7 @@ class AgentRunObserver:
         try:
             if self._usage is not None:
                 self._usage.observe(message)
+            self._interruptions.observe(message)
             if not self._root.recording:
                 return
             kind = type(message).__name__
@@ -1014,7 +1028,9 @@ class AgentRunObserver:
             _warn_once("observe", "could not trace an SDK message (%s)", type(exc).__name__)
 
     def close(self, error: BaseException | None = None) -> None:
+        self.classifier_interruptions = self._interruptions.result(error)
         try:
+            self._root.set_attributes({CLASSIFIER_INTERRUPTIONS: self.classifier_interruptions})
             for scope in list(self._chats):
                 self._end_chat(scope)
             for handle in self._tools.values():
@@ -1054,7 +1070,7 @@ class AgentRunObserver:
             model = _bounded(getattr(message, "model", None), 128)
             attributes: dict[str, Any] = {
                 "gen_ai.operation.name": "chat",
-                "gen_ai.provider.name": PROVIDER,
+                "gen_ai.provider.name": self._provider,
             }
             if self._model:
                 attributes["gen_ai.request.model"] = self._model
@@ -1145,7 +1161,7 @@ class _NoopObserver(AgentRunObserver):
         super().__init__(NOOP, None, usage)
 
     def close(self, error: BaseException | None = None) -> None:
-        return None
+        self.classifier_interruptions = self._interruptions.result(error)
 
 
 class agent_run:
@@ -1162,8 +1178,9 @@ class agent_run:
     built when the span opens (`__enter__`, not `__init__`), so it can carry
     the `invoke_agent` span's trace and span ids."""
 
-    def __init__(self, agent: str, model: str | None) -> None:
+    def __init__(self, agent: str, model: str | None, *, session_env: Mapping[str, str] | None = None) -> None:
         self._agent = agent
+        self._session_env = session_env
         self._model = model
         self._span_cm: Any = None
         self._usage: Any = None
@@ -1178,11 +1195,18 @@ class agent_run:
 
             ids = current_trace_ids()
             if ids is not None:
-                return usage_ledger.UsageRecorder.from_env(self._agent, trace_id=ids[0], span_id=ids[1])
-            return usage_ledger.UsageRecorder.from_env(self._agent)
+                return usage_ledger.UsageRecorder.from_env(
+                    self._agent, session_env=self._session_env, trace_id=ids[0], span_id=ids[1]
+                )
+            return usage_ledger.UsageRecorder.from_env(self._agent, session_env=self._session_env)
         except Exception as exc:  # noqa: BLE001
             _warn_once("usage", "usage recording unavailable for this run (%s)", type(exc).__name__)
             return None
+
+    def _provider_name(self) -> str:
+        prov = getattr(self._usage, "provenance", None)
+        name = getattr(prov, "provider", None) if getattr(prov, "third_party", False) else None
+        return name if isinstance(name, str) and name else PROVIDER
 
     def __enter__(self) -> AgentRunObserver:
         if not _state.enabled:
@@ -1200,11 +1224,17 @@ class agent_run:
         self._span_cm = span(f"invoke_agent {self._agent}", attributes, kind="client")
         handle = self._span_cm.__enter__()
         self._usage = self._build_recorder()  # the invoke_agent span is current here
-        self._observer = AgentRunObserver(handle, self._model, self._usage)
+        provider = self._provider_name()
+        if provider != PROVIDER:
+            handle.set_attributes({"gen_ai.provider.name": provider})
+        self._observer = AgentRunObserver(handle, self._model, self._usage, provider)
         return self._observer
 
     def __exit__(self, exc_type: Any, exc: BaseException | None, tb: Any) -> None:
         self._observer.close(exc)
+        # Always printed, tracing on or off, so the run's log carries it;
+        # 0 and "unobserved" included (mctl-agents#849).
+        print(f"info: {self._agent} classifier_interruptions={self._observer.classifier_interruptions}")
         if self._span_cm is not None:
             # span() re-raises the block's exception itself; returning its
             # result (None/False) keeps it propagating exactly once.

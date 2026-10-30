@@ -80,7 +80,7 @@ from typing import Any, cast
 
 import yaml
 
-from config.model_policy import DEFAULT_POLICY_PATH, resolve_model
+from config.model_policy import ProviderSpec, active_policy_path, resolve_model
 from config.settings import MCTL_MCP_URL
 from orchestrator.capability import MCTL_API_PROVIDER_ID, PROVIDER_TYPES, ProviderRef
 from orchestrator.manifest import ManifestError as _ManifestError
@@ -307,12 +307,24 @@ class ExecutionPlan:
     # identical to today's.
     capability_discovery_enabled: bool = False
     capability_providers: tuple[ProviderRef, ...] = ()
+    # Non-Anthropic model endpoint from the model policy, or None.
+    provider: ProviderSpec | None = None
+    # Reasoning effort from the model policy profile, or None (CLI default).
+    effort: str | None = None
 
     def to_log_dict(self) -> dict[str, Any]:
         """JSON-serializable snapshot for structured logging (mctlhq/mctl-agents#227
         acceptance criteria: "ExecutionPlan identifiers are logged in
         structured form")."""
+        provider_log: dict[str, Any] = {}
+        if self.provider is not None:
+            provider_log["provider"] = {
+                "name": self.provider.name,
+                "base_url": self.provider.base_url,
+            }
         return {
+            **provider_log,
+            "effort": self.effort,
             "agent": self.agent,
             "definition_version": self.definition_version,
             "definition_content_hash": self.definition_content_hash,
@@ -905,11 +917,11 @@ def parse_release_binding(
 
 
 def _model_policy_version() -> str:
-    """Version identifier for config/model-policy.yaml at resolution time —
+    """Version identifier for the model policy file that resolve_model loads, at resolution time —
     the declared schema `version:` plus a content hash, so a policy edit
     that changes model routing without bumping `version:` still changes the
     identifier a plan pins."""
-    document, content_hash = _read_yaml_and_hash(DEFAULT_POLICY_PATH)
+    document, content_hash = _read_yaml_and_hash(active_policy_path())
     schema_version = document.get("version")
     return f"v{schema_version}+{content_hash}"
 
@@ -1140,6 +1152,8 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
         binding_source=binding.binding_source,
         model=model_selection.model,
         model_policy_version=_model_policy_version(),
+        provider=model_selection.provider,
+        effort=model_selection.effort,
         prompt_hashes=tuple(_hash_prompt_source(s) for s in definition.prompt_sources),
         skill_hashes=tuple(hashlib.sha256(skill.encode()).hexdigest() for skill in profile.skills),
         tools=profile.tools,

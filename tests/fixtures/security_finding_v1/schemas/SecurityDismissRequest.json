@@ -1,0 +1,32 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "authority_ref": {
+      "maxLength": 512,
+      "type": "string"
+    },
+    "expected_state_version": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "note": {
+      "maxLength": 4096,
+      "type": "string"
+    },
+    "reason": {
+      "enum": [
+        "false_positive",
+        "accepted_risk",
+        "duplicate",
+        "not_applicable",
+        "provider_withdrawn"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "reason",
+    "authority_ref"
+  ],
+  "type": "object"
+}

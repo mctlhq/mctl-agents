@@ -78,6 +78,7 @@ from orchestrator.usage_ledger import (
     DEFAULT_BASE_URL,
     DEVLOOP_STAGES,
     INGEST_PATH,
+    PRICE_SOURCES,
     SCHEMA_VERSION,
     TARGET_REPO_RE,
     TOKEN_ENV,
@@ -109,7 +110,7 @@ _ALLOWED_FIELDS = frozenset({
     "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
     "reasoning_tokens", "web_search_requests",
     "outcome", "api_error_status", "stop_reason", "terminal_reason",
-    "num_turns", "duration_api_ms", "retry_attempt", "recorded_at",
+    "num_turns", "duration_api_ms", "retry_attempt", "recorded_at", "price_source",
 })
 
 # The two shapes `_ALLOWED_FIELDS` (minus session_id/model_key/schema_version,
@@ -122,6 +123,7 @@ _STRING_FIELDS = frozenset({
     "result_uuid", "canonical_model", "provider", "agent", "devloop_stage",
     "target_repo", "work_item_id", "trace_id", "span_id",
     "outcome", "api_error_status", "stop_reason", "terminal_reason", "recorded_at",
+    "price_source",
 })
 _INT_FIELDS = frozenset({
     "issue_number", "pr_number",
@@ -349,7 +351,9 @@ def sanitise(raw: dict[str, Any]) -> dict[str, Any] | None:
     pattern `orchestrator.usage_ledger._checked_correlation` enforces for
     the other producer), or an `issue_number`/`pr_number` that is not a
     positive number or has no accompanying `target_repo` to be read
-    against. In every one of those cases the single offending field is
+    against. The one exception is `price_source`: a value outside
+    `PRICE_SOURCES` is rewritten to `unknown`, never dropped, because its
+    absence means `mctl_catalog`. In every other case the single offending field is
     dropped, with a warning, rather than forwarded — the artifact is
     untrusted input, and the ingest is one transaction, so one malformed
     field would otherwise fail every record chunked into the same batch,
@@ -403,6 +407,18 @@ def sanitise(raw: dict[str, Any]) -> dict[str, Any] | None:
             f"{session_id!r}/{model_key!r} — not in the devloop_stage vocabulary"
         )
         del sanitised["devloop_stage"]
+
+    # price_source fails closed instead of being dropped: absent on the wire
+    # means mctl_catalog, so dropping a malformed value would get a
+    # third-party record priced from the catalog. Any value the producer did
+    # write but that is not in the vocabulary (including one the type check
+    # above already dropped) is forwarded as `unknown`.
+    if "price_source" in raw and sanitised.get("price_source") not in PRICE_SOURCES:
+        print(
+            f"WARN: rewriting field 'price_source'={raw['price_source']!r} of record "
+            f"{session_id!r}/{model_key!r} to 'unknown' — not in the price_source vocabulary"
+        )
+        sanitised["price_source"] = "unknown"
 
     repo = sanitised.get("target_repo")
     if repo is not None and not TARGET_REPO_RE.match(repo):

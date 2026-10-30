@@ -44,6 +44,8 @@ from orchestrator.temporal import worker as worker_module
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
 from orchestrator.temporal.activities.canonical_execution import EnsuredExecution
 from orchestrator.temporal.activities.execution_requests import (
+    NOT_ATTACHED,
+    UNREADABLE_TYPE,
     AdvanceInput,
     advance_dispatched_execution,
     bind_dispatched_execution,
@@ -1094,6 +1096,54 @@ async def test_a_rejected_request_ends_its_loop_without_running_anything(api, en
     )
 
     assert xr.LOOP_ACTIVE in result.ended and seen == [] and api.executions == []
+
+
+async def test_an_advance_before_the_fulfil_creates_nothing_and_the_fulfil_still_lands(api):
+    """mctlhq/mctl-agents#858: an attach under an engine ref the store does
+    not hold CREATES an execution. An advance that reaches the store before
+    the fulfil (a loop that ended before its bind, a stray run) must not mint
+    the `#xr_` execution itself: the fulfil would then answer `a resume
+    starts a new run` and the request defer for ever."""
+    rid = api.create_request("start")
+    ref = request_engine_ref(workflow_id_for(URL), rid)
+
+    answer = await advance_dispatched_execution(AdvanceInput(work_item_id=WID, engine_ref=ref, phase="Succeeded"))
+
+    assert answer.startswith(NOT_ATTACHED) and api.executions == []
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+    assert outcome.action == dx.FULFILLED and outcome.engine_ref == ref
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Running")]
+
+
+async def test_an_advance_of_a_fulfilled_execution_lands_its_phase(api):
+    """The guard reads the ledger the store answered (mctl-api's `engine_ref`
+    parsed into `temporal_workflow_id`): an execution the fulfil minted is
+    found and advanced, not reported `NOT_ATTACHED`."""
+    rid = api.create_request("start")
+    ref = request_engine_ref(workflow_id_for(URL), rid)
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+    assert outcome.action == dx.FULFILLED
+
+    answer = await advance_dispatched_execution(AdvanceInput(work_item_id=WID, engine_ref=ref, phase="Succeeded"))
+
+    assert not answer.startswith(NOT_ATTACHED) and outcome.execution_id in answer
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Succeeded")]
+
+
+async def test_an_advance_that_cannot_read_the_ledger_raises_and_attaches_nothing(api):
+    """Could not observe is not observed absent: an unreadable ledger is a
+    retry, never `NOT_ATTACHED`, and never an attach."""
+    rid = api.create_request("start")
+    ref = request_engine_ref(workflow_id_for(URL), rid)
+    for path in (f"/api/v1/work-items/{WID}", f"/api/v1/work-items/{WID}/executions"):
+        api.fail[("GET", path)] = _HTTPResult(503, {"code": "unavailable", "error": "mctl-api restarting"})
+
+    with pytest.raises(ApplicationError) as raised:
+        await advance_dispatched_execution(AdvanceInput(work_item_id=WID, engine_ref=ref, phase="Failed"))
+
+    assert raised.value.type == UNREADABLE_TYPE
+    assert api.executions == []
+    assert not [p for m, p, _ in api.requests if m == "POST" and p.endswith("/executions")]
 
 
 # -- resume: onto a live loop versus a finished one ---------------------------

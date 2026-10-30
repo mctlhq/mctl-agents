@@ -1,0 +1,66 @@
+# Mirrors the implement template's pod posture (securityContext, emptyDir,
+# limits, proxy env, runner/executor ServiceAccount split).
+# ConfigMap fixture-881 holds fixture.tgz (fixture/ plus probes/, created by the workflow).
+# pod_spec_patch selects the runtime: '{}' keeps the default runc handler (an
+# empty runtimeClassName is rejected by the API server, so runc never sets the
+# field); '{"runtimeClassName":"gvisor"}' selects gVisor.
+# mode=fixture runs the compatibility ops and the probes; mode=cancel only
+# sleeps, so the dispatcher can stop the workflow and time the cancellation.
+# Applied as a WorkflowTemplate; dispatch.sh submits one Workflow per pass that
+# references it and passes the parameters.
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: fixture-881
+  namespace: spike881
+spec:
+  entrypoint: fixture
+  activeDeadlineSeconds: 1800
+  serviceAccountName: spike881-runner
+  automountServiceAccountToken: false
+  executor:
+    serviceAccountName: spike881-executor
+  arguments:
+    parameters:
+      - name: agent_image
+      - name: pod_spec_patch
+        value: "{}"
+      - name: mode
+        value: fixture
+  podSpecPatch: "{{workflow.parameters.pod_spec_patch}}"
+  volumes:
+    - name: work
+      emptyDir: {}
+    - name: fixture
+      configMap: {name: fixture-881, defaultMode: 0555}
+  templates:
+    - name: fixture
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      container:
+        image: "{{workflow.parameters.agent_image}}"
+        imagePullPolicy: IfNotPresent
+        command: [bash, -c]
+        args:
+          - |
+            tar xzf /fixture/fixture.tgz -C /work
+            if [ "{{workflow.parameters.mode}}" = cancel ]; then exec sleep 600; fi
+            bash /work/fixture/run-fixture.sh
+            bash /work/probes/negative-probes.sh
+        env:
+          - {name: WORKDIR, value: /work/run}
+          - {name: HTTPS_PROXY, value: "http://squid.spike881.svc:3128"}
+          - {name: https_proxy, value: "http://squid.spike881.svc:3128"}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: ["ALL"]}
+        resources:
+          requests: {cpu: 200m, memory: 3Gi, ephemeral-storage: 10Gi}
+          limits: {cpu: 3000m, memory: 8Gi, ephemeral-storage: 11Gi}
+        volumeMounts:
+          - {name: work, mountPath: /work}
+          - {name: fixture, mountPath: /fixture}

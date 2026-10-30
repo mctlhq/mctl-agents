@@ -1,0 +1,280 @@
+{"op": "argo_executor", "ok": true, "seconds": 45.0, "stderr_tail": "workflow phase: Succeeded"}
+{"op": "log_collection", "ok": true, "seconds": 0.0, "stderr_tail": "pod fixture-881-7m5l7"}
+{"op": "git_clone_local", "ok": true, "seconds": 0.021, "stderr_tail": ""}
+{"op": "gh_version", "ok": true, "seconds": 0.038, "stderr_tail": ""}
+{"op": "uv_pytest_mypy_ruff", "ok": true, "seconds": 2.258, "stderr_tail": ""}
+{"op": "npm_ci", "ok": true, "seconds": 0.454, "stderr_tail": ""}
+{"op": "go_test", "ok": true, "seconds": 10.096, "stderr_tail": ""}
+{"op": "go_test_race", "ok": true, "seconds": 13.174, "stderr_tail": ""}
+{"op": "c_compile", "ok": true, "seconds": 0.038, "stderr_tail": ""}
+{"op": "emptydir_io", "ok": true, "seconds": 0.459, "stderr_tail": ""}
+{"op": "dns", "ok": true, "seconds": 0.019, "stderr_tail": ""}
+{"op": "https_direct", "ok": true, "seconds": 0.368, "stderr_tail": ""}
+{"op": "https_proxy", "ok": true, "seconds": 0.371, "stderr_tail": ""}
+{"metric": "cgroup", "cpu_stat": "usage_usec 61617386 user_usec 51873498 system_usec 9743888 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 267 nr_throttled 146 throttled_usec 6801171 nr_bursts 0 burst_usec 0 ", "memory_peak": "659070976 ", "io_stat": "8:0 rbytes=0 wbytes=472035328 rios=0 wios=5899 dbytes=13594624 dios=256 "}
+{"probe": "kernel_release", "value": "7.0.0-1017-azure"}
+{"probe": "dev_listing", "value": "core fd full mqueue null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "}
+{"probe": "dev_kvm", "value": "ls: cannot access '/dev/kvm': No such file or directory"}
+{"probe": "readable:/proc/version", "value": "yes"}
+{"probe": "readable:/proc/kallsyms", "value": "yes"}
+{"probe": "readable:/proc/modules", "value": "yes"}
+{"probe": "entries:/sys/kernel", "value": "37"}
+{"probe": "entries:/sys/firmware", "value": "0"}
+{"probe": "mountinfo_lines", "value": "28"}
+{"probe": "pid1_cgroup", "value": "0::/"}
+{"probe": "cpu_vmx_svm", "value": "4"}
+time="2026-10-29T20:48:44.081Z" level=info msg="sub-process exited" argo=true error="<nil>"
+{"metric": "startup", "seconds": 1.0}
+{"op": "cancellation", "ok": true, "seconds": 11.0, "stderr_tail": "main started: true; phase after terminate: Failed"}
+{"op": "argo_executor", "ok": true, "seconds": 44.0, "stderr_tail": "workflow phase: Succeeded"}
+{"op": "log_collection", "ok": true, "seconds": 0.0, "stderr_tail": "pod fixture-881-l8vz6"}
+{"op": "git_clone_local", "ok": true, "seconds": 0.021, "stderr_tail": ""}
+{"op": "gh_version", "ok": true, "seconds": 0.037, "stderr_tail": ""}
+{"op": "uv_pytest_mypy_ruff", "ok": true, "seconds": 2.252, "stderr_tail": ""}
+{"op": "npm_ci", "ok": true, "seconds": 0.476, "stderr_tail": ""}
+{"op": "go_test", "ok": true, "seconds": 9.892, "stderr_tail": ""}
+{"op": "go_test_race", "ok": true, "seconds": 13.241, "stderr_tail": ""}
+{"op": "c_compile", "ok": true, "seconds": 0.04, "stderr_tail": ""}
+{"op": "emptydir_io", "ok": true, "seconds": 0.501, "stderr_tail": ""}
+{"op": "dns", "ok": true, "seconds": 0.016, "stderr_tail": ""}
+{"op": "https_direct", "ok": true, "seconds": 0.385, "stderr_tail": ""}
+{"op": "https_proxy", "ok": true, "seconds": 0.384, "stderr_tail": ""}
+{"metric": "cgroup", "cpu_stat": "usage_usec 61251940 user_usec 51660057 system_usec 9591883 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 268 nr_throttled 144 throttled_usec 6982548 nr_bursts 0 burst_usec 0 ", "memory_peak": "646742016 ", "io_stat": "8:0 rbytes=0 wbytes=472035328 rios=0 wios=5899 dbytes=13594624 dios=258 "}
+{"probe": "kernel_release", "value": "7.0.0-1017-azure"}
+{"probe": "dev_listing", "value": "core fd full mqueue null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "}
+{"probe": "dev_kvm", "value": "ls: cannot access '/dev/kvm': No such file or directory"}
+{"probe": "readable:/proc/version", "value": "yes"}
+{"probe": "readable:/proc/kallsyms", "value": "yes"}
+{"probe": "readable:/proc/modules", "value": "yes"}
+{"probe": "entries:/sys/kernel", "value": "37"}
+{"probe": "entries:/sys/firmware", "value": "0"}
+{"probe": "mountinfo_lines", "value": "28"}
+{"probe": "pid1_cgroup", "value": "0::/"}
+{"probe": "cpu_vmx_svm", "value": "4"}
+time="2026-10-29T20:50:46.456Z" level=info msg="sub-process exited" argo=true error="<nil>"
+{"metric": "startup", "seconds": 1.0}
+{"op": "cancellation", "ok": true, "seconds": 5.0, "stderr_tail": "main started: true; phase after terminate: Failed"}
+{"op": "argo_executor", "ok": true, "seconds": 45.0, "stderr_tail": "workflow phase: Succeeded"}
+{"op": "log_collection", "ok": true, "seconds": 0.0, "stderr_tail": "pod fixture-881-6v7cb"}
+{"op": "git_clone_local", "ok": true, "seconds": 0.022, "stderr_tail": ""}
+{"op": "gh_version", "ok": true, "seconds": 0.04, "stderr_tail": ""}
+{"op": "uv_pytest_mypy_ruff", "ok": true, "seconds": 2.29, "stderr_tail": ""}
+{"op": "npm_ci", "ok": true, "seconds": 0.449, "stderr_tail": ""}
+{"op": "go_test", "ok": true, "seconds": 9.981, "stderr_tail": ""}
+{"op": "go_test_race", "ok": true, "seconds": 13.056, "stderr_tail": ""}
+{"op": "c_compile", "ok": true, "seconds": 0.042, "stderr_tail": ""}
+{"op": "emptydir_io", "ok": true, "seconds": 0.458, "stderr_tail": ""}
+{"op": "dns", "ok": true, "seconds": 0.014, "stderr_tail": ""}
+{"op": "https_direct", "ok": true, "seconds": 0.348, "stderr_tail": ""}
+{"op": "https_proxy", "ok": true, "seconds": 0.359, "stderr_tail": ""}
+{"metric": "cgroup", "cpu_stat": "usage_usec 60951967 user_usec 51296260 system_usec 9655707 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 265 nr_throttled 148 throttled_usec 6325708 nr_bursts 0 burst_usec 0 ", "memory_peak": "646574080 ", "io_stat": "8:0 rbytes=0 wbytes=472035328 rios=0 wios=5899 dbytes=13594624 dios=261 "}
+{"probe": "kernel_release", "value": "7.0.0-1017-azure"}
+{"probe": "dev_listing", "value": "core fd full mqueue null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "}
+{"probe": "dev_kvm", "value": "ls: cannot access '/dev/kvm': No such file or directory"}
+{"probe": "readable:/proc/version", "value": "yes"}
+{"probe": "readable:/proc/kallsyms", "value": "yes"}
+{"probe": "readable:/proc/modules", "value": "yes"}
+{"probe": "entries:/sys/kernel", "value": "37"}
+{"probe": "entries:/sys/firmware", "value": "0"}
+{"probe": "mountinfo_lines", "value": "28"}
+{"probe": "pid1_cgroup", "value": "0::/"}
+{"probe": "cpu_vmx_svm", "value": "4"}
+time="2026-10-29T20:52:48.821Z" level=info msg="sub-process exited" argo=true error="<nil>"
+{"metric": "startup", "seconds": 1.0}
+{"op": "cancellation", "ok": true, "seconds": 11.0, "stderr_tail": "main started: true; phase after terminate: Failed"}
+{"op": "argo_executor", "ok": true, "seconds": 45.0, "stderr_tail": "workflow phase: Succeeded"}
+{"op": "log_collection", "ok": true, "seconds": 0.0, "stderr_tail": "pod fixture-881-h9g96"}
+{"op": "git_clone_local", "ok": true, "seconds": 0.02, "stderr_tail": ""}
+{"op": "gh_version", "ok": true, "seconds": 0.04, "stderr_tail": ""}
+{"op": "uv_pytest_mypy_ruff", "ok": true, "seconds": 2.284, "stderr_tail": ""}
+{"op": "npm_ci", "ok": true, "seconds": 0.462, "stderr_tail": ""}
+{"op": "go_test", "ok": true, "seconds": 10.031, "stderr_tail": ""}
+{"op": "go_test_race", "ok": true, "seconds": 13.005, "stderr_tail": ""}
+{"op": "c_compile", "ok": true, "seconds": 0.039, "stderr_tail": ""}
+{"op": "emptydir_io", "ok": true, "seconds": 0.484, "stderr_tail": ""}
+{"op": "dns", "ok": true, "seconds": 0.014, "stderr_tail": ""}
+{"op": "https_direct", "ok": true, "seconds": 0.374, "stderr_tail": ""}
+{"op": "https_proxy", "ok": true, "seconds": 0.331, "stderr_tail": ""}
+{"metric": "cgroup", "cpu_stat": "usage_usec 61159221 user_usec 51578911 system_usec 9580310 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 265 nr_throttled 142 throttled_usec 6433933 nr_bursts 0 burst_usec 0 ", "memory_peak": "646578176 ", "io_stat": "8:0 rbytes=0 wbytes=467841024 rios=0 wios=5897 dbytes=13594624 dios=261 "}
+{"probe": "kernel_release", "value": "7.0.0-1017-azure"}
+{"probe": "dev_listing", "value": "core fd full mqueue null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "}
+{"probe": "dev_kvm", "value": "ls: cannot access '/dev/kvm': No such file or directory"}
+{"probe": "readable:/proc/version", "value": "yes"}
+{"probe": "readable:/proc/kallsyms", "value": "yes"}
+{"probe": "readable:/proc/modules", "value": "yes"}
+{"probe": "entries:/sys/kernel", "value": "37"}
+{"probe": "entries:/sys/firmware", "value": "0"}
+{"probe": "mountinfo_lines", "value": "28"}
+{"probe": "pid1_cgroup", "value": "0::/"}
+{"probe": "cpu_vmx_svm", "value": "4"}
+time="2026-10-29T20:54:57.219Z" level=info msg="sub-process exited" argo=true error="<nil>"
+{"metric": "startup", "seconds": 2.0}
+{"op": "cancellation", "ok": true, "seconds": 5.0, "stderr_tail": "main started: true; phase after terminate: Failed"}
+{"op": "argo_executor", "ok": true, "seconds": 45.0, "stderr_tail": "workflow phase: Succeeded"}
+{"op": "log_collection", "ok": true, "seconds": 0.0, "stderr_tail": "pod fixture-881-s2ngk"}
+{"op": "git_clone_local", "ok": true, "seconds": 0.026, "stderr_tail": ""}
+{"op": "gh_version", "ok": true, "seconds": 0.046, "stderr_tail": ""}
+{"op": "uv_pytest_mypy_ruff", "ok": true, "seconds": 2.322, "stderr_tail": ""}
+{"op": "npm_ci", "ok": true, "seconds": 0.463, "stderr_tail": ""}
+{"op": "go_test", "ok": true, "seconds": 9.941, "stderr_tail": ""}
+{"op": "go_test_race", "ok": true, "seconds": 12.971, "stderr_tail": ""}
+{"op": "c_compile", "ok": true, "seconds": 0.039, "stderr_tail": ""}
+{"op": "emptydir_io", "ok": true, "seconds": 0.501, "stderr_tail": ""}
+{"op": "dns", "ok": true, "seconds": 0.015, "stderr_tail": ""}
+{"op": "https_direct", "ok": true, "seconds": 0.381, "stderr_tail": ""}
+{"op": "https_proxy", "ok": true, "seconds": 0.349, "stderr_tail": ""}
+{"metric": "cgroup", "cpu_stat": "usage_usec 60888745 user_usec 51154307 system_usec 9734438 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 265 nr_throttled 144 throttled_usec 6658269 nr_bursts 0 burst_usec 0 ", "memory_peak": "645488640 ", "io_stat": "8:0 rbytes=0 wbytes=467841024 rios=0 wios=5897 dbytes=13594624 dios=260 "}
+{"probe": "kernel_release", "value": "7.0.0-1017-azure"}
+{"probe": "dev_listing", "value": "core fd full mqueue null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "}
+{"probe": "dev_kvm", "value": "ls: cannot access '/dev/kvm': No such file or directory"}
+{"probe": "readable:/proc/version", "value": "yes"}
+{"probe": "readable:/proc/kallsyms", "value": "yes"}
+{"probe": "readable:/proc/modules", "value": "yes"}
+{"probe": "entries:/sys/kernel", "value": "37"}
+{"probe": "entries:/sys/firmware", "value": "0"}
+{"probe": "mountinfo_lines", "value": "28"}
+{"probe": "pid1_cgroup", "value": "0::/"}
+{"probe": "cpu_vmx_svm", "value": "4"}
+time="2026-10-29T20:57:00.615Z" level=info msg="sub-process exited" argo=true error="<nil>"
+{"metric": "startup", "seconds": 2.0}
+{"op": "cancellation", "ok": true, "seconds": 11.0, "stderr_tail": "main started: true; phase after terminate: Failed"}
+{"op": "argo_executor", "ok": true, "seconds": 45.0, "stderr_tail": "workflow phase: Succeeded"}
+{"op": "log_collection", "ok": true, "seconds": 0.0, "stderr_tail": "pod fixture-881-8pqzg"}
+{"op": "git_clone_local", "ok": true, "seconds": 0.021, "stderr_tail": ""}
+{"op": "gh_version", "ok": true, "seconds": 0.039, "stderr_tail": ""}
+{"op": "uv_pytest_mypy_ruff", "ok": true, "seconds": 2.3, "stderr_tail": ""}
+{"op": "npm_ci", "ok": true, "seconds": 0.448, "stderr_tail": ""}
+{"op": "go_test", "ok": true, "seconds": 9.945, "stderr_tail": ""}
+{"op": "go_test_race", "ok": true, "seconds": 13.03, "stderr_tail": ""}
+{"op": "c_compile", "ok": true, "seconds": 0.038, "stderr_tail": ""}
+{"op": "emptydir_io", "ok": true, "seconds": 0.49, "stderr_tail": ""}
+{"op": "dns", "ok": true, "seconds": 0.026, "stderr_tail": ""}
+{"op": "https_direct", "ok": true, "seconds": 0.381, "stderr_tail": ""}
+{"op": "https_proxy", "ok": true, "seconds": 0.382, "stderr_tail": ""}
+{"metric": "cgroup", "cpu_stat": "usage_usec 61165721 user_usec 51620043 system_usec 9545678 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 265 nr_throttled 146 throttled_usec 6940129 nr_bursts 0 burst_usec 0 ", "memory_peak": "646385664 ", "io_stat": "8:0 rbytes=0 wbytes=475959296 rios=0 wios=5901 dbytes=13594624 dios=263 "}
+{"probe": "kernel_release", "value": "7.0.0-1017-azure"}
+{"probe": "dev_listing", "value": "core fd full mqueue null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "}
+{"probe": "dev_kvm", "value": "ls: cannot access '/dev/kvm': No such file or directory"}
+{"probe": "readable:/proc/version", "value": "yes"}
+{"probe": "readable:/proc/kallsyms", "value": "yes"}
+{"probe": "readable:/proc/modules", "value": "yes"}
+{"probe": "entries:/sys/kernel", "value": "37"}
+{"probe": "entries:/sys/firmware", "value": "0"}
+{"probe": "mountinfo_lines", "value": "28"}
+{"probe": "pid1_cgroup", "value": "0::/"}
+{"probe": "cpu_vmx_svm", "value": "4"}
+time="2026-10-29T20:59:05.905Z" level=info msg="sub-process exited" argo=true error="<nil>"
+{"metric": "startup", "seconds": 1.0}
+{"op": "cancellation", "ok": true, "seconds": 11.0, "stderr_tail": "main started: true; phase after terminate: Failed"}
+{"op": "argo_executor", "ok": true, "seconds": 46.0, "stderr_tail": "workflow phase: Succeeded"}
+{"op": "log_collection", "ok": true, "seconds": 0.0, "stderr_tail": "pod fixture-881-v6lj9"}
+{"op": "git_clone_local", "ok": true, "seconds": 0.02, "stderr_tail": ""}
+{"op": "gh_version", "ok": true, "seconds": 0.04, "stderr_tail": ""}
+{"op": "uv_pytest_mypy_ruff", "ok": true, "seconds": 2.204, "stderr_tail": ""}
+{"op": "npm_ci", "ok": true, "seconds": 0.502, "stderr_tail": ""}
+{"op": "go_test", "ok": true, "seconds": 9.864, "stderr_tail": ""}
+{"op": "go_test_race", "ok": true, "seconds": 13.137, "stderr_tail": ""}
+{"op": "c_compile", "ok": true, "seconds": 0.038, "stderr_tail": ""}
+{"op": "emptydir_io", "ok": true, "seconds": 0.455, "stderr_tail": ""}
+{"op": "dns", "ok": true, "seconds": 0.015, "stderr_tail": ""}
+{"op": "https_direct", "ok": true, "seconds": 0.383, "stderr_tail": ""}
+{"op": "https_proxy", "ok": true, "seconds": 0.395, "stderr_tail": ""}
+{"metric": "cgroup", "cpu_stat": "usage_usec 60982904 user_usec 51445758 system_usec 9537145 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 265 nr_throttled 151 throttled_usec 7147472 nr_bursts 0 burst_usec 0 ", "memory_peak": "645599232 ", "io_stat": "8:0 rbytes=0 wbytes=475959296 rios=0 wios=5901 dbytes=13594624 dios=261 "}
+{"probe": "kernel_release", "value": "7.0.0-1017-azure"}
+{"probe": "dev_listing", "value": "core fd full mqueue null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "}
+{"probe": "dev_kvm", "value": "ls: cannot access '/dev/kvm': No such file or directory"}
+{"probe": "readable:/proc/version", "value": "yes"}
+{"probe": "readable:/proc/kallsyms", "value": "yes"}
+{"probe": "readable:/proc/modules", "value": "yes"}
+{"probe": "entries:/sys/kernel", "value": "37"}
+{"probe": "entries:/sys/firmware", "value": "0"}
+{"probe": "mountinfo_lines", "value": "28"}
+{"probe": "pid1_cgroup", "value": "0::/"}
+{"probe": "cpu_vmx_svm", "value": "4"}
+time="2026-10-29T21:01:10.241Z" level=info msg="sub-process exited" argo=true error="<nil>"
+{"metric": "startup", "seconds": 1.0}
+{"op": "cancellation", "ok": true, "seconds": 4.0, "stderr_tail": "main started: true; phase after terminate: Failed"}
+{"op": "argo_executor", "ok": true, "seconds": 45.0, "stderr_tail": "workflow phase: Succeeded"}
+{"op": "log_collection", "ok": true, "seconds": 0.0, "stderr_tail": "pod fixture-881-lwtww"}
+{"op": "git_clone_local", "ok": true, "seconds": 0.021, "stderr_tail": ""}
+{"op": "gh_version", "ok": true, "seconds": 0.039, "stderr_tail": ""}
+{"op": "uv_pytest_mypy_ruff", "ok": true, "seconds": 2.293, "stderr_tail": ""}
+{"op": "npm_ci", "ok": true, "seconds": 0.456, "stderr_tail": ""}
+{"op": "go_test", "ok": true, "seconds": 9.894, "stderr_tail": ""}
+{"op": "go_test_race", "ok": true, "seconds": 13.207, "stderr_tail": ""}
+{"op": "c_compile", "ok": true, "seconds": 0.04, "stderr_tail": ""}
+{"op": "emptydir_io", "ok": true, "seconds": 0.473, "stderr_tail": ""}
+{"op": "dns", "ok": true, "seconds": 0.016, "stderr_tail": ""}
+{"op": "https_direct", "ok": true, "seconds": 0.363, "stderr_tail": ""}
+{"op": "https_proxy", "ok": true, "seconds": 0.371, "stderr_tail": ""}
+{"metric": "cgroup", "cpu_stat": "usage_usec 61173546 user_usec 51447839 system_usec 9725706 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 267 nr_throttled 147 throttled_usec 7315092 nr_bursts 0 burst_usec 0 ", "memory_peak": "646008832 ", "io_stat": "8:0 rbytes=0 wbytes=475959296 rios=0 wios=5901 dbytes=13594624 dios=260 "}
+{"probe": "kernel_release", "value": "7.0.0-1017-azure"}
+{"probe": "dev_listing", "value": "core fd full mqueue null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "}
+{"probe": "dev_kvm", "value": "ls: cannot access '/dev/kvm': No such file or directory"}
+{"probe": "readable:/proc/version", "value": "yes"}
+{"probe": "readable:/proc/kallsyms", "value": "yes"}
+{"probe": "readable:/proc/modules", "value": "yes"}
+{"probe": "entries:/sys/kernel", "value": "37"}
+{"probe": "entries:/sys/firmware", "value": "0"}
+{"probe": "mountinfo_lines", "value": "28"}
+{"probe": "pid1_cgroup", "value": "0::/"}
+{"probe": "cpu_vmx_svm", "value": "4"}
+time="2026-10-29T21:03:09.644Z" level=info msg="sub-process exited" argo=true error="<nil>"
+{"metric": "startup", "seconds": 1.0}
+{"op": "cancellation", "ok": true, "seconds": 6.0, "stderr_tail": "main started: true; phase after terminate: Failed"}
+{"op": "argo_executor", "ok": true, "seconds": 45.0, "stderr_tail": "workflow phase: Succeeded"}
+{"op": "log_collection", "ok": true, "seconds": 0.0, "stderr_tail": "pod fixture-881-mf994"}
+{"op": "git_clone_local", "ok": true, "seconds": 0.02, "stderr_tail": ""}
+{"op": "gh_version", "ok": true, "seconds": 0.04, "stderr_tail": ""}
+{"op": "uv_pytest_mypy_ruff", "ok": true, "seconds": 2.276, "stderr_tail": ""}
+{"op": "npm_ci", "ok": true, "seconds": 0.453, "stderr_tail": ""}
+{"op": "go_test", "ok": true, "seconds": 9.929, "stderr_tail": ""}
+{"op": "go_test_race", "ok": true, "seconds": 13.041, "stderr_tail": ""}
+{"op": "c_compile", "ok": true, "seconds": 0.039, "stderr_tail": ""}
+{"op": "emptydir_io", "ok": true, "seconds": 0.481, "stderr_tail": ""}
+{"op": "dns", "ok": true, "seconds": 0.014, "stderr_tail": ""}
+{"op": "https_direct", "ok": true, "seconds": 0.384, "stderr_tail": ""}
+{"op": "https_proxy", "ok": true, "seconds": 0.394, "stderr_tail": ""}
+{"metric": "cgroup", "cpu_stat": "usage_usec 61058011 user_usec 51464180 system_usec 9593831 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 265 nr_throttled 146 throttled_usec 6964047 nr_bursts 0 burst_usec 0 ", "memory_peak": "646586368 ", "io_stat": "8:0 rbytes=0 wbytes=467841024 rios=0 wios=5897 dbytes=13594624 dios=258 "}
+{"probe": "kernel_release", "value": "7.0.0-1017-azure"}
+{"probe": "dev_listing", "value": "core fd full mqueue null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "}
+{"probe": "dev_kvm", "value": "ls: cannot access '/dev/kvm': No such file or directory"}
+{"probe": "readable:/proc/version", "value": "yes"}
+{"probe": "readable:/proc/kallsyms", "value": "yes"}
+{"probe": "readable:/proc/modules", "value": "yes"}
+{"probe": "entries:/sys/kernel", "value": "37"}
+{"probe": "entries:/sys/firmware", "value": "0"}
+{"probe": "mountinfo_lines", "value": "28"}
+{"probe": "pid1_cgroup", "value": "0::/"}
+{"probe": "cpu_vmx_svm", "value": "4"}
+time="2026-10-29T21:05:10.018Z" level=info msg="sub-process exited" argo=true error="<nil>"
+{"metric": "startup", "seconds": 1.0}
+{"op": "cancellation", "ok": true, "seconds": 10.0, "stderr_tail": "main started: true; phase after terminate: Failed"}
+{"op": "argo_executor", "ok": true, "seconds": 45.0, "stderr_tail": "workflow phase: Succeeded"}
+{"op": "log_collection", "ok": true, "seconds": 0.0, "stderr_tail": "pod fixture-881-42pmg"}
+{"op": "git_clone_local", "ok": true, "seconds": 0.021, "stderr_tail": ""}
+{"op": "gh_version", "ok": true, "seconds": 0.038, "stderr_tail": ""}
+{"op": "uv_pytest_mypy_ruff", "ok": true, "seconds": 2.295, "stderr_tail": ""}
+{"op": "npm_ci", "ok": true, "seconds": 0.46, "stderr_tail": ""}
+{"op": "go_test", "ok": true, "seconds": 9.927, "stderr_tail": ""}
+{"op": "go_test_race", "ok": true, "seconds": 13.115, "stderr_tail": ""}
+{"op": "c_compile", "ok": true, "seconds": 0.039, "stderr_tail": ""}
+{"op": "emptydir_io", "ok": true, "seconds": 0.477, "stderr_tail": ""}
+{"op": "dns", "ok": true, "seconds": 0.016, "stderr_tail": ""}
+{"op": "https_direct", "ok": true, "seconds": 0.349, "stderr_tail": ""}
+{"op": "https_proxy", "ok": true, "seconds": 0.42, "stderr_tail": ""}
+{"metric": "cgroup", "cpu_stat": "usage_usec 61237373 user_usec 51674433 system_usec 9562939 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 265 nr_throttled 146 throttled_usec 6578332 nr_bursts 0 burst_usec 0 ", "memory_peak": "646316032 ", "io_stat": "8:0 rbytes=0 wbytes=472035328 rios=0 wios=5899 dbytes=13594624 dios=261 "}
+{"probe": "kernel_release", "value": "7.0.0-1017-azure"}
+{"probe": "dev_listing", "value": "core fd full mqueue null ptmx pts random shm stderr stdin stdout termination-log tty urandom zero "}
+{"probe": "dev_kvm", "value": "ls: cannot access '/dev/kvm': No such file or directory"}
+{"probe": "readable:/proc/version", "value": "yes"}
+{"probe": "readable:/proc/kallsyms", "value": "yes"}
+{"probe": "readable:/proc/modules", "value": "yes"}
+{"probe": "entries:/sys/kernel", "value": "37"}
+{"probe": "entries:/sys/firmware", "value": "0"}
+{"probe": "mountinfo_lines", "value": "28"}
+{"probe": "pid1_cgroup", "value": "0::/"}
+{"probe": "cpu_vmx_svm", "value": "4"}
+time="2026-10-29T21:07:15.326Z" level=info msg="sub-process exited" argo=true error="<nil>"
+{"metric": "startup", "seconds": 2.0}
+{"op": "cancellation", "ok": true, "seconds": 5.0, "stderr_tail": "main started: true; phase after terminate: Failed"}

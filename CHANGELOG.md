@@ -1,5 +1,171 @@
 # Changelog
 
+## [1.111.1](https://github.com/mctlhq/mctl-agents/compare/1.111.0...1.111.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* **spike-881:** executor token Secret and fail-fast harness preflight ([a4ffd4a](https://github.com/mctlhq/mctl-agents/commit/a4ffd4a84194f271e1fb4f4160d10c30184ea154))
+
+## [1.111.0](https://github.com/mctlhq/mctl-agents/compare/1.110.0...1.111.0) (2026-10-29)
+
+
+### Features
+
+* **agents:** issue-875-spike-how-do-github-agentic-workflows-sa ([4134b71](https://github.com/mctlhq/mctl-agents/commit/4134b71c7bad17ee815f8cd169d6bf37343c92ea))
+* **agents:** issue-876-feat-scout-generate-structured-spike-dra ([d129488](https://github.com/mctlhq/mctl-agents/commit/d129488fa8c4b8895ebcf37a30f40f370c564d6a))
+* **agents:** issue-876-feat-scout-generate-structured-spike-dra ([097c2b5](https://github.com/mctlhq/mctl-agents/commit/097c2b59deb6fbf6efa5c79e16e9c70749071f15))
+* **agents:** issue-881-spike-does-mctl-need-a-stronger-pod-sand ([ef030af](https://github.com/mctlhq/mctl-agents/commit/ef030af8938c1a4dfa3f05815bed7504bf3b72a3))
+* **agents:** issue-881-spike-does-mctl-need-a-stronger-pod-sand ([95b6f69](https://github.com/mctlhq/mctl-agents/commit/95b6f691dafb288750e2682ce8b3f6a9267a08f0))
+
+
+### Bug Fixes
+
+* **spike-881:** cancellation needs a started container; summarise resources ([232eebc](https://github.com/mctlhq/mctl-agents/commit/232eebc85bf89a277f3b5715a2fee7ea8f392800))
+* **spike-881:** make the Phase B harness produce usable data ([82c3e6d](https://github.com/mctlhq/mctl-agents/commit/82c3e6dc94bffcf88f54407a508dfaf5af4039f3))
+
+## [1.110.0](https://github.com/mctlhq/mctl-agents/compare/1.109.0...1.110.0) (2026-10-28)
+
+
+### Features
+
+* **agents:** issue-830-spike-what-runtime-observability-and-egr ([5a0ee5e](https://github.com/mctlhq/mctl-agents/commit/5a0ee5eff58ac5f32f397afb310f808651b7921b))
+
+## [1.109.0](https://github.com/mctlhq/mctl-agents/compare/1.108.0...1.109.0) (2026-10-28)
+
+
+### Features
+
+* **scout:** open spike drafts in the spike issue form ([d9b0598](https://github.com/mctlhq/mctl-agents/commit/d9b05983d46a2e0232de482a625c866726d0a38a))
+* **scout:** open spike drafts in the spike issue form ([79a0369](https://github.com/mctlhq/mctl-agents/commit/79a0369cb19b699d267a1180d2a1ace189069aba))
+
+## [1.108.0](https://github.com/mctlhq/mctl-agents/compare/1.107.0...1.108.0) (2026-10-28)
+
+
+### Features
+
+* **agents:** issue-670-spike-devloop-add-decision-context-expla ([d25d7b7](https://github.com/mctlhq/mctl-agents/commit/d25d7b7889af73c1fd3b0133b6158ffd93ea8cb9))
+* **agents:** issue-670-spike-devloop-add-decision-context-expla ([14efbce](https://github.com/mctlhq/mctl-agents/commit/14efbce7599bb9c3ea6cac00c675919e3f851e34))
+* **agents:** issue-852-spike-do-the-sandbox-isolation-gaps-desc ([1a13472](https://github.com/mctlhq/mctl-agents/commit/1a134728f1844b15b034e44f5284121e290aa8fa))
+* **agents:** issue-852-spike-do-the-sandbox-isolation-gaps-desc ([27e34b7](https://github.com/mctlhq/mctl-agents/commit/27e34b781c0695163590445ac99c095de72d8278))
+* **agents:** issue-854-spike-what-agent-observability-signals-t ([8788dd6](https://github.com/mctlhq/mctl-agents/commit/8788dd676e4dd71fea3188457311002d7efa75ba))
+* **agents:** issue-854-spike-what-agent-observability-signals-t ([94ef153](https://github.com/mctlhq/mctl-agents/commit/94ef1537db1dccefcbada5c44a6d00cdeff3d5b8))
+* **orchestrator:** count Claude Code safety-classifier interruptions ([6929dd0](https://github.com/mctlhq/mctl-agents/commit/6929dd09949d5a8bdf5db11dd3a94944b8fda72b))
+* **orchestrator:** count Claude Code safety-classifier interruptions ([edbf9b8](https://github.com/mctlhq/mctl-agents/commit/edbf9b8352ac0ef5c6849e419c4ee099b7a92b21)), closes [#849](https://github.com/mctlhq/mctl-agents/issues/849)
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-852-spike-do-the-sandbox-isolation-gaps-desc ([9ecf525](https://github.com/mctlhq/mctl-agents/commit/9ecf52558cebd2722abf74234d730039ad3b7724))
+* **agents:** address P1/P2 codex findings on issue-852-spike-do-the-sandbox-isolation-gaps-desc ([e9d1f1e](https://github.com/mctlhq/mctl-agents/commit/e9d1f1e7de7cf5f8aba751aa60b69fdf909a72f0))
+* **devloop:** never mint a dispatched execution from an advance ([be64500](https://github.com/mctlhq/mctl-agents/commit/be64500450035e4876634ce754b837604a3f3d6d))
+* **devloop:** never mint a dispatched execution from an advance ([2d3e927](https://github.com/mctlhq/mctl-agents/commit/2d3e9277750d977efe088538e48aba0493331d63)), closes [#858](https://github.com/mctlhq/mctl-agents/issues/858)
+* **spike-670:** reject non-mapping blocks and stop timing a no-op ([44faeef](https://github.com/mctlhq/mctl-agents/commit/44faeefcc931b92768dccbda4d72163701e3c745))
+* **spike-796:** bind REA by npm provenance, count classifier stops ([c1d540b](https://github.com/mctlhq/mctl-agents/commit/c1d540b4919a3d4b6a1b89ff72eab87cff0aa336))
+* **spike-796:** bind REA by npm provenance, count classifier stops ([62837ca](https://github.com/mctlhq/mctl-agents/commit/62837cab1ff0977726d5956dc10732cc8bd627b9))
+* **spike-796:** record which REA operations a run invoked ([7afb04b](https://github.com/mctlhq/mctl-agents/commit/7afb04b561358bbf46e6a666d011d130a0b75aab))
+* **spike-796:** record which REA operations a run invoked ([b221567](https://github.com/mctlhq/mctl-agents/commit/b2215676c888c0f43c85aa7ee3884e02800a89de))
+* **spike-796:** remove the REA harness after the REJECT verdict ([4460df2](https://github.com/mctlhq/mctl-agents/commit/4460df2692ce9973d2e8fd1bc990c55313e36684))
+* **spike-796:** remove the REA harness after the REJECT verdict ([72b9d17](https://github.com/mctlhq/mctl-agents/commit/72b9d17ee47834a45b1f3585f625ae15dbc75a8e)), closes [#850](https://github.com/mctlhq/mctl-agents/issues/850)
+
+## [1.107.0](https://github.com/mctlhq/mctl-agents/compare/1.106.0...1.107.0) (2026-10-27)
+
+
+### Features
+
+* **agents:** issue-826-fix-usage-record-provider-and-price-sour ([41eaec1](https://github.com/mctlhq/mctl-agents/commit/41eaec1833c74b5d4364926ed143e39edc1315e3))
+
+
+### Bug Fixes
+
+* **agents:** fail price_source closed in the collector ([92dcf3d](https://github.com/mctlhq/mctl-agents/commit/92dcf3d8c87c262d31a006ab543c325470589830))
+* **agents:** fail price_source closed in the collector ([ea25ccd](https://github.com/mctlhq/mctl-agents/commit/ea25ccdcee4ce291fde2120025c96a831883dc11)), closes [#826](https://github.com/mctlhq/mctl-agents/issues/826)
+
+## [1.106.0](https://github.com/mctlhq/mctl-agents/compare/1.105.1...1.106.0) (2026-10-27)
+
+
+### Features
+
+* **agents:** issue-824-feat-policy-provider-seam-for-non-anthro ([f8dc34c](https://github.com/mctlhq/mctl-agents/commit/f8dc34c52e80fb3bd448ff5902cb92867ffa6d27))
+* **agents:** issue-825-feat-sessions-per-provider-model-reasoni ([87e0781](https://github.com/mctlhq/mctl-agents/commit/87e078166d3a4a5b5f193e47879b27daadffaad5))
+* **agents:** issue-825-feat-sessions-per-provider-model-reasoni ([69db459](https://github.com/mctlhq/mctl-agents/commit/69db459ab4b5235e579b3767bbc37ce610c8a231))
+* **scout:** add Create spike callback button next to each draft ([9191537](https://github.com/mctlhq/mctl-agents/commit/919153738ddb219604ab2b2de6563f6af3fdc895))
+* **scout:** add Create spike callback button next to each draft ([a794c17](https://github.com/mctlhq/mctl-agents/commit/a794c172326a9446e3227d7aa8623a1cb68b2b45))
+
+
+### Bug Fixes
+
+* **ci:** fix failing required checks on issue-825-feat-sessions-per-provider-model-reasoni ([6ad1923](https://github.com/mctlhq/mctl-agents/commit/6ad192396987f17ffbf3e0fc44b2eda282c02316))
+
+## [1.105.1](https://github.com/mctlhq/mctl-agents/compare/1.105.0...1.105.1) (2026-10-27)
+
+
+### Bug Fixes
+
+* **scout:** count healthy sources in the footer instead of listing them ([2ead75b](https://github.com/mctlhq/mctl-agents/commit/2ead75b5a16a3d8c1e8aaf6dbb891a73979fdf6a))
+* **scout:** count healthy sources in the footer instead of listing them ([6e53cb5](https://github.com/mctlhq/mctl-agents/commit/6e53cb5f6dd022236018e9fe57c80e4f3e99d323))
+
+## [1.105.0](https://github.com/mctlhq/mctl-agents/compare/1.104.0...1.105.0) (2026-10-27)
+
+
+### Features
+
+* **agents:** register mctl-support as an issue-driven service ([009f3b6](https://github.com/mctlhq/mctl-agents/commit/009f3b6546ce4563f51507fb542534370af1dbfa))
+* **agents:** register mctl-support as an issue-driven service ([73888f0](https://github.com/mctlhq/mctl-agents/commit/73888f0cc7d914c3e9e16a79f3ac4e5ad5d16f0c))
+* **spike-791:** opt-in candidate reasoning effort and exploratory report ([cc674ce](https://github.com/mctlhq/mctl-agents/commit/cc674ce73b1ac81c16e94c3ac138df8d3ce3f4d0))
+
+
+### Bug Fixes
+
+* **spike-791:** address review P3s on rule inputs, merge and arm misuse ([7c234e3](https://github.com/mctlhq/mctl-agents/commit/7c234e33c2de7f64a9b9d11ee292743a02dfa1e4))
+* **spike-791:** keep effort runs out of merge, decide and the pre-registered dir ([1a528c0](https://github.com/mctlhq/mctl-agents/commit/1a528c08c1ca1526cefb7bb06e44dc13b6a08ca9))
+
+## [1.104.0](https://github.com/mctlhq/mctl-agents/compare/1.103.0...1.104.0) (2026-10-26)
+
+
+### Features
+
+* **scout:** add Hetzner blog with a date_only source option ([b310fc1](https://github.com/mctlhq/mctl-agents/commit/b310fc1d0606aa4f54869cf7a4a48c0f0c1fc48b))
+* **scout:** add Hetzner blog with a date_only source option ([6544faa](https://github.com/mctlhq/mctl-agents/commit/6544faa2c5a8c46e7979b58d18422c515b44ca66))
+
+
+### Bug Fixes
+
+* **scout:** keep the stamp's own date for date_only feeds ([f3ff297](https://github.com/mctlhq/mctl-agents/commit/f3ff297c6e820765af0aa6f35c12384ad47d8d84))
+
+## [1.103.0](https://github.com/mctlhq/mctl-agents/compare/1.102.0...1.103.0) (2026-10-26)
+
+
+### Features
+
+* **scout:** vendor feeds and a sitemap source for Anthropic News ([0c6fc95](https://github.com/mctlhq/mctl-agents/commit/0c6fc95f6960cba1371f8f9650fd06d658ba3df2))
+* **scout:** vendor feeds and a sitemap source for Anthropic News ([402f244](https://github.com/mctlhq/mctl-agents/commit/402f244dc1643aca8eaf7e6c9b49edc15d734d8b))
+
+## [1.102.0](https://github.com/mctlhq/mctl-agents/compare/1.101.1...1.102.0) (2026-10-26)
+
+
+### Features
+
+* **agents:** issue-796-spike-devloop-evaluate-rea-as-investigat ([c898d65](https://github.com/mctlhq/mctl-agents/commit/c898d659db23c021833b8e5468a86fa65edec734))
+* **agents:** issue-799-feat-directives-mctl-investigate-starts ([c689614](https://github.com/mctlhq/mctl-agents/commit/c689614a094f64d82426e4f39a237e5d029e76e1))
+* **agents:** issue-809-feat-agents-securityfinding-remediation ([6c4f67f](https://github.com/mctlhq/mctl-agents/commit/6c4f67fef12b2d37858c8ec62c00d7633d9b4bc8))
+* **agents:** issue-809-feat-agents-securityfinding-remediation ([a05cbe7](https://github.com/mctlhq/mctl-agents/commit/a05cbe7494469a9d270b248daadd9c566819c33a))
+* **agents:** issue-813-fix-security-harden-landed-binding-corre ([5147eb7](https://github.com/mctlhq/mctl-agents/commit/5147eb774e5c417146146820066723136effe47e))
+* **agents:** issue-815-feat-spike-add-operator-workflow-to-exec ([53d0ff4](https://github.com/mctlhq/mctl-agents/commit/53d0ff47138629675e24d0f6b865098312457387))
+* **agents:** issue-815-feat-spike-add-operator-workflow-to-exec ([4f0cdd9](https://github.com/mctlhq/mctl-agents/commit/4f0cdd921e50e797305d1be45dc22f8c43791d3c))
+* **scout:** add ITNEXT (Medium) source, strip Medium feed tracking ([7e398a5](https://github.com/mctlhq/mctl-agents/commit/7e398a5a6e7a887fc0d709601b36959b270fe31b))
+* **scout:** add ITNEXT (Medium) source, strip Medium feed tracking ([a04c569](https://github.com/mctlhq/mctl-agents/commit/a04c5696a1be4e3f8b5cb0656269d839432a3815))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-815-feat-spike-add-operator-workflow-to-exec ([01aa73c](https://github.com/mctlhq/mctl-agents/commit/01aa73cd18b5ba0f7046f7e2344cd56981de0481))
+* **agents:** address P1/P2 codex findings on issue-815-feat-spike-add-operator-workflow-to-exec ([3ad0a7e](https://github.com/mctlhq/mctl-agents/commit/3ad0a7e9bab82bfe4db024f4b9a78313b019ccc2))
+* **agents:** address P1/P2 codex findings on issue-815-feat-spike-add-operator-workflow-to-exec ([dfd5b2d](https://github.com/mctlhq/mctl-agents/commit/dfd5b2d5b7c835fb407ad6dc5cc84fa0dfa43a8b))
+* **agents:** address P1/P2 codex findings on issue-815-feat-spike-add-operator-workflow-to-exec ([77409fc](https://github.com/mctlhq/mctl-agents/commit/77409fc0356ce0106f502c7529cbe5d527e1bf7b))
+* **agents:** address P1/P2 codex findings on issue-815-feat-spike-add-operator-workflow-to-exec ([e48a67b](https://github.com/mctlhq/mctl-agents/commit/e48a67bdddf44e54478306f308128ca44425c6ed))
+* **agents:** issue-813-fix-security-harden-landed-binding-corre ([07a9432](https://github.com/mctlhq/mctl-agents/commit/07a94321811c295f39788fbd1d0b500800eac538))
+
 ## [1.101.1](https://github.com/mctlhq/mctl-agents/compare/1.101.0...1.101.1) (2026-10-26)
 
 

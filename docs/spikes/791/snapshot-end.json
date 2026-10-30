@@ -1,0 +1,267 @@
+{
+  "catalog_ids": [
+    "Qwen/Qwen3.6-35B-A3B",
+    "Qwen/Qwen3.6-35B-A3B-FP8",
+    "Qwen/Qwen3.8-27B",
+    "Qwen3.8-27B"
+  ],
+  "endpoint": "https://inference.hetzner.com/api",
+  "messages_probe": {
+    "error": null,
+    "headers": {},
+    "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+    "ok": true,
+    "status": 200
+  },
+  "models_error": null,
+  "models_status": 200,
+  "retries": 0,
+  "schema": "hetzner-snapshot/v1",
+  "selected": {
+    "DeepSeek-V4-Flash-0731": {
+      "availability": "UNAVAILABLE_AT_RUN_TIME",
+      "preregistered": true
+    },
+    "GLM-5.2-NVFP4": {
+      "availability": "UNAVAILABLE_AT_RUN_TIME",
+      "preregistered": true
+    },
+    "Kimi-K2.7-Code": {
+      "availability": "UNAVAILABLE_AT_RUN_TIME",
+      "preregistered": true
+    },
+    "Qwen/Qwen3.6-35B-A3B": {
+      "availability": "AVAILABLE",
+      "function_call": {
+        "error": null,
+        "finish_reason": "tool_calls",
+        "headers": {},
+        "latency_ms": 1505,
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "status": 200,
+        "tool_call_returned": true,
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"city\": \"Berlin\"}",
+              "name": "get_weather"
+            },
+            "id": "chatcmpl-tool-bf0d6ffa82c7b3e6",
+            "type": "function"
+          }
+        ],
+        "usage": {
+          "completion_tokens": 138,
+          "completion_tokens_details": {
+            "reasoning_tokens": 110
+          },
+          "prompt_tokens": 277,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 415
+        }
+      },
+      "preregistered": false,
+      "trivial": {
+        "error": null,
+        "finish_reason": "length",
+        "headers": {},
+        "latency_ms": 738,
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "status": 200,
+        "tool_calls": [],
+        "usage": {
+          "completion_tokens": 32,
+          "completion_tokens_details": {
+            "reasoning_tokens": 32
+          },
+          "prompt_tokens": 14,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 46
+        }
+      }
+    },
+    "Qwen/Qwen3.6-35B-A3B-FP8": {
+      "availability": "AVAILABLE",
+      "function_call": {
+        "error": null,
+        "finish_reason": "tool_calls",
+        "headers": {},
+        "latency_ms": 1136,
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "status": 200,
+        "tool_call_returned": true,
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"city\": \"Berlin\"}",
+              "name": "get_weather"
+            },
+            "id": "chatcmpl-tool-95706a216c9a00be",
+            "type": "function"
+          }
+        ],
+        "usage": {
+          "completion_tokens": 116,
+          "completion_tokens_details": {
+            "reasoning_tokens": 88
+          },
+          "prompt_tokens": 277,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 393
+        }
+      },
+      "preregistered": true,
+      "trivial": {
+        "error": null,
+        "finish_reason": "length",
+        "headers": {},
+        "latency_ms": 647,
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "status": 200,
+        "tool_calls": [],
+        "usage": {
+          "completion_tokens": 32,
+          "completion_tokens_details": {
+            "reasoning_tokens": 32
+          },
+          "prompt_tokens": 14,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 46
+        }
+      }
+    },
+    "Qwen/Qwen3.8-27B": {
+      "availability": "AVAILABLE",
+      "function_call": {
+        "error": null,
+        "finish_reason": "tool_calls",
+        "headers": {},
+        "latency_ms": 1727,
+        "model": "Qwen/Qwen3.8-27B",
+        "status": 200,
+        "tool_call_returned": true,
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"city\": \"Berlin\"}",
+              "name": "get_weather"
+            },
+            "id": "chatcmpl-tool-ba174a6c868d2625",
+            "type": "function"
+          }
+        ],
+        "usage": {
+          "completion_tokens": 61,
+          "completion_tokens_details": {
+            "reasoning_tokens": 33
+          },
+          "prompt_tokens": 315,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 376
+        }
+      },
+      "preregistered": false,
+      "trivial": {
+        "error": null,
+        "finish_reason": "stop",
+        "headers": {},
+        "latency_ms": 560,
+        "model": "Qwen/Qwen3.8-27B",
+        "status": 200,
+        "tool_calls": [],
+        "usage": {
+          "completion_tokens": 22,
+          "completion_tokens_details": {
+            "reasoning_tokens": 18
+          },
+          "prompt_tokens": 56,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 78
+        }
+      }
+    },
+    "Qwen3.8-27B": {
+      "availability": "AVAILABLE",
+      "function_call": {
+        "error": null,
+        "finish_reason": "tool_calls",
+        "headers": {},
+        "latency_ms": 1861,
+        "model": "Qwen/Qwen3.8-27B",
+        "status": 200,
+        "tool_call_returned": true,
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"city\": \"Berlin\"}",
+              "name": "get_weather"
+            },
+            "id": "chatcmpl-tool-82fce740df694982",
+            "type": "function"
+          }
+        ],
+        "usage": {
+          "completion_tokens": 54,
+          "completion_tokens_details": {
+            "reasoning_tokens": 26
+          },
+          "prompt_tokens": 315,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 369
+        }
+      },
+      "preregistered": false,
+      "trivial": {
+        "error": null,
+        "finish_reason": "stop",
+        "headers": {},
+        "latency_ms": 628,
+        "model": "Qwen/Qwen3.8-27B",
+        "status": 200,
+        "tool_calls": [],
+        "usage": {
+          "completion_tokens": 21,
+          "completion_tokens_details": {
+            "reasoning_tokens": 17
+          },
+          "prompt_tokens": 56,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 77
+        }
+      }
+    }
+  },
+  "timestamp_utc": "2026-10-26T21:46:52Z"
+}

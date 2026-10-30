@@ -1,0 +1,65 @@
+{
+  "properties": {
+    "aliases": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 16,
+      "type": "array"
+    },
+    "claimed_action": {
+      "default": "present",
+      "enum": [
+        "present",
+        "fixed",
+        "absent",
+        "withdrawn"
+      ],
+      "type": "string"
+    },
+    "evidence_refs": {
+      "items": {
+        "$ref": "#/components/schemas/SecurityEvidenceRef"
+      },
+      "maxItems": 32,
+      "type": "array"
+    },
+    "identity": {
+      "description": "CVE-YYYY-N, GHSA-xxxx-xxxx-xxxx, or a provider-scoped rule id",
+      "type": "string"
+    },
+    "observed_artifact_digest": {
+      "type": "string"
+    },
+    "observed_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "observed_revision": {
+      "type": "string"
+    },
+    "provider": {
+      "description": "Untrusted: stored as untrusted.claimed_provider, never used for authority",
+      "type": "string"
+    },
+    "source_finding_id": {
+      "type": "string"
+    },
+    "subject": {
+      "$ref": "#/components/schemas/SecuritySubject"
+    },
+    "tenant": {
+      "description": "Must be in the authenticated provider's configured tenants",
+      "type": "string"
+    },
+    "untrusted": {
+      "$ref": "#/components/schemas/SecurityUntrusted"
+    }
+  },
+  "required": [
+    "tenant",
+    "identity",
+    "subject"
+  ],
+  "type": "object"
+}

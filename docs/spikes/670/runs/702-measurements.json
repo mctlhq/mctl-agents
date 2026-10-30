@@ -1,0 +1,30 @@
+{
+  "subject": "mctlhq/mctl-agents#702",
+  "target_repo_sha": "a42c3e7c6160671cb8b4a052ab57092d8901ab7e",
+  "proposal_content_digest": "sha256:0a0dd447ecc3512cb2cee720e460ec66d56e53c0c9ee817cd1ace86415a63d8c",
+  "generator": "Claude Code subagent, read-only (Read, Glob, Grep), no git or network",
+  "generated_at": "2026-10-27",
+  "latency_s": 108,
+  "total_tokens": 122934,
+  "input_tokens": "unobserved",
+  "output_tokens": "unobserved",
+  "cost_usd": "unobserved",
+  "tool_calls": 10,
+  "artifact_bytes": 13347,
+  "files_read": [
+    "orchestrator/temporal/workflows/dev_loop.py",
+    "orchestrator/temporal/start.py",
+    "orchestrator/temporal/cli.py",
+    "orchestrator/temporal/activities/delegated_approval.py",
+    "orchestrator/temporal/activities/canonical_execution.py",
+    "tests/test_dev_loop_workflow.py",
+    "tests/test_temporal_cli.py"
+  ],
+  "validator_violations": 0,
+  "claims": 32,
+  "grounded_claims": 23,
+  "freshness_at_bound_sha": "fresh",
+  "freshness_at_709_merge": "stale",
+  "reviewer_time_current_s": "unobserved",
+  "reviewer_time_experimental_s": "unobserved"
+}

@@ -1,7 +1,7 @@
 """mctl platform configuration."""
 from pathlib import Path
 
-from config.model_policy import resolve_model
+from config.model_policy import ModelPolicyError, resolve_model
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENTS_DIR = REPO_ROOT / "agents"
@@ -83,6 +83,12 @@ AGENTS_DIR = REPO_ROOT / "agents"
 # issues. Same shape as `mctl-claude-remote`: no `agents/mctl-alice/`
 # scaffold, so it must NOT enter ROTATING_SERVICES; the generic implementer
 # covers it and its PRs stay shepherd-owned.
+#
+# `mctl-support` (tenant support agent over A2A, epic mctlhq/.github#243;
+# private Python/uv repo) is issue-driven only, registered for its S1
+# slices starting with mctlhq/mctl-support#2. Same shape as `mctl-alice`:
+# no `agents/mctl-support/` scaffold, so it must NOT enter ROTATING_SERVICES;
+# the generic implementer covers it and its PRs stay shepherd-owned.
 SERVICES = [
     "mctl-web",
     "mctl-docs",
@@ -101,6 +107,7 @@ SERVICES = [
     "newton-mcp-gateway",
     "mctl-claude-remote",
     "mctl-alice",
+    "mctl-support",
     # "upwork-mcp",
 ]
 
@@ -134,6 +141,7 @@ SERVICE_TENANTS = {
     "newton-mcp-gateway": PLATFORM_TENANT,
     "mctl-claude-remote": PLATFORM_TENANT,
     "mctl-alice": PLATFORM_TENANT,
+    "mctl-support": PLATFORM_TENANT,
 }
 
 
@@ -156,6 +164,7 @@ NON_ROTATING_SERVICES = {
     "newton-mcp-gateway",
     "mctl-claude-remote",
     "mctl-alice",
+    "mctl-support",
 }
 
 # Subset of SERVICES that the proactive R&D rotation analyzes via
@@ -187,6 +196,28 @@ SHEPHERD_SELECTION = resolve_model(
 )
 SCOUT_RELEVANCE_SELECTION = resolve_model("scout_relevance")
 SCOUT_SCORING_SELECTION = resolve_model("scout_scoring")
+
+# The *_MODEL constants below carry a model string only, so they cannot carry
+# a provider endpoint. Fail closed at import (stops the whole worker process,
+# intentionally) instead of sending a third-party model name to Anthropic.
+for _selection in (
+    SERVICE_AGENT_SELECTION,
+    MENTOR_SELECTION,
+    SHEPHERD_SELECTION,
+    SCOUT_RELEVANCE_SELECTION,
+    SCOUT_SCORING_SELECTION,
+):
+    if _selection.provider is not None:
+        raise ModelPolicyError(
+            f"task {_selection.task!r} resolves to provider profile "
+            f"{_selection.profile!r}, which string-only model paths cannot carry"
+        )
+    if _selection.effort is not None:
+        raise ModelPolicyError(
+            f"task {_selection.task!r} resolves to profile "
+            f"{_selection.profile!r} with effort {_selection.effort!r}, "
+            "which string-only model paths cannot carry"
+        )
 
 SERVICE_AGENT_MODEL = SERVICE_AGENT_SELECTION.model
 MENTOR_MODEL = MENTOR_SELECTION.model

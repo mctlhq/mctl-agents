@@ -1,0 +1,12 @@
+{
+  "model_input": "claude-opus-5-5",
+  "investigator_model": "claude-opus-5-5",
+  "model_matches_investigator": true,
+  "claude_agent_sdk": "0.2.168",
+  "claude_cli": "2.1.301 (Claude Code)",
+  "mcp": "1.29.0",
+  "python": "Python 3.12.3",
+  "runner_os": "Linux",
+  "run_id": "40533093166",
+  "git_sha": "7afb04b561358bbf46e6a666d011d130a0b75aab"
+}

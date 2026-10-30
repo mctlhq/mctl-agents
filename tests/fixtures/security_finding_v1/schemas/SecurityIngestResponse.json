@@ -1,0 +1,14 @@
+{
+  "properties": {
+    "results": {
+      "items": {
+        "$ref": "#/components/schemas/SecurityItemResult"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "results"
+  ],
+  "type": "object"
+}

@@ -199,12 +199,31 @@ async def bind_dispatched_execution(input: BindInput) -> BoundExecution:
     return BoundExecution(BOUND, execution_id=attached.execution_id, sequence=attached.attempt)
 
 
+#: `advance_dispatched_execution`'s answer when the ledger, read whole, holds
+#: no execution under the engine ref: there is nothing to advance.
+NOT_ATTACHED = "not-attached"
+
+
 @activity.defn
 async def advance_dispatched_execution(input: AdvanceInput) -> str:
     """Advance this loop's execution to `input.phase`. A definite refusal is
-    returned (the caller logs it); an unanswered one raises for a retry."""
+    returned (the caller logs it); an unanswered one raises for a retry.
+
+    Only an execution the ledger already holds is advanced. mctl-api's attach
+    CREATES one under an engine ref it does not know, and a `#xr_` engine ref
+    is minted by the dispatcher's fulfil alone: a terminal execution created
+    here first makes that fulfil answer `a resume starts a new run`, so the
+    request defers for ever (mctlhq/mctl-agents#858). A ledger that cannot be
+    read raises; only a read that answered and lacks the engine ref is
+    `NOT_ATTACHED`."""
+    client = _client()
+    read = await asyncio.to_thread(client.get, input.work_item_id)
+    if read.verdict != WORK_ITEM_FOUND or read.item is None:
+        raise ApplicationError(f"work item {input.work_item_id}: {read.verdict} {read.reason}", type=UNREADABLE_TYPE)
+    if not any(e.temporal_workflow_id == input.engine_ref for e in read.item.executions):
+        return f"{NOT_ATTACHED} {ENGINE_TEMPORAL}/{input.engine_ref} of {input.work_item_id}"
     run = EngineRun(engine=ENGINE_TEMPORAL, engine_ref=input.engine_ref)
-    answer = await asyncio.to_thread(_client().attach_execution, input.work_item_id, run, input.phase)
+    answer = await asyncio.to_thread(client.attach_execution, input.work_item_id, run, input.phase)
     if answer.usable or answer.verdict == EXECUTION_REFUSED:
         return f"{answer.verdict} {answer.execution_id or answer.reason}".strip()
     raise ApplicationError(f"advance to {input.phase}: {answer.verdict} {answer.reason}", type=UNREADABLE_TYPE)

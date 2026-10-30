@@ -1,0 +1,22 @@
+{
+  "description": "Provider free text. Inert data: no transition, policy or authorization\ncode reads it. Bounded (title 256 B, severity 32 B, description 4096 B).\n",
+  "properties": {
+    "claimed_provider": {
+      "description": "Any provider text the payload carried; never used for identity, scope, authority or strength",
+      "type": "string"
+    },
+    "description": {
+      "maxLength": 4096,
+      "type": "string"
+    },
+    "severity": {
+      "maxLength": 32,
+      "type": "string"
+    },
+    "title": {
+      "maxLength": 256,
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

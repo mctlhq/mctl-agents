@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from orchestrator.run_usage_collector import _ALLOWED_FIELDS, sanitise
 
 FIXTURE = Path(__file__).parent / "fixtures" / "model-usage-records.json"
@@ -209,3 +211,24 @@ def test_no_correlation_added_from_this_processs_own_environment(monkeypatch):
     assert "temporal_workflow_id" not in sanitised
     assert "work_item_id" not in sanitised
     assert "execution_id" not in sanitised
+
+
+def test_valid_price_source_is_forwarded():
+    sanitised = sanitise({**_fixture_records()[0], "price_source": "provider_free"})
+    assert sanitised is not None
+    assert sanitised["price_source"] == "provider_free"
+
+
+@pytest.mark.parametrize("bad", ["free", "", 3, None])
+def test_invalid_price_source_fails_closed_to_unknown(capsys, bad):
+    # Absent means mctl_catalog, so a malformed value must not simply vanish.
+    sanitised = sanitise({**_fixture_records()[0], "price_source": bad})
+    assert sanitised is not None
+    assert sanitised["price_source"] == "unknown"
+    assert "price_source" in capsys.readouterr().out
+
+
+def test_absent_price_source_stays_absent():
+    sanitised = sanitise(dict(_fixture_records()[0]))
+    assert sanitised is not None
+    assert "price_source" not in sanitised

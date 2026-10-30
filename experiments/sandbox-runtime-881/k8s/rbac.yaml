@@ -1,0 +1,53 @@
+# Disposable-cluster only. Mirrors the production split: the main container
+# gets no ServiceAccount token, while the Argo executor (init/wait) gets one so
+# it can report the step result through workflowtaskresults.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spike881-runner
+  namespace: spike881
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spike881-executor
+  namespace: spike881
+---
+# The controller mounts the executor token from a Secret it finds by this name
+# (<serviceaccount>.service-account-token); Kubernetes no longer creates one for
+# a ServiceAccount by itself. Mirrors mctl-agents-executor in mctl-gitops
+# platform-gitops/argo-workflows/config/sa-and-rbac.yaml. Without it the init
+# container waits forever on the exec-sa-token volume (Phase B run 40946018896).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: spike881-executor.service-account-token
+  namespace: spike881
+  annotations:
+    kubernetes.io/service-account.name: spike881-executor
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spike881-executor
+  namespace: spike881
+rules:
+  - apiGroups: [argoproj.io]
+    resources: [workflowtaskresults]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spike881-executor
+  namespace: spike881
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spike881-executor
+subjects:
+  - kind: ServiceAccount
+    name: spike881-executor
+    namespace: spike881

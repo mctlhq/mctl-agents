@@ -579,3 +579,38 @@ def test_a_span_name_carrying_a_credential_is_replaced_at_export(exported):
     tracing.tracer().start_span("execute_tool ghp_" + "a" * 36).end()
     (span,) = exported.get_finished_spans()
     assert span.name == "redacted"
+
+
+def _provider_of_run(exported, session_env, scoped=None):
+    from contextlib import nullcontext
+
+    with scoped or nullcontext():
+        with tracing.agent_run("issue-investigator", MODEL, session_env=session_env) as obs:
+            obs.observe(_assistant("m1", [TextBlock(text="hi")]))
+    spans = _spans(exported)
+    return (
+        spans["invoke_agent issue-investigator"].attributes["gen_ai.provider.name"],
+        spans[f"chat {MODEL}"].attributes["gen_ai.provider.name"],
+    )
+
+
+def test_provider_name_follows_the_provenance(exported, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    declared = usage_ledger.ModelProvenance("hetzner", "provider_free", True)
+    assert _provider_of_run(exported, None, usage_ledger.attribute_model(declared)) == ("hetzner", "hetzner")
+    exported.clear()
+    override = {"ANTHROPIC_BASE_URL": "https://inference.hetzner.com/api"}
+    assert _provider_of_run(exported, override) == ("unknown", "unknown")
+    exported.clear()
+    assert _provider_of_run(exported, None) == ("anthropic", "anthropic")
+
+
+def test_classifier_interruptions_reach_the_root_span_without_the_notice_text(exported, tmp_path, monkeypatch):
+    """mctl-agents#849: the investigator's root span carries the count of
+    safety-classifier notices, and never the notice text itself."""
+    notice = "Your response above was stopped by a safety classifier -- this is not a tool or API error."
+    messages = [_assistant("m1", [TextBlock(text=notice)]), *_stream()]
+    _run_investigator_agent(tmp_path, monkeypatch, messages)
+    root = _spans(exported)["invoke_agent issue-investigator"]
+    assert root.attributes[tracing.CLASSIFIER_INTERRUPTIONS] == 1
+    _assert_no_payload(exported, "safety classifier")

@@ -784,7 +784,13 @@ def _check_capability_discovery_matches_gateway_allowlist(
     previous_token = os.environ.get("MCTL_TOKEN")
     os.environ["MCTL_TOKEN"] = _DUMMY_MCTL_TOKEN
     try:
-        plan = cast("Any", SimpleNamespace(tools=tuple(declared_tools), model="dummy-model", budget_usd=1.0))
+        plan = cast(
+            "Any",
+            SimpleNamespace(
+                tools=tuple(declared_tools), model="dummy-model", budget_usd=1.0, provider=None,
+                effort=None,
+            ),
+        )
         try:
             options = build_issue_investigator_options_from_plan(
                 plan, _DUMMY_PATH, _DUMMY_PATH / "proposal",

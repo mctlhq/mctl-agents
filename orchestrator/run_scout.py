@@ -74,7 +74,7 @@ async def run_scout(
     results: list[feeds.SourceResult] = []
     with feeds.make_client(http_transport) as http:
         for src in cfg.sources:
-            results.append(feeds.fetch_source(http, src))
+            results.append(feeds.fetch_source(http, src, now))
     counts = render.Counts()
     all_items = [i for r in results if r.status == "ok" for i in r.items]
     counts.fetched = len(all_items)
@@ -122,7 +122,7 @@ async def run_scout(
         print(text)
         for row in (markup or {}).get("inline_keyboard", []):
             for b in row:
-                print(f"[{b['text']}] {b['url']}")
+                print(f"[{b['text']}] {b.get('url') or b.get('callback_data')}")
         for o in overflow:
             print(o)
     else:

@@ -1,0 +1,58 @@
+{
+  "description": "Append-only evidence on an occurrence.",
+  "properties": {
+    "claimed_action": {
+      "enum": [
+        "present",
+        "fixed",
+        "absent",
+        "withdrawn"
+      ],
+      "type": "string"
+    },
+    "delivery_id": {
+      "type": "string"
+    },
+    "evidence_refs": {
+      "items": {
+        "$ref": "#/components/schemas/SecurityEvidenceRef"
+      },
+      "type": "array"
+    },
+    "id": {
+      "description": "sob_...",
+      "type": "string"
+    },
+    "ingested_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "observation_hash": {
+      "type": "string"
+    },
+    "observed_artifact_digest": {
+      "type": "string"
+    },
+    "observed_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "observed_revision": {
+      "type": "string"
+    },
+    "occurrence_id": {
+      "type": "string"
+    },
+    "provider_ref": {
+      "description": "From the authenticated principal",
+      "type": "string"
+    },
+    "source_finding_id": {
+      "type": "string"
+    },
+    "untrusted": {
+      "$ref": "#/components/schemas/SecurityUntrusted"
+    }
+  },
+  "type": "object"
+}

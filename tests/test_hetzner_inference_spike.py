@@ -50,7 +50,7 @@ def _fake_hetzner(catalog: list[str], messages_ok: bool = False):
 def test_snapshot_missing_model_is_unavailable_and_not_substituted():
     catalog = ["Kimi-K2.7-Code", "GLM-5.2-NVFP4", "Qwen/Qwen3.6-35B-A3B-FP8", "DeepSeek-V4-Flash"]  # near miss
     snap = hs.take_snapshot(_client(_fake_hetzner(catalog)), base_url="https://example.test")
-    assert snap["selected"]["DeepSeek-V4-Flash-0731"] == {"availability": hs.UNAVAILABLE}
+    assert snap["selected"]["DeepSeek-V4-Flash-0731"] == {"availability": hs.UNAVAILABLE, "preregistered": True}
     assert snap["selected"]["Kimi-K2.7-Code"]["function_call"]["tool_call_returned"] is True
     assert snap["messages_probe"]["ok"] is False
     assert "timestamp_utc" in snap and not hs.contains_credential(json.dumps(snap))
@@ -176,7 +176,8 @@ def test_bench_dry_run_and_model_mismatch(tmp_path):
     assert manifest["baseline"]["model"] == "claude-test" and set(manifest["fixtures"]) == set(hs.TASKS)
     hs.write_artifact(tmp_path / "records.jsonl", hs.render_jsonl(records))
     snapshot = hs.take_snapshot(_client(_fake_hetzner(["Kimi-K2.7-Code"])), base_url="https://example.test")
-    assert "Proposed verdict:" in hs.render_report(records, snapshot, manifest)
+    text = hs.render_report(records, snapshot, manifest, snapshot)
+    assert "## Rule outcome" in text and "Catalog drift: none" in text
 
 
 # T7
@@ -247,3 +248,177 @@ def test_candidate_mcp_call_is_rejected_not_a_bypass_and_home_is_isolated():
     assert rec["policy_bypasses"] == 0 and rec["tool_calls_invalid"] == 1
     out = hs.hetzner_session_env({"PATH": "/bin", "HOME": "/home/operator"}, base_url="u", token="t", model="M")
     assert out["HOME"] != "/home/operator"
+
+
+def test_owner_added_model_is_probed_and_flagged_and_bench_never_substitutes():
+    snap = hs.take_snapshot(_client(_fake_hetzner(["Qwen/Qwen3.6-35B-A3B-FP8", "Qwen3.8-27B"])),
+                            base_url="https://example.test", extra=["Qwen3.8-27B", "Absent-1"])
+    assert snap["selected"]["Qwen3.8-27B"]["preregistered"] is False
+    assert snap["selected"]["Qwen3.8-27B"]["function_call"]["tool_call_returned"] is True
+    assert snap["selected"]["Absent-1"]["availability"] == hs.UNAVAILABLE
+    assert hs.bench_models(snap, []) == ["Qwen/Qwen3.6-35B-A3B-FP8", "Qwen3.8-27B"]
+    assert hs.bench_models(snap, ["Qwen3.8-27B"]) == ["Qwen3.8-27B"]
+    with pytest.raises(hs.SpikeError):
+        hs.bench_models(snap, ["Absent-1"])
+
+
+def test_deep_probes_record_protocol_framing_not_content():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "M"}]})
+        body = json.loads(request.content)
+        if body.get("stream"):
+            sse = (b'data: {"type":"message_start"}\n\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"secret-ish"}}\n\n'
+                   b"data: [DONE]\n\n")
+            return httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
+        if request.url.path == "/v1/messages":
+            last = body["messages"][-1]["content"]
+            if body.get("tools") and isinstance(last, str):
+                return httpx.Response(200, json={"type": "message", "stop_reason": "tool_use", "model": "M",
+                                                 "content": [{"type": "tool_use", "id": "t1", "name": "get_weather", "input": {}}]})
+            return httpx.Response(200, json={"type": "message", "stop_reason": "end_turn", "model": "M",
+                                             "content": [{"type": "text", "text": "ok"}], "usage": {"input_tokens": 5}})
+        return _fake_hetzner(["M"])(request)
+
+    snap = hs.take_snapshot(_client(handler), base_url="https://example.test", selected=("M",), deep=True)
+    probes = snap["selected"]["M"]["protocols"]
+    assert probes["messages_tool_use"]["stop_reason"] == "tool_use"
+    assert probes["messages_tool_result"]["stop_reason"] == "end_turn"
+    assert probes["messages_stream_text"]["event_types"] == {"message_start": 1, "content_block_delta:text_delta": 1, "[DONE]": 1}
+    assert "secret-ish" not in json.dumps(snap)
+    assert snap["selected"]["M"]["long_context"]["status"] == 200
+    assert snap["selected"]["M"]["long_context"]["prompt_chars"] == hs.LONG_CONTEXT_CHARS
+
+
+def test_merge_joins_arms_and_refuses_mismatched_fixtures():
+    fx = {"t": {"id": "x", "sha256": "s", "limits": {}}}
+    m1 = {"run_id": "a", "repo_sha": "r", "fixtures": fx, "baseline": {"model_policy_version": 1}, "started_utc": "1",
+          "finished_utc": "2", "arms": ["baseline"], "available_models": [], "repetitions_achieved": {"t|b": 3},
+          "run_location": {"baseline": "host"}}
+    m2 = {**m1, "run_id": "c", "arms": ["candidate"], "available_models": ["M"], "repetitions_achieved": {"t|M": 3},
+          "run_location": {"candidate": "container"}, "started_utc": "3", "finished_utc": "4"}
+    records, merged = hs.merge_runs([([{"model": "b", "task": "t", "repetition": 1}], m1),
+                                     ([{"model": "M", "task": "t", "repetition": 1}], m2)])
+    assert len(records) == 2 and merged["arms"] == ["baseline", "candidate"] and merged["available_models"] == ["M"]
+    assert merged["repetitions_achieved"] == {"t|b": 3, "t|M": 3} and merged["finished_utc"] == "4"
+    with pytest.raises(hs.SpikeError):
+        hs.merge_runs([([], m1), ([], {**m2, "fixtures": {"t": {"id": "y", "sha256": "z", "limits": {}}}})])
+    with pytest.raises(hs.SpikeError):
+        hs.merge_runs([([], m2), ([], m2)])
+
+
+def test_checklist_flags_write_in_read_only_task_and_budget_stop():
+    rec = {"model": "M", "task": "review", "status": "ok", "oracle_result": "fail", "tool_calls_valid": 1,
+           "tool_calls_hallucinated": 0, "finish_reasons": ["max_tokens"], "tool_names": {"Edit": 1}}
+    checks = hs.model_checklist([rec], {"long_context": {"status": 400, "type": None}})
+    assert checks["complies with read-only instruction"] == "fail"
+    assert checks["reasoning does not exhaust output budget"] == "fail"
+    assert checks["long context (~60k tokens) accepted"] == "fail"
+    assert checks["recovers after a tool error"] == "unknown"
+
+
+def test_bench_arm_misuse_is_refused(tmp_path):
+    snap = {"selected": {"M": {"availability": hs.UNAVAILABLE}}, "messages_probe": {"ok": True}}
+    (tmp_path / "snapshot-start.json").write_text(json.dumps(snap))
+    common = ["bench", "--allow-live", "--out-dir", str(tmp_path)]
+    assert hs.main([*common, "--arm", "baseline", "--models", "M"]) == 2
+    assert hs.main([*common, "--arm", "candidate"]) == 2
+
+
+def test_effort_is_candidate_only_and_recorded(tmp_path):
+    snap = {"selected": {"M": {"availability": hs.AVAILABLE}}, "messages_probe": {"ok": True}}
+    (tmp_path / "snapshot-start.json").write_text(json.dumps(snap))
+    common = ["bench", "--allow-live", "--out-dir", str(tmp_path), "--effort", "medium"]
+    assert hs.main([*common, "--arm", "baseline"]) == 2
+    assert hs.main([*common, "--arm", "all"]) == 2
+    fixtures = hs.load_fixtures()
+
+    async def runner(task, model, provider, rep, ws):
+        return {"tool_calls": [], "final_text": "", "usage_models": [model], "http_errors": 0, "timeouts": 0}
+
+    base = {"model": "claude-test", "model_policy_version": 1}
+    records, manifest = anyio.run(lambda: hs.run_bench(runner, fixtures, ["M"], reps=1, baseline=base,
+                                                       include_baseline=False, effort="medium"))
+    assert {r["effort"] for r in records} == {"medium"} and manifest["candidate_effort"] == "medium"
+    text = hs.render_exploratory(records, manifest, {"timestamp_utc": "t", "catalog_ids": ["M"], "selected": {}})
+    assert "`medium`" in text and "| `M` |" in text
+    assert hs.main(["bench", "--allow-live", "--arm", "candidate", "--effort", "medium"]) == 2
+    base_manifest = {**manifest, "run_id": "b", "arms": ["baseline"], "candidate_effort": "cli-default"}
+    with pytest.raises(hs.SpikeError, match="exploratory"):
+        hs.merge_runs([([], base_manifest), (records, manifest)])
+    with pytest.raises(hs.SpikeError, match="exploratory"):
+        hs.merge_runs([([], base_manifest), (records, {**manifest, "candidate_effort": "cli-default"})])
+
+
+def _policy_bench_setup(tmp_path, monkeypatch, *, available=True, base_url="https://inference.hetzner.com/api"):
+    snap = {"selected": {"Qwen/Qwen3.8-27B": {"availability": hs.AVAILABLE if available else hs.UNAVAILABLE}},
+            "messages_probe": {"ok": True}}
+    (tmp_path / "snapshot-start.json").write_text(json.dumps(snap))
+    monkeypatch.setenv("HETZNER_INFERENCE_BASE_URL", base_url)
+    monkeypatch.setenv("HETZNER_INFERENCE_API_KEY", "k")
+    policy = str(ROOT / "docs" / "spikes" / "825" / "model-policy-qwen38.yaml")
+    return ["bench", "--allow-live", "--out-dir", str(tmp_path), "--arm", "candidate",
+            "--model-policy", policy, "--policy-task", "bench_candidate"]
+
+
+def test_committed_825_bench_policy_resolves_to_qwen38_medium_hetzner():
+    from config.model_policy import ModelPolicy
+
+    sel = ModelPolicy.load(ROOT / "docs" / "spikes" / "825" / "model-policy-qwen38.yaml").resolve(
+        "bench_candidate", log=False)
+    assert (sel.model, sel.effort) == ("Qwen/Qwen3.8-27B", "medium")
+    assert sel.provider is not None and sel.provider.name == "hetzner"
+
+
+def test_policy_bench_refusals_happen_before_any_live_call(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("live call attempted")
+
+    monkeypatch.setattr(hs, "make_sdk_runner", boom)
+    monkeypatch.setattr(hs, "HetznerClient", boom)
+    args = _policy_bench_setup(tmp_path, monkeypatch)
+
+    def swap(flag, value):
+        out = list(args)
+        out[out.index(flag) + 1] = value
+        return out
+
+    assert hs.main([*args, "--effort", "medium"]) == 2
+    assert hs.main(swap("--arm", "all")) == 2
+    assert hs.main(args[:-2]) == 2  # --policy-task missing
+    assert hs.main([*args, "--models", "other"]) == 2
+    assert hs.main(swap("--out-dir", str(hs.SPIKE_DIR))) == 2
+    monkeypatch.setenv("HETZNER_INFERENCE_BASE_URL", "https://elsewhere.example")
+    assert hs.main(args) == 2
+    args = _policy_bench_setup(tmp_path, monkeypatch, available=False)
+    assert hs.main(args) == 2
+    # a policy task that resolves to no provider
+    args = _policy_bench_setup(tmp_path, monkeypatch)
+    assert hs.main(swap("--policy-task", "service_agent")) == 2
+
+
+def test_policy_bench_records_effort_source_and_stays_exploratory(tmp_path, monkeypatch):
+    args = _policy_bench_setup(tmp_path, monkeypatch)
+    ns = hs.argparse.Namespace(model_policy=args[args.index("--model-policy") + 1], policy_task="bench_candidate",
+                               effort=None, arm="candidate")
+    snap = json.loads((tmp_path / "snapshot-start.json").read_text())
+    model, effort, info = hs._policy_candidate(ns, snap)
+    assert (model, effort) == ("Qwen/Qwen3.8-27B", "medium") and len(info["model_policy_sha256"]) == 64
+    fixtures = hs.load_fixtures()
+
+    async def runner(task, m, provider, rep, ws):
+        return {"tool_calls": [], "final_text": "", "usage_models": [m], "http_errors": 0, "timeouts": 0}
+
+    base = {"model": "claude-test", "model_policy_version": 1}
+    records, manifest = anyio.run(lambda: hs.run_bench(
+        runner, fixtures, [model], reps=1, baseline=base, include_baseline=False, effort=effort,
+        effort_source="policy", policy_info=info))
+    assert {(r["effort"], r["effort_source"]) for r in records} == {("medium", "policy")}
+    assert manifest["candidate_effort_source"] == "policy" and manifest["model_policy_sha256"]
+    with pytest.raises(hs.SpikeError, match="exploratory"):
+        hs._refuse_exploratory(records, [manifest])
+
+
+def test_count_http_400():
+    recs = [{"error": "api_error_status=400"}, {"error": "api_error_status=429"}, {"error": None}, {}]
+    assert hs.count_http_400(recs) == 1

@@ -81,6 +81,15 @@ the shape of (the environment's three are free text there). A value it would
 reject is dropped here, with a warning: the ingest is all-or-nothing, so one
 malformed field would otherwise cost the whole batch.
 
+Provider and price source (mctlhq/mctl-agents#826, ADR-012 amendment
+2026-10-27). `ModelUsage.provider` describes the CLI's transport, not who
+served the tokens. A session with a declared third-party provenance
+(`attribute_model`) records the declared `provider` and a `price_source`
+from PRICE_SOURCES; an undeclared `ANTHROPIC_BASE_URL` override records
+`unknown`/`unknown`. A default session records exactly what it always did
+(no `price_source`, which means `mctl_catalog`). No cost is ever sent. The
+total input count is `input_tokens + cache_read_tokens + cache_write_tokens`.
+
 Never fatal. Recording is bookkeeping about a run, not part of it: every
 failure here is logged and swallowed.
 """
@@ -96,8 +105,10 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -174,6 +185,85 @@ Post = Callable[[str, dict[str, Any], dict[str, str]], httpx.Response]
 # Correlation the runner scopes around an SDK session; see the module
 # docstring. A fresh dict per scope, never mutated.
 _SCOPED: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("usage_ledger_correlation")
+
+# Where a record's price comes from. Absent on the wire means mctl_catalog.
+PRICE_SOURCES = frozenset({"mctl_catalog", "provider_free", "unknown"})
+PRICE_SOURCE_DEFAULT = "mctl_catalog"
+_ANTHROPIC_HOSTS = frozenset({"api.anthropic.com"})
+_PROVIDER_ID_RE = re.compile(r"^[a-z0-9-]+$")
+BASE_URL_OVERRIDE_ENV = "ANTHROPIC_BASE_URL"
+
+# Cost fields no record may carry: mctl-api prices at ingest, and a CLI cost
+# estimate must never reach the ledger.
+_FORBIDDEN_COST_FIELDS = (
+    "calculated_cost", "provider_reported_cost", "pricing_version",
+    "invoice_reconciled_cost", "costUSD", "total_cost_usd", "cost_usd",
+)
+
+
+@dataclass(frozen=True)
+class ModelProvenance:
+    """Who served a session's tokens and where their price comes from.
+    `provider=None` keeps the CLI-reported provider (default sessions)."""
+
+    provider: str | None
+    price_source: str
+    third_party: bool
+
+
+_DEFAULT_PROVENANCE = ModelProvenance(None, PRICE_SOURCE_DEFAULT, False)
+
+_PROVENANCE: contextvars.ContextVar[ModelProvenance] = contextvars.ContextVar("usage_ledger_provenance")
+
+# Hosts already warned about by provenance_for_env.
+_WARNED_OVERRIDE_HOSTS: set[str] = set()
+
+
+def provenance_for_env(
+    env: Mapping[str, str], *, declared: ModelProvenance | None = None
+) -> ModelProvenance:
+    """The single validation gate for provenance; see the module docstring."""
+    if declared is not None:
+        if not _PROVIDER_ID_RE.match(declared.provider or ""):
+            raise ValueError(f"provider id {declared.provider!r} must match [a-z0-9-]+")
+        if declared.price_source not in PRICE_SOURCES:
+            raise ValueError(f"price_source {declared.price_source!r} is not one of {sorted(PRICE_SOURCES)}")
+        if declared.price_source == PRICE_SOURCE_DEFAULT:
+            raise ValueError("a third-party provenance may not claim price_source=mctl_catalog")
+        return ModelProvenance(declared.provider, declared.price_source, True)
+    base = (env.get(BASE_URL_OVERRIDE_ENV) or "").strip()
+    if not base:
+        return _DEFAULT_PROVENANCE
+    try:
+        host = (urlsplit(base).hostname or "").lower()
+    except ValueError:
+        host = ""
+    if host in _ANTHROPIC_HOSTS:
+        return _DEFAULT_PROVENANCE
+    shown = host or "<unparseable>"
+    # Once per host per process: from_env runs on every agent_run, and a
+    # long-lived worker would otherwise repeat the same line every session.
+    if shown not in _WARNED_OVERRIDE_HOSTS:
+        _WARNED_OVERRIDE_HOSTS.add(shown)
+        logger.warning(
+            "usage ledger: %s points at %r and no provenance was declared; "
+            "recording provider=unknown, price_source=unknown",
+            BASE_URL_OVERRIDE_ENV, shown,
+        )
+    return ModelProvenance("unknown", "unknown", True)
+
+
+@contextlib.contextmanager
+def attribute_model(provenance: ModelProvenance) -> Iterator[None]:
+    """Declare the provenance of every recorder built in this context.
+    Validated on entry, so a bad declaration fails before the lane runs."""
+    checked = provenance_for_env({}, declared=provenance)
+    token = _PROVENANCE.set(checked)
+    try:
+        yield
+    finally:
+        _PROVENANCE.reset(token)
+
 
 # The shapes mctl-api validates at ingest (internal/usage/types.go,
 # validateCorrelation). Kept in step with it: a looser check here lets a
@@ -400,7 +490,9 @@ class UsageRecorder:
         post: Post | None = None,
         sleep: Callable[[float], None] = time.sleep,
         submit: Callable[[Callable[[], None]], None] | None = None,
+        provenance: ModelProvenance | None = None,
     ) -> None:
+        self.provenance = provenance or _DEFAULT_PROVENANCE
         self.agent = _AGENT_NAMES.get(agent, agent)
         self._token = token.strip()
         self._off_reason = "" if self._token else f"{TOKEN_ENV} is not set"
@@ -434,15 +526,24 @@ class UsageRecorder:
         cls,
         agent: str,
         environ: Mapping[str, str] | None = None,
+        session_env: Mapping[str, str] | None = None,
         **correlation: Any,
     ) -> UsageRecorder:
         env = os.environ if environ is None else environ
+        scoped = _PROVENANCE.get(None)
+        if scoped is not None:
+            provenance = scoped
+        elif session_env is not None:
+            provenance = provenance_for_env({**env, **session_env})
+        else:
+            provenance = provenance_for_env(env)
         found = {field: env.get(name, "").strip() for name, field in _CORRELATION_ENV}
         return cls(
             agent,
             token=env.get(TOKEN_ENV, ""),
             base_url=env.get(BASE_URL_ENV, "").strip() or DEFAULT_BASE_URL,
             correlation={**found, **_SCOPED.get({}), **correlation},
+            provenance=provenance,
         )
 
     @property
@@ -572,9 +673,17 @@ class UsageRecorder:
             canonical = usage.get("canonicalModel")
             if isinstance(canonical, str) and canonical:
                 record["canonical_model"] = canonical
-            provider = usage.get("provider")
-            if isinstance(provider, str) and provider:
-                record["provider"] = provider
+            if self.provenance.third_party:
+                record["provider"] = self.provenance.provider
+                record["price_source"] = self.provenance.price_source
+            else:
+                provider = usage.get("provider")
+                if isinstance(provider, str) and provider:
+                    record["provider"] = provider
+            for forbidden in _FORBIDDEN_COST_FIELDS:
+                if forbidden in record:
+                    del record[forbidden]
+                    self._warn_once("cost-field", "usage ledger: dropped cost field %s from a record", forbidden)
             planned.append((
                 seen_key,
                 (session_id, str(model_key)),

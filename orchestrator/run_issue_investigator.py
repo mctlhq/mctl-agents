@@ -2534,7 +2534,9 @@ async def _run_agent(
     # The model/tool spans of mctl-agents#195: `trace_run.observe` sees every
     # message `_note` sees, and records names, ids and usage counters only.
     async with (
-        tracing.agent_run("issue-investigator", getattr(options, "model", None)) as trace_run,
+        tracing.agent_run(
+            "issue-investigator", getattr(options, "model", None), session_env=getattr(options, "env", None)
+        ) as trace_run,
         ClaudeSDKClient(options=options) as client,
     ):
         if mcp_configured and capability_mode != "discovery":
