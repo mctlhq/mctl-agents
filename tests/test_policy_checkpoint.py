@@ -147,7 +147,9 @@ def test_the_rule_table_classifies_the_recorded_mctl_tool_inventory():
     tools = facts["mcp_tools"]
     assert len(tools) == facts["mcp_tool_count"]
     reads = {t for t in tools if t.removeprefix("mctl_").startswith(("get_", "list_", "read_", "search_", "describe_"))
-             or t.removeprefix("mctl_") in ("whoami", "incident_summary", "resolve_agent")}
+             or t.removeprefix("mctl_") in ("whoami", "incident_summary", "resolve_agent", "deploy_analyze",
+                                            "inspect_lifecycle_conflict", "plan_epic_wave", "erpact_list_sites",
+                                            "erpact_site_status")}
     mutations = {"mctl_resolve_incident", "mctl_acknowledge_incident"}
     # Any agent holding the mctl server: reads only. The incident responder,
     # which also grants the two mutations by name: reads plus those two.

@@ -140,3 +140,65 @@ def test_facts_from_code_extracts_every_local_fact_from_this_repo() -> None:
     assert facts["schedules"], "no Temporal schedules found in worker.py"
     assert "DevLoopWorkflow" in facts["workflows"]
     assert set(facts["manifest_api_versions"]) == set(facts["agents"])
+
+
+def _fake_api(root: Path) -> Path:
+    """A minimal mctl-api tree shaped like the real one: server.go registers
+    every tool, but only some are defined there (mctlhq/mctl-agents#888)."""
+    mcp = root / "internal" / "mcp"
+    mcp.mkdir(parents=True)
+    (mcp / "server.go").write_text(
+        "func (s *Server) register(srv *server.MCPServer) {\n"
+        "\tsrv.AddTool(s.toolWhoami())\n"
+        "\tsrv.AddTool(s.toolGetUsageSummary())\n"
+        "\tsrv.AddTool(s.toolPlanEpicWave())\n"
+        "}\n"
+        "func (s *Server) toolWhoami() (mcplib.Tool, server.ToolHandlerFunc) {\n"
+        '\ttool := mcplib.NewTool("mctl_whoami",\n'
+        '\t\tmcplib.WithDescription("Follow up with mctl_get_usage_summary."),\n'
+        "\t)\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (mcp / "usage.go").write_text(
+        "func (s *Server) toolGetUsageSummary() (mcplib.Tool, server.ToolHandlerFunc) {\n"
+        '\ttool := mcplib.NewTool("mctl_get_usage_summary", mcplib.WithReadOnlyHintAnnotation(true))\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    (mcp / "roadmap_wave.go").write_text(
+        "func (s *Server) toolPlanEpicWave() (mcplib.Tool, server.ToolHandlerFunc) {\n"
+        "\ttool := mcplib.NewTool(\n"
+        '\t\t"mctl_plan_epic_wave",\n'
+        "\t)\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    # Test files define throwaway tools; they are not part of the inventory.
+    (mcp / "usage_test.go").write_text('var _ = mcplib.NewTool("mctl_test_only_tool")\n', encoding="utf-8")
+    ops = root / "internal" / "operations"
+    ops.mkdir(parents=True)
+    (ops / "registry.go").write_text('\t\tName: "deploy-service",\n', encoding="utf-8")
+    reg = root / "internal" / "agentregistry"
+    reg.mkdir(parents=True)
+    (reg / "types.go").write_text('\tEnvironmentProduction = "production"\n', encoding="utf-8")
+    return root
+
+
+def test_mcp_tools_are_collected_from_every_file_not_only_server_go(tmp_path: Path) -> None:
+    """Tools defined outside server.go are part of the inventory, and the
+    name list and the AddTool count come from the same file set, so they
+    agree. server.go alone sees one of the three tools (plus a name quoted
+    in a description) while counting three registrations."""
+    facts = df.facts_from_code(None, _fake_api(tmp_path / "api"))
+    assert facts["mcp_tools"] == ["mctl_get_usage_summary", "mctl_plan_epic_wave", "mctl_whoami"]
+    assert facts["mcp_tool_count"] == len(facts["mcp_tools"]) == 3
+
+
+def test_mcp_tools_without_sources_is_a_failed_read_not_an_empty_inventory(tmp_path: Path) -> None:
+    (tmp_path / "internal" / "mcp").mkdir(parents=True)
+    with pytest.raises(FileNotFoundError):
+        df.mcp_tools_from_api(tmp_path)
+    (tmp_path / "internal" / "mcp" / "server.go").write_text("package mcp\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="NewTool"):
+        df.mcp_tools_from_api(tmp_path)
