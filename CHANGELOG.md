@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.112.1](https://github.com/mctlhq/mctl-agents/compare/1.112.0...1.112.1) (2026-10-30)
+
+
+### Bug Fixes
+
+* **diagrams:** collect MCP tools from all of mctl-api's internal/mcp ([eef19b8](https://github.com/mctlhq/mctl-agents/commit/eef19b86eafb00bc5df0ab44648faa6e93a19cfe))
+* **diagrams:** collect MCP tools from all of mctl-api's internal/mcp ([98b50f8](https://github.com/mctlhq/mctl-agents/commit/98b50f8e45a936892d0274c796b1ac430384a03f)), closes [#888](https://github.com/mctlhq/mctl-agents/issues/888)
+
 ## [1.112.0](https://github.com/mctlhq/mctl-agents/compare/1.111.2...1.112.0) (2026-10-30)
 
 
