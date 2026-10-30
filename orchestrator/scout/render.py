@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import json
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode
@@ -10,6 +11,10 @@ from orchestrator.scout.feeds import SourceResult
 
 MAX_BUTTON_URL_CHARS = 2000
 MAX_MESSAGE_CHARS = 4096
+# Telegram rejects the whole message ("reply markup is too long") past an undocumented
+# total keyboard size; 10 full structured drafts (~1.8k chars each) crossed it on
+# 2026-10-30 while ~1k-char drafts never did. Measured as serialized JSON.
+MAX_MARKUP_CHARS = 9000
 
 
 # Static, compact scaffold: the button URL carries the body, so prose size is budgeted
@@ -62,11 +67,11 @@ class Counts:
     backlog_unavailable: bool = False
 
 
-def draft_body(item: Scored, run_id: str) -> str:
+def draft_body(item: Scored, run_id: str, scaffold: bool = True) -> str:
     related = ", ".join(item.related) if item.related else "none"
     sections = "".join(
         f"\n\n## {heading}" + "".join(f"\n- {b}" for b in bullets) for heading, bullets in SPIKE_SECTIONS
-    )
+    ) if scaffold else ""
     return (
         f"Source: {item.link}\n"
         f"Question: {item.question}\n"
@@ -86,17 +91,58 @@ def _url(repo: str, title: str, body: str) -> str:
     return f"https://github.com/mctlhq/{repo}/issues/new?{q}"
 
 
-def draft_url(item: Scored, run_id: str) -> tuple[str, str | None]:
+def draft_url(item: Scored, run_id: str, scaffold: bool = True) -> tuple[str, str | None]:
     """Return (url, full_body_if_fallback). Fallback uses the short body."""
     title = f"spike: {item.question}"
-    body = draft_body(item, run_id)
+    body = draft_body(item, run_id, scaffold)
     url = _url(item.repo, title, body)
     if len(url) <= MAX_BUTTON_URL_CHARS:
         return url, None
+    return source_only_url(item), body
+
+
+def source_only_url(item: Scored) -> str:
+    title = f"spike: {item.question}"
     short = _url(item.repo, title, f"Source: {item.link}")
     if len(short) > MAX_BUTTON_URL_CHARS:
         short = _url(item.repo, title[:120], f"Source: {item.link}")
-    return short, body
+    return short
+
+
+def _row(n: int, url: str) -> list[dict[str, str]]:
+    # mctl-agent's scout:create:N callback reads the draft back from the URL
+    # button in the same row (mctl-agent internal/scoutspike), so both must
+    # stay together and keep these exact texts.
+    return [{"text": f"Draft spike {n}", "url": url},
+            {"text": f"Create spike {n}", "callback_data": f"scout:create:{n}"}]
+
+
+def markup_size(rows: list[list[dict[str, str]]]) -> int:
+    return len(json.dumps({"inline_keyboard": rows}))
+
+
+def build_keyboard(items: list[Scored], run_id: str) -> tuple[list[list[dict[str, str]]], list[tuple[int, str]]]:
+    """Rows for items within MAX_MARKUP_CHARS, plus (n, full_body) for drafts cut by the URL cap.
+
+    Higher-ranked items keep the richest draft that still leaves room for every
+    later item at its smallest (Source-only) form. A draft dropped only for the
+    keyboard budget gets no reply: "Create spike" builds the issue from the URL.
+    """
+    floor = [_row(n, source_only_url(it)) for n, it in enumerate(items, 1)]
+    rows: list[list[dict[str, str]]] = []
+    fallbacks: list[tuple[int, str]] = []
+    for n, it in enumerate(items, 1):
+        rest = floor[n:]
+        chosen = floor[n - 1]
+        for scaffold in (True, False):
+            url, full = draft_url(it, run_id, scaffold)
+            if markup_size([*rows, _row(n, url), *rest]) <= MAX_MARKUP_CHARS:
+                chosen = _row(n, url)
+                if full and scaffold:
+                    fallbacks.append((n, f"Draft {n}:\n{html.escape(full)}"))
+                break
+        rows.append(chosen)
+    return rows, fallbacks
 
 
 def render_footer(results: list[SourceResult], c: Counts) -> str:
@@ -139,11 +185,8 @@ def render_digest(
         return "Scout: all sources failed.\n\n" + footer, None, []
     if not ranked:
         return "Scout: no relevant items were found.\n\n" + footer, None, []
-    rows: list[list[dict[str, str]]] = []
     blocks: list[str] = []
-    fallbacks: list[tuple[int, str]] = []
     for n, it in enumerate(ranked, 1):
-        url, full = draft_url(it, run_id)
         rel = ("adds to " if it.adds_to else "related: ") + ", ".join(it.related) if it.related else ""
         block = (
             f"{n}. <a href=\"{html.escape(it.link, quote=True)}\">{html.escape(it.title)}</a> "
@@ -151,13 +194,6 @@ def render_digest(
             f"{html.escape(it.pitch_ru)}" + (f"\n{html.escape(rel)}" if rel else "")
         )
         blocks.append(block)
-        # mctl-agent's scout:create:N callback reads the draft back from the URL
-        # button in the same row (mctl-agent internal/scoutspike), so both must
-        # stay together and keep these exact texts.
-        rows.append([{"text": f"Draft spike {n}", "url": url},
-                     {"text": f"Create spike {n}", "callback_data": f"scout:create:{n}"}])
-        if full:
-            fallbacks.append((n, f"Draft {n}:\n{html.escape(full)}"))
     tail = "\n\n" + footer
     keep = len(blocks)
     while keep > 1 and len("\n\n".join(blocks[:keep])) + len(tail) > MAX_MESSAGE_CHARS:
@@ -165,6 +201,7 @@ def render_digest(
     text = "\n\n".join(blocks[:keep]) + tail
     if len(text) > MAX_MESSAGE_CHARS:
         text = text[: MAX_MESSAGE_CHARS - 1] + "~"
-    # Only items still in the message: fallbacks holds just the overflowing ones.
-    overflow = [f[:MAX_MESSAGE_CHARS] for n, f in fallbacks if n <= keep]
-    return text, {"inline_keyboard": rows[:keep]}, overflow
+    # Budget the keyboard only over items still in the message.
+    rows, fallbacks = build_keyboard(ranked[:keep], run_id)
+    overflow = [f[:MAX_MESSAGE_CHARS] for _n, f in fallbacks]
+    return text, {"inline_keyboard": rows}, overflow

@@ -42,6 +42,13 @@ because the body travels in the button URL. If the URL exceeds 2000 characters t
 falls back to a `Source:`-only body and the full structured body is sent as a `Draft N:`
 overflow reply. The org `spike.yml` form should mirror this vocabulary (separate follow-up).
 
+The whole keyboard is also budgeted (`MAX_MARKUP_CHARS`, serialized JSON): Telegram
+rejects the entire message with "reply markup is too long" past an undocumented size.
+Higher-ranked items keep the full structured draft; once the budget runs short, later
+items get the header-only draft (no scaffold) and then a `Source:`-only one, with no
+overflow reply, so "Create spike" on those creates a thinner issue. If Telegram still
+refuses the keyboard, the digest is resent without buttons and the run exits 1.
+
 ## Rules
 
 - Never call `getUpdates`, `deleteWebhook` or `setWebhook` on @MCTL_AI_bot. Its
