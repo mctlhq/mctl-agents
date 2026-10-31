@@ -18,6 +18,7 @@ from claude_agent_sdk.types import HookMatcher
 from config.model_policy import ProviderSpec, provider_session_env
 from config.settings import MCTL_MCP_URL
 from orchestrator.ci_checks import CI_LOG_MAX_CHECKS
+from orchestrator.credential_files import file_env_names, read_credential
 from orchestrator.evidence_producer import agent_env_without_evidence_token
 from orchestrator.exec_budget import (
     CommandBudgetLedger,
@@ -130,7 +131,7 @@ def mctl_mcp_config(*, always_load: bool = False) -> dict:
     # static token; any other run is unchanged.
     from orchestrator import run_token
 
-    token, scope_headers = run_token.mcp_auth(os.environ.get("MCTL_TOKEN", "").strip())
+    token, scope_headers = run_token.mcp_auth(read_credential("MCTL_TOKEN"))
     if not token:
         print("warn: MCTL_TOKEN is not set — agent will run without mctl MCP tools.")
         return {}
@@ -1287,7 +1288,13 @@ def _scrubbed(
     options.env = agent_env_without_mctl_token(
         agent_env_without_evidence_token(agent_env_without_writer_token(options.env or os.environ))
     )
-    if provider is not None:
+    options.env = {**options.env, **{name: "" for name in file_env_names()}}
+    if provider is None:
+        # Deferred: auth loads .env at import.
+        from orchestrator.auth import session_auth_env
+
+        options.env = {**options.env, **session_auth_env()}
+    else:
         if options.fallback_model is not None:
             raise ValueError("a provider session must not set fallback_model")
         if not options.model or not options.model.strip():

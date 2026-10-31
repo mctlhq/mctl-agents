@@ -37,6 +37,7 @@ from pathlib import Path
 import httpx
 
 from config.settings import MCTL_MCP_URL
+from orchestrator.credential_files import read_credential
 
 MODE_ENV = "MCTL_RUN_TOKEN_MODE"
 SA_TOKEN_FILE_ENV = "MCTL_RUN_TOKEN_SA_TOKEN_FILE"  # noqa: S105 — an env var name, not a credential
@@ -260,7 +261,7 @@ def mctl_api_bearer(static_token: str | None = None) -> str:
     if _state.mode == MODE_ENFORCE or mode() == MODE_ENFORCE:
         return _state.token.token if _state.token is not None else ""
     if static_token is None:
-        static_token = os.environ.get("MCTL_TOKEN", "")
+        static_token = read_credential("MCTL_TOKEN")
     return static_token.strip()
 
 

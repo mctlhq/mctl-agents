@@ -33,6 +33,8 @@ from datetime import UTC, datetime
 from typing import Any, TypeGuard
 from urllib.parse import quote, urlencode
 
+from orchestrator.credential_files import read_credential
+
 QUOTE_ENCODING_VERSION = "mctl-commerce-quote/v1"
 TERMS_ENCODING_VERSION = "mctl-commerce-terms/v1"
 DISPATCH_AUTHORIZATION_VERSION = "mctl-commerce-dispatch/v1"
@@ -628,19 +630,26 @@ class CommerceClient:
 
     def __init__(self, base_url: str | None = None, token: str | None = None, timeout: int = 10) -> None:
         self._base = (base_url or os.environ.get("MCTL_API_BASE_URL", "https://api.mctl.ai")).rstrip("/")
-        self._token = token if token is not None else os.environ.get("MCTL_TOKEN", "").strip()
+        self._injected_token = token
         self._timeout = timeout
         self._opener = _no_redirect_opener()
 
+    def _current_token(self) -> str:
+        # Resolved per request so a rotated MCTL_TOKEN_FILE takes effect.
+        if self._injected_token is not None:
+            return self._injected_token
+        return read_credential("MCTL_TOKEN")
+
     def _request(self, method: str, path: str, payload: Mapping[str, Any] | None) -> tuple[int, dict[str, Any]]:
-        if not self._token:
+        token = self._current_token()
+        if not token:
             raise CommerceUnavailable("MCTL_TOKEN is not set")
         url = f"{self._base}{path}"
         if not url.startswith("https://"):
             raise CommerceUnavailable(f"refusing non-https MCTL_API_BASE_URL: {self._base}")
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(url, data=data, method=method)  # noqa: S310 — scheme checked above
-        req.add_header("Authorization", f"Bearer {self._token}")
+        req.add_header("Authorization", f"Bearer {token}")
         # Cloudflare in front of api.mctl.ai answers 403 to urllib's default
         # `Python-urllib/*`, which is what an operator-run client (the live
         # proof, tools/commerce_proof.py) reaches; in-cluster callers never

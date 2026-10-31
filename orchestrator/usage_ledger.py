@@ -112,6 +112,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from orchestrator.credential_files import read_credential
+
 logger = logging.getLogger(__name__)
 
 TOKEN_ENV = "MCTL_USAGE_WRITER_TOKEN"  # noqa: S105 — an env var name, not a credential
@@ -485,6 +487,7 @@ class UsageRecorder:
         agent: str,
         *,
         token: str,
+        token_source: Callable[[], str] | None = None,
         base_url: str = DEFAULT_BASE_URL,
         correlation: Mapping[str, Any] | None = None,
         post: Post | None = None,
@@ -495,6 +498,9 @@ class UsageRecorder:
         self.provenance = provenance or _DEFAULT_PROVENANCE
         self.agent = _AGENT_NAMES.get(agent, agent)
         self._token = token.strip()
+        # Re-resolved at each delivery, so a rotated token file is picked up;
+        # `enabled` and the off reason come from the first resolution.
+        self._token_source = token_source
         self._off_reason = "" if self._token else f"{TOKEN_ENV} is not set"
         if self._token and not base_url.startswith("https://"):
             # Operator-supplied, like everywhere else this variable is read
@@ -540,7 +546,8 @@ class UsageRecorder:
         found = {field: env.get(name, "").strip() for name, field in _CORRELATION_ENV}
         return cls(
             agent,
-            token=env.get(TOKEN_ENV, ""),
+            token=read_credential(TOKEN_ENV, env),
+            token_source=lambda: read_credential(TOKEN_ENV, env),
             base_url=env.get(BASE_URL_ENV, "").strip() or DEFAULT_BASE_URL,
             correlation={**found, **_SCOPED.get({}), **correlation},
             provenance=provenance,
@@ -701,7 +708,8 @@ class UsageRecorder:
         turn (under another result_uuid, which no server dedupe catches)
         would count them twice.
         """
-        headers = {"Authorization": f"Bearer {self._token}"}
+        token = (self._token_source() if self._token_source is not None else "") or self._token
+        headers = {"Authorization": f"Bearer {token}"}
         body = {"records": records}
         may_have_landed = False
         failure = ""

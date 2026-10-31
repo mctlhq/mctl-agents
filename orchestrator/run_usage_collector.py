@@ -71,6 +71,7 @@ from typing import Any
 import httpx
 
 from config.settings import SERVICES
+from orchestrator.credential_files import read_credential
 from orchestrator.github_token import refresh_github_token
 from orchestrator.proc import CommandFailed, run_capturing
 from orchestrator.usage_ledger import (
@@ -623,6 +624,8 @@ def collect(
 
 
 def main() -> None:
+    # Authenticate the first gh/git call from GITHUB_TOKEN_FILE without an env seed.
+    refresh_github_token()
     ap = argparse.ArgumentParser(
         description="Usage-collector — pull reviewer model-usage-records artifacts into the mctl-api usage ledger"
     )
@@ -670,7 +673,7 @@ def main() -> None:
     except (CommandFailed, subprocess.CalledProcessError) as exc:
         raise SystemExit(f"usage-collector: gh could not authenticate — {exc}") from exc
 
-    token = os.environ.get(TOKEN_ENV, "")
+    token = read_credential(TOKEN_ENV)
     base_url = os.environ.get(BASE_URL_ENV, "").strip() or DEFAULT_BASE_URL
 
     print(f"Sweeping {len(repos)} repository(ies) for '{ARTIFACT_NAME}' artifacts (lookback={args.lookback_days}d):")

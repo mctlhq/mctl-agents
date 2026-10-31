@@ -116,6 +116,7 @@ import anyio
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
 from orchestrator import evidence_producer, policy_checkpoint, tracing, usage_ledger
 from orchestrator.ci_checks import CheckBlocker, CIStatus, fetch_failure_logs, read_required_checks
+from orchestrator.credential_files import read_credential
 from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
 from orchestrator.github_token import refresh_github_token
 from orchestrator.lifecycle import rollout, shadow
@@ -247,7 +248,7 @@ def _dev_loop_owns_answer(service: str, slug: str) -> str:
         # (incident-*, anything pre-Temporal) never had a DevLoop, so the old
         # mechanism genuinely answers "nobody drives this".
         return LEGACY_FREE
-    token = os.environ.get("MCTL_TOKEN", "").strip()
+    token = read_credential("MCTL_TOKEN")
     if not token:
         # Never asked.
         return LEGACY_UNKNOWN
@@ -4978,6 +4979,8 @@ def _print_summary(results: list[ShepherdResult]) -> None:
 
 
 def main() -> None:
+    # Authenticate the first gh/git call from GITHUB_TOKEN_FILE without an env seed.
+    refresh_github_token()
     ap = argparse.ArgumentParser(
         description="Tier 3 PR shepherd — drive implementer-opened PRs to merge",
     )

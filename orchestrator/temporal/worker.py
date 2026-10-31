@@ -43,6 +43,7 @@ from temporalio.runtime import PrometheusConfig, Runtime, TelemetryConfig
 from temporalio.worker import Interceptor, Worker
 
 from orchestrator import tracing
+from orchestrator.github_token import refresh_github_token
 from orchestrator.temporal.activities.action_approval import read_action_approval
 from orchestrator.temporal.activities.argo import submit_and_wait
 from orchestrator.temporal.activities.canonical_execution import ensure_issue_execution
@@ -829,6 +830,8 @@ def build_worker(client: Client, plan: WorkerPlan, interceptors: list[Intercepto
 
 
 async def main() -> None:
+    # Authenticate the first gh/git call from GITHUB_TOKEN_FILE without an env seed.
+    refresh_github_token()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--role",

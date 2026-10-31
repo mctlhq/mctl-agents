@@ -17,32 +17,20 @@ sufficient; no per-subprocess plumbing needed.
 from __future__ import annotations
 
 import os
-from pathlib import Path
+
+from orchestrator.credential_files import read_credential
 
 
 def refresh_github_token() -> None:
-    """Re-read GITHUB_TOKEN from GITHUB_TOKEN_FILE, if configured.
+    """Refresh os.environ["GITHUB_TOKEN"] from GITHUB_TOKEN_FILE, if configured.
 
-    No-op when GITHUB_TOKEN_FILE is unset (short-lived crons like
-    issue-poll/reconcile keep using the static secretKeyRef env var — their
-    whole run comfortably fits inside one token's TTL) or when the file is
-    momentarily unreadable (a mid-rotation race). In both cases the existing
-    os.environ["GITHUB_TOKEN"] — set at pod start — is left as-is rather than
-    cleared, so callers never regress to no-token behaviour.
+    No-op when GITHUB_TOKEN_FILE is unset and no GITHUB_TOKEN env seed exists.
+    When the file is momentarily unreadable (a mid-rotation race, possibly
+    invalid UTF-8) `read_credential` falls back to the last good value, then
+    to the env seed; the existing os.environ value is never cleared. Only the
+    variable name, path and exception type name are logged: a
+    UnicodeDecodeError message embeds a byte of the token.
     """
-    path = os.environ.get("GITHUB_TOKEN_FILE", "").strip()
-    if not path:
-        return
-    try:
-        token = Path(path).read_text().strip()
-    except (OSError, ValueError) as e:
-        # ValueError covers UnicodeDecodeError: a Secret volume update isn't
-        # atomic from the reader's side, so a read landing mid-rotation can
-        # observe a truncated write with invalid UTF-8 tail bytes. That must
-        # degrade the same as a missing file, not crash — an uncaught
-        # exception here would propagate out of _run() and abort every
-        # subsequent gh/git call for the rest of the process.
-        print(f"refresh_github_token: could not read {path}: {e}; keeping previous token")
-        return
+    token = read_credential("GITHUB_TOKEN")
     if token:
         os.environ["GITHUB_TOKEN"] = token
