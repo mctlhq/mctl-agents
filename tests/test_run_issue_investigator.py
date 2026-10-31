@@ -4578,7 +4578,9 @@ def test_work_context_ref_folds_flags_and_canonical_state():
     assert ref.surface_transition is True
 
     # A first execution with no resume and no declared surface: sequence 1,
-    # no transition claimed.
+    # and no transition claimed either way — the provenance was never
+    # observed, so it is unknown (None, omitted when sealed), not "no
+    # transition" (mctlhq/mctl-agents#904, #573).
     first = run_issue_investigator._work_context_ref(
         canonical=CanonicalState(work_item_id="wi-1", state="new"),
         item=item,
@@ -4590,7 +4592,8 @@ def test_work_context_ref_folds_flags_and_canonical_state():
         actor_id=None,
     )
     assert first.execution_sequence == 1
-    assert first.surface_transition is False
+    assert first.surface_transition is None
+    assert "surface_transition" not in first.to_dict()
 
 
 def test_provenance_is_recorded_at_mode_observe(tmp_path, monkeypatch, capsys):
@@ -5161,9 +5164,11 @@ def test_surface_transition_baseline_excludes_self_and_kindless_executions():
     )
     out = ref(kindless_last, surface="telegram", actor_kind="human", actor_id="bob")
     assert out.surface_transition is True
-    # And the same declared surface as the last KNOWN one is not one.
+    # The same declared surface as the last KNOWN one is not a surface
+    # change — but no actor was declared, so the actor axis was never
+    # measured and "no transition" cannot be claimed (#904): unknown.
     out = ref(kindless_last, surface="github")
-    assert out.surface_transition is False
+    assert out.surface_transition is None
 
     # Only kindless executions recorded: origin is the fallback.
     only_seed = WorkItem(

@@ -3030,6 +3030,14 @@ def _work_context_ref(
     # work item's origin. Only comparisons where both sides are known can
     # claim a change: unlike the dev_loop signal, an undeclared side here is
     # an optional CLI flag, not a rejected resume.
+    #
+    # And only comparisons where both sides are known can claim NO change
+    # (mctlhq/mctl-agents#904, #573): a resume whose surface or actor never
+    # reached this process (an investigate submission that did not forward
+    # them) is "could not observe", which must not be sealed as
+    # `surface_transition=false`. A measured change on either axis is a
+    # transition; "no transition" needs both axes measured; anything else is
+    # None, which the sealed document omits.
     priors_newest_first = sorted(
         (
             e for e in item.executions
@@ -3042,13 +3050,19 @@ def _work_context_ref(
         (e.surface.kind for e in priors_newest_first if e.surface.kind), item.origin.kind
     )
     baseline_actor = next((e.actor for e in priors_newest_first if e.actor.kind), None)
-    surface_changed = bool(surface and baseline_surface and surface != baseline_surface)
-    actor_changed = bool(
-        actor_kind
-        and baseline_actor is not None
-        and baseline_actor.kind
-        and (actor_kind != baseline_actor.kind or (actor_id or "") != baseline_actor.actor_id)
+    surface_known = bool(surface and baseline_surface)
+    actor_known = bool(actor_kind and baseline_actor is not None and baseline_actor.kind)
+    surface_changed = surface_known and surface != baseline_surface
+    actor_changed = actor_known and baseline_actor is not None and (
+        actor_kind != baseline_actor.kind or (actor_id or "") != baseline_actor.actor_id
     )
+    transition: bool | None
+    if surface_changed or actor_changed:
+        transition = True
+    elif surface_known and actor_known:
+        transition = False
+    else:
+        transition = None
     return WorkContextRef(
         work_item_id=canonical.work_item_id,
         # Store-supplied and unbounded on the way in — clamped like
@@ -3064,7 +3078,7 @@ def _work_context_ref(
         current_surface=surface or "",
         actor_kind=actor_kind or "",
         actor_id=actor_id or "",
-        surface_transition=surface_changed or actor_changed,
+        surface_transition=transition,
     )
 
 

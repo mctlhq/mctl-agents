@@ -600,7 +600,14 @@ class WorkContextRef:
     current_surface: str = ""
     actor_kind: str = ""
     actor_id: str = ""
-    surface_transition: bool = False
+    #: Did THIS execution change the surface or actor relative to the one
+    #: before it? None when that was not measured (mctlhq/mctl-agents#904,
+    #: #573): an unknown side is "could not observe", never "no change", so
+    #: it must not be recorded as False. Omitted from the document when None,
+    #: like `intent_high_water`; every snapshot sealed before this was
+    #: optional carries the key, so its bytes and `snapshot_id` are unchanged.
+    #: An explicit `null` is refused on read, keeping one encoding of unknown.
+    surface_transition: bool | None = None
     #: The WorkItem intent high-water mark this snapshot leaves for the next
     #: execution (mctlhq/mctl-agents#542): every intent id at or below it
     #: was either carried or deliberately cut. Recorded on every snapshot
@@ -624,8 +631,9 @@ class WorkContextRef:
             "current_surface": self.current_surface,
             "actor_kind": self.actor_kind,
             "actor_id": self.actor_id,
-            "surface_transition": self.surface_transition,
         }
+        if self.surface_transition is not None:
+            data["surface_transition"] = self.surface_transition
         if self.intent_high_water is not None:
             data["intent_high_water"] = self.intent_high_water
         return data
@@ -669,8 +677,10 @@ class WorkContextRef:
             ),
             actor_kind=_require_str(mapping.get("actor_kind", ""), where="work_context.actor_kind", allow_empty=True),
             actor_id=_require_str(mapping.get("actor_id", ""), where="work_context.actor_id", allow_empty=True),
-            surface_transition=_require_bool(
-                mapping.get("surface_transition", False), where="work_context.surface_transition"
+            surface_transition=(
+                _require_bool(mapping["surface_transition"], where="work_context.surface_transition")
+                if "surface_transition" in mapping
+                else None
             ),
             intent_high_water=intent_high_water,
         )

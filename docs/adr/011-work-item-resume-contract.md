@@ -439,6 +439,43 @@ nothing — but the returned outcome is `refused`/`proposal-terminal` even
 there, so the run is distinguishable from a real one in the ledger either
 way.
 
+### 9. The `mcp` surface, and provenance the investigator never saw (#904, #573)
+
+`mcp` is in both closed surface vocabularies (`work_context.contract.SURFACE_KINDS`
+and `context_snapshot.WORK_CONTEXT_SURFACE_KINDS`, still pinned equal). It is
+mctl-api's label for a request made through its MCP tool, and it is a label
+only: the actor is the authenticated `requested_by` principal, and no client,
+session, model or inference-account identity is recorded anywhere. So two
+MCP clients acting as one principal (Claude, then Codex) are the same surface
+and the same actor: not a transition, no re-armed approval, and never
+evidence of reviewer independence. The approval stays bound to the proposal's
+content digest, which the approve flip re-checks whatever client asked.
+
+The dispatched request's provenance now reaches its investigator. The run's
+own start request (Update-with-Start, section 8) records its surface and
+actor when they pass the closed vocabularies, apart from the approval
+baseline `_current_surface`/`_current_actor`, and the loop forwards them as
+the `surface`, `actor_kind` and `actor_id` investigate parameters (omitted
+when empty, and dropped from a human-input continuation, which runs without
+a work context). They take effect only when the investigate CWFT declares
+them and mctl-api's operation registry does too: mctl-api strips undeclared
+operation parameters.
+
+`WorkContextRef.surface_transition` is optional. The investigator seals
+`true` when it measured a change on either axis, `false` only when it
+measured both the surface and the actor and neither changed, and otherwise
+omits the key: "could not observe" is never sealed as "no transition", which
+is what #573's C2 recorded. Snapshots sealed before this always carry the
+key and keep their bytes; an explicit `null` is refused on read.
+
+Rollout order: (1) the mctl-agents image (the new parameters are inert,
+stripped by mctl-api); (2) the investigate CWFT in mctl-gitops declares the
+three parameters with default `""` and maps each to its flag when non-empty;
+(3) mctl-api's registry declares them with validation patterns, after which
+a live resume seals real provenance; (4) only then is new MCP execution
+admission enabled. An image without `mcp` in its vocabulary fails closed: the
+loop refuses the resume and the investigator CLI exits non-zero.
+
 ## Alternatives
 
 1. **Reuse `StepRef` for cross-execution chaining.** Rejected: it would
