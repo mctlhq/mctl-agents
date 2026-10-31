@@ -6,6 +6,7 @@ docs/spikes/917/records-schema.md) and prints per-window throughput,
 throughput. Nothing imports this module; it never prints a provider-billed
 figure. Run with: python -I tools/spike_917_capacity.py RECORDS MANIFEST
 """
+
 from __future__ import annotations
 
 import json
@@ -61,9 +62,7 @@ def rejection_summary(records: list[dict[str, Any]]) -> dict[str, tuple[int, flo
     return {k: (int(v[0]), v[1]) for k, v in acc.items()}
 
 
-def stage_rates(
-    records: list[dict[str, Any]], hours: float | None
-) -> dict[tuple[str, str], dict[str, Any]]:
+def stage_rates(records: list[dict[str, Any]], hours: float | None) -> dict[tuple[str, str], dict[str, Any]]:
     """Per (stage, model): completed stages, output tokens, cost estimate."""
     acc: dict[tuple[str, str], dict[str, Any]] = {}
     for rec in records:
@@ -103,9 +102,7 @@ def binding_limit(series: dict[str, list[tuple[float, float]]]) -> str:
     return min(latest, key=lambda k: latest[k])
 
 
-def marginal_throughput(
-    records: list[dict[str, Any]], manifest: dict[str, Any]
-) -> str:
+def marginal_throughput(records: list[dict[str, Any]], manifest: dict[str, Any]) -> str:
     """Completed stages between first would-be five_hour boundary and first weekly warning."""
     t0 = manifest.get("first_five_hour_boundary_ts")
     t1 = None
@@ -117,11 +114,7 @@ def marginal_throughput(
                     t1 = ts
     if t0 is None or t1 is None or t1 <= t0:
         return NOT_OBSERVED
-    n = sum(
-        1
-        for r in records
-        if r.get("outcome") == "completed" and t0 <= r.get("ended_at", -1) <= t1
-    )
+    n = sum(1 for r in records if r.get("outcome") == "completed" and t0 <= r.get("ended_at", -1) <= t1)
     return f"{n} stages in {(t1 - t0) / 3600.0:.2f}h ({n / ((t1 - t0) / 3600.0):.2f}/h)"
 
 
@@ -131,7 +124,7 @@ def report(records: list[dict[str, Any]] | None, manifest: dict[str, Any] | None
         lines.append(f"records: {NOT_OBSERVED if records is None else 'ok'}")
         lines.append(f"manifest: {NOT_OBSERVED if manifest is None else 'ok'}")
         return "\n".join(lines)
-    for name in sorted((manifest.get("sources") or {})):
+    for name in sorted(manifest.get("sources") or {}):
         src = manifest["sources"][name]
         state = "observed" if src.get("observed") else f"{NOT_OBSERVED} ({src.get('reason', 'no reason given')})"
         lines.append(f"source {name}: {state}")
@@ -144,8 +137,7 @@ def report(records: list[dict[str, Any]] | None, manifest: dict[str, Any] | None
             cost = (
                 NOT_OBSERVED
                 if row["cost"] is None
-                else f"{row['cost']:.2f} "
-                + COST_LABEL.format(v=",".join(sorted(row["pv"])))
+                else f"{row['cost']:.2f} " + COST_LABEL.format(v=",".join(sorted(row["pv"])))
             )
             lines.append(
                 f"stage={stage} model={model} completed={row['n']} "
@@ -160,11 +152,7 @@ def report(records: list[dict[str, Any]] | None, manifest: dict[str, Any] | None
     series = weekly_series(manifest)
     for name in ("all_models", "fable"):
         pts = series[name]
-        text = (
-            NOT_OBSERVED
-            if not pts
-            else ", ".join(f"{int(t)}:{p:.0f}%" for t, p in sorted(pts))
-        )
+        text = NOT_OBSERVED if not pts else ", ".join(f"{int(t)}:{p:.0f}%" for t, p in sorted(pts))
         lines.append(f"weekly remaining {name}: {text}")
     lines.append(f"binding weekly limit: {binding_limit(series)}")
     after = [r for r in records if r.get("window") == "after"]

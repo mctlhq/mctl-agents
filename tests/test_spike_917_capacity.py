@@ -1,4 +1,5 @@
 """Tests for tools/spike_917_capacity.py (spike mctlhq/mctl-agents#917)."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -6,9 +7,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location(
-    "spike_917_capacity", ROOT / "tools" / "spike_917_capacity.py"
-)
+_spec = importlib.util.spec_from_file_location("spike_917_capacity", ROOT / "tools" / "spike_917_capacity.py")
 assert _spec and _spec.loader
 cap = importlib.util.module_from_spec(_spec)
 sys.modules["spike_917_capacity"] = cap
