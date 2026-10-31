@@ -23,11 +23,17 @@ the class of bug this harness exists to expose.
 The implementation worker carries the SAME slot limit production does, so a
 test that approves more loops than N can observe the admission it is
 testing rather than a pool that admits everything.
+
+The second half of this module is the teardown every SDK worker in the
+suite gets when it stops (#912): see `evict_left_over_runs`.
 """
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
+from temporalio.bridge.proto import workflow_activation
 from temporalio.worker import Worker as _TemporalWorker
 
 from orchestrator.temporal.constants import (
@@ -153,3 +159,93 @@ class Worker:
         self._entered.clear()
         if first_error is not None:
             raise first_error
+
+
+# --- What a stopped worker leaves cached (mctlhq/mctl-agents#912) -----------
+#
+# Neither Core nor the SDK evicts a cached run when a worker shuts down. Core
+# reports shutdown once no run has pending work, and a run parked on a timer
+# has none; `_WorkflowWorker.run` then leaves its poll loop with the instance
+# still in `_running_workflows`. Production never notices: a process runs at
+# most one worker with workflows (`worker_plans` in
+# orchestrator/temporal/worker.py) and exits once it stops. The suite stops
+# worker after worker in one process, and each leftover -- the instance, its
+# event loop, every coroutine suspended in it -- becomes cyclic garbage that
+# whichever thread the collector next runs in finalizes.
+#
+# A finalized coroutine runs its `finally` blocks, and the SDK finds "the
+# current workflow" through `asyncio.get_running_loop()`. When the collector
+# runs inside another workflow's activation -- the thread that activation
+# runs in has that workflow installed as its running loop -- the dead run's
+# cleanup schedules its commands on THAT workflow. The SDK's own eviction
+# exists to rule this out ("no GC'ing of the tasks occurs (which can cause
+# them to wake up in different threads)", temporalio/worker/_workflow.py);
+# a worker that shuts down drops its cache without one.
+#
+# #912 is this firing. test_execution_request_dispatch.py, which runs just
+# before the replay tests, terminates DevLoopWorkflows in their merge watch
+# with a lifecycle claim held and stops their worker. Once a full collection
+# lands inside a Replayer activation, `_watch_pr`'s `finally` schedules
+# `lifecycle_ownership` (op=release) as the replayed run's first activity --
+# reproduced verbatim by forcing that collection:
+#
+#   [TMPRL1100] Nondeterminism error: Activity type of scheduled event
+#   'ensure_issue_execution' does not match activity type of activity
+#   command 'lifecycle_ownership'
+#
+# So the harness finishes what shutdown skips: once a worker's poll loop is
+# over, every run it still caches gets the RemoveFromCache activation a
+# normal eviction applies. That cancels the run's tasks inside its OWN loop,
+# where every command is refused, and leaves nothing for the collector.
+
+#: Runs `evict_left_over_runs` could not tear down, as "<run id>: <error>".
+#: conftest fails the test that stopped the worker on a non-empty list: a run
+#: that survives its eviction is the #912 hazard still armed, and a teardown
+#: that failed quietly is how it went unseen in the first place.
+EVICTION_FAILURES: list[str] = []
+
+
+async def evict_left_over_runs(workflow_worker: Any) -> None:
+    """Evict every run an SDK `_WorkflowWorker` whose poll loop has ended
+    still holds, the way its own cache eviction would."""
+    try:
+        running = workflow_worker._running_workflows
+    except AttributeError as error:
+        # An SDK that moved its run cache must not turn this into a no-op.
+        EVICTION_FAILURES.append(f"cannot see the stopped worker's cached runs: {error!r}")
+        return
+    while running:
+        run_id, run = running.popitem()
+        eviction = workflow_activation.WorkflowActivation(
+            run_id=run_id,
+            is_replaying=True,
+            jobs=[
+                workflow_activation.WorkflowActivationJob(
+                    remove_from_cache=workflow_activation.RemoveFromCache(
+                        message="test worker stopped with this run still cached (#912)",
+                        reason=workflow_activation.RemoveFromCache.EvictionReason.LANG_REQUESTED,
+                    )
+                )
+            ],
+        )
+        try:
+            # On an executor thread, as the SDK runs every activation: the
+            # instance installs itself as that thread's running loop.
+            await asyncio.get_running_loop().run_in_executor(None, run.activate, eviction)
+        except Exception as error:  # noqa: BLE001 - reported through EVICTION_FAILURES
+            # The SDK raises "Eviction processed, but N tasks remain" for a
+            # run whose coroutines outlive the cancellation.
+            EVICTION_FAILURES.append(f"{run_id}: {error!r}")
+
+
+def evicting_after_shutdown(sdk_run: Callable[[Any], Awaitable[None]]) -> Callable[[Any], Awaitable[None]]:
+    """`_WorkflowWorker.run`, followed by `evict_left_over_runs` however the
+    poll loop ended. Installed for the whole session by conftest."""
+
+    async def run(self: Any) -> None:
+        try:
+            await sdk_run(self)
+        finally:
+            await evict_left_over_runs(self)
+
+    return run
