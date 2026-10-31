@@ -19,6 +19,8 @@ from claude_agent_sdk import ClaudeSDKClient
 
 from config.settings import AGENTS_DIR, SCOUT_RELEVANCE_SELECTION, SCOUT_SCORING_SELECTION, SERVICES
 from orchestrator.auth import ensure_auth_for_sdk
+from orchestrator.credential_files import read_credential
+from orchestrator.github_token import refresh_github_token
 from orchestrator.options import SCOUT_BUDGET_USD
 from orchestrator.scout import backlog as backlog_mod
 from orchestrator.scout import dedupe, feeds, render, scoring
@@ -54,7 +56,7 @@ async def run_scout(
     http_transport: httpx.BaseTransport | None = None,
     now: datetime | None = None,
 ) -> int:
-    token = os.getenv("SCOUT_TELEGRAM_BOT_TOKEN", "")
+    token = read_credential("SCOUT_TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("SCOUT_TELEGRAM_CHAT_ID", "")
     if not dry_run and not (token and chat_id):
         print("scout: SCOUT_TELEGRAM_BOT_TOKEN and SCOUT_TELEGRAM_CHAT_ID are required", file=sys.stderr)
@@ -149,6 +151,8 @@ async def run_scout(
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Authenticate the first gh/git call from GITHUB_TOKEN_FILE without an env seed.
+    refresh_github_token()
     ap = argparse.ArgumentParser(prog="orchestrator.run_scout")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--top-n", type=int)

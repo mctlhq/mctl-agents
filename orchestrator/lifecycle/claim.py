@@ -20,11 +20,11 @@ rather than raising.
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
 from typing import Any
 
+from orchestrator.credential_files import read_credential
 from orchestrator.lifecycle import rollout
 from orchestrator.lifecycle.client import (
     DEFAULT_TIMEOUT_S,
@@ -131,7 +131,7 @@ class ClaimClient:
         self, base_url: str | None = None, token: str | None = None, timeout: int = DEFAULT_TIMEOUT_S
     ) -> None:
         self._base = (base_url or api_base()).rstrip("/")
-        self._token = token if token is not None else os.environ.get("MCTL_TOKEN", "").strip()
+        self._injected_token = token
         self._timeout = timeout
         self._opener = _no_redirect_opener()
 
@@ -143,15 +143,22 @@ class ClaimClient:
     # bound method onto another's `self` would tie their lifecycles together
     # for no benefit — each already carries its own opener and token.
 
+    def _current_token(self) -> str:
+        # Resolved per request so a rotated MCTL_TOKEN_FILE takes effect.
+        if self._injected_token is not None:
+            return self._injected_token
+        return read_credential("MCTL_TOKEN")
+
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> _HTTPResult:
-        if not self._token:
+        token = self._current_token()
+        if not token:
             raise OwnershipUnavailable("MCTL_TOKEN is not set")
         url = f"{self._base}{path}"
         if not url.startswith("https://"):
             raise OwnershipUnavailable(f"refusing non-https MCTL_API_BASE_URL: {self._base}")
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(url, data=data, method=method)  # noqa: S310 — scheme checked above
-        req.add_header("Authorization", f"Bearer {self._token}")
+        req.add_header("Authorization", f"Bearer {token}")
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:

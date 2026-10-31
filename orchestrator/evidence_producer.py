@@ -92,6 +92,7 @@ import httpx
 
 from orchestrator import execution_evidence as ee
 from orchestrator.context_snapshot import canonical_json, hash_bytes
+from orchestrator.credential_files import read_credential
 
 logger = logging.getLogger(__name__)
 
@@ -983,7 +984,7 @@ def writer_credentials(env: Mapping[str, str]) -> tuple[str, str, str]:
     Also what `orchestrator.decision_records` writes with: mctl-api admits
     this principal to the decision routes too. A token is only ever sent
     over https."""
-    token = env.get(TOKEN_ENV, "").strip()
+    token = read_credential(TOKEN_ENV, env)
     base_url = env.get(BASE_URL_ENV, "").strip() or DEFAULT_BASE_URL
     if not token:
         return "", "", f"{TOKEN_ENV} is not set"

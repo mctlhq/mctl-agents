@@ -4550,6 +4550,8 @@ def _work_context_from_args(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    # Authenticate the first gh/git call from GITHUB_TOKEN_FILE without an env seed.
+    refresh_github_token()
     ap = argparse.ArgumentParser(
         description="Issue-investigator — turn a GitHub issue into a proposal"
     )

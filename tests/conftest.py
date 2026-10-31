@@ -42,6 +42,17 @@ def _no_live_refusal_replies(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_credential_state(monkeypatch):
+    """The last-good credential cache and the 429 rotation flag are process state."""
+    credential_files = importlib.import_module("orchestrator.credential_files")
+    auth = importlib.import_module("orchestrator.auth")
+    credential_files._LAST_GOOD.clear()
+    monkeypatch.setattr(auth, "_use_secondary", False)
+    yield
+    credential_files._LAST_GOOD.clear()
+
+
+@pytest.fixture(autouse=True)
 def _granted_approval(monkeypatch):
     """Answer the implementer's approval-grant check as a spent human grant.
 

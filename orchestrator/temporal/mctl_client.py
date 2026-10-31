@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 
+from orchestrator.credential_files import read_credential
+
 MCTL_API_BASE_URL = os.environ.get("MCTL_API_BASE_URL", "https://api.mctl.ai")
 
 
@@ -21,7 +23,7 @@ def mctl_token() -> str:
     token into an immediate, legible activity failure instead of a stream
     of 401s discovered only from mctl-api's logs.
     """
-    token = os.environ.get("MCTL_TOKEN", "").strip()
+    token = read_credential("MCTL_TOKEN")
     if not token:
         raise RuntimeError("MCTL_TOKEN is not set — the dev-loop worker cannot call mctl-api")
     return token

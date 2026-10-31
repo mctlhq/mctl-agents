@@ -34,6 +34,7 @@ from typing import Any
 
 from config.settings import SERVICES
 from orchestrator import run_shepherd
+from orchestrator.credential_files import read_credential
 from orchestrator.lifecycle import policy, rollout
 from orchestrator.lifecycle.client import OwnershipClient
 from orchestrator.lifecycle.contract import (
@@ -352,7 +353,7 @@ def _devloop_free(
     """
     if run_shepherd._dev_loop_owns_answer(service, slug) != run_shepherd.LEGACY_FREE:
         return False
-    if closing_issue_numbers and not os.environ.get("MCTL_TOKEN", "").strip():
+    if closing_issue_numbers and not read_credential("MCTL_TOKEN"):
         if probe_budget is not None:
             probe_budget.note_missing_token()
     for n in closing_issue_numbers:

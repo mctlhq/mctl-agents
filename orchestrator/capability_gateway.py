@@ -388,16 +388,15 @@ def _default_remote_headers() -> dict[str, str]:
     rather than reimplemented). Reused verbatim so the gateway's own
     connection carries the exact identity the CLI's direct connection
     would have."""
-    import os
-
     from orchestrator import run_token
+    from orchestrator.credential_files import read_credential
     from orchestrator.options import _execution_context_headers
 
     headers = dict(_execution_context_headers())
     # The same credential choice as mctl_mcp_config(): a run-token enforce
     # run reaches mctl through the gateway with its run token, never with
     # the static one (mctlhq/mctl-agents#717).
-    token, scope_headers = run_token.mcp_auth(os.environ.get("MCTL_TOKEN", "").strip())
+    token, scope_headers = run_token.mcp_auth(read_credential("MCTL_TOKEN"))
     if token:
         headers["Authorization"] = f"Bearer {token}"
         headers.update(scope_headers)

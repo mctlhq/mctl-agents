@@ -20,6 +20,7 @@ import anyio
 
 from config.settings import ROTATING_SERVICES, SERVICES
 from orchestrator.auth import ensure_auth_for_sdk
+from orchestrator.github_token import refresh_github_token
 from orchestrator.mcp_guard import McpNotConnectedError
 from orchestrator.run_incident_responder import run_incident_responder
 from orchestrator.run_mentor import run_mentor
@@ -142,6 +143,8 @@ async def _single_service(service: str) -> None:
 
 
 async def main() -> None:
+    # Authenticate the first gh/git call from GITHUB_TOKEN_FILE without an env seed.
+    refresh_github_token()
     mode = os.getenv("RUN_MODE", "full").strip()
     service = os.getenv("RUN_SERVICE", "").strip()
 

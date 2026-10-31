@@ -6002,6 +6002,8 @@ def _max_proposals_error(max_proposals: int, dry_run: bool) -> str | None:
 
 
 def main() -> None:
+    # Authenticate the first gh/git call from GITHUB_TOKEN_FILE without an env seed.
+    refresh_github_token()
     ap = argparse.ArgumentParser(description="Tier 2 implementer — open PRs from accepted proposals")
     ap.add_argument("--service", default="", help=f"Filter by service (one of: {', '.join(SERVICES)})")
     ap.add_argument("--slug", default="", help="Filter by proposal slug")
