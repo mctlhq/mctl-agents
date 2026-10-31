@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.112.2](https://github.com/mctlhq/mctl-agents/compare/1.112.1...1.112.2) (2026-10-31)
+
+
+### Bug Fixes
+
+* **deps:** migrate to the mcp Python SDK 2.x ([2d87316](https://github.com/mctlhq/mctl-agents/commit/2d87316948538f91801a08777eb6585c0c8833b0))
+* **deps:** migrate to the mcp Python SDK 2.x ([535fb6a](https://github.com/mctlhq/mctl-agents/commit/535fb6a8d08c209219e71d7914c5579385c4ea70))
+
 ## [1.112.1](https://github.com/mctlhq/mctl-agents/compare/1.112.0...1.112.1) (2026-10-30)
 
 
