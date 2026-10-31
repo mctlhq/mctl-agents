@@ -1,0 +1,16 @@
+{
+  "note": "Synthetic fixture. Not real measurements.",
+  "windows": {
+    "before": {"start": 0, "end": 36000},
+    "after": {"start": 0, "end": 36000}
+  },
+  "first_five_hour_boundary_ts": 3000,
+  "sources": {
+    "usage_ledger": {"observed": true},
+    "provider_usage_page": {"observed": false, "reason": "owner has not exported it"}
+  },
+  "weekly_samples": [
+    {"ts": 1000, "all_models_remaining_pct": 90, "fable_remaining_pct": 80},
+    {"ts": 9000, "all_models_remaining_pct": 40, "fable_remaining_pct": 15}
+  ]
+}
