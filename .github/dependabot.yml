@@ -13,8 +13,20 @@ updates:
       # applies its members one at a time, so every attempt is unresolvable
       # and fails the whole run. Bump the three together by hand.
       - dependency-name: "opentelemetry-*"
+    # One weekly PR for every minor and patch update instead of one PR per
+    # package: each lockfile PR conflicts with the next on uv.lock, so
+    # separate PRs mean a rebase and a fresh review per merge. Majors stay
+    # separate PRs.
+    groups:
+      uv-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # pr-validation.yml's commit-lint requires a release-please-releasable
+    # type (feat/fix/perf/revert) on any PR that touches pyproject.toml or
+    # uv.lock, because a `deps:` commit lands on main and never gets a
+    # release. `fix(deps)` cuts a patch release for the bump.
     commit-message:
-      prefix: "deps"
+      prefix: "fix(deps)"
 
   - package-ecosystem: github-actions
     directory: /
@@ -31,5 +43,13 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    ignore:
+      # The base image moves only together with requires-python, uv.lock
+      # and the CI python pins (see the Dockerfile header). Bumping the
+      # base image alone breaks `uv sync --locked` (1.29.2 on 3.14; #924
+      # proposed 3.15).
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+    # Same commit-lint reason as the uv entry: the Dockerfile ships.
     commit-message:
-      prefix: "deps"
+      prefix: "fix(deps)"
