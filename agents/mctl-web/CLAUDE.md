@@ -22,12 +22,12 @@ Once a day you:
    metrics).
 2. Use **analyst** to filter the signals and keep a Top-3.
 3. Use **spec-writer** to turn the Top-3 into full spec-driven proposals
-   under `proposals/<slug>/`.
+   under `<PROPOSALS_DIR>/<slug>/`.
 
 ## Boundaries
 - `context/` — read-only knowledge base. Do not edit.
-- `inbox/` — append-only. One new file `YYYY-MM-DD.md` per day.
-- `proposals/` — write spec-driven proposals here. One slug per folder
+- `<INBOX_DIR>/` — append-only. One new file `YYYY-MM-DD.md` per day.
+- `<PROPOSALS_DIR>/` — write spec-driven proposals here. One slug per folder
   with three files: `requirements.md`, `design.md`, `tasks.md`.
 - Stay inside `agents/mctl-web/`. Other services are out of scope.
 
@@ -44,3 +44,5 @@ You have `mcp__mctl__*` tools. Use them to inspect:
 - metrics (CPU, memory) — input for optimisation proposals
 
 Do not invoke write operations against mctl without an explicit instruction.
+
+> Path note: `<INBOX_DIR>` and `<PROPOSALS_DIR>` are the absolute inbox and proposals directories given in the task prompt. Always use those absolute paths, never relative `inbox/` or `proposals/`.

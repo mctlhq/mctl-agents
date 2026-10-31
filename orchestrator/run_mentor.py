@@ -10,7 +10,14 @@ from pathlib import Path
 import anyio
 from claude_agent_sdk import ClaudeSDKClient
 
-from config.settings import MENTOR_DIR, MENTOR_MODEL, SERVICES
+from config.settings import (
+    MENTOR_DIR,
+    MENTOR_MODEL,
+    ensure_dir,
+    mentor_digest_dir,
+    mentor_services,
+    service_proposals_dir,
+)
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import build_mentor_options
@@ -91,8 +98,10 @@ def _rotate_old_digests(digest_dir: Path, keep_weeks: int = 8) -> None:
 
 def build_prompt() -> str:
     iso_year, iso_week, _ = date.today().isocalendar()
-    digest_path = f"_mentor/digest/{iso_year}-W{iso_week:02d}.md"
-    services_list = ", ".join(SERVICES)
+    digest_path = mentor_digest_dir() / f"{iso_year}-W{iso_week:02d}.md"
+    services = mentor_services()
+    services_list = ", ".join(services)
+    proposals_dirs = "\n".join(f"   - `{service_proposals_dir(s)}`" for s in services)
 
     return f"""\
 **Output language: English ONLY. Every section, heading, summary, table cell,
@@ -117,7 +126,8 @@ You are the mentor for the mctl platform. Today you assemble the weekly digest.
 
 Active services: {services_list}.
 
-1. Read `proposals/` in every agent repo ({services_list}).
+1. Read the proposals directories (absolute paths):
+{proposals_dirs}
    Only consider fresh proposals that did not appear in earlier digests.
 2. For each proposal, score:
    - impact (1-5): effect on the platform
@@ -127,7 +137,7 @@ Active services: {services_list}.
 3. Group related proposals (one theme — one block).
 4. Use `mcp__mctl__*` tools to cross-check against reality:
    current service versions, open incidents, tenant resource limits.
-5. Write the result to {digest_path}:
+5. Write the result to `{digest_path}` (absolute path):
    - top 5 proposals ready for review
    - a short summary per item: what, why, impact/effort, conflicts
    - a "Platform risks" section with cross-cutting observations
@@ -139,7 +149,7 @@ Finish with a single short message linking to the created file. All output in En
 async def run_mentor() -> None:
     # Retention is enforced by the orchestrator (deterministic, no token spend);
     # the agent itself is not asked to manage old files.
-    digest_dir = MENTOR_DIR / "digest"
+    digest_dir = ensure_dir(mentor_digest_dir())
     _rotate_old_digests(digest_dir)
 
     options = build_mentor_options(MENTOR_DIR, MENTOR_MODEL)

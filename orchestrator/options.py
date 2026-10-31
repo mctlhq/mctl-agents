@@ -5,7 +5,7 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -16,7 +16,7 @@ from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk.types import HookMatcher
 
 from config.model_policy import ProviderSpec, provider_session_env
-from config.settings import MCTL_MCP_URL
+from config.settings import MCTL_MCP_URL, agent_state_root
 from orchestrator.ci_checks import CI_LOG_MAX_CHECKS
 from orchestrator.credential_files import file_env_names, read_credential
 from orchestrator.evidence_producer import agent_env_without_evidence_token
@@ -1306,18 +1306,20 @@ def _scrubbed(
     return options
 
 
-def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOptions:
+def build_service_agent_options(
+    service_dir: Path, model: str, state_dirs: Sequence[Path] = ()
+) -> ClaudeAgentOptions:
     """Options for a service-owner agent."""
     allowed_tools = ["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()]
     return _scrubbed(ClaudeAgentOptions(
-        cwd=str(service_dir),                  # CLAUDE.md, .claude/, inbox/, proposals/
+        cwd=str(service_dir),                  # CLAUDE.md, .claude/, context/; inbox/proposals via add_dirs
         setting_sources=["project"],           # pick up .claude/skills and .claude/agents
         model=model,
         allowed_tools=allowed_tools,
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",         # non-interactive — meant for cron
         max_budget_usd=SERVICE_AGENT_BUDGET_USD,
-        add_dirs=_sibling_add_dirs(service_dir.name),
+        add_dirs=[*_sibling_add_dirs(service_dir.name), *(str(d) for d in state_dirs)],
         hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
         # Extend (NOT replace) parent env — child needs HOME for the Claude
         # credentials lookup, and PATH for `git`/`gh`/`node`/`npm`, which the
@@ -1414,6 +1416,7 @@ def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=MENTOR_BUDGET_USD,
+        add_dirs=[str(agent_state_root())],
     ))
 
 

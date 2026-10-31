@@ -7,12 +7,20 @@ import sys
 import traceback
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
+from pathlib import Path
 from typing import Any, cast
 
 import anyio
 from claude_agent_sdk import ClaudeSDKClient, ResultMessage
 
-from config.settings import AGENTS_DIR, SERVICE_AGENT_MODEL, SERVICES
+from config.settings import (
+    AGENTS_DIR,
+    SERVICE_AGENT_MODEL,
+    SERVICES,
+    ensure_dir,
+    service_inbox_dir,
+    service_proposals_dir,
+)
 from orchestrator import classifier_notice
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.mcp_guard import ensure_mctl_connected
@@ -84,12 +92,16 @@ PROMPT = """\
 
 Autonomous daily run. **Do not ask the human anything — there is no human.** Work with what you have.
 
+Your state directories (absolute paths; use them verbatim, and pass them verbatim to the researcher, analyst and spec-writer sub-agents):
+- inbox: `<INBOX_DIR>`
+- proposals: `<PROPOSALS_DIR>`
+
 Use `context/` (read-only knowledge base — architecture, ADRs, current version) and `.claude/skills/` as your playbook.
 
 Strict sequence (execute each step and create the corresponding files):
 
 **Step 1 — researcher:**
-- Create the file `inbox/{today's ISO date YYYY-MM-DD}.md`
+- Create the file `<INBOX_DIR>/{today's ISO date YYYY-MM-DD}.md`
 - Sources:
   - GitHub releases of key deps (list in `context/architecture.md`, section "Dependencies for researcher") — via WebFetch
   - CVE / security advisories for the same deps — via WebSearch
@@ -103,7 +115,7 @@ Strict sequence (execute each step and create the corresponding files):
 - Cross-check `context/decisions/` — do not propose anything already rejected
 
 **Step 3 — spec-writer:**
-- For each Top-3 item create `proposals/<slug>/` with three files: `requirements.md`, `design.md`, `tasks.md` (format in `.claude/agents/spec-writer.md`)
+- For each Top-3 item create `<PROPOSALS_DIR>/<slug>/` with three files: `requirements.md`, `design.md`, `tasks.md` (format in `.claude/agents/spec-writer.md`)
 - EARS notation for acceptance criteria
 - If a slug already exists, append `-v2`
 
@@ -116,12 +128,24 @@ Strict sequence (execute each step and create the corresponding files):
 - All written output must be in English."""
 
 
+def build_prompt(inbox_dir: Path, proposals_dir: Path) -> str:
+    # str.replace, not str.format: PROMPT contains a literal `{today's ...}`.
+    return PROMPT.replace("<INBOX_DIR>", str(inbox_dir)).replace(
+        "<PROPOSALS_DIR>", str(proposals_dir)
+    )
+
+
 async def run_service_agent(service: str) -> None:
     service_dir = AGENTS_DIR / service
     if not service_dir.exists():
         raise SystemExit(f"Agent directory not found: {service_dir}")
 
-    options = build_service_agent_options(service_dir, SERVICE_AGENT_MODEL)
+    inbox_dir = ensure_dir(service_inbox_dir(service))
+    proposals_dir = ensure_dir(service_proposals_dir(service))
+    options = build_service_agent_options(
+        service_dir, SERVICE_AGENT_MODEL, state_dirs=[inbox_dir, proposals_dir]
+    )
+    prompt = build_prompt(inbox_dir, proposals_dir)
     mcp_configured = bool(options.mcp_servers)
     print(f"\n=== Running agent {service} ({SERVICE_AGENT_MODEL}) ===\n")
 
@@ -130,7 +154,7 @@ async def run_service_agent(service: str) -> None:
     interruptions = classifier_notice.InterruptionCounter()
     error: BaseException | None = None
     try:
-        await _run_session(options, mcp_configured, interruptions)
+        await _run_session(options, mcp_configured, interruptions, prompt)
     except BaseException as exc:
         error = exc
         raise
@@ -139,7 +163,10 @@ async def run_service_agent(service: str) -> None:
 
 
 async def _run_session(
-    options: Any, mcp_configured: bool, interruptions: classifier_notice.InterruptionCounter
+    options: Any,
+    mcp_configured: bool,
+    interruptions: classifier_notice.InterruptionCounter,
+    prompt: str,
 ) -> None:
     def _note(message: Any) -> None:
         # Stream messages. Could be prettier-formatted; just print for now.
@@ -155,7 +182,7 @@ async def _run_session(
             # than indistinguishable from "nothing to report" (see
             # orchestrator/mcp_guard.py).
             await ensure_mctl_connected(client, fatal=False)
-        await client.query(PROMPT)
+        await client.query(prompt)
         ledger = LiveTaskLedger()
         # receive_messages(), NOT receive_response(): the latter returns at the
         # first ResultMessage, and a ResultMessage ends one TURN, not the RUN.

@@ -1,4 +1,5 @@
 """mctl platform configuration."""
+import os
 from pathlib import Path
 
 from config.model_policy import ModelPolicyError, resolve_model
@@ -176,6 +177,38 @@ ROTATING_SERVICES = [s for s in SERVICES if s not in NON_ROTATING_SERVICES]
 
 MENTOR_DIR = AGENTS_DIR / "_mentor"
 SHEPHERD_DIR = AGENTS_DIR / "_shepherd"
+
+
+def agent_state_root() -> Path:
+    """Root of the per-service inbox/proposals/digest tree.
+
+    `STATE_DIR` when set and non-empty (the mctl-gitops agents-state tree),
+    else the baked-in `AGENTS_DIR`. Read at call time so tests can patch it.
+    """
+    state = os.environ.get("STATE_DIR", "")
+    return Path(state) if state else AGENTS_DIR
+
+
+def service_inbox_dir(service: str) -> Path:
+    return agent_state_root() / service / "inbox"
+
+
+def service_proposals_dir(service: str) -> Path:
+    return agent_state_root() / service / "proposals"
+
+
+def mentor_digest_dir() -> Path:
+    return agent_state_root() / "_mentor" / "digest"
+
+
+def mentor_services() -> list[str]:
+    """Services the mentor reads: those with a baked `agents/<svc>/` scaffold."""
+    return [s for s in SERVICES if (AGENTS_DIR / s).is_dir()]
+
+
+def ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 # mctl MCP — shared by every agent
 MCTL_MCP_URL = "https://api.mctl.ai/mcp"

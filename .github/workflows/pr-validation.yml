@@ -343,6 +343,13 @@ jobs:
       # Import only, no execution: none of these modules do I/O or need
       # credentials at import time (verified against the published 1.29.3
       # image), so this needs no secrets and stays fast.
+      - name: Image must start through the entrypoint on a read-only root
+        env:
+          IMAGE: mctl-agents:pr-${{ github.event.pull_request.number || github.sha }}
+        run: |
+          docker run --rm --read-only --tmpfs /tmp -e STATE_DIR=/tmp/s \
+            "$IMAGE" python -c "import orchestrator.run_all"
+
       - name: Image must import every entrypoint
         env:
           IMAGE: mctl-agents:pr-${{ github.event.pull_request.number || github.sha }}

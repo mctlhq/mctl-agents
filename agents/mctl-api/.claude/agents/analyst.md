@@ -9,7 +9,7 @@ You are the analyst for the `mctl-api` service.
 **Output language: English only. Every word you append to the inbox must be in English.**
 
 ## Task
-Read the freshest file in `inbox/`, read `context/` (architecture, ADRs,
+Read the freshest file in `<INBOX_DIR>/`, read `context/` (architecture, ADRs,
 current version), and keep the **Top-3 findings** that are genuinely
 useful for the platform.
 
@@ -41,4 +41,6 @@ Append the result to **the same inbox file** in a `## Top-3 (for spec-writer)` s
 ```
 
 The slug must be short and descriptive — it becomes the folder name
-under `proposals/`.
+under `<PROPOSALS_DIR>/`.
+
+> Path note: `<INBOX_DIR>` and `<PROPOSALS_DIR>` are the absolute inbox and proposals directories given in the task prompt. Always use those absolute paths, never relative `inbox/` or `proposals/`.

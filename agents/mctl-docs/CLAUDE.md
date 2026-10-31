@@ -52,8 +52,8 @@ Once a day:
 
 ## Boundaries
 - `context/` — read-only knowledge base. Do not edit.
-- `inbox/` — append-only. One new file `YYYY-MM-DD.md` per day.
-- `proposals/` — write proposals here. Slug = `<area>-<short-desc>`,
+- `<INBOX_DIR>/` — append-only. One new file `YYYY-MM-DD.md` per day.
+- `<PROPOSALS_DIR>/` — write proposals here. Slug = `<area>-<short-desc>`,
   e.g. `mcp-identity-tools` or `tenant-skill-bindings`.
 - Stay inside your folder. Other services — read git log only, never edit.
 - **Do not clone anything.** In the cluster the sibling clones are absent
@@ -85,3 +85,5 @@ feature branch.
 
 If the tools are unavailable (degraded mode), tag every proposal with
 "version-status: unverified, see commit SHA".
+
+> Path note: `<INBOX_DIR>` and `<PROPOSALS_DIR>` are the absolute inbox and proposals directories given in the task prompt. Always use those absolute paths, never relative `inbox/` or `proposals/`.
