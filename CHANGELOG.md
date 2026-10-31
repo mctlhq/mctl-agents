@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.112.3](https://github.com/mctlhq/mctl-agents/compare/1.112.2...1.112.3) (2026-10-31)
+
+
+### Bug Fixes
+
+* **deps:** bump opentelemetry to 1.45.1 for CVE-2026-114603 ([870cbbf](https://github.com/mctlhq/mctl-agents/commit/870cbbf04eef721951b5b2b9a7432b086cfa0405))
+* **deps:** bump opentelemetry to 1.45.1 for CVE-2026-114603 ([4b2492a](https://github.com/mctlhq/mctl-agents/commit/4b2492a59a70e072a790ff7e4d92173ac8971548))
+
 ## [1.112.2](https://github.com/mctlhq/mctl-agents/compare/1.112.1...1.112.2) (2026-10-31)
 
 
