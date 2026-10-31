@@ -1,9 +1,10 @@
 # Spike #807: Kubernetes isolation primitives for non-deterministic agents
 
-STATUS: DRAFT
+STATUS: HARDEN_IN_PLACE
 
-The decision token (one of `NO_CHANGE`, `HARDEN_IN_PLACE`, `DEDICATED_AGENT_NAMESPACE`,
-`SANDBOX_RUNTIME_REQUIRED`) is the #807 owner's call. This report proposes `HARDEN_IN_PLACE`.
+Owner decision recorded 2026-10-31: `HARDEN_IN_PLACE` (allowed: `NO_CHANGE`, `HARDEN_IN_PLACE`,
+`DEDICATED_AGENT_NAMESPACE`, `SANDBOX_RUNTIME_REQUIRED`). `SANDBOX_RUNTIME_REQUIRED` was not decided: it
+stays a separate, later owner decision. See [Decision](#decision). Refs mctlhq/mctl-agents#807.
 
 ## Environment and versions
 
@@ -72,25 +73,34 @@ USD budgets (ADR 011, `orchestrator/exec_budget.py`), the MCP policy checkpoint 
 capability gateway (ADR 017) are in-process controls. A model-driven `Bash` runs in the same container and
 is not mediated by them, so they do not replace the pod-level primitives above.
 
-## Follow-ups
+## Follow-ups (filed 2026-10-31)
 
-All target mctl-gitops unless noted. None is applied by this spike.
+All target mctl-gitops unless noted. None is applied by this spike. (a) to (e) and (g) are
+tracked; (f) is deferred and not filed.
 
 - (a) **Default-deny egress for agent pods.** Tracked in mctlhq/mctl-gitops#2159 (stage A proxy in flight). Files: new `argo-workflows/config/networkpolicy-agents-egress.yaml`.
   Expected traffic: DNS, mctl-api, otel-collector, Temporal if needed, api.anthropic.com, github.com,
   npm/PyPI/Go module proxy (implementer test runs). Needs the CNI answer to pick FQDN policy vs proxy.
   Rollback: delete the policy.
 - (b) **Env tokens to short-lived file-mounted or proxy-injected credentials.** Files: the agent CWFTs,
-  `mctl-agents` entrypoint. Rollback: restore the `secretKeyRef` env entries.
+  `mctl-agents` entrypoint. Rollback: restore the `secretKeyRef` env entries. Tracked: mctlhq/mctl-gitops#2288.
 - (c) **East-west narrowing.** Files: `argo-workflows/config/networkpolicy.yaml`,
   `bootstrap/templates/core-infra/vault-netpol.yaml`, `mctl-api-netpol.yaml`, `backstage-netpol.yaml`,
   `infra-components/data/cnpg/shared/networkpolicy.yaml`, `infra-components/observability/otel-collector/networkpolicy.yaml`.
   Rollback: revert the selectors (platform workflows need Vault and mctl-api access, so test deploy-service first).
+  Tracked: mctlhq/mctl-gitops#2289.
 - (d) **PSA `restricted` via a dedicated agent namespace, plus `readOnlyRootFilesystem`.** Files: namespace
   manifest, agent CWFTs. Platform helper steps run as root, so not on `argo-workflows` itself. Rollback: revert the namespace label.
+  The decision keeps the shared namespace, so (d) is filed as hardening in place: `readOnlyRootFilesystem` on
+  agent steps, tracked in mctlhq/mctl-gitops#2290. The namespace `warn`/`audit` labels and the non-root
+  `clone-gitops` prerequisite were already tracked (mctlhq/mctl-gitops#1719, mctlhq/mctl-gitops#1720).
+  `enforce: restricted` on `argo-workflows` stays blocked while any step there needs root.
 - (e) **ResourceQuota / LimitRange for agent pods.** Size from per-pod limits times max concurrency. Rollback: delete the objects.
+  Tracked: mctlhq/mctl-gitops#2291.
 - (f) **gVisor RuntimeClass evaluation.** Node pool and `runtimeClassName` on one agent CWFT first. Rollback: remove `runtimeClassName`.
-- (g) **Run the auditor in mctl-gitops CI.** Rollback: remove the CI step.
+  Deferred, not filed: `SANDBOX_RUNTIME_REQUIRED` stays a separate owner decision (see [Decision](#decision)).
+- (g) **Run the auditor in mctl-gitops CI.** Rollback: remove the CI step. Tracked: mctlhq/mctl-gitops#2292, which also
+  covers an auditor false positive found on the re-check (see [Decision](#decision)).
 
 Optional owner-run probe (not run here): a throwaway pod labelled `app.kubernetes.io/name: mctl-agents`
 in `argo-workflows` that attempts outbound HTTPS to an arbitrary host and a TCP connect to Vault.
@@ -228,4 +238,25 @@ against mctl-gitops `f6727392c4e7bd843a86eea77896fd555417bc79`. Env vars are rep
 
 ## Decision
 
-STATUS: DRAFT. Proposed: `HARDEN_IN_PLACE`, with `SANDBOX_RUNTIME_REQUIRED` as a separate later decision.
+STATUS: HARDEN_IN_PLACE
+
+Owner decision recorded 2026-10-31: `HARDEN_IN_PLACE`. Agent pods stay in the shared `argo-workflows`
+namespace and are hardened there; a dedicated agent namespace was not chosen. Follow-ups (a) to (e) and
+(g) are tracked:
+
+- (a) G1, default-deny egress: mctlhq/mctl-gitops#2159
+- (b) G2, short-lived file-mounted credentials: mctlhq/mctl-gitops#2288
+- (c) G3, east-west narrowing: mctlhq/mctl-gitops#2289
+- (d) G4, `readOnlyRootFilesystem` in place: mctlhq/mctl-gitops#2290 (namespace Pod Security already in
+  mctlhq/mctl-gitops#1719 and mctlhq/mctl-gitops#1720)
+- (e) G6, ResourceQuota / LimitRange: mctlhq/mctl-gitops#2291
+- (g) auditor in mctl-gitops CI: mctlhq/mctl-gitops#2292
+
+Not decided: the sandbox runtime (G5, follow-up (f)). It stays a separate, later owner decision and has no
+issue. Spike #881 measured gVisor, and on 2026-10-29 the owner decided not to install `runsc` on the
+workers; a dedicated gVisor node pool would conflict with the standing rule against adding nodes.
+
+Evidence re-checked on mctl-gitops main at `eb39bc2` (2026-10-31): the 110 auditor rows above are
+unchanged. The one new row, `allow-agent-ingress` of the mctl-gitops#2159 egress proxy, is an auditor
+false positive: that policy admits agent pods only, by design, and the auditor ignores a `podSelector`
+in the same `from` peer. (g) tracks the fix.
