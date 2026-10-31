@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.114.0](https://github.com/mctlhq/mctl-agents/compare/1.113.0...1.114.0) (2026-10-31)
+
+
+### Features
+
+* **agents:** issue-947-fix-image-make-the-agent-entrypoint-work ([30cbfe6](https://github.com/mctlhq/mctl-agents/commit/30cbfe6b2702ce79d8f8098662ec591af5a077ae))
+* **agents:** issue-947-fix-image-make-the-agent-entrypoint-work ([535924e](https://github.com/mctlhq/mctl-agents/commit/535924e00f9e7b1e8f1fe85146df4702802529ef))
+
 ## [1.113.0](https://github.com/mctlhq/mctl-agents/compare/1.112.3...1.113.0) (2026-10-31)
 
 
