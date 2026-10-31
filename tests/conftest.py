@@ -84,6 +84,46 @@ def _authorized_execution(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _evict_cached_runs_when_a_worker_stops():
+    """Make every SDK worker the suite stops evict the runs it still caches,
+    instead of leaving them for the garbage collector to finalize inside some
+    later workflow's activation (mctlhq/mctl-agents#912; the mechanism is
+    written up in tests/temporal_harness.py).
+
+    Patched on the SDK's `_WorkflowWorker` rather than in
+    `temporal_harness.Worker`, because every worker the process stops has
+    the hazard: the bare `temporalio.worker.Worker`s some modules build, and
+    the ones orchestrator/temporal/worker.py builds under test_worker_roles.
+    `setattr` raises if `run` is ever gone, and a missing run cache fails the
+    test through `_unevicted_runs_fail_the_test`, so an SDK upgrade cannot
+    quietly turn this into a no-op. tests/test_worker_teardown_eviction.py
+    replays #912 itself, which is what catches a cache the SDK still has but
+    no longer fills.
+    """
+    from temporalio.worker._workflow import _WorkflowWorker
+
+    from tests.temporal_harness import evicting_after_shutdown
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_WorkflowWorker, "run", evicting_after_shutdown(_WorkflowWorker.run))
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _unevicted_runs_fail_the_test():
+    """Fail the test whose worker stopped with a run the teardown eviction
+    could not tear down: that run's coroutines are still suspended, which is
+    exactly the state #912 came from."""
+    yield
+    from tests.temporal_harness import EVICTION_FAILURES
+
+    failures = list(EVICTION_FAILURES)
+    EVICTION_FAILURES.clear()
+    if failures:
+        pytest.fail("a stopped worker left runs its eviction could not tear down (#912): " + "; ".join(failures))
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     # Pins anyio's pytest plugin (auto-registered since anyio is already a
