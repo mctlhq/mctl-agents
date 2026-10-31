@@ -8,7 +8,9 @@ task 6b's PolicyDecidePolicyCheckpoint DoD.
 No real network and no real `mcp`/`claude_agent_sdk` server: every provider
 is a fake satisfying `capability_gateway.ProviderSession`, and every remote
 connection goes through an injected fake `ProviderConnector` — the point of
-that seam.
+that seam. The one exception is the "on the wire" section, which runs the
+real `mcp` client against an in-process server on `httpx2.MockTransport`,
+still with no socket opened.
 """
 from __future__ import annotations
 
@@ -786,10 +788,10 @@ def _patch_mcp_transport(monkeypatch, *, fail_initialize: Exception | None = Non
     import mcp.client.streamable_http as streamable_http
 
     @asynccontextmanager
-    async def _client(_url, headers=None):
-        yield (object(), object(), lambda: None)
+    async def _client(_url, *, http_client=None, terminate_on_close=True, max_sse_event_size=None):
+        yield (object(), object())
 
-    monkeypatch.setattr(streamable_http, "streamablehttp_client", _client)
+    monkeypatch.setattr(streamable_http, "streamable_http_client", _client)
     monkeypatch.setattr(mcp, "ClientSession",
                         lambda *streams: _FakeClientSession(*streams, fail_initialize=fail_initialize))
 
@@ -821,6 +823,182 @@ def test_default_connector_still_classifies_connection_failures(monkeypatch):
 
     with pytest.raises(gw.ProviderUnavailableError):
         anyio.run(_connect)
+
+
+# -- the default remote connector on the wire --------------------------------
+#
+# mcp 2.x moved headers and timeouts from the transport onto the HTTP client,
+# renamed the model fields to snake_case, caps one SSE event at 1 MiB by
+# default and validates every result against the negotiated protocol
+# revision (mctlhq/mctl-agents#887). The fakes above cannot see any of that,
+# so these tests run the real `mcp` client against an in-process server.
+
+_WIRE_HEADERS = {"Authorization": "Bearer wire-token", "X-Mctl-Execution-Id": "exec-887"}
+_WIRE_PROVIDER = cap.ProviderRef(type="mcp-remote", id="mctl-api", alias="mctl", endpoint_ref="http://wire.test/mcp")
+_BIG_TEXT = "x" * (3 * 1024 * 1024 // 2)  # 1.5 MiB, over 2.x's default 1 MiB event cap
+
+
+def _wire_tools() -> list[dict]:
+    return [
+        {
+            "name": "mctl_whoami",
+            "description": "Who am I",
+            "inputSchema": {"type": "object", "properties": {}},
+            "annotations": {"title": "Who", "readOnlyHint": True, "destructiveHint": False},
+        },
+        {
+            "name": "paid_long",
+            "inputSchema": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+            "execution": {"taskSupport": "required"},
+        },
+        {"name": "fails", "inputSchema": {"type": "object"}},
+        {"name": "big", "inputSchema": {"type": "object"}},
+    ]
+
+
+@dataclass
+class _WireServer:
+    """A minimal Streamable HTTP MCP server behind `httpx2.MockTransport`.
+    It records every request, and every `AsyncClient` the connector builds."""
+
+    tools: list[dict] = field(default_factory=_wire_tools)
+    requests: list = field(default_factory=list)
+    clients: list[dict] = field(default_factory=list)
+
+    def handle(self, request):
+        import httpx2
+
+        self.requests.append(request)
+        if request.method == "GET":
+            return httpx2.Response(405)  # no standalone SSE stream
+        if request.method == "DELETE":
+            return httpx2.Response(200)
+        body = json.loads(request.content)
+        if "id" not in body:
+            return httpx2.Response(202)  # a notification
+
+        def result(value):
+            return {"jsonrpc": "2.0", "id": body["id"], "result": value}
+
+        if body["method"] == "initialize":
+            return httpx2.Response(200, headers={"mcp-session-id": "wire-session"}, json=result({
+                "protocolVersion": body["params"]["protocolVersion"],
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "wire", "version": "0"},
+            }))
+        if body["method"] == "tools/list":
+            return httpx2.Response(200, json=result({"tools": self.tools}))
+        if body["method"] == "tools/call":
+            name = body["params"]["name"]
+            if name == "fails":
+                return httpx2.Response(200, json=result({"content": [{"type": "text", "text": "it broke"}],
+                                                         "isError": True}))
+            if name == "big":
+                event = json.dumps(result({"content": [{"type": "text", "text": _BIG_TEXT}]}))
+                return httpx2.Response(200, headers={"content-type": "text/event-stream"},
+                                       content=f"event: message\ndata: {event}\n\n".encode())
+            return httpx2.Response(200, json=result({"content": [{"type": "text", "text": f"ran {name}"}]}))
+        return httpx2.Response(200, json={"jsonrpc": "2.0", "id": body["id"],
+                                          "error": {"code": -32601, "message": "method not found"}})
+
+
+@pytest.fixture
+def wire(monkeypatch):
+    """Routes every `httpx2.AsyncClient` the connector builds to a fresh
+    `_WireServer`, keeping the client's own headers and timeout."""
+    import httpx2
+
+    server = _WireServer()
+    real_client = httpx2.AsyncClient
+
+    class _RecordingClient(real_client):
+        def __init__(self, **kwargs):
+            server.clients.append(kwargs)
+            super().__init__(transport=httpx2.MockTransport(server.handle), **kwargs)
+
+    monkeypatch.setattr(httpx2, "AsyncClient", _RecordingClient)
+    return server
+
+
+def _through_wire(body):
+    async def _run():
+        with anyio.fail_after(30):
+            async with gw._default_remote_connector(_WIRE_PROVIDER, _WIRE_HEADERS) as session:
+                return await body(session)
+
+    return anyio.run(_run)
+
+
+def _leaf_exceptions(exc: BaseException) -> list[BaseException]:
+    if isinstance(exc, BaseExceptionGroup):
+        return [leaf for member in exc.exceptions for leaf in _leaf_exceptions(member)]
+    return [exc]
+
+
+def test_default_connector_lists_tools_over_the_wire_with_the_callers_headers_and_1x_timeouts(wire):
+    """The caller's headers (bearer token, #196 correlation) must reach every
+    request, and the timeouts must stay mcp 1.x's: 30 s to connect, write
+    and wait for a pooled connection, 300 s to read. Tool fields come back
+    under the gateway's own names, with the protocol's camelCase annotation
+    keys and `execution.taskSupport` intact."""
+    tools = {t.name: t for t in _through_wire(lambda session: session.list_tools())}
+
+    assert [client["headers"] for client in wire.clients] == [_WIRE_HEADERS]
+    timeout = wire.clients[0]["timeout"]
+    assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (30.0, 300.0, 30.0, 30.0)
+    assert [request.method for request in wire.requests].count("POST") >= 3  # initialize, initialized, tools/list
+    for request in wire.requests:
+        assert request.headers["authorization"] == "Bearer wire-token"
+        assert request.headers["x-mctl-execution-id"] == "exec-887"
+
+    assert set(tools) == {"mctl_whoami", "paid_long", "fails", "big"}
+    whoami, paid = tools["mctl_whoami"], tools["paid_long"]
+    assert whoami.description == "Who am I"
+    assert whoami.input_schema == {"type": "object", "properties": {}}
+    assert whoami.annotations == {"title": "Who", "readOnlyHint": True, "destructiveHint": False}
+    assert whoami.annotations_unparseable is False
+    assert whoami.task_support == ""
+    assert paid.description == ""
+    assert paid.input_schema == {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+    assert paid.annotations == {}
+    assert paid.task_support == "required"
+
+
+def test_default_connector_reports_a_wire_is_error_result_as_an_error(wire):
+    """A tool result carrying `isError: true` is a failed call, not a
+    successful one with odd text."""
+    assert _through_wire(lambda session: session.call_tool("fails", {})) == gw.ToolCallResult(
+        is_error=True, text="it broke",
+    )
+    assert _through_wire(lambda session: session.call_tool("mctl_whoami", {})) == gw.ToolCallResult(
+        is_error=False, text="ran mctl_whoami",
+    )
+
+
+def test_default_connector_accepts_one_sse_event_over_one_mebibyte(wire):
+    """mcp 1.x never capped an SSE event; 2.x fails any event over 1 MiB
+    unless told otherwise, which would turn a large but well-formed tool
+    result into a provider error."""
+    result = _through_wire(lambda session: session.call_tool("big", {}))
+
+    assert result == gw.ToolCallResult(is_error=False, text=_BIG_TEXT)
+
+
+def test_a_tool_listing_the_protocol_rejects_fails_discovery_instead_of_sealing_a_shorter_set(wire):
+    """mcp 2.x validates a `tools/list` result against the negotiated
+    protocol revision, where `inputSchema` must have `type: "object"`. One
+    such tool fails the whole listing, and discovery must raise rather than
+    seal the tools that did validate (ADR 017 sec. 5)."""
+    wire.tools = [*_wire_tools(), {"name": "untyped_schema", "inputSchema": {}}]
+
+    with pytest.raises(Exception) as caught:
+        anyio.run(partial(
+            gw.resolve_eligible, _plan(("mcp__mctl__*",)), _execution(), [_WIRE_PROVIDER], headers={},
+        ))
+
+    failures = [leaf for leaf in _leaf_exceptions(caught.value) if isinstance(leaf, gw.GatewayError)]
+    assert failures, caught.value
+    assert "list_tools failed" in str(failures[0])
 
 
 # -- the SDK tool layer ------------------------------------------------------
@@ -987,12 +1165,12 @@ def test_a_non_json_object_arguments_capability_id_is_also_bounded_in_the_trace(
 class _FakeMcpToolInfo:
     """Shapes a real `mcp.types.Tool` enough for `_McpProviderSession.list_tools`
     — no `mcp` import needed, that dataclass is duck-typed (`t.name`,
-    `t.description`, `t.inputSchema`, `t.annotations`)."""
+    `t.description`, `t.input_schema`, `t.annotations`)."""
 
     def __init__(self, name: str, annotations=None) -> None:
         self.name = name
         self.description = ""
-        self.inputSchema = {"type": "object"}
+        self.input_schema = {"type": "object"}
         self.annotations = annotations
 
 
@@ -1087,7 +1265,7 @@ def test_empty_annotations_are_not_counted_as_a_drop(capsys):
     CAPABILITY_PROVIDER_DEGRADED line (claude P3 on #509)."""
 
     class _AllUnset:
-        def model_dump(self, exclude_none=False):
+        def model_dump(self, by_alias=False, exclude_none=False):
             return {}
 
     real_session = _FakeRealMcpSession([

@@ -24,9 +24,10 @@ import tomllib
 from pathlib import Path
 
 import anyio
+import httpx2
 import mcp.types as types
 from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
@@ -63,8 +64,8 @@ def refusal(reason: str, detail: str) -> types.CallToolResult:
     # Same shape as `refusal()` in src/bridge.rs.
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=f"{reason}: {detail}")],
-        isError=True,
-        structuredContent={"reason_code": reason},
+        is_error=True,
+        structured_content={"reason_code": reason},
     )
 
 
@@ -77,15 +78,23 @@ class Upstream:
     async def hold(self, url: str, token: str, timeout_s: float) -> None:
         """Keep the upstream session open for the life of the process."""
         try:
-            async with streamablehttp_client(
-                url, headers={"Authorization": f"Bearer {token}"}, timeout=timeout_s
-            ) as (read, write, _get_session_id):
-                async with ClientSession(read, write) as session:
-                    with anyio.fail_after(timeout_s):
-                        await session.initialize()
-                    self.session = session
-                    self.ready.set()
-                    await anyio.sleep_forever()
+            # mcp 2.x takes headers and timeouts on the HTTP client. These are
+            # what mcp 1.x's `streamablehttp_client(timeout=timeout_s)` built:
+            # `timeout_s` to connect, write and wait for a pooled connection,
+            # 300 s to read, and no cap on one SSE event.
+            async with httpx2.AsyncClient(
+                headers={"Authorization": f"Bearer {token}"}, timeout=httpx2.Timeout(timeout_s, read=300.0)
+            ) as http_client:
+                async with streamable_http_client(url, http_client=http_client, max_sse_event_size=None) as (
+                    read,
+                    write,
+                ):
+                    async with ClientSession(read, write) as session:
+                        with anyio.fail_after(timeout_s):
+                            await session.initialize()
+                        self.session = session
+                        self.ready.set()
+                        await anyio.sleep_forever()
         except Exception:
             self.error = True
         finally:
@@ -99,50 +108,49 @@ class Upstream:
 
 
 def build_server(allowlist: list[str], upstream: Upstream, has_token: bool, timeout_s: float) -> Server:
-    server = Server("mctl-runtime-baseline")
     allowed = set(allowlist)
 
-    # Raw request handlers: the decorator API consults a tool cache that can
-    # trigger an upstream tools/list for an unlisted name, and it re-wraps
-    # results. These return the SDK result objects as they are.
-    async def on_list(_req: types.ListToolsRequest) -> types.ServerResult:
+    # Constructor handlers: mcp 2.x sends what they return without wrapping
+    # it, and puts no tool cache in front of them (the 1.x decorator API kept
+    # one that could trigger an upstream tools/list for an unlisted name).
+    # These return the SDK result objects as they are.
+    async def on_list(_ctx, _params: types.PaginatedRequestParams | None) -> types.ListToolsResult:
         session = await upstream.get(timeout_s) if has_token else None
         if session is None:
-            return types.ServerResult(types.ListToolsResult(tools=[]))
+            return types.ListToolsResult(tools=[])
         tools: list[types.Tool] = []
         cursor = None
         try:
             for _ in range(10):
+                page_params = types.PaginatedRequestParams(cursor=cursor) if cursor is not None else None
                 with anyio.fail_after(timeout_s):
-                    page = await session.list_tools(cursor=cursor)
+                    page = await session.list_tools(params=page_params)
                 tools.extend(t for t in page.tools if t.name in allowed)
-                cursor = page.nextCursor
+                cursor = page.next_cursor
                 if not cursor:
                     break
         except Exception:
             tools = []
-        return types.ServerResult(types.ListToolsResult(tools=tools))
+        return types.ListToolsResult(tools=tools)
 
-    async def on_call(req: types.CallToolRequest) -> types.ServerResult:
-        name = req.params.name
+    async def on_call(_ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
+        name = params.name
         if name not in allowed:
             # Fail closed: no upstream I/O at all.
-            return types.ServerResult(refusal("not-eligible", f"{name} is not allowlisted"))
+            return refusal("not-eligible", f"{name} is not allowlisted")
         if not has_token:
-            return types.ServerResult(refusal("credential-absent", "no credential configured"))
+            return refusal("credential-absent", "no credential configured")
         session = await upstream.get(timeout_s)
         if session is None:
-            return types.ServerResult(refusal("provider-unavailable", "upstream session unavailable"))
+            return refusal("provider-unavailable", "upstream session unavailable")
         try:
             with anyio.fail_after(timeout_s):
-                result = await session.call_tool(name, req.params.arguments or {})
+                result = await session.call_tool(name, params.arguments or {})
         except Exception as exc:
-            return types.ServerResult(refusal("provider-unavailable", type(exc).__name__))
-        return types.ServerResult(result)
+            return refusal("provider-unavailable", type(exc).__name__)
+        return result
 
-    server.request_handlers[types.ListToolsRequest] = on_list
-    server.request_handlers[types.CallToolRequest] = on_call
-    return server
+    return Server("mctl-runtime-baseline", on_list_tools=on_list, on_call_tool=on_call)
 
 
 async def serve(args: argparse.Namespace, allowlist: list[str], token: str | None) -> None:

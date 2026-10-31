@@ -72,10 +72,11 @@ def eager_first_turn_bytes(mctl_tools: Sequence[Any]) -> int:
     """Sum of every mctl-api tool's input-schema bytes — what
     `mcp_servers=mctl_mcp_config(always_load=True)` plus the profile's
     `mcp__mctl__*` allow-list puts in the model's first turn today.
-    `mctl_tools` is whatever a provider's `list_tools()` returned (real
-    `mcp.types.Tool`s in production, a plain object with `.inputSchema` in
-    tests) — only that one attribute is read."""
-    return sum(_schema_bytes(getattr(t, "inputSchema", None)) for t in mctl_tools)
+    `mctl_tools` is whatever a provider session's `list_tools()` returned
+    (`orchestrator.capability_gateway.ProviderTool`s in production, a plain
+    object with `.input_schema` in tests) — only that one attribute is
+    read."""
+    return sum(_schema_bytes(getattr(t, "input_schema", None)) for t in mctl_tools)
 
 
 def discovery_first_turn_bytes(gateway_tools: Sequence[Any]) -> int:
@@ -107,22 +108,21 @@ def _live_mctl_tools() -> list[Any]:
     pulls in `claude_agent_sdk`/`mcp` — the same RUNTIME half `orchestrator/
     capability_gateway.py`'s own module docstring keeps out of the worker's
     import graph. Deferred import for the same reason; this function is
-    never called by anything this repo's test suite exercises."""
+    never called by anything this repo's test suite exercises.
+
+    Connects through the gateway's own `_default_remote_connector`, so the
+    measured listing travels the exact transport, headers and timeouts
+    discovery mode uses, and an SDK change has one call site to follow."""
     import anyio
 
     from config.settings import MCTL_MCP_URL
-    from orchestrator.capability_gateway import _default_remote_headers
+    from orchestrator.capability import MCTL_API_PROVIDER_ID, ProviderRef
+    from orchestrator.capability_gateway import _default_remote_connector, _default_remote_headers
 
     async def _list() -> list[Any]:
-        import mcp
-        from mcp.client.streamable_http import streamablehttp_client
-
-        headers = _default_remote_headers()
-        async with streamablehttp_client(MCTL_MCP_URL, headers=headers) as (read_stream, write_stream, _get_id):
-            async with mcp.ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                result = await session.list_tools()
-                return list(result.tools)
+        provider = ProviderRef(type="mcp-remote", id=MCTL_API_PROVIDER_ID, alias="mctl", endpoint_ref=MCTL_MCP_URL)
+        async with _default_remote_connector(provider, _default_remote_headers()) as session:
+            return list(await session.list_tools())
 
     return anyio.run(_list)
 
