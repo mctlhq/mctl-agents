@@ -55,15 +55,15 @@ requires-python = ">=3.12,<3.13"
 # mctl-api's Ed25519 dispatch authorizations with it. Pinned at the version
 # uv.lock already resolves, imported lazily inside the verify/sign helpers.
 dependencies = [
-    "claude-agent-sdk==0.2.168",
-    "anyio==4.14.2",
+    "claude-agent-sdk==0.2.174",
+    "anyio==4.15.1",
     "python-dotenv==1.2.4",
     "PyYAML==6.0.3",
     "temporalio==1.34.0",
     "httpx==0.28.1",
     "mcp==2.3.0",
     "httpx2==2.16.0",
-    "cryptography==50.0.0",
+    "cryptography==50.0.2",
     "opentelemetry-api==1.45.1",
     "opentelemetry-sdk==1.45.1",
     "opentelemetry-exporter-otlp-proto-http==1.45.1",
