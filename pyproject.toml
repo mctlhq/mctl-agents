@@ -55,7 +55,7 @@ requires-python = ">=3.12,<3.13"
 # mctl-api's Ed25519 dispatch authorizations with it. Pinned at the version
 # uv.lock already resolves, imported lazily inside the verify/sign helpers.
 dependencies = [
-    "claude-agent-sdk==0.2.168",
+    "claude-agent-sdk==0.2.174",
     "anyio==4.14.2",
     "python-dotenv==1.2.4",
     "PyYAML==6.0.3",
