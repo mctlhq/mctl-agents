@@ -1,0 +1,117 @@
+{
+  "metrics": {
+    "corpus_size": 16,
+    "coverage": 0.75,
+    "eligible": 12,
+    "false_negatives_from_gating": 0,
+    "false_rate": 0.0,
+    "fpr_after": 0.0,
+    "fpr_before": 1.0,
+    "hypothesis_by_design": 4,
+    "labelled_eligible": 9,
+    "model_cost_usd": 0,
+    "not_reproduced_rate": 0.167,
+    "precision_after": 1.0,
+    "precision_before": 0.667,
+    "reviewer_time_to_decision": "not-measured: no human study; timestamps not captured",
+    "unknown_rate": 0.25
+  },
+  "results": [
+    {
+      "binding": "ce96096631f6b901a11728c31a7ffa8cdbb99e15@2026-10-04T21:19:19Z",
+      "class": "stale_premise",
+      "id": "f01",
+      "outcome": "VALIDATED_FINDING"
+    },
+    {
+      "binding": "5bf27f69a9dea94b3044fa1cf4434cc04c11982f@2026-10-04T21:19:20Z",
+      "class": "stale_premise",
+      "id": "f02",
+      "outcome": "VALIDATED_FINDING"
+    },
+    {
+      "binding": "ae8e5a4c4ac32bd8af46d4f29e15cf9dbffc922e@2026-10-31T11:45:00Z",
+      "class": "stale_premise",
+      "id": "f03",
+      "outcome": "VALIDATED_FINDING"
+    },
+    {
+      "binding": "none@2026-10-23T07:18:25Z",
+      "class": "stale_premise",
+      "id": "f04",
+      "outcome": "VALIDATED_FINDING"
+    },
+    {
+      "binding": "6fb856a46f40d25e029a3b9ae3a74f2eddc0061b@2026-10-31T11:45:00Z",
+      "class": "runtime_test_failure",
+      "id": "f05",
+      "outcome": "UNKNOWN"
+    },
+    {
+      "binding": "6fb856a46f40d25e029a3b9ae3a74f2eddc0061b@2026-10-29T10:30:00Z",
+      "class": "runtime_test_failure",
+      "id": "f06",
+      "outcome": "UNKNOWN"
+    },
+    {
+      "binding": "ae8e5a4c4ac32bd8af46d4f29e15cf9dbffc922e@2026-10-31T11:45:00Z",
+      "class": "static_invariant",
+      "id": "f07",
+      "outcome": "VALIDATED_FINDING"
+    },
+    {
+      "binding": "ae8e5a4c4ac32bd8af46d4f29e15cf9dbffc922e@2026-10-31T11:45:00Z",
+      "class": "static_invariant",
+      "id": "f08",
+      "outcome": "VALIDATED_FINDING"
+    },
+    {
+      "binding": "ae8e5a4c4ac32bd8af46d4f29e15cf9dbffc922e@2026-10-31T11:45:00Z",
+      "class": "static_invariant",
+      "id": "f09",
+      "outcome": "NOT_REPRODUCED"
+    },
+    {
+      "binding": "ae8e5a4c4ac32bd8af46d4f29e15cf9dbffc922e@2026-10-31T11:45:00Z",
+      "class": "dependency_version",
+      "id": "f10",
+      "outcome": "NOT_REPRODUCED"
+    },
+    {
+      "binding": "ae8e5a4c4ac32bd8af46d4f29e15cf9dbffc922e@2026-10-31T11:45:00Z",
+      "class": "dependency_version",
+      "id": "f11",
+      "outcome": "VALIDATED_FINDING"
+    },
+    {
+      "binding": null,
+      "class": "dependency_version",
+      "id": "f12",
+      "outcome": "UNKNOWN"
+    },
+    {
+      "binding": null,
+      "class": "architecture_design",
+      "id": "f13",
+      "outcome": "HYPOTHESIS"
+    },
+    {
+      "binding": null,
+      "class": "governance_ownership",
+      "id": "f14",
+      "outcome": "HYPOTHESIS"
+    },
+    {
+      "binding": null,
+      "class": "incomplete_requirement",
+      "id": "f15",
+      "outcome": "HYPOTHESIS"
+    },
+    {
+      "binding": null,
+      "class": "security_local_oracle",
+      "id": "f16",
+      "outcome": "HYPOTHESIS"
+    }
+  ]
+}
