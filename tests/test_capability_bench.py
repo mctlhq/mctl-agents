@@ -24,11 +24,21 @@ import capability_bench as cb
 
 def test_eager_first_turn_bytes_sums_every_advertised_tool():
     tools = [
-        SimpleNamespace(inputSchema={"type": "object", "properties": {"a": {"type": "string"}}}),
-        SimpleNamespace(inputSchema={"type": "object"}),
+        SimpleNamespace(input_schema={"type": "object", "properties": {"a": {"type": "string"}}}),
+        SimpleNamespace(input_schema={"type": "object"}),
     ]
-    assert cb.eager_first_turn_bytes(tools) == sum(cb._schema_bytes(t.inputSchema) for t in tools)
+    assert cb.eager_first_turn_bytes(tools) == sum(cb._schema_bytes(t.input_schema) for t in tools)
     assert cb.eager_first_turn_bytes([]) == 0
+
+
+def test_eager_first_turn_bytes_reads_the_schema_the_live_listing_returns():
+    """`_live_mctl_tools` hands back the gateway's own `ProviderTool`s. A
+    misnamed attribute would not raise: `getattr` would quietly count every
+    schema as `{}` and understate eager's first turn (mctlhq/mctl-agents#887)."""
+    from orchestrator.capability_gateway import ProviderTool
+
+    schema = {"type": "object", "properties": {"a": {"type": "string", "description": "x" * 100}}}
+    assert cb.eager_first_turn_bytes([ProviderTool(name="t", input_schema=schema)]) == cb._schema_bytes(schema)
 
 
 def test_discovery_first_turn_bytes_sums_the_three_gateway_tools():
@@ -41,7 +51,7 @@ def test_discovery_first_turn_bytes_sums_the_three_gateway_tools():
 
 
 def test_schema_bytes_report_computes_the_saving():
-    mctl_tools = [SimpleNamespace(inputSchema={"type": "object"}) for _ in range(70)]
+    mctl_tools = [SimpleNamespace(input_schema={"type": "object"}) for _ in range(70)]
     gateway_tools = [SimpleNamespace(input_schema={"type": "object"}) for _ in range(3)]
 
     report = cb.schema_bytes_report(mctl_tools, gateway_tools)
@@ -57,7 +67,7 @@ def test_a_tool_with_no_schema_attribute_counts_as_an_empty_schema():
     `{}`, matching `orchestrator/capability_gateway.py`'s own `or {}`
     convention for the same field."""
     assert cb._schema_bytes(None) == cb._schema_bytes({})
-    assert cb.eager_first_turn_bytes([SimpleNamespace(inputSchema=None)]) == cb._schema_bytes({})
+    assert cb.eager_first_turn_bytes([SimpleNamespace(input_schema=None)]) == cb._schema_bytes({})
 
 
 # ---------------------------------------------------------------------------

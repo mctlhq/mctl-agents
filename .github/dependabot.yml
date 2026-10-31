@@ -6,10 +6,6 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
-    ignore:
-      # mcp 2.x renamed streamable_http_client; the migration is mctl-agents#887.
-      - dependency-name: mcp
-        update-types: ["version-update:semver-major"]
     commit-message:
       prefix: "deps"
 

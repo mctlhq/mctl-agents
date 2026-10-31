@@ -22,9 +22,11 @@ requires-python = ">=3.12,<3.13"
 # claude-agent-sdk wheel, so the pin below also fixes the CLI version.
 #
 # temporalio: orchestrator/temporal/ — the dev-workflow control plane worker
-# (plan phase 4). httpx: promoted from a transitive dep (already pulled in by
+# (plan phase 4). httpx: promoted from a transitive dep (then pulled in by
 # claude-agent-sdk/mcp) to a direct, deliberately-pinned one because
 # orchestrator/temporal/activities/* now import it directly to call mctl-api.
+# Since mcp 2.x nothing else pulls it in; this pin is the only reason it is
+# installed.
 #
 # opentelemetry-*: execution traces (mctl-agents#195, docs/observability/
 # execution-traces.md). The three packages temporalio's own `opentelemetry`
@@ -39,8 +41,14 @@ requires-python = ">=3.12,<3.13"
 # direct, deliberately-pinned one, following the httpx precedent above --
 # orchestrator/capability_gateway.py (mctlhq/mctl-agents#242 slice 2) now
 # imports mcp.client.streamable_http and mcp.ClientSession directly to
-# connect a remote MCP capability provider. Pinned at the version already
-# resolved in uv.lock so this promotion changes no resolved version.
+# connect a remote MCP capability provider. Moved to 2.x in
+# mctlhq/mctl-agents#887; claude-agent-sdk supports both majors.
+#
+# httpx2: the HTTP client mcp 2.x is built on, promoted from a transitive dep
+# for the same reason -- the gateway builds the httpx2.AsyncClient it hands to
+# mcp's streamable_http_client, since 2.x takes headers and timeouts there
+# rather than on the transport. Pinned at the version uv.lock resolves for
+# mcp, so the promotion changes no resolved version.
 #
 # cryptography: promoted from a transitive dep for the same reason --
 # orchestrator/commerce.py (mctlhq/mctl-agents#619, ADR 020 sec. 9) verifies
@@ -53,7 +61,8 @@ dependencies = [
     "PyYAML==6.0.3",
     "temporalio==1.34.0",
     "httpx==0.28.1",
-    "mcp==1.30.0",
+    "mcp==2.3.0",
+    "httpx2==2.16.0",
     "cryptography==50.0.0",
     "opentelemetry-api==1.44.0",
     "opentelemetry-sdk==1.44.0",

@@ -216,8 +216,9 @@ async def _default_remote_connector(
     needs the shapes — mirrors `orchestrator/capability.py`'s own lazy
     `yaml` import in `load_consequence_table`.
     """
+    import httpx2
     import mcp
-    from mcp.client.streamable_http import streamablehttp_client
+    from mcp.client.streamable_http import streamable_http_client
 
     # Only a failure BEFORE the session is handed out is a connection
     # failure. An exception raised inside the caller's `async with` body is
@@ -226,13 +227,23 @@ async def _default_remote_connector(
     # provider-unavailable.
     connected = False
     try:
-        async with streamablehttp_client(provider.endpoint_ref, headers=dict(headers)) as (
-            read_stream, write_stream, _get_session_id,
-        ):
-            async with mcp.ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                connected = True
-                yield _McpProviderSession(provider, session)
+        # mcp 2.x takes headers and timeouts on the HTTP client instead of on
+        # the transport. These are the values mcp 1.x's
+        # `streamablehttp_client` applied: 30 s to connect, write and wait
+        # for a pooled connection, 300 s to read, since a response stream
+        # may be held open. `max_sse_event_size=None` keeps 1.x's unbounded
+        # SSE events; 2.x would otherwise fail any single event over 1 MiB,
+        # turning a large but well-formed tool result into provider-error.
+        async with httpx2.AsyncClient(
+            headers=dict(headers), timeout=httpx2.Timeout(30.0, read=300.0),
+        ) as http_client:
+            async with streamable_http_client(
+                provider.endpoint_ref, http_client=http_client, max_sse_event_size=None,
+            ) as (read_stream, write_stream):
+                async with mcp.ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    connected = True
+                    yield _McpProviderSession(provider, session)
     except TimeoutError as exc:
         if connected:
             raise
@@ -266,7 +277,7 @@ class _McpProviderSession:
             tools.append(ProviderTool(
                 name=t.name,
                 description=t.description or "",
-                input_schema=t.inputSchema or {},
+                input_schema=t.input_schema or {},
                 annotations=converted or {},
                 # Only a genuine coercion failure counts here. An empty
                 # `annotations: {}` (or every hint unset) converts to {} and
@@ -284,12 +295,12 @@ class _McpProviderSession:
         except Exception as exc:
             raise GatewayError(f"provider {self.provider.id!r}: call_tool failed: {exc}") from exc
         text = "\n".join(str(getattr(block, "text", "")) for block in (result.content or []))
-        return ToolCallResult(is_error=bool(result.isError), text=text)
+        return ToolCallResult(is_error=bool(result.is_error), text=text)
 
 
 def _task_support(tool: Any) -> str:
     execution = getattr(tool, "execution", None)
-    value = getattr(execution, "taskSupport", None) if execution is not None else None
+    value = getattr(execution, "task_support", None) if execution is not None else None
     return value if isinstance(value, str) else ""
 
 
@@ -307,7 +318,10 @@ def _annotations_to_dict(annotations: Any) -> dict[str, Any] | None:
     if annotations is None:
         return {}
     if hasattr(annotations, "model_dump"):
-        raw: Any = annotations.model_dump(exclude_none=True)
+        # `by_alias`: mcp 2.x models name their fields in snake_case and keep
+        # the wire's camelCase only as aliases. The keys sealed into a
+        # descriptor stay the protocol's own (`readOnlyHint`, ...), as on 1.x.
+        raw: Any = annotations.model_dump(by_alias=True, exclude_none=True)
     elif isinstance(annotations, Mapping):
         raw = dict(annotations)
     else:
