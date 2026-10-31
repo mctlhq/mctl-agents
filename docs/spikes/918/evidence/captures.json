@@ -1,0 +1,44 @@
+{
+  "ev-repo-files": {
+    "kind": "repo_files", "status": "ok", "revision": "ae8e5a4c4ac32bd8af46d4f29e15cf9dbffc922e",
+    "captured_at": "2026-10-31T11:45:00Z",
+    "data": {"files": {
+      "orchestrator/sdd/verify.py": ["SpecVerdict"],
+      "orchestrator/run_shepherd.py": ["CodexFinding"],
+      "orchestrator/ci_checks.py": ["CheckBlocker", "CIStatus"],
+      "orchestrator/execution_evidence.py": ["AUTHORITIES"],
+      "orchestrator/runtime_assurance.py": ["transition_finding"],
+      "orchestrator/human_input.py": ["HumanInput"],
+      "docs/spikes/875-gh-aw-guardrail-comparison.md": []
+    }}
+  },
+  "ev-lock": {
+    "kind": "lockfile", "status": "ok", "revision": "ae8e5a4c4ac32bd8af46d4f29e15cf9dbffc922e",
+    "captured_at": "2026-10-31T11:45:00Z",
+    "data": {"versions": {"pyyaml": "6.0.3"}}
+  },
+  "ev-pr-484": {
+    "kind": "github_state", "status": "ok", "revision": "ce96096631f6b901a11728c31a7ffa8cdbb99e15",
+    "captured_at": "2026-10-04T21:19:19Z", "data": {"state": "closed", "merged": false}
+  },
+  "ev-pr-483": {
+    "kind": "github_state", "status": "ok", "revision": "5bf27f69a9dea94b3044fa1cf4434cc04c11982f",
+    "captured_at": "2026-10-04T21:19:20Z", "data": {"state": "closed", "merged": false}
+  },
+  "ev-pr-877": {
+    "kind": "github_state", "status": "ok", "revision": "6fb856a46f40d25e029a3b9ae3a74f2eddc0061b",
+    "captured_at": "2026-10-29T18:54:33Z", "data": {"state": "closed", "merged": true}
+  },
+  "ev-completion-746": {
+    "kind": "github_state", "status": "ok", "revision": "none",
+    "captured_at": "2026-10-23T07:18:25Z", "data": {"state": "no_commits"}
+  },
+  "ev-ci-877": {
+    "kind": "check_run", "status": "failed", "revision": "6fb856a46f40d25e029a3b9ae3a74f2eddc0061b",
+    "captured_at": "2026-10-31T11:45:00Z", "data": {}
+  },
+  "ev-ci-flaky": {
+    "kind": "check_run", "status": "ok", "revision": "6fb856a46f40d25e029a3b9ae3a74f2eddc0061b",
+    "captured_at": "2026-10-29T10:30:00Z", "data": {"reruns": ["failure", "success"]}
+  }
+}
