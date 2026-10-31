@@ -1,9 +1,12 @@
-"""Guards for the #807 agent-isolation spike PR. A follow-up that adopts a decision deletes this file."""
+"""Guards for the #807 agent-isolation spike report, decided 2026-10-31.
+
+The spike PR's check that no runtime path changed was removed once #810 merged (#916): on any later
+branch it could only fail a legitimate change, or skip where origin/main is not fetched.
+"""
 
 from __future__ import annotations
 
 import re
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -11,7 +14,6 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 REPORT = ROOT / "docs" / "spikes" / "807-agent-isolation-k8s.md"
 TOKENS = ("NO_CHANGE", "HARDEN_IN_PLACE", "DEDICATED_AGENT_NAMESPACE", "SANDBOX_RUNTIME_REQUIRED")
-GUARDED = ("orchestrator", "config", "agents/_manifests")
 
 
 def decision_errors(text: str) -> list[str]:
@@ -37,8 +39,11 @@ def decision_errors(text: str) -> list[str]:
     return []
 
 
-def test_report_is_draft_or_has_exactly_one_token() -> None:
-    assert decision_errors(REPORT.read_text()) == []
+def test_report_records_exactly_one_token() -> None:
+    text = REPORT.read_text()
+    assert decision_errors(text) == []
+    status = re.search(r"^STATUS:\s*(\w+)", text, re.MULTILINE)
+    assert status and status.group(1) in TOKENS, "the decision is recorded; the report must not return to DRAFT"
 
 
 @pytest.mark.parametrize(("text", "ok"), [
@@ -52,19 +57,6 @@ def test_report_is_draft_or_has_exactly_one_token() -> None:
 ])
 def test_decision_guard_cases(text: str, ok: bool) -> None:
     assert (decision_errors(text) == []) is ok
-
-
-def test_no_runtime_path_changed() -> None:
-    base = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], cwd=ROOT, text=True, capture_output=True)
-    if base.returncode != 0:
-        pytest.skip("no origin/main to diff against")
-    diff = subprocess.run(
-        ["git", "diff", "--name-only", base.stdout.strip(), "HEAD", "--", *GUARDED],
-        cwd=ROOT, text=True, capture_output=True,
-    )
-    if diff.returncode != 0:
-        pytest.skip("git diff unavailable")
-    assert diff.stdout.strip() == "", f"spike must not change guarded paths:\n{diff.stdout}"
 
 
 def test_matrix_rows_have_source() -> None:
