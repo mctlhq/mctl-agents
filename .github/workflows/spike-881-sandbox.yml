@@ -112,7 +112,7 @@ jobs:
           mkdir -p measurements
           { echo "kvm_on_runner: $(stat -c '%A %n' /dev/kvm 2>&1)"; uname -r; echo "head_sha: $GITHUB_SHA"; echo "run_id: $GITHUB_RUN_ID"; echo "ref: $GITHUB_REF"; df -h / || true; kubectl describe node 2>&1 | sed -n '/^Conditions:/,/^Addresses:/p;/^Taints:/p' || true; } > measurements/runner-info.txt 2>&1
           python3 -I "$E/collect.py" --out measurements --runs "$RUNS" runc=measurements/runc.log gvisor=measurements/gvisor.log
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: spike-881-measurements
