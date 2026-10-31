@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.113.0](https://github.com/mctlhq/mctl-agents/compare/1.112.3...1.113.0) (2026-10-31)
+
+
+### Features
+
+* **agents:** issue-917-spike-does-verified-claude-ultra-remove ([0debfd9](https://github.com/mctlhq/mctl-agents/commit/0debfd9376a529d5aaf2001b040adad49782e6ab))
+* **agents:** issue-917-spike-does-verified-claude-ultra-remove ([37d85ad](https://github.com/mctlhq/mctl-agents/commit/37d85ad7db79da1fbec8c983349eae78118f22c1))
+* **agents:** issue-918-spike-which-devloop-finding-classes-shou ([2e23f0d](https://github.com/mctlhq/mctl-agents/commit/2e23f0dc0b320f701ac57e1664eb2c7e8cf112a6))
+* **agents:** issue-918-spike-which-devloop-finding-classes-shou ([cac34ef](https://github.com/mctlhq/mctl-agents/commit/cac34efecb363512d3cc7ccee174a169dcdb7aaa))
+* **agents:** issue-920-security-agents-consume-rotated-agent-cr ([5a7b29f](https://github.com/mctlhq/mctl-agents/commit/5a7b29f00b244607daf0c7ee49a9a75578e5f75b))
+* **agents:** issue-920-security-agents-consume-rotated-agent-cr ([e72201f](https://github.com/mctlhq/mctl-agents/commit/e72201f0cfea08029745e7052a7556336de02994))
+* **agents:** issue-921-fix-auditor-model-networkpolicy-peers-wi ([eb6297b](https://github.com/mctlhq/mctl-agents/commit/eb6297b78c9cb0e4feb212ceeda167d3ac27b739))
+
+
+### Bug Fixes
+
+* **agents:** evaluate NetworkPolicy peers as namespace AND pod selector ([6a4f5b9](https://github.com/mctlhq/mctl-agents/commit/6a4f5b92584918028d76b6ec047e62ccf5739ce3))
+* **deps:** bump the uv-minor-patch group with 6 updates ([a05f07a](https://github.com/mctlhq/mctl-agents/commit/a05f07ad64b2becbed6bedbd072997d7b1c5515c))
+* **deps:** bump the uv-minor-patch group with 6 updates ([344366e](https://github.com/mctlhq/mctl-agents/commit/344366e107380fc16b4a47d40d4664bfaf998473))
+
 ## [1.112.3](https://github.com/mctlhq/mctl-agents/compare/1.112.2...1.112.3) (2026-10-31)
 
 
