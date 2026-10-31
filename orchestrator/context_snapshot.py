@@ -97,7 +97,8 @@ MAX_CONFLICT_SOURCE_IDS = 64
 # whichever module is wrong.
 # `api` = mctl-api's default surface for a direct API call (see SURFACE_KINDS
 # in work_context/contract.py); tests pin the two vocabularies as identical.
-WORK_CONTEXT_SURFACE_KINDS = frozenset({"github", "telegram", "web", "cli", "api"})
+# `mcp` is a surface label only; it implies no client, session or model identity.
+WORK_CONTEXT_SURFACE_KINDS = frozenset({"github", "telegram", "web", "cli", "api", "mcp"})
 WORK_CONTEXT_ACTOR_KINDS = frozenset({"human", "agent", "system"})
 
 # Bounded-length rule (ADR 009 sec. 7): locator/selector are addresses and

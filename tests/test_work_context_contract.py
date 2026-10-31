@@ -265,10 +265,14 @@ def test_a_null_origin_surface_is_no_origin_not_a_broken_record():
     assert wc.answer_from(200, _view(origin_surface=None)).verdict == wc.WORK_ITEM_FOUND
 
 
+def test_mcp_origin_surface_is_found():
+    assert wc.answer_from(200, _view(origin_surface="mcp")).verdict == wc.WORK_ITEM_FOUND
+
+
 def test_out_of_vocabulary_origin_surface_is_unknown():
-    answer = wc.answer_from(200, _view(origin_surface="mcp"))
+    answer = wc.answer_from(200, _view(origin_surface="carrier-pigeon"))
     assert answer.verdict == wc.WORK_ITEM_UNKNOWN
-    assert "mcp" in answer.reason and "origin" in answer.reason
+    assert "carrier-pigeon" in answer.reason and "origin" in answer.reason
     assert wc.answer_from(200, _view(origin_surface="")).verdict == wc.WORK_ITEM_FOUND
 
 
