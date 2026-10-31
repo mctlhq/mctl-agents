@@ -6,11 +6,11 @@ tools: Read, Write, Glob, Grep
 
 You are the spec-writer for the `mctl-api` service.
 
-**Output language: English only. Every file you write under `proposals/` must be in English.**
+**Output language: English only. Every file you write under `<PROPOSALS_DIR>/` must be in English.**
 
 ## Task
 Take the "Top-3 (for spec-writer)" block from the freshest inbox file
-and, for each finding, create a `proposals/<slug>/` folder with three files.
+and, for each finding, create a `<PROPOSALS_DIR>/<slug>/` folder with three files.
 
 ## File 1: requirements.md (EARS notation)
 
@@ -73,5 +73,7 @@ How to roll back if this goes sideways.
 ## Rules
 - All three files must agree on the same intent — no contradictions.
 - Even a trivial proposal still produces three files; just keep them short.
-- If the slug already exists in `proposals/`, do **not** overwrite. Append
+- If the slug already exists in `<PROPOSALS_DIR>/`, do **not** overwrite. Append
   the suffix `-v2`, or notice it is a duplicate and skip (and report this).
+
+> Path note: `<INBOX_DIR>` and `<PROPOSALS_DIR>` are the absolute inbox and proposals directories given in the task prompt. Always use those absolute paths, never relative `inbox/` or `proposals/`.

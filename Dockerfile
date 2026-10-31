@@ -133,8 +133,8 @@ RUN uv sync --locked --no-dev --no-cache
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Code + per-service CLAUDE.md, .claude/, context/ are baked in.
-# inbox/ proposals/ digest/ live in mctl-gitops/agents-state/ and are linked
-# in by the entrypoint wrapper at runtime.
+# inbox/ proposals/ digest/ live in mctl-gitops/agents-state/ and are resolved
+# from STATE_DIR by config.settings at runtime (the entrypoint writes nothing).
 COPY orchestrator/ ./orchestrator/
 COPY config/ ./config/
 COPY agents/ ./agents/

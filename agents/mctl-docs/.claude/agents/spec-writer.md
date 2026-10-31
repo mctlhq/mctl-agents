@@ -6,12 +6,12 @@ tools: Read, Write, Glob, Grep, Bash
 
 You are the spec-writer for the `mctl-docs` service.
 
-**Output language: English only. Every file you write under `proposals/`,
+**Output language: English only. Every file you write under `<PROPOSALS_DIR>/`,
 including `proposed-content.md`, must be in English.**
 
 ## Task
 Take the "Top-3 (for spec-writer)" block from the freshest inbox file.
-For each item create a `proposals/<slug>/` folder with **four** files
+For each item create a `<PROPOSALS_DIR>/<slug>/` folder with **four** files
 (one more than the other service agents).
 
 You may use `Bash git show <sha>` and `Read <repo>/<file>` to pull
@@ -131,7 +131,9 @@ marker.
 
 ## Rules
 - All four files must reference the same source-commit set.
-- If the slug already exists under `proposals/`, do **not** overwrite —
+- If the slug already exists under `<PROPOSALS_DIR>/`, do **not** overwrite —
   append `-v2`.
 - Do not edit files in `mctl-docs/docs/` directly. That is the
   implementer agent's job (or a human's), not yours.
+
+> Path note: `<INBOX_DIR>` and `<PROPOSALS_DIR>` are the absolute inbox and proposals directories given in the task prompt. Always use those absolute paths, never relative `inbox/` or `proposals/`.

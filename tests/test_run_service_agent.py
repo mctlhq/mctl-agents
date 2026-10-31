@@ -324,3 +324,42 @@ def test_the_module_entrypoint_goes_through_the_guard():
     source = inspect.getsource(rsa.main)
     assert "run_service_agent_tolerating_orphans" in source
     assert "anyio.run(run_service_agent," not in source
+
+
+def test_prompt_template_and_build_prompt(tmp_path):
+    assert isinstance(rsa.PROMPT, str)
+    out = rsa.build_prompt(tmp_path / "inbox", tmp_path / "proposals")
+    assert str(tmp_path / "inbox") in out
+    assert str(tmp_path / "proposals") in out
+    assert "<INBOX_DIR>" not in out
+    assert "<PROPOSALS_DIR>" not in out
+
+
+def test_run_creates_state_dirs_under_state_dir_only(monkeypatch, tmp_path):
+    from config import settings
+
+    state = tmp_path / "state"
+    fake_agents = tmp_path / "agents"
+    (fake_agents / "mctl-web").mkdir(parents=True)
+    monkeypatch.setenv("STATE_DIR", str(state))
+    monkeypatch.setattr(rsa, "AGENTS_DIR", fake_agents)
+    monkeypatch.setattr(settings, "AGENTS_DIR", fake_agents)
+    seen = {}
+
+    def fake_build(service_dir, model, state_dirs=()):
+        seen["state_dirs"] = list(state_dirs)
+        return types.SimpleNamespace(mcp_servers=None)
+
+    async def fake_session(options, mcp_configured, interruptions, prompt):
+        seen["prompt"] = prompt
+
+    monkeypatch.setattr(rsa, "build_service_agent_options", fake_build)
+    monkeypatch.setattr(rsa, "_run_session", fake_session)
+    anyio.run(rsa.run_service_agent, "mctl-web")
+    assert (state / "mctl-web" / "inbox").is_dir()
+    assert (state / "mctl-web" / "proposals").is_dir()
+    assert str(state / "mctl-web" / "inbox") in seen["prompt"]
+    assert str(state / "mctl-web" / "proposals") in seen["prompt"]
+    assert seen["state_dirs"] == [state / "mctl-web" / "inbox", state / "mctl-web" / "proposals"]
+    assert not (fake_agents / "mctl-web" / "inbox").exists()
+    assert not (fake_agents / "mctl-web" / "proposals").exists()

@@ -9,7 +9,7 @@ You are the analyst for the `mctl-docs` service.
 **Output language: English only. Every word you append to the inbox must be in English.**
 
 ## Task
-Read the freshest file in `inbox/`, read `context/docs-tree.md` (current
+Read the freshest file in `<INBOX_DIR>/`, read `context/docs-tree.md` (current
 structure of `docs.mctl.ai`) and keep the **Top-3 doc gaps** that are
 genuinely useful for users of the platform.
 
@@ -49,7 +49,7 @@ update / rewrite; proposed path for new-page)
 ```
 
 The slug must be short and descriptive — it becomes the folder name
-under `proposals/`.
+under `<PROPOSALS_DIR>/`.
 
 ## Edge cases
 - If the inbox says "no actionable doc gaps this week", write an empty
@@ -57,3 +57,5 @@ under `proposals/`.
   spec-writer will skip too.
 - If the researcher could not read a repo (path missing), that is an
   infra problem, not a doc gap — do not spend a slot on it.
+
+> Path note: `<INBOX_DIR>` and `<PROPOSALS_DIR>` are the absolute inbox and proposals directories given in the task prompt. Always use those absolute paths, never relative `inbox/` or `proposals/`.
