@@ -297,3 +297,69 @@ def test_quota_and_markdown_render(tmp_path: Path, capsys: pytest.CaptureFixture
     out = capsys.readouterr().out.splitlines()
     assert out[0].startswith("| primitive | scope | status |")
     assert all(ln.startswith("|") and ln.count(" | ") >= 7 for ln in out[2:])
+
+
+_AW_NS = {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "argo-workflows"}}}
+_AGENT_POD = {"podSelector": {"matchLabels": {"app.kubernetes.io/name": "mctl-agents"}}}
+
+
+def _allow_agent_ingress(*peers: dict[str, Any]) -> dict[str, Any]:
+    return {"kind": "NetworkPolicy",
+            "metadata": {"name": "allow-agent-ingress", "namespace": "mctl-agents-egress"},
+            "spec": {"podSelector": {}, "policyTypes": ["Ingress"],
+                     "ingress": [{"from": list(peers), "ports": [{"port": 3128, "protocol": "TCP"}]}]}}
+
+
+def _xns(tmp_path: Path, *peers: dict[str, Any], ns: str = "mctl-agents-egress") -> list[aud.Row]:
+    root = _tree(tmp_path, _cwft(), [INGRESS_ONLY])
+    pol = _allow_agent_ingress(*peers)
+    pol["metadata"]["namespace"] = ns
+    p = root / "infra/egress/networkpolicy.yaml"
+    p.parent.mkdir(parents=True)
+    p.write_text(yaml.safe_dump(pol))
+    return _find(_rows(root), "NetworkPolicy/cross-namespace")
+
+
+def test_combined_peer_is_agents_only_enforced(tmp_path: Path) -> None:
+    rows = _xns(tmp_path, {**_AW_NS, **_AGENT_POD})
+    assert [(r.status, r.severity) for r in rows] == [("enforced", "low")]
+    assert "only agent pods" in rows[0].detail
+
+
+def test_podselector_removed_is_partial(tmp_path: Path) -> None:
+    rows = _xns(tmp_path, dict(_AW_NS))
+    assert [r.status for r in rows] == ["partial"]
+    assert "whole argo-workflows namespace" in rows[0].detail
+
+
+def test_pod_only_peer_in_other_namespace_no_row(tmp_path: Path) -> None:
+    assert _xns(tmp_path, dict(_AGENT_POD), ns="vault") == []
+
+
+def test_or_across_peers(tmp_path: Path) -> None:
+    other = {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "other"}}}
+    assert [r.status for r in _xns(tmp_path / "a", {**_AW_NS, **_AGENT_POD}, dict(_AW_NS))] == ["partial"]
+    assert [r.status for r in _xns(tmp_path / "b", {**_AW_NS, **_AGENT_POD}, other)] == ["enforced"]
+
+
+def test_empty_selectors_are_partial(tmp_path: Path) -> None:
+    cases = [{"namespaceSelector": {}}, {"namespaceSelector": {}, "podSelector": {}},
+             {**_AW_NS, "podSelector": {}}]
+    for i, peer in enumerate(cases):
+        (tmp_path / str(i)).mkdir()
+        assert [r.status for r in _xns(tmp_path / str(i), peer)] == ["partial"]
+
+
+def test_undecidable_peers_not_observed(tmp_path: Path) -> None:
+    cases = [{"namespaceSelector": {"matchExpressions": [{"key": "a", "operator": "Exists"}]}},
+             {**_AW_NS, "podSelector": {"matchLabels": {"app": "other"}}},
+             {**_AW_NS, "podSelector": {"matchExpressions": [{"key": "a", "operator": "Exists"}]}}]
+    for i, peer in enumerate(cases):
+        (tmp_path / str(i)).mkdir()
+        assert [r.status for r in _xns(tmp_path / str(i), peer)] == ["not-observed"]
+
+
+def test_json_schema_version(tmp_path: Path) -> None:
+    inp = aud.load_inputs(_tree(tmp_path, _cwft(), [INGRESS_ONLY]))
+    out = json.loads(aud.render(aud.audit(inp), inp, "json"))
+    assert out["schema_version"] == 2

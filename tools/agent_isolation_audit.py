@@ -15,6 +15,10 @@ Every `*.yaml`/`*.yml` file under the root that declares a top-level
 wherever they live. A scanned file that does not parse as plain YAML (a Helm
 or Go template) yields a `not-observed` row, never silence.
 
+JSON output carries a top-level integer `schema_version`. Version 2 means
+ingress peers are evaluated as the intersection of `namespaceSelector` and
+`podSelector` (peers in a `from` list are a union). Unversioned output is v1.
+
 Exit code: 0 on a completed audit whatever it finds, 2 on unreadable input
 (a missing root, an unreadable or non-UTF-8 core file, invalid YAML in a core file).
 """
@@ -35,6 +39,7 @@ AGENT_IMAGE = "{{workflow.parameters.agent_image}}"
 RUNNER_SA = "mctl-agents-runner"
 AGENT_LABEL = ("app.kubernetes.io/name", "mctl-agents")
 NS = "argo-workflows"
+SCHEMA_VERSION = 2
 
 CWFT_GLOB = "argo-workflows/cluster-templates/cwft-mctl-agents-*.yaml"
 SA_RBAC = "argo-workflows/config/sa-and-rbac.yaml"
@@ -341,6 +346,55 @@ def check_egress(netpol: list[dict[str, Any]] | None,
                "restrictive egress policy selects agent pods", rec)
 
 
+_ADMIT_ORDER = {"none": 0, "agents": 1, "unknown": 2, "all": 3}
+_NS_NAME_KEY = "kubernetes.io/metadata.name"
+
+
+def _peer_admits(peer: dict[str, Any], policy_ns: str | None) -> str:
+    """Which argo-workflows pods does one ingress peer admit: none|all|agents|unknown.
+
+    Kubernetes rule: selectors inside ONE peer are ANDed (pods matching
+    podSelector within namespaces matching namespaceSelector); peers in a
+    `from` list are ORed (see `_policy_admission`). Conservative: an
+    undecidable selector is `unknown`, never `agents`.
+    """
+    if "ipBlock" in peer:
+        return "none"
+    ns_sel = peer.get("namespaceSelector")
+    pod_sel = peer.get("podSelector")
+    if ns_sel is None:
+        # Pod-only peer: resolved against the policy's own namespace.
+        if policy_ns is None:
+            return "unknown"
+        if policy_ns != NS:
+            return "none"
+    elif ns_sel != {}:
+        name = (ns_sel.get("matchLabels") or {}).get(_NS_NAME_KEY)
+        if name is None:
+            return "unknown"
+        if name != NS:
+            return "none"
+    if not pod_sel:
+        return "all"
+    if (pod_sel.get("matchLabels") or {}).get(AGENT_LABEL[0]) == AGENT_LABEL[1]:
+        return "agents"
+    return "unknown"
+
+
+def _policy_admission(pol: dict[str, Any], policy_ns: str | None) -> str:
+    """Fold all ingress rules/peers (OR); broadest wins: all > unknown > agents > none."""
+    result = "none"
+    for rule in (pol.get("spec") or {}).get("ingress") or []:
+        peers = (rule or {}).get("from") or []
+        if not peers:
+            return "all"
+        for peer in peers:
+            got = _peer_admits(peer or {}, policy_ns)
+            if _ADMIT_ORDER[got] > _ADMIT_ORDER[result]:
+                result = got
+    return result
+
+
 def check_east_west(netpol: list[dict[str, Any]] | None, others: dict[str, list[dict[str, Any]]],
                     unparsed: dict[str, bool] | None = None) -> list[Row]:
     unparsed = unparsed or {}
@@ -348,8 +402,7 @@ def check_east_west(netpol: list[dict[str, Any]] | None, others: dict[str, list[
         return [Row("NetworkPolicy/east-west", NS, "not-observed", "medium", NETPOL, "spec.podSelector",
                     "networkpolicy.yaml not readable", "Provide the file.")]
     wide = [d for d in netpol if d.get("kind") == "NetworkPolicy"
-            and any(any(f.get("podSelector") == {} for f in (r.get("from") or []))
-                    for r in (d.get("spec") or {}).get("ingress") or [])]
+            and _policy_admission(d, NS) == "all"]
     rows = [Row("NetworkPolicy/east-west", NS, "partial" if wide else "enforced", "medium", NETPOL,
                 "spec.ingress[].from[].podSelector",
                 "ingress admits every pod in the namespace (agent -> platform pod reachable)" if wide
@@ -362,13 +415,25 @@ def check_east_west(netpol: list[dict[str, Any]] | None, others: dict[str, list[
                         "Audit the rendered manifest."))
     for path, docs in sorted(others.items()):
         for d in docs:
-            if any((f.get("namespaceSelector") or {}).get("matchLabels", {}).get(
-                    "kubernetes.io/metadata.name") == NS
-                   for r in (d.get("spec") or {}).get("ingress") or [] for f in r.get("from") or []):
-                rows.append(Row("NetworkPolicy/cross-namespace", (d.get("metadata") or {}).get("name", "?"),
+            adm = _policy_admission(d, (d.get("metadata") or {}).get("namespace"))
+            name = (d.get("metadata") or {}).get("name", "?")
+            if adm == "all":
+                rows.append(Row("NetworkPolicy/cross-namespace", name,
                                 "partial", "medium", path, "spec.ingress[].from[].namespaceSelector",
                                 f"admits the whole {NS} namespace, agent pods included",
                                 "Narrow the selector to non-agent pods."))
+            elif adm == "agents":
+                rows.append(Row("NetworkPolicy/cross-namespace", name,
+                                "enforced", "low", path,
+                                "spec.ingress[].from[].namespaceSelector+podSelector",
+                                f"admits only agent pods ({AGENT_LABEL[0]}={AGENT_LABEL[1]}) from {NS}",
+                                "Confirm agents should reach this destination."))
+            elif adm == "unknown":
+                rows.append(Row("NetworkPolicy/cross-namespace", name,
+                                "not-observed", "medium", path,
+                                "spec.ingress[].from[]",
+                                "peer selector not statically decidable",
+                                "Use matchLabels with kubernetes.io/metadata.name and an explicit podSelector."))
     return rows
 
 
@@ -443,7 +508,7 @@ def render(rows: list[Row], inp: Inputs, fmt: str) -> str:
     if fmt == "json":
         classified = {p: [{"cwft": c, "template": t.get("name"), "agent": a}
                           for c, t, a, _ in classify_templates(d)] for p, d in inp.cwfts.items()}
-        return json.dumps({"files_read": sorted(inp.cwfts), "templates": classified,
+        return json.dumps({"schema_version": SCHEMA_VERSION, "files_read": sorted(inp.cwfts), "templates": classified,
                            "rows": [asdict(r) for r in rows]}, indent=2, sort_keys=True)
     head = "| primitive | scope | status | severity | source | field | detail | recommendation |"
     lines = [head, "|" + "---|" * 8]
