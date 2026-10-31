@@ -6,6 +6,13 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    ignore:
+      # api, sdk and the OTLP exporter are released in lockstep and pinned
+      # exactly (sdk X needs api==X, exporter X needs sdk~=X). The uv updater
+      # moves one pin per change and cannot unlock several, and a group still
+      # applies its members one at a time, so every attempt is unresolvable
+      # and fails the whole run. Bump the three together by hand.
+      - dependency-name: "opentelemetry-*"
     commit-message:
       prefix: "deps"
 
