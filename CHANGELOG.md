@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.114.2](https://github.com/mctlhq/mctl-agents/compare/1.114.1...1.114.2) (2026-11-01)
+
+
+### Bug Fixes
+
+* **dispatcher:** reject a request whose pinned intent is unavailable ([a4547b0](https://github.com/mctlhq/mctl-agents/commit/a4547b065c4482fd3499e2d9592940f6d47f38a8))
+* **dispatcher:** reject a request whose pinned intent is unavailable ([29ccb11](https://github.com/mctlhq/mctl-agents/commit/29ccb114cc8106c337a09d0a395dd24e6bfd58ff))
+
 ## [1.114.1](https://github.com/mctlhq/mctl-agents/compare/1.114.0...1.114.1) (2026-11-01)
 
 
