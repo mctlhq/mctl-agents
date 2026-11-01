@@ -570,6 +570,14 @@ class ReviewRequest:
         # the gate answers `unknown` for it, and the Tier B adapter refuses it.
         if self.authoring_execution_id:
             _str(self.authoring_execution_id, "authoring_execution_id", pattern=_EXECUTION_ID_RE)
+        # Same bounds from_dict applies, so seal_request and the wire round-trip agree.
+        if len(self.author_actors) > MAX_ACTORS or len(self.authoring_attempt_ids) > MAX_ACTORS:
+            raise ReviewError(CODE_MALFORMED, f"actor and attempt lists hold at most {MAX_ACTORS} entries")
+        for value in self.author_actors:
+            _str(value, "author_actors")
+        for value in self.authoring_attempt_ids:
+            _str(value, "authoring_attempt_ids")
+        _str(self.authoring_lineage_root, "authoring_lineage_root", empty=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {**self._payload(), "request_id": self.request_id, "content_hash": self.content_hash,
@@ -836,15 +844,24 @@ def evaluate_review_gate(
     pool = [r for r in same if r.subject.binding() == live.binding()]
     if not pool:
         return GATE_STALE if same else GATE_MISSING
-    if request is None or request.subject.identity() != live.identity():
+    # The authoring facts must describe this exact revision: a request sealed
+    # for an older binding says nothing about who wrote the live one.
+    if request is None or request.subject.binding() != live.binding() or not request.request_id:
         return GATE_UNKNOWN
     if request.mode == "worker" and not request.authoring_execution_id:
         return GATE_UNKNOWN
-    authors = set(request.author_actors)
+    pool = [r for r in pool if r.request_id == request.request_id]
+    if not pool:
+        return GATE_MISSING
+    authors = {a.casefold() for a in request.author_actors}
     attempts = set(request.authoring_attempt_ids)
 
     def independent(r: ReviewReceipt) -> bool:
-        if not r.reviewer_actor or r.reviewer_actor in authors:
+        if not r.reviewer_actor or r.reviewer_actor.casefold() in authors:
+            return False
+        # A worker receipt that cannot name its execution, attempt and lineage
+        # cannot be compared with the author's: unobserved is not independent.
+        if r.mode == "worker" and not (r.reviewer_execution_id and r.attempt_id and r.lineage_root):
             return False
         if request.authoring_execution_id and r.reviewer_execution_id == request.authoring_execution_id:
             return False

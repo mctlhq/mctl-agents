@@ -389,3 +389,60 @@ def test_gate_signature_has_no_github_input_and_module_is_isolated():
     strings = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
     assert not any("[bot]" in v for v in strings)
     assert "GATING_BOTS" not in {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+
+
+def test_gate_request_for_older_binding_is_unknown():
+    # Authoring facts sealed for an older revision say nothing about the live one,
+    # so a self-review of the live revision must not become `satisfied`.
+    old = spike(head=SHA_A)
+    live = spike(head=SHA_C)
+    old_req = request(old, authors=("operator",))
+    live_req = request(live, authors=("operator",))
+    self_review = receipt(live_req, actor="operator")
+    assert gate(live, old_req, [self_review]) == rr.GATE_UNKNOWN
+    assert gate(live, live_req, [self_review]) == rr.GATE_NOT_INDEPENDENT
+
+
+def test_gate_ignores_receipts_of_another_request():
+    req = request()
+    other = rr.seal_request(
+        subject=req.subject, mode="worker", author_actors=("operator",), nonce="n2",
+        authoring_execution_id=EXEC_AUTHOR, authoring_attempt_ids=("at-1",), authoring_lineage_root="trace-1",
+    )  # fmt: skip
+    assert other.request_id != req.request_id
+    assert gate(req.subject, req, [receipt(other)]) == rr.GATE_MISSING
+    assert gate(req.subject, req, [receipt(other), receipt(req)]) == rr.GATE_SATISFIED
+
+
+@pytest.mark.parametrize("field", ["execution", "attempt", "lineage"])
+def test_gate_worker_receipt_without_identity_is_not_independent(field):
+    req = request()
+    assert gate(req.subject, req, [receipt(req, **{field: ""})]) == rr.GATE_NOT_INDEPENDENT
+
+
+def test_gate_actor_match_is_case_insensitive():
+    req = request(authors=("Operator",))
+    assert gate(req.subject, req, [receipt(req, actor="operator")]) == rr.GATE_NOT_INDEPENDENT
+    assert gate(req.subject, req, [receipt(req, actor="OPERATOR")]) == rr.GATE_NOT_INDEPENDENT
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"authors": ("a" * 257,)},
+        {"attempts": ("b" * 257,)},
+        {"lineage": "c" * 257},
+        {"authors": tuple(f"a{i}" for i in range(65))},
+    ],
+)
+def test_request_bounds_hold_in_seal_and_from_dict(kwargs):
+    with pytest.raises(rr.ReviewError) as exc:
+        request(**kwargs)
+    assert exc.value.code == rr.CODE_MALFORMED
+    good = request().to_dict()
+    key = {"authors": "author_actors", "attempts": "authoring_attempt_ids", "lineage": "authoring_lineage_root"}
+    name, value = next(iter(kwargs.items()))
+    good[key[name]] = list(value) if name != "lineage" else value
+    with pytest.raises(rr.ReviewError) as exc:
+        rr.ReviewRequest.from_dict(good)
+    assert exc.value.code == rr.CODE_MALFORMED
