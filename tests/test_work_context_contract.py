@@ -269,11 +269,17 @@ def test_mcp_origin_surface_is_found():
     assert wc.answer_from(200, _view(origin_surface="mcp")).verdict == wc.WORK_ITEM_FOUND
 
 
-def test_out_of_vocabulary_origin_surface_is_unknown():
+def test_out_of_vocabulary_origin_surface_from_the_api_is_an_unknown_origin():
+    """mctl-api accepts any short lowercase origin label. An unrecognised one
+    is read as no recorded origin, never as a reason to refuse the item:
+    otherwise whoever created it with that label would make every later run
+    on it refuse (the poisoning #960 closed for execution surfaces)."""
     answer = wc.answer_from(200, _view(origin_surface="carrier-pigeon"))
-    assert answer.verdict == wc.WORK_ITEM_UNKNOWN
-    assert "carrier-pigeon" in answer.reason and "origin" in answer.reason
+    assert answer.verdict == wc.WORK_ITEM_FOUND
+    assert answer.item is not None and answer.item.origin == wc.SurfaceRef()
     assert wc.answer_from(200, _view(origin_surface="")).verdict == wc.WORK_ITEM_FOUND
+    # A non-string origin is still a malformed body.
+    assert wc.answer_from(200, _view(origin_surface=5)).verdict != wc.WORK_ITEM_FOUND
 
 
 # ---------------------------------------------------------------------------
