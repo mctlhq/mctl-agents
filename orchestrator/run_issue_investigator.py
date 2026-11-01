@@ -3052,34 +3052,40 @@ def _work_context_ref(
     if len(prior_ids) > MAX_PRIOR_EXECUTION_IDS:
         prior_ids = prior_ids[-MAX_PRIOR_EXECUTION_IDS:]
     # `surface_transition` matches ExecutionRef's definition — did THIS
-    # execution change the surface or actor relative to the one before it —
-    # so the baseline is the newest PRIOR execution with a known kind
+    # execution change the surface or actor relative to the one before it.
+    # The baseline is therefore the PREVIOUS execution: the newest prior one
     # (never this execution itself, nor one recorded after it — the same
-    # exclusion `_prior_execution_ids` makes; and never a kindless seed,
-    # which carries no provenance to compare against), falling back to the
-    # work item's origin. Only comparisons where both sides are known can
-    # claim a change: unlike the dev_loop signal, an undeclared side here is
-    # an optional CLI flag, not a rejected resume.
+    # exclusion `_prior_execution_ids` makes). Its surface and actor are what
+    # mctl-api's executions listing reports for it (the fulfilled request's
+    # `surface`/`requested_by`, mctl-api#871). When it reports none (an
+    # execution attached without a request, a kindless seed, or a surface
+    # outside this image's vocabulary) the baseline is unknown: it is never
+    # skipped over to an older execution, nor replaced by the item's origin,
+    # because either would compare against something that is not the
+    # previous execution (mctlhq/mctl-agents#960: an MCP -> MCP resume over a
+    # Telegram origin sealed `true`). The origin is the baseline only when
+    # there is no prior execution at all.
     #
-    # And only comparisons where both sides are known can claim NO change
-    # (mctlhq/mctl-agents#904, #573): a resume whose surface or actor never
-    # reached this process (an investigate submission that did not forward
-    # them) is "could not observe", which must not be sealed as
-    # `surface_transition=false`. A measured change on either axis is a
+    # Only comparisons where both sides are known can claim a change, and
+    # only comparisons where both sides are known can claim NO change
+    # (mctlhq/mctl-agents#904, #573): "could not observe" must not be sealed
+    # as `surface_transition=false`. A measured change on either axis is a
     # transition; "no transition" needs both axes measured; anything else is
     # None, which the sealed document omits.
-    priors_newest_first = sorted(
+    previous = max(
         (
             e for e in item.executions
             if e.execution_id and e.execution_id != execution_id and e.sequence < execution_sequence
         ),
         key=lambda e: e.sequence,
-        reverse=True,
+        default=None,
     )
-    baseline_surface = next(
-        (e.surface.kind for e in priors_newest_first if e.surface.kind), item.origin.kind
-    )
-    baseline_actor = next((e.actor for e in priors_newest_first if e.actor.kind), None)
+    if previous is None:
+        baseline_surface = item.origin.kind
+        baseline_actor = None
+    else:
+        baseline_surface = previous.surface.kind
+        baseline_actor = previous.actor if previous.actor.kind else None
     surface_known = bool(surface and baseline_surface)
     actor_known = bool(actor_kind and baseline_actor is not None and baseline_actor.kind)
     surface_changed = surface_known and surface != baseline_surface

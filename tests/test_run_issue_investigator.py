@@ -5115,10 +5115,12 @@ def test_canonical_issue_key_compares_identities_not_spellings():
 
 
 def test_surface_transition_baseline_excludes_self_and_kindless_executions():
-    """#408 round 4 (claude/agy P3): the baseline must be the newest PRIOR
-    execution with a known kind — never this execution itself (the store
-    may already have recorded it), and never a kindless seed (dev_loop's
-    execution #1 carries no provenance to compare against)."""
+    """#408 round 4, revised by #960: the baseline is the PREVIOUS execution
+    (the newest prior one), never this execution itself (the store may
+    already have recorded it). A previous execution that carries no
+    provenance (a kindless seed, an attached execution) is an unknown
+    baseline: it is not skipped over to an older execution, and the origin
+    stands in only when there is no prior execution at all."""
     from orchestrator.work_context.contract import (
         ActorRef,
         CanonicalState,
@@ -5152,9 +5154,9 @@ def test_surface_transition_baseline_excludes_self_and_kindless_executions():
     out = ref(self_recorded, execution_id="e2", surface="telegram", actor_kind="human", actor_id="bob")
     assert out.surface_transition is True
 
-    # Kindless seed as last execution: falls through to e1's github — a
-    # telegram resume still counts as a transition instead of comparing
-    # against "".
+    # Kindless previous execution: the baseline is unknown, so nothing was
+    # measured on either axis and the transition is unknown, not e1's github
+    # (#960: skipping to an older execution compares against the wrong run).
     kindless_last = WorkItem(
         work_item_id="wi-1", revision="r1", origin=SurfaceRef(kind="github"),
         executions=(
@@ -5162,21 +5164,20 @@ def test_surface_transition_baseline_excludes_self_and_kindless_executions():
             ExecutionRef(execution_id="e2", sequence=2),  # dev_loop seed shape
         ),
     )
-    out = ref(kindless_last, surface="telegram", actor_kind="human", actor_id="bob")
-    assert out.surface_transition is True
-    # The same declared surface as the last KNOWN one is not a surface
-    # change — but no actor was declared, so the actor axis was never
-    # measured and "no transition" cannot be claimed (#904): unknown.
-    out = ref(kindless_last, surface="github")
-    assert out.surface_transition is None
+    assert ref(kindless_last, surface="telegram", actor_kind="human", actor_id="bob").surface_transition is None
+    assert ref(kindless_last, surface="github").surface_transition is None
 
-    # Only kindless executions recorded: origin is the fallback.
+    # A kindless prior execution is still a prior execution: the origin is
+    # not the baseline.
     only_seed = WorkItem(
         work_item_id="wi-1", revision="r1", origin=SurfaceRef(kind="github"),
         executions=(ExecutionRef(execution_id="e1", sequence=1),),
     )
-    out = ref(only_seed, surface="telegram")
-    assert out.surface_transition is True
+    assert ref(only_seed, surface="telegram").surface_transition is None
+
+    # No prior execution at all: the origin is the surface baseline.
+    first = WorkItem(work_item_id="wi-1", revision="r1", origin=SurfaceRef(kind="github"), executions=())
+    assert ref(first, surface="telegram").surface_transition is True
 
 
 def test_id_shaped_flags_are_length_bounded_at_the_cli():

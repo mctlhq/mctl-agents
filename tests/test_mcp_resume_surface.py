@@ -249,3 +249,92 @@ def test_an_old_vocabulary_investigator_exits_on_surface_mcp(monkeypatch):
     monkeypatch.setattr(wc, "SURFACE_KINDS", frozenset(LEGACY_SURFACES))
     with pytest.raises(SystemExit):
         run_issue_investigator._work_context_from_args(_args(surface="mcp", actor_kind="human"))
+
+
+# ---------------------------------------------------------------------------
+# mctlhq/mctl-agents#960: the baseline is the previous execution, read from
+# mctl-api's executions listing (mctl-api#871 provenance fields).
+# ---------------------------------------------------------------------------
+
+W1 = "wi_6c136ca9-ae65-4ef4-8868-74ad4b810a92"
+
+
+def _v1(attempt: int, **extra):
+    entry = {
+        "id": f"we_{attempt}", "work_item_id": W1, "engine": "temporal",
+        "engine_ref": f"dev-loop-x#xr_{attempt}", "attempt": attempt, "phase": "Succeeded",
+        "started_at": "2026-11-01T00:00:00Z",
+    }
+    entry.update(extra)
+    return entry
+
+
+def test_v1_execution_carries_request_provenance():
+    e = wc.ExecutionRef.from_v1(_v1(1, surface="mcp", requested_by="github:mashkovd"), W1)
+    assert e.surface == SurfaceRef(kind="mcp")
+    assert e.actor == ActorRef(kind="human", actor_id="github:mashkovd")
+    bare = wc.ExecutionRef.from_v1(_v1(1), W1)
+    assert bare.surface == SurfaceRef() and bare.actor == ActorRef()
+
+
+@pytest.mark.parametrize("field,value", [("surface", 7), ("requested_by", ["x"])])
+def test_v1_execution_with_non_string_provenance_is_malformed(field, value):
+    assert wc.ExecutionRef.from_v1(_v1(1, **{field: value}), W1) is None
+
+
+def test_unrecognised_api_surface_is_unknown_not_a_poisoned_item():
+    """mctl-api accepts any short lowercase surface label. One outside this
+    image's vocabulary must not reach `surface.kind`: that would make
+    `work_item_verdict_for` refuse the whole item for every later run."""
+    ledger, reason = wc.executions_from(
+        200, {"schema_version": wc.SCHEMA_VERSION, "executions": [_v1(1, surface="zzz", requested_by="github:x")]}, W1
+    )
+    assert reason == "" and ledger is not None
+    assert ledger[0].surface == SurfaceRef()
+    item = wc.WorkItem(work_item_id=W1, revision="1", state="active", origin=SurfaceRef(kind="telegram"),
+                       executions=ledger)
+    assert wc.work_item_verdict_for(item) == wc.WORK_ITEM_FOUND
+
+
+def _seal(executions, *, surface, actor_id, origin="telegram"):
+    ledger, reason = wc.executions_from(200, {"schema_version": wc.SCHEMA_VERSION, "executions": executions}, W1)
+    assert reason == "", reason
+    item = wc.WorkItem(work_item_id=W1, revision="3", state="active", origin=SurfaceRef(kind=origin), executions=ledger)
+    current = ledger[-1]
+    return run_issue_investigator._work_context_ref(
+        canonical=wc.CanonicalState(work_item_id=W1, state="active"), item=item,
+        execution_id=current.execution_id, execution_sequence=current.sequence,
+        resume_from_execution_id=None, surface=surface, actor_kind="human", actor_id=actor_id,
+    ).surface_transition
+
+
+def test_live_w1_mcp_to_mcp_over_a_telegram_origin_is_no_transition():
+    """The 2026-11-01 live case: C3 sealed `true` against the origin. E2 was
+    already an MCP resume by the same principal, so E3 is no transition."""
+    executions = [
+        _v1(1, surface="telegram", requested_by="github:mashkovd", acting_principal="surface:telegram"),
+        _v1(2, surface="mcp", requested_by="github:mashkovd"),
+        _v1(3, surface="mcp", requested_by="github:mashkovd"),
+    ]
+    assert _seal(executions, surface="mcp", actor_id="github:mashkovd") is False
+
+
+def test_previous_execution_decides_a_change():
+    base = [_v1(1, surface="telegram", requested_by="github:mashkovd")]
+    # Surface change against the previous execution.
+    assert _seal([*base, _v1(2, surface="mcp", requested_by="github:mashkovd")],
+                 surface="mcp", actor_id="github:mashkovd") is True
+    # Same surface, another principal.
+    assert _seal([*base, _v1(2, surface="telegram", requested_by="github:bob")],
+                 surface="telegram", actor_id="github:bob") is True
+
+
+def test_previous_execution_without_provenance_is_unknown_not_the_origin():
+    """An attached previous execution (no request, so no fields) is an
+    unknown baseline: neither the origin nor an older execution stands in."""
+    executions = [
+        _v1(1, surface="mcp", requested_by="github:mashkovd"),
+        _v1(2),
+        _v1(3, surface="mcp", requested_by="github:mashkovd"),
+    ]
+    assert _seal(executions, surface="mcp", actor_id="github:mashkovd") is None
