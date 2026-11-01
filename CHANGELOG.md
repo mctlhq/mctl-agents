@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.114.3](https://github.com/mctlhq/mctl-agents/compare/1.114.2...1.114.3) (2026-11-01)
+
+
+### Bug Fixes
+
+* **work-context:** measure surface_transition against the previous run ([edbdeca](https://github.com/mctlhq/mctl-agents/commit/edbdecaca3e8f9f4f6028cfef3c351735a72d68c))
+* **work-context:** measure surface_transition against the previous run ([5585aec](https://github.com/mctlhq/mctl-agents/commit/5585aec060ea59fb48332b0efd5e62b2f8b9b6ed))
+
 ## [1.114.2](https://github.com/mctlhq/mctl-agents/compare/1.114.1...1.114.2) (2026-11-01)
 
 
