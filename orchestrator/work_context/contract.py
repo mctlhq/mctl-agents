@@ -348,6 +348,18 @@ class WorkItem:
             origin_surface = ""  # absent or null: no origin recorded
         elif not isinstance(origin_surface, str):
             return None
+        elif origin_surface not in SURFACE_KINDS:
+            # mctl-api accepts any short lowercase label
+            # (`^[a-z][a-z0-9_-]{0,31}$`). One this image does not know is
+            # unknown, not a reason to refuse the item: carried into
+            # `origin.kind`, `work_item_verdict_for` would classify the whole
+            # item WORK_ITEM_UNKNOWN and every later run on it would be
+            # refused. Read as "" it seals as no recorded origin, which
+            # `ContextSnapshot.validate()` accepts, and leaves the first
+            # execution's transition unmeasured. The same rule
+            # `ExecutionRef.from_v1` applies to an execution's surface
+            # (mctlhq/mctl-agents#960).
+            origin_surface = ""
         external_key = _str(data.get("external_key"))
         return WorkItem(
             work_item_id=work_item_id,

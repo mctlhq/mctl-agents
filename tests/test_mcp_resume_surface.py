@@ -338,3 +338,21 @@ def test_previous_execution_without_provenance_is_unknown_not_the_origin():
         _v1(3, surface="mcp", requested_by="github:mashkovd"),
     ]
     assert _seal(executions, surface="mcp", actor_id="github:mashkovd") is None
+
+
+def test_unrecognised_origin_seals_as_no_origin_and_an_unmeasured_first_run():
+    """An item created with an origin label this image does not know is still
+    workable: its first execution seals `origin_surface=""` and leaves the
+    transition unmeasured, instead of the item being refused as unknown."""
+    from tests.test_work_context_contract import _view
+
+    answer = wc.answer_from(200, _view(origin_surface="carrier-pigeon"))
+    assert answer.verdict == wc.WORK_ITEM_FOUND
+    item = dataclasses.replace(answer.item, executions=())
+    ref = run_issue_investigator._work_context_ref(
+        canonical=wc.CanonicalState(work_item_id=item.work_item_id, state="active"), item=item,
+        execution_id="we_1", execution_sequence=1, resume_from_execution_id=None,
+        surface="mcp", actor_kind="human", actor_id="github:mashkovd",
+    )
+    assert ref.origin_surface == ""
+    assert ref.surface_transition is None
