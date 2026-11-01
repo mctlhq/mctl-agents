@@ -90,10 +90,20 @@ class DispatchFakeApi(FakeMctlApi):
         self.lose_next_fulfil_answer = False
         #: phase -> how many attaches advancing to it answer 503 first.
         self.unavailable_advances: dict[str, int] = {}
+        #: The item's `origin_surface` (the base fake's is always github).
+        self.origin_surface = "github"
 
     # -- tests' own writes ----------------------------------------------
 
-    def create_request(self, kind: str, *, work_item_id: str = WID, resumed_from: str = "") -> str:
+    def create_request(
+        self,
+        kind: str,
+        *,
+        work_item_id: str = WID,
+        resumed_from: str = "",
+        surface: str = "telegram",
+        requested_by: str = "user:alice",
+    ) -> str:
         rid = f"xr_{len(self.xrs) + 1:08d}-0000-4000-8000-000000000461"
         self.xrs[rid] = {
             "id": rid,
@@ -101,8 +111,8 @@ class DispatchFakeApi(FakeMctlApi):
             "kind": kind,
             "state": "pending",
             "expected_state_version": self.state_version,
-            "surface": "telegram",
-            "requested_by": "user:alice",
+            "surface": surface,
+            "requested_by": requested_by,
             "created_at": f"2026-09-23T12:00:{len(self.xrs):02d}Z",
             "resumed_from_execution_id": resumed_from,
             "schema_version": SV,
@@ -117,6 +127,7 @@ class DispatchFakeApi(FakeMctlApi):
 
     def _view(self) -> dict[str, Any]:
         view = super()._view()
+        view["work_item"]["origin_surface"] = self.origin_surface
         view["work_item"]["external_key"] = self.external_key
         view["work_item"]["state_version"] = self.state_version
         view["state_version"] = self.state_version
@@ -1222,12 +1233,20 @@ async def test_resume_onto_a_live_loop_is_delivered_and_onto_a_finished_loop_con
 _CWFT_FORWARDED = ("work_item_id", "execution_id", "temporal_workflow_id", "temporal_run_id", "execution_request_id")
 
 
-def _run_real_investigator(params: dict, state_dir: Any) -> Any:
+#: The investigate CWFT once mctl-gitops and mctl-api declare the provenance
+#: parameters (mctlhq/mctl-agents#573, #904 rollout steps 2-3). Until then the
+#: deployed path is `_CWFT_FORWARDED`: mctl-api strips the undeclared keys.
+_CWFT_FORWARDED_WITH_PROVENANCE = (*_CWFT_FORWARDED, "surface", "actor_kind", "actor_id")
+
+
+def _run_real_investigator(
+    params: dict, state_dir: Any, *, forwarded_names: tuple[str, ...] = _CWFT_FORWARDED
+) -> Any:
     """What the investigate pod does with `params`: the real investigator,
     handed exactly the flags the CWFT would build from them."""
     from orchestrator.run_issue_investigator import investigate
 
-    forwarded = {name: params[name] for name in _CWFT_FORWARDED if params.get(name)}
+    forwarded = {name: params[name] for name in forwarded_names if params.get(name)}
     return investigate(params["issue_url"], state_dir=state_dir, **forwarded)
 
 
@@ -1343,6 +1362,79 @@ async def test_offline_end_to_end_request_to_a_snapshot_sealed_for_the_dispatche
     audit = _audit(capsys.readouterr().out)
     assert [a["event"] for a in audit] == ["claim", "deliver", "fulfil"]
     assert audit[-1]["execution_id"] == we
+
+
+async def _dispatch_mcp_request_over_a_telegram_item(
+    api, env, tmp_path, *, forwarded_names: tuple[str, ...]
+) -> tuple[str, dict, dict]:
+    """An item created on Telegram, continued by a request made through
+    mctl-api's MCP tool (surface `mcp`, the authenticated principal as
+    `requested_by`), dispatched end to end to the real investigator.
+    Returns the dispatched `we_`, the params the loop submitted, and the
+    sealed `work_context`."""
+    runs: list[tuple[dict, Any]] = []
+
+    @activity.defn(name="submit_and_wait")
+    async def submit(input: SubmitAndWaitInput) -> WorkflowResult:
+        if input.operation != "mctl-agents-investigate":
+            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+        p = input.params
+        result = _run_real_investigator(p, tmp_path, forwarded_names=forwarded_names)
+        runs.append((dict(p), result))
+        ok = result.error is None and result.skipped_reason is None
+        return WorkflowResult(workflow_name="mctl-agents-investigate-e2e", phase="Succeeded" if ok else "Failed")
+
+    api.origin_surface = "telegram"
+    api.create_request("start", surface="mcp", requested_by="github:mashkovd")
+    loop_id = workflow_id_for(URL)
+    async with _worker(env, submit):
+        outcome = await _dispatcher(env).dispatch_once()
+        assert outcome.action == dx.FULFILLED
+        await _wait_for(lambda: len(runs) == 1, limit=60)
+        await _wait_for(lambda: api.executions[0]["phase"] == "Running")
+        await _end(env, loop_id)
+    params, result = runs[0]
+    assert result.error is None and result.skipped_reason is None, result
+    we = outcome.execution_id
+    assert list(api.snapshots) == [we]
+    return we, params, api.document(we)["work_context"]
+
+
+async def test_an_mcp_request_over_a_telegram_item_seals_the_transition(api, env, monkeypatch, tmp_path):
+    """mctlhq/mctl-agents#573 / #904 (T5): the 2026-10-04 live E2E sealed
+    `current_surface=""` and `surface_transition=false` for exactly this
+    shape, because the loop never handed the request's provenance to the
+    investigator. With the CWFT forwarding it, the snapshot records the MCP
+    surface, the authenticated principal as the actor, and the transition.
+
+    Mutation-checked: removing the `surface`/`actor_kind`/`actor_id` keys
+    from `investigate_params` in dev_loop.py fails this test."""
+    _real_investigator_setup(monkeypatch, tmp_path)
+    we, params, wc = await _dispatch_mcp_request_over_a_telegram_item(
+        api, env, tmp_path, forwarded_names=_CWFT_FORWARDED_WITH_PROVENANCE
+    )
+    assert (params["surface"], params["actor_kind"], params["actor_id"]) == (
+        "mcp", dx.RESUME_ACTOR_KIND, "github:mashkovd"
+    )
+    assert wc["execution_id"] == we
+    assert wc["origin_surface"] == "telegram" and wc["current_surface"] == "mcp"
+    assert (wc["actor_kind"], wc["actor_id"]) == (dx.RESUME_ACTOR_KIND, "github:mashkovd")
+    assert wc["surface_transition"] is True
+
+
+async def test_without_the_cwft_forwarding_the_transition_is_unknown_not_false(api, env, monkeypatch, tmp_path):
+    """#904 (T6): the deployed path today. The loop sends the provenance,
+    mctl-api strips the keys its registry does not declare, and the
+    investigator never sees them. The sealed snapshot must then say "not
+    observed" (no `surface_transition` key, empty current surface), never
+    `surface_transition=false` as #573's C2 did."""
+    _real_investigator_setup(monkeypatch, tmp_path)
+    _we, params, wc = await _dispatch_mcp_request_over_a_telegram_item(
+        api, env, tmp_path, forwarded_names=_CWFT_FORWARDED
+    )
+    assert params["surface"] == "mcp"  # sent, then stripped before the pod
+    assert wc["origin_surface"] == "telegram" and wc["current_surface"] == ""
+    assert "surface_transition" not in wc
 
 
 async def test_a_dispatched_loop_recognises_the_clarification_its_own_investigator_sealed(

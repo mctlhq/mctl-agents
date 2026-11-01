@@ -1864,6 +1864,16 @@ class DevLoopWorkflow:
         self._resume_rejections: list[ResumeRejection] = []
         self._current_surface = SurfaceRef()
         self._current_actor = ActorRef()
+        # The surface and actor of the execution request this run was started
+        # for (Update-with-Start, #461 option A), forwarded to that request's
+        # investigator (mctlhq/mctl-agents#573, #904). Kept apart from
+        # `_current_*` on purpose: those are the approval baseline, and
+        # adopting a start request's provenance there would change when a
+        # later resume re-arms approval. Empty unless the own start delivery
+        # carried a valid one, which forwards nothing (the investigator then
+        # seals the transition as unknown).
+        self._start_surface = SurfaceRef()
+        self._start_actor = ActorRef()
         # mctl-agents#420: set by the `abandon` signal. Observed by both long
         # waits (the approval park and _watch_pr's merge watch) so an operator
         # can end an execution gracefully without Temporal `terminate`, which
@@ -2663,6 +2673,15 @@ class DevLoopWorkflow:
         if rid == self._start_request_id:
             # The request this run was started for (Update-with-Start): `run`
             # binds and runs it on the dispatched path; nothing to deliver.
+            # Its provenance is recorded only for the investigate submission
+            # (#573/#904), and only when it passes the same closed
+            # vocabularies a resume must: anything else stays unknown.
+            # No command is scheduled, so replay is unaffected.
+            surface, actor, refusal = self._resume_provenance(
+                delivery.surface, delivery.actor_kind, delivery.actor_id
+            )
+            if not refusal:
+                self._start_surface, self._start_actor = surface, actor
             self._accepted_request_ids.add(rid)
             return DELIVERY_ACCEPTED
         surface, actor, _ = self._resume_provenance(delivery.surface, delivery.actor_kind, delivery.actor_id)
@@ -3600,6 +3619,26 @@ class DevLoopWorkflow:
                 # Correlation only (gitops#1345's `execution_request_id`):
                 # the execution identity is still `execution_id`.
                 investigate_params["execution_request_id"] = str(issue.execution_request_id)
+            if dispatched is not None:
+                # The dispatched request's provenance (mctlhq/mctl-agents#573,
+                # #904): without it the investigator seals an empty
+                # `current_surface` and cannot tell a Telegram -> MCP resume
+                # from no transition at all. It is what the own start delivery
+                # carried: the dispatcher's `request.surface` and the
+                # authenticated `requested_by`, never a client, session or
+                # model name. Each key is omitted when empty, like the ones
+                # above. Inert until the investigate CWFT and mctl-api's
+                # operation registry declare them (mctl-api strips undeclared
+                # params); with them stripped the investigator seals the
+                # transition as unknown, never false. Replay-safe without a
+                # marker for the same reason as the temporal_* ids above:
+                # activity input is not compared on replay.
+                if self._start_surface.kind:
+                    investigate_params["surface"] = self._start_surface.kind
+                if self._start_actor.kind:
+                    investigate_params["actor_kind"] = self._start_actor.kind
+                    if self._start_actor.actor_id:
+                        investigate_params["actor_id"] = self._start_actor.actor_id
 
             self._investigate_in_flight = True
             try:
@@ -3750,6 +3789,10 @@ class DevLoopWorkflow:
                     # under the same execution. It runs without the identity.
                     continuation_params.pop("work_item_id", None)
                     continuation_params.pop("execution_id", None)
+                    # Provenance describes the dispatched execution; without
+                    # its identity there is no work context to seal it into.
+                    for key in ("surface", "actor_kind", "actor_id"):
+                        continuation_params.pop(key, None)
                 continuation_params["human_input_responses"] = json.dumps(accepted_answers)
                 if self._human_input_owner_principal_id:
                     # Popping the identity above also dropped the owner the

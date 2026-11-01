@@ -41,7 +41,10 @@ SCHEMA_VERSION = "workitem/v1"
 # created directly on its API with no `origin_surface`/`surface` in the body
 # (`defaultWorkItemSurface`, internal/api/handlers_work_items.go). It is a
 # value the store writes itself, so it must classify FOUND, not UNKNOWN.
-SURFACE_KINDS = frozenset({"github", "telegram", "web", "cli", "api"})
+# `mcp` is a surface label only (requests made through mctl-api's MCP tool); it
+# never implies a client, session, model or inference-account identity. The
+# actor is the authenticated principal.
+SURFACE_KINDS = frozenset({"github", "telegram", "web", "cli", "api", "mcp"})
 ACTOR_KINDS = frozenset({"human", "agent", "system"})
 # mctl-api's `workitems.State*` constants. `resumed` is deliberately absent:
 # mctl-api records it only as an event kind, never as a state.
