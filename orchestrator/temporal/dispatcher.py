@@ -158,6 +158,13 @@ TERMINAL_PHASES = frozenset({"Succeeded", "Failed", "Error"})
 #:   asked about. No later fulfil of this request can match it again.
 #: - `invalid_transition`: the item is terminal, or cannot take this kind
 #:   any more (a `start` for an item that has run, or is waiting).
+#: - `intent_unavailable` (mctl-api#871): the intent the request pins lost
+#:   its text to retention after the claim. Redacted text never comes back
+#:   and the request's `intent_id` never changes, so deferring would only
+#:   cycle claim, deliver and fulfil until the loop's FULFILMENT_WAIT ran
+#:   out, then reject with the misleading `engine_run_ended`
+#:   (mctlhq/mctl-agents#963). The remedy is a new request pinning a
+#:   replacement intent (ADR 011 §10).
 #:
 #: Everything else DEFERS (the lease lapses, a later claim retries) because it
 #: says nothing permanent about the request:
@@ -172,7 +179,7 @@ TERMINAL_PHASES = frozenset({"Succeeded", "Failed", "Error"})
 #:   every request that a fixed build could still serve.
 #: - a local policy-checkpoint DENY (no code at all): a statement about this
 #:   worker's identity or configuration, not about the request.
-TERMINAL_FULFIL_CODES = frozenset({"state_version_conflict", "invalid_transition"})
+TERMINAL_FULFIL_CODES = frozenset({"state_version_conflict", "invalid_transition", "intent_unavailable"})
 
 
 def enabled() -> bool:
@@ -380,6 +387,14 @@ class Dispatcher:
         try:
             if request.kind not in xr.KINDS:
                 return await self._reject(request, token, loop, xr.UNSUPPORTED_KIND)
+            if request.intent_id is not None and claim.intent_available is False:
+                # mctl-api said the pinned intent's text is gone
+                # (mctlhq/mctl-agents#963): refuse before any loop learns of
+                # the request, so nothing is delivered, started or minted.
+                # Only an explicit False refuses; an absent field (an older
+                # mctl-api) delivers as before, behind the fulfil guard and
+                # the investigator's own refusal (#961).
+                return await self._reject(request, token, loop, xr.INTENT_UNAVAILABLE)
             answer = await asyncio.to_thread(self._api.get, request.work_item_id)
             if answer.verdict != WORK_ITEM_FOUND or answer.item is None:
                 # Not a reason to reject: the store did not answer. Guessing

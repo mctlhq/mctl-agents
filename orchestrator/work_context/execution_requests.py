@@ -93,6 +93,13 @@ RESUME_REFUSAL_REASONS = frozenset(
 #: starts the issue's loop again instead (nothing ran for the request), so
 #: this build never writes it. Kept as mctl-api vocabulary for old rows.
 ENGINE_RUN_ENDED = "engine_run_ended"
+#: The request pins a WorkItem intent whose text is unavailable (redacted
+#: by retention): mctl-api said so on the claim (`intent_available: false`,
+#: mctl-api#871). Rejected before any delivery, so no loop learns of the
+#: request and no execution is minted. Permanent for this request: redacted
+#: text never comes back and a request's `intent_id` never changes. The
+#: remedy is a new request pinning a replacement intent (ADR 011 §10).
+INTENT_UNAVAILABLE = "intent_unavailable"
 #: The engine ref this dispatcher would mint, `issue_ref.request_engine_ref`'s
 #: `<loop>#<request id>`, exceeds mctl-api's `workitems.MaxEngineRefBytes`.
 #: Top-level and kind-neutral (mctlhq/mctl-agents#488): the ref is minted for
@@ -220,6 +227,13 @@ class RequestAnswer:
     #: mctl-api's typed error code, when it gave one.
     code: str = ""
     reason: str = ""
+    #: A claim's `intent_available` (mctl-api#871): False only when mctl-api
+    #: said the pinned intent's text is unavailable, True when it said it is
+    #: readable, None when it said nothing (an older mctl-api, a request that
+    #: pins no intent, or a non-boolean value). None is "not observed", never
+    #: "available": it only means this answer cannot refuse the request, and
+    #: the fulfil guard and the investigator's own check still apply.
+    intent_available: bool | None = None
 
     def __repr__(self) -> str:  # the token must not reach a log line by accident
         rid = self.request.request_id if self.request else ""
@@ -261,7 +275,13 @@ def answer_from_claim(status: int, payload: dict[str, Any], *, body_empty: bool 
         token = payload.get("claim_token")
         if request is None or request.state != STATE_CLAIMED or not isinstance(token, str) or not token:
             return RequestAnswer(UNKNOWN, reason="HTTP 200 does not describe a claimed execution request")
-        return RequestAnswer(CLAIMED, request=request, claim_token=token)
+        raw = payload.get("intent_available")
+        return RequestAnswer(
+            CLAIMED,
+            request=request,
+            claim_token=token,
+            intent_available=raw if isinstance(raw, bool) else None,
+        )
     return _refusal(status, payload)
 
 

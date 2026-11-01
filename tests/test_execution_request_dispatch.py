@@ -189,7 +189,12 @@ class DispatchFakeApi(FakeMctlApi):
                 _expires=self.now + lease,
                 claim_expires_at=f"t+{self.now + lease}",
             )
-            return _HTTPResult(200, {"schema_version": SV, "execution_request": self._public(x), "claim_token": token})
+            body = {"schema_version": SV, "execution_request": self._public(x), "claim_token": token}
+            # mctl-api#871: present only when the request pins an intent and
+            # the test scripted an answer for it.
+            if x.get("_intent_available") is not None:
+                body["intent_available"] = x["_intent_available"]
+            return _HTTPResult(200, body)
         return _HTTPResult(204, {}, body_empty=True)
 
     def _holds(self, x: dict[str, Any], body: dict) -> bool:
@@ -1834,6 +1839,80 @@ async def test_a_typed_re_decision_at_fulfil_rejects_the_request(api):
 
     assert outcome.action == dx.REJECTED
     assert api.request_state(rid)["reason"] == f"{xr.FULFIL_REFUSED}:state_version_conflict"
+
+
+# mctlhq/mctl-agents#963: a pinned intent whose text retention removed.
+
+
+def _pin(api, rid: str, *, intent_id: int = 7, available: Any = None) -> None:
+    api.xrs[rid]["intent_id"] = intent_id
+    api.xrs[rid]["_intent_available"] = available
+
+
+async def test_intent_unavailable_at_fulfil_rejects_instead_of_deferring(api):
+    """Redacted after the claim: mctl-api refuses the fulfil with
+    `intent_unavailable`. Permanent for this request, so it is rejected now
+    rather than deferred until the loop's FULFILMENT_WAIT runs out."""
+    rid = api.create_request("start")
+    api.fail[("POST", f"/api/v1/execution-requests/{rid}/fulfil")] = _HTTPResult(
+        409, {"code": "intent_unavailable", "error": "intent text is unavailable", "details": {"intent_id": 7}}
+    )
+
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+
+    assert outcome.action == dx.REJECTED
+    assert api.request_state(rid)["state"] == "rejected"
+    assert api.request_state(rid)["reason"] == f"{xr.FULFIL_REFUSED}:intent_unavailable"
+    assert api.executions == []
+
+
+async def test_claim_saying_the_pinned_intent_is_unavailable_rejects_before_delivery(api):
+    rid = api.create_request("start")
+    _pin(api, rid, available=False)
+    temporal = FakeTemporal()
+
+    outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert outcome.action == dx.REJECTED
+    assert api.request_state(rid)["reason"] == xr.INTENT_UNAVAILABLE
+    assert temporal.delivered == []
+    assert api.fulfils() == []
+    assert api.executions == []
+
+
+@pytest.mark.parametrize("available", [True, None, "false", 0])
+async def test_claim_without_a_false_intent_available_delivers_as_before(api, available):
+    """Only an explicit `false` refuses. Absent (an older mctl-api), `true`
+    or a non-boolean value is not an observation of unavailability; the
+    fulfil guard and the investigator's own refusal still apply."""
+    rid = api.create_request("start")
+    _pin(api, rid, available=available)
+    temporal = FakeTemporal()
+
+    outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert outcome.action == dx.FULFILLED
+    assert api.request_state(rid)["state"] == "fulfilled"
+    assert len(temporal.delivered) == 1
+
+
+async def test_intent_available_false_without_a_pinned_intent_is_ignored(api):
+    """A request that pins nothing cannot have an unavailable pin."""
+    rid = api.create_request("start")
+    api.xrs[rid]["_intent_available"] = False
+
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+
+    assert outcome.action == dx.FULFILLED
+
+
+def test_claim_answer_reads_intent_available_only_as_a_boolean():
+    request = {"id": "xr_1", "work_item_id": WID, "kind": "start", "state": "claimed", "schema_version": SV}
+    for raw, want in ((False, False), (True, True), ("false", None), (0, None), (None, None)):
+        payload = {"schema_version": SV, "execution_request": request, "claim_token": "xrc_t"}
+        if raw is not None:
+            payload["intent_available"] = raw
+        assert xr.answer_from_claim(200, payload).intent_available is want
 
 
 async def test_an_untyped_400_at_fulfil_defers_instead_of_rejecting(api):
