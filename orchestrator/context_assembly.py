@@ -1894,6 +1894,30 @@ class IntentUnresolved(RuntimeError):
     lacks the intent would claim a completeness it does not have."""
 
 
+class IntentRefused(IntentUnresolved):
+    """The pinned resume intent was read and is not one this run may act
+    on (mctlhq/mctl-agents#959, ADR 011 §10): retention removed its text
+    (`intent-redacted`), the store documents it as absent
+    (`intent-absent`), or a principal other than the requester wrote it
+    (`intent-foreign-principal`). Unlike its parent this is not "could not
+    observe": the store answered, and the answer forbids running. The run
+    ends `refused` / `reason`, the model is never invoked and nothing is
+    sealed; the remedy is a new execution request pinning a replacement
+    intent. A subclass, so every path that already propagates
+    `IntentUnresolved` propagates this too.
+
+    `str(exc)` names ids and verdicts only, never intent text."""
+
+    #: The closed set of `reason` slugs (ADR 018 `_SLUG_PATTERN`).
+    REASONS = frozenset({"intent-redacted", "intent-absent", "intent-foreign-principal"})
+
+    def __init__(self, reason: str, message: str) -> None:
+        if reason not in self.REASONS:
+            raise ValueError(f"IntentRefused reason {reason!r} is not one of {sorted(self.REASONS)!r}")
+        super().__init__(message)
+        self.reason = reason
+
+
 def _resolve_work_item_intents(
     work_context: WorkContextRef | None,
     client: Any | None,
@@ -1910,7 +1934,9 @@ def _resolve_work_item_intents(
     Every read that fails is `IntentUnresolved`, never "no intent": the
     execution request (whose `intent_id` decides what is pinned), the pinned
     intent itself, and the listing. Only a request that names no intent pins
-    nothing."""
+    nothing. A pinned intent that WAS read but is redacted, documented
+    absent, or another principal's is `IntentRefused` (#959): an answer
+    that forbids running, not a failure to observe."""
     if work_context is None or client is None:
         return None
     from orchestrator.work_context import execution_requests as xr
@@ -1940,9 +1966,40 @@ def _resolve_work_item_intents(
             )
         if request.intent_id is not None:
             read = client.work_item_intent(wid, request.intent_id)
+            if read.verdict == wi.INTENT_ABSENT:
+                # The store's documented absence (a 404 it names), not a
+                # failed read: retrying cannot bring the intent back.
+                raise IntentRefused(
+                    "intent-absent",
+                    f"resume intent {request.intent_id} of {wid} is absent ({read.verdict}): {read.reason}",
+                )
             if read.verdict != wi.INTENT_FOUND or read.intent is None:
                 raise IntentUnresolved(
                     f"resume intent {request.intent_id} of {wid} is unresolved ({read.verdict}): {read.reason}"
+                )
+            # Whose instruction this is. The request's `requested_by` is
+            # mctl-api's authenticated caller, as is the intent's
+            # `actor_principal`; a request may pin only its own requester's
+            # intent. An empty `requested_by` cannot be compared, so it is
+            # unresolved rather than a pass.
+            if not request.requested_by:
+                raise IntentUnresolved(
+                    f"execution request {execution_request_id} of {wid} carries no requested_by "
+                    f"to check resume intent {request.intent_id} against"
+                )
+            if read.intent.actor_principal != request.requested_by:
+                raise IntentRefused(
+                    "intent-foreign-principal",
+                    f"resume intent {request.intent_id} of {wid} was written by another principal "
+                    f"than execution request {execution_request_id}'s requester",
+                )
+            # Checked at read time, so an intent redacted after the request
+            # was enqueued is refused the same way (#959 T9). The model must
+            # never run on "[text removed by retention]".
+            if read.intent.text_redacted:
+                raise IntentRefused(
+                    "intent-redacted",
+                    f"resume intent {request.intent_id} of {wid} has text_redacted=true",
                 )
             resume_intent = read.intent
     prior_document = (

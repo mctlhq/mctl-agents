@@ -34,6 +34,7 @@ from tests.test_run_issue_investigator import (
 
 WID = "wi-542"
 REQUEST_ID = "xr_1"
+REQUESTER = "user:mashkovd"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -43,11 +44,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _intent(iid: int, *, wid: str = WID, text: str | None = None, redacted: bool = False,
-            params: Any = None) -> dict[str, Any]:
+            params: Any = None, actor: str = "user:mashkovd") -> dict[str, Any]:
     return {
         "id": iid,
         "work_item_id": wid,
-        "actor_principal": "user:mashkovd",
+        "actor_principal": actor,
         "surface": "telegram",
         "text": "" if redacted else (text if text is not None else f"please do step {iid}"),
         "text_redacted": redacted,
@@ -66,6 +67,10 @@ class _FakeStore:
         self.intents = list(intents or [])
         self.intent_id = intent_id
         self.request_work_item_id = request_work_item_id
+        # mctl-api always records the authenticated requester; the default
+        # is the principal `_intent` writes, so a pinned intent is the
+        # requester's own unless a test says otherwise (#959).
+        self.requested_by = REQUESTER
         self.request_answer: tuple[int, dict[str, Any]] | None = None
         self.read_answer: tuple[int, dict[str, Any]] | None = None
         self.listing_answer: tuple[int, dict[str, Any]] | None = None
@@ -84,6 +89,8 @@ class _FakeStore:
                 "id": REQUEST_ID, "work_item_id": self.request_work_item_id, "kind": "resume",
                 "state": xr.STATE_CLAIMED,
             }
+            if self.requested_by:
+                request["requested_by"] = self.requested_by
             if self.intent_id is not None:
                 request["intent_id"] = self.intent_id
             return wc_client._HTTPResult(200, {"schema_version": wi.SCHEMA_VERSION, "execution_request": request})
@@ -254,7 +261,6 @@ def test_t13_intent_is_present_although_the_issue_has_no_comments(tmp_path, monk
 
 
 _UNRESOLVED_READS = {
-    "404-intent-not-found": (404, {"code": wi.INTENT_NOT_FOUND_CODE}),
     "other-item": (200, {"schema_version": wi.SCHEMA_VERSION, "intent": _intent(7, wid="wi-other")}),
     "5xx": (503, {"code": "unavailable"}),
     "malformed": (200, {"schema_version": wi.SCHEMA_VERSION, "intent": {"id": 7}}),
@@ -370,24 +376,134 @@ def test_request_without_intent_id_pins_nothing(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_redacted_resume_intent_is_carried_with_text_redacted_in_provenance(tmp_path, monkeypatch):
+SECRET = "deploy the thing at midnight"
+
+
+def _refused_run(tmp_path, monkeypatch, store: _FakeStore, *, number: int, path: str):
     _env(monkeypatch, switch="on")
-    _install(monkeypatch, _FakeStore(intents=[_intent(5, redacted=True)], intent_id=5))
+    _install(monkeypatch, store)
+    _stub_dispatched_work_item(monkeypatch)
+    persisted = _record_persist(monkeypatch)
+    issue = _dispatched_resume_issue(monkeypatch, number=number)  # _run_agent raises if invoked
+    _spy_clone(monkeypatch, tmp_path)
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / build_slug(number, "Fix work context resume")
+    if path == "context-only":
+        _terminal_proposal(tmp_path, issue, number, "merged")
+    before = _tree(proposal_dir) if proposal_dir.exists() else {}
+    result = _run_resume(tmp_path, issue)
+    after = _tree(proposal_dir) if proposal_dir.exists() else {}
+    return result, persisted, before, after
+
+
+@pytest.mark.parametrize("path", ["context-only", "full"])
+def test_t8_redacted_pinned_intent_is_refused_before_the_model(tmp_path, monkeypatch, capsys, path):
+    """#959 T8: a pinned intent with text_redacted=true never reaches the
+    model as "[text removed by retention]": the run is refused, seals
+    nothing, and leaves the proposal untouched."""
+    store = _FakeStore(intents=[_intent(5, redacted=True)], intent_id=5)
+    result, persisted, before, after = _refused_run(tmp_path, monkeypatch, store, number=565, path=path)
+
+    assert (result.outcome_code, result.outcome_reason) == ("refused", "intent-redacted")
+    assert result.error is not None
+    assert result.context_only is (path == "context-only")
+    assert persisted == []
+    assert after == before
+    assert "[outcome] code=refused reason=intent-redacted" in capsys.readouterr().out
+
+
+def test_t9_intent_redacted_after_enqueue_is_refused_at_read(tmp_path, monkeypatch):
+    """#959 T9: the intent was readable when the request was made (the
+    listing still shows its text) and is redacted when the investigator
+    reads it by id. The read-time answer decides."""
+    store = _FakeStore(intents=[_intent(5, text=SECRET)], intent_id=5)
+    store.read_answer = (200, {"schema_version": wi.SCHEMA_VERSION, "intent": _intent(5, redacted=True)})
+    result, persisted, _, _ = _refused_run(tmp_path, monkeypatch, store, number=566, path="full")
+
+    assert (result.outcome_code, result.outcome_reason) == ("refused", "intent-redacted")
+    assert persisted == []
+    assert SECRET not in (result.error or "")
+
+
+@pytest.mark.parametrize("path", ["context-only", "full"])
+def test_documented_absent_pinned_intent_is_refused(tmp_path, monkeypatch, path):
+    """A 404 the store names is its documented absence: refused
+    `intent-absent`, not the retryable `intent-unresolved`. This is also
+    what an intent of another work item looks like from here: mctl-api
+    looks the id up under this item only."""
+    store = _FakeStore(intents=[_intent(7)], intent_id=7)
+    store.read_answer = (404, {"code": wi.INTENT_NOT_FOUND_CODE})
+    result, persisted, before, after = _refused_run(tmp_path, monkeypatch, store, number=567, path=path)
+
+    assert (result.outcome_code, result.outcome_reason) == ("refused", "intent-absent")
+    assert result.error is not None
+    assert persisted == []
+    assert after == before
+
+
+def test_t10_another_principals_intent_is_refused_without_leaking_it(tmp_path, monkeypatch):
+    store = _FakeStore(intents=[_intent(8, text=SECRET, actor="user:someone-else")], intent_id=8)
+    result, persisted, _, _ = _refused_run(tmp_path, monkeypatch, store, number=568, path="full")
+
+    assert (result.outcome_code, result.outcome_reason) == ("refused", "intent-foreign-principal")
+    assert persisted == []
+    assert SECRET not in (result.error or "")
+    assert "someone-else" not in (result.error or "")
+
+
+def test_request_without_requested_by_cannot_vouch_for_its_intent(tmp_path, monkeypatch):
+    """No requester to compare against is "could not observe", never a pass."""
+    store = _FakeStore(intents=[_intent(8)], intent_id=8)
+    store.requested_by = ""
+    result, persisted, _, _ = _refused_run(tmp_path, monkeypatch, store, number=569, path="context-only")
+
+    assert (result.outcome_code, result.outcome_reason) == ("failed", "intent-unresolved")
+    assert persisted == []
+
+
+def test_t10_replacement_intent_on_a_new_request_is_pinned(tmp_path, monkeypatch):
+    """The remedy (ADR 011 §10): append a replacement intent, then a new
+    execution request pinning it. The redacted one stays an ordinary listed
+    source; only the replacement is pinned."""
+    _env(monkeypatch, switch="on")
+    _install(monkeypatch, _FakeStore(intents=[_intent(5, redacted=True), _intent(6, text=SECRET)], intent_id=6))
     _stub_dispatched_work_item(monkeypatch)
     _record_persist(monkeypatch)
     captured = _capture_assembly(monkeypatch)
-    issue = _dispatched_resume_issue(monkeypatch, number=565)
+    issue = _dispatched_resume_issue(monkeypatch, number=570)
     _spy_clone(monkeypatch, tmp_path)
-    _terminal_proposal(tmp_path, issue, 565, "merged")
+    _terminal_proposal(tmp_path, issue, 570, "merged")
 
     result = _run_resume(tmp_path, issue)
 
     assert result.outcome_code == "succeeded"
-    (source,) = _intent_sources(captured[0].snapshot)
-    assert source["selector"]["text_redacted"] is True
-    assert source["content_hash"] == cs.hash_bytes(cs.canonical_json({"text": "", "params": {"step": 5}}))
-    rendered = "\n".join(captured[0].rendered.values())
-    assert "[text removed by retention]" in rendered
+    pinned = [s for s in _intent_sources(captured[0].snapshot) if s["selection"]["reason_code"] == "resume-intent"]
+    assert [s["selector"]["intent_id"] for s in pinned] == [6]
+    assert pinned[0]["selector"]["text_redacted"] is False
+
+
+def test_main_exits_nonzero_on_intent_refused(monkeypatch):
+    """Required, not incidental: the DevLoop reads the CWFT's Argo phase, so
+    an exit 0 would end the dispatched execution Succeeded."""
+    def _refused(*args, **kwargs):
+        return run_issue_investigator.InvestigateResult(
+            "svc", "slug", Path("/nonexistent"), error="WorkItem resume intent refused: x",
+            outcome_code="refused", outcome_reason="intent-redacted",
+        )
+
+    monkeypatch.setattr(run_issue_investigator, "investigate", _refused)
+    monkeypatch.setattr("orchestrator.auth.ensure_auth_for_sdk", lambda: None)
+    monkeypatch.setattr(
+        "sys.argv", ["run_issue_investigator", "--issue-url", "https://github.com/mctlhq/mctl-telegram/issues/1"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        run_issue_investigator.main()
+    assert exc.value.code not in (0, None)
+
+
+def test_intent_refused_reasons_are_closed():
+    with pytest.raises(ValueError):
+        ca.IntentRefused("intent-gone", "x")
+    assert issubclass(ca.IntentRefused, ca.IntentUnresolved)
 
 
 def test_redacted_and_empty_text_are_distinct_sources():

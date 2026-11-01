@@ -2718,6 +2718,36 @@ def _intent_unresolved(
     )
 
 
+def _intent_refused(
+    service: str,
+    slug: str,
+    proposal_dir: Path,
+    exc: Any,
+    *,
+    execution_id: str,
+    work_item_id: str,
+    context_only: bool,
+) -> InvestigateResult:
+    """The typed refusal for a pinned resume intent this run may not act on
+    (mctlhq/mctl-agents#959, ADR 011 §10): `refused` / `exc.reason` with
+    `error` set. `error` is what makes `main()` exit non-zero, and that is
+    required, not incidental: the DevLoop reads the investigate CWFT's Argo
+    phase, so an exit 0 would end the dispatched execution Succeeded and
+    park the loop on approval of a proposal this run never wrote. The model
+    was not invoked and nothing was sealed or persisted. The message names
+    ids and verdicts only, never intent text."""
+    print(
+        f"[outcome] code=refused reason={exc.reason} context_only={str(context_only).lower()} "
+        f"snapshot_id=- execution_id={execution_id} work_item_id={work_item_id}"
+    )
+    return InvestigateResult(
+        service, slug, proposal_dir,
+        error=f"WorkItem resume intent refused: {exc}",
+        outcome_code="refused", outcome_reason=exc.reason,
+        context_only=context_only,
+    )
+
+
 def _assemble_context(
     *,
     mode: str,
@@ -3711,6 +3741,11 @@ def _investigate(
                     fatal=True,
                     execution_request_id=execution_request_id,
                 )
+            except context_assembly.IntentRefused as exc:
+                return _intent_refused(
+                    service, slug, proposal_dir, exc,
+                    execution_id=outcome_execution_id, work_item_id=outcome_work_item_id, context_only=True,
+                )
             except context_assembly.IntentUnresolved as exc:
                 return _intent_unresolved(
                     service, slug, proposal_dir, exc,
@@ -3834,6 +3869,13 @@ def _investigate(
                 # execution agree on it.
                 argo_workflow_name=execution_context.correlation.argo_workflow_name,
                 execution_request_id=execution_request_id,
+            )
+        except context_assembly.IntentRefused as exc:
+            return _intent_refused(
+                service, slug, proposal_dir, exc,
+                execution_id=work_context_ref.execution_id if work_context_ref is not None else (execution_id or "-"),
+                work_item_id=work_context_ref.work_item_id if work_context_ref is not None else (work_item_id or "-"),
+                context_only=False,
             )
         except context_assembly.IntentUnresolved as exc:
             return _intent_unresolved(

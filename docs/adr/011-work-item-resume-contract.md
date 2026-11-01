@@ -476,6 +476,55 @@ a live resume seals real provenance; (4) only then is new MCP execution
 admission enabled. An image without `mcp` in its vocabulary fails closed: the
 loop refuses the resume and the investigator CLI exits non-zero.
 
+### 10. A pinned intent the run may not act on is refused, not parked (#959)
+
+An execution request may pin a WorkItem intent (`intent_id`, mctl-api#368).
+With `WORK_ITEM_INTENT_SOURCE=on`, the investigator reads that intent by id
+before it builds a prompt. Since #542, a read it cannot make has been
+`failed` / `intent-unresolved`. A read that succeeds but returns an intent
+the run must not act on is now `refused`, with one of three reasons:
+
+- `intent-redacted`: the intent carries `text_redacted=true`. The model must
+  never run on `[text removed by retention]`. The check runs at read time,
+  so an intent redacted after its request was enqueued is refused in the
+  same way.
+- `intent-absent`: the store documents the intent as absent (the 404 it
+  names). mctl-api looks an id up under the request's own work item only,
+  so an intent of another work item arrives here as absent.
+- `intent-foreign-principal`: the intent's `actor_principal` differs from
+  the request's `requested_by`. Both are mctl-api's authenticated callers.
+  A request may pin only its own requester's intent. An empty
+  `requested_by` cannot be compared, so it is `intent-unresolved`, not a
+  pass.
+
+A refused run invokes no model, seals no snapshot and leaves the proposal
+untouched. Its error and log line name ids and verdicts only, never intent
+text or a principal. It exits non-zero on purpose. The DevLoop judges the
+investigate CWFT by its Argo phase, so an exit 0 would end the dispatched
+execution `Succeeded` and park the loop on approval of a proposal this run
+never wrote. The typed `refused` reason goes into the run's execution
+evidence (ADR 018). The WorkItem execution ends `Failed`.
+
+**The remedy is the existing request path, not a clarification round.** The
+requester appends a replacement intent through mctl-api's authorized intent
+route, then makes a new execution request that pins it. That request becomes
+a new execution with its own sealed snapshot, chained to the previous one in
+the usual way. A replacement that is redacted in turn is refused again; each
+retry is one more explicit request, so no round counter is needed.
+
+We considered and rejected the alternative of #904's Slice C: park in
+`WAITING_FOR_INPUT` with an orchestrator-authored ADR 013 request and rebind
+the replacement in a continuation. A continuation runs without a work
+context, and section 8 lets only the dispatcher mint an execution, from a
+request. The answer would have to become an execution request anyway, and
+the design would add a second publish path (a request with no proposal
+triplet) and an ADR 013 amendment to get there.
+
+Surfaces see the execution as `Failed`. mctl-api does not expose the refusal
+reason on an execution, and its MCP tool `mctl_request_work_item_execution`
+does not yet take `intent_id`. Both are tracked on the mctl-api side
+(mctl-api#871) and are needed before the remedy is usable outside REST.
+
 ## Alternatives
 
 1. **Reuse `StepRef` for cross-execution chaining.** Rejected: it would
