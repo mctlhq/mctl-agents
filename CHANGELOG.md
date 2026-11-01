@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.114.0](https://github.com/mctlhq/mctl-agents/compare/1.113.0...1.114.0) (2026-11-01)
+
+
+### Features
+
+* **agents:** issue-947-fix-image-make-the-agent-entrypoint-work ([30cbfe6](https://github.com/mctlhq/mctl-agents/commit/30cbfe6b2702ce79d8f8098662ec591af5a077ae))
+* **agents:** issue-947-fix-image-make-the-agent-entrypoint-work ([535924e](https://github.com/mctlhq/mctl-agents/commit/535924e00f9e7b1e8f1fe85146df4702802529ef))
+
+
+### Bug Fixes
+
+* **agents:** issue-904-fix-work-context-accept-mcp-resume-surfa ([e02b31b](https://github.com/mctlhq/mctl-agents/commit/e02b31baed899dad9c6ec109daecbb77e4e0e5a6))
+* **work-context:** accept the MCP surface and forward resume provenance ([a0129a8](https://github.com/mctlhq/mctl-agents/commit/a0129a836f1caec349701b33af3e2d6d674f2b3c))
+* **work-context:** forward MCP resume provenance, never seal unknown ([4519d9e](https://github.com/mctlhq/mctl-agents/commit/4519d9e8e6ea90d20fa9ff74aee63b47ef904f50))
+
 ## [1.113.0](https://github.com/mctlhq/mctl-agents/compare/1.112.3...1.113.0) (2026-10-31)
 
 
