@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.114.1](https://github.com/mctlhq/mctl-agents/compare/1.114.0...1.114.1) (2026-11-01)
+
+
+### Bug Fixes
+
+* **work-context:** refuse a redacted, absent or foreign pinned intent ([79170ac](https://github.com/mctlhq/mctl-agents/commit/79170acc9cb817e3cf81d667ffe808b14ec56d07))
+* **work-context:** refuse a redacted, absent or foreign pinned intent ([78cc910](https://github.com/mctlhq/mctl-agents/commit/78cc910a3867e25f7ef629ecc9976357f00622c9))
+
 ## [1.114.0](https://github.com/mctlhq/mctl-agents/compare/1.113.0...1.114.0) (2026-11-01)
 
 
