@@ -832,9 +832,11 @@ def evaluate_review_gate(
     candidate pool from Tier B in server ingest order, oldest first. There is
     no GitHub review input.
 
-    Order: unknown live -> pool by exact binding (stale/missing) -> authoring
-    execution observable (else unknown) -> independence (not_independent) ->
-    assurance (advisory_only) -> latest receipt's outcome.
+    Order: unknown live -> pool by exact binding (stale/missing) -> request
+    sealed, bound to the live binding and with an observable authoring
+    execution (else unknown) -> receipts of this request only (else missing)
+    -> independence, where an unobserved worker identity does not count
+    (not_independent) -> assurance (advisory_only) -> latest receipt's outcome.
     """
     if required_assurance not in REQUIRED_ASSURANCES:
         raise ValueError(f"required_assurance must be one of {REQUIRED_ASSURANCES}")

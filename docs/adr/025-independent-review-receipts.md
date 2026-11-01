@@ -68,13 +68,16 @@ dismissal or check input. Order:
 1. `live` unobserved -> `unknown`.
 2. Receipts for the same subject identity with the exact binding form the pool (spike: every subject field;
    proposal: `service`, `slug`, `content_digest`). Empty pool: `stale` if other bindings exist, else `missing`.
-3. No `request`, or a worker request without `authoring_execution_id` -> `unknown`. Actor inequality alone
+3. No `request`, an unsealed request, a request bound to a different revision than `live` (exact binding, not
+   just identity), or a worker request without `authoring_execution_id` -> `unknown`. Actor inequality alone
    never proves independence, because agent commits carry the operator's identity.
-4. Drop receipts whose reviewer actor is empty or an author actor, whose execution equals the authoring
-   execution, whose `attempt_id` is an authoring attempt, or whose `lineage_root` equals the authoring one.
-   Nothing left -> `not_independent`.
-5. `required_assurance=independent` and only advisory receipts left -> `advisory_only`.
-6. The latest remaining receipt (Tier B ingest order, oldest first): `satisfied`, `changes_requested`,
+4. Keep only receipts whose `request_id` is the request's own; none left -> `missing`.
+5. Drop receipts whose reviewer actor is empty or matches an author actor (case-insensitive), whose execution
+   equals the authoring execution, whose `attempt_id` is an authoring attempt, or whose `lineage_root` equals
+   the authoring one. A worker receipt with an empty `reviewer_execution_id`, `attempt_id` or `lineage_root`
+   is dropped too: an unobserved identity is not independence. Nothing left -> `not_independent`.
+6. `required_assurance=independent` and only advisory receipts left -> `advisory_only`.
+7. The latest remaining receipt (Tier B ingest order, oldest first): `satisfied`, `changes_requested`,
    `needs_human` or `unobservable`.
 
 Reviewer identity is never inferred from a model name, a pasted string or an OAuth client name (#891).
