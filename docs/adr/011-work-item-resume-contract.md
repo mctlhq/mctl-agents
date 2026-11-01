@@ -468,6 +468,23 @@ omits the key: "could not observe" is never sealed as "no transition", which
 is what #573's C2 recorded. Snapshots sealed before this always carry the
 key and keep their bytes; an explicit `null` is refused on read.
 
+The comparison is against the **previous execution** (#960), read from
+mctl-api's executions listing.
+- Since mctl-api 4.147.0 (mctl-api#871), each execution in the listing
+  carries its fulfilled request's `surface` and `requested_by`. The
+  requester maps to a `human` actor, the same mapping the dispatcher uses.
+- An execution with no fields is an unknown baseline. That covers an
+  execution attached without a request, a seed, and a surface label outside
+  this image's vocabulary. mctl-api accepts any short label, and an
+  unrecognised one must not poison `work_item_verdict_for`. An unknown
+  baseline is never replaced by an older execution or by the item's origin.
+- The origin is the baseline only when there is no prior execution.
+
+Before this, the baseline fell back to the origin whenever the ledger had
+no kinds, and the v1 ledger never did. So an MCP -> MCP resume over a
+Telegram origin sealed `true`; the live C3 `cs_0c8288c6…` of 2026-11-01 is
+such a case.
+
 Rollout order: (1) the mctl-agents image (the new parameters are inert,
 stripped by mctl-api); (2) the investigate CWFT in mctl-gitops declares the
 three parameters with default `""` and maps each to its flag when non-empty;

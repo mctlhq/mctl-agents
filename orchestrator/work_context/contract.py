@@ -259,12 +259,30 @@ class ExecutionRef:
         # missing or non-string one is a malformed record, not a new engine.
         if not isinstance(engine, str) or not engine:
             return None
+        # Provenance of the request this execution fulfilled (mctl-api#871).
+        # Absent is unknown, and so is a surface outside this image's
+        # vocabulary: mctl-api accepts any short lowercase label, so carrying
+        # an unrecognised one into `surface.kind` would let any requester make
+        # `work_item_verdict_for` refuse the whole item. It is dropped to
+        # unknown instead, which only makes the transition unmeasured
+        # (mctlhq/mctl-agents#960). A present value that is not a string is a
+        # malformed record. A request always comes from a person (mctl-api
+        # refuses the service principal), so its requester is a `human` actor:
+        # the same mapping the dispatcher gives the execution it delivers.
+        surface_raw = data.get("surface")
+        requested_by = data.get("requested_by")
+        if surface_raw is not None and not isinstance(surface_raw, str):
+            return None
+        if requested_by is not None and not isinstance(requested_by, str):
+            return None
         return ExecutionRef(
             execution_id=execution_id,
             sequence=attempt,
             temporal_workflow_id=_str(data.get("engine_ref")) if engine == "temporal" else "",
             started_at=_str(data.get("started_at")),
             phase=_str(data.get("phase")),
+            surface=SurfaceRef(kind=surface_raw) if surface_raw in SURFACE_KINDS else SurfaceRef(),
+            actor=ActorRef(kind="human", actor_id=requested_by) if requested_by else ActorRef(),
         )
 
 
