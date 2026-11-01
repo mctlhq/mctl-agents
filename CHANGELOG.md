@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.115.0](https://github.com/mctlhq/mctl-agents/compare/1.114.4...1.115.0) (2026-11-01)
+
+
+### Features
+
+* **agents:** issue-905-feat-review-define-version-bound-indepen ([577306d](https://github.com/mctlhq/mctl-agents/commit/577306dd4da4f52b4068a31d90e7574656b49e42))
+* **agents:** issue-905-feat-review-define-version-bound-indepen ([e482a25](https://github.com/mctlhq/mctl-agents/commit/e482a2596d3d02dd8e3f21985c0cfa36e27e3085))
+
+
+### Bug Fixes
+
+* **review:** fail closed on stale requests and unobserved reviewer identity ([b86b151](https://github.com/mctlhq/mctl-agents/commit/b86b151e6ed9b9204fea7d7c35d9e91be7a34dee))
+
 ## [1.114.4](https://github.com/mctlhq/mctl-agents/compare/1.114.3...1.114.4) (2026-11-01)
 
 
