@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.116.0](https://github.com/mctlhq/mctl-agents/compare/1.115.0...1.116.0) (2026-11-02)
+
+
+### Features
+
+* **agents:** issue-975-feat-review-vendor-canonical-execution-p ([ef08d15](https://github.com/mctlhq/mctl-agents/commit/ef08d150e42966fdfd1fceb486781d1457d5b5fd))
+* **agents:** issue-975-feat-review-vendor-canonical-execution-p ([4bed35f](https://github.com/mctlhq/mctl-agents/commit/4bed35f05903e7e064fdefdd9de4b9f6f6227f33))
+* **agents:** issue-977-feat-review-adr-025-amendment-so-tier-a ([5858c24](https://github.com/mctlhq/mctl-agents/commit/5858c2436c6f9219af20bf5ee470cac48e0b5054))
+* **review:** accept we_&lt;uuid&gt; execution ids in ADR 025 Tier A ([757ce7d](https://github.com/mctlhq/mctl-agents/commit/757ce7de8318ae10fb1e58189a5106574f34cf7e))
+
+
+### Bug Fixes
+
+* **review:** keep ADR 025 Documents list intact, assert refusal code ([95898f2](https://github.com/mctlhq/mctl-agents/commit/95898f22f4cc06cdf23352ca453f4e4656e46764))
+
 ## [1.115.0](https://github.com/mctlhq/mctl-agents/compare/1.114.4...1.115.0) (2026-11-01)
 
 
