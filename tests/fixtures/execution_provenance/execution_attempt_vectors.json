@@ -1,0 +1,95 @@
+{
+  "contract_version": "execution_attempt_v1",
+  "vectors": [
+    {
+      "name": "temporal plain",
+      "engine": "temporal",
+      "engine_ref": "wf-1/run-abc",
+      "root_execution_id": "we_11111111-2222-3333-4444-555555555555",
+      "attempt_canonical": "[\"execution_attempt_v1\",\"attempt\",\"temporal\",\"wf-1/run-abc\"]",
+      "attempt_id": "at_cf39e00d0131f2dc76adcebc08ff7cb3",
+      "lineage_canonical": "[\"execution_attempt_v1\",\"lineage\",\"we_11111111-2222-3333-4444-555555555555\"]",
+      "lineage_root": "ln_d1d0c87df62123c766325befd276df5e"
+    },
+    {
+      "name": "argo plain",
+      "engine": "argo",
+      "engine_ref": "mctl-agents-implement-1785399300",
+      "root_execution_id": "we_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "attempt_canonical": "[\"execution_attempt_v1\",\"attempt\",\"argo\",\"mctl-agents-implement-1785399300\"]",
+      "attempt_id": "at_1863d62eca5b4a7558fbf661445dc200",
+      "lineage_canonical": "[\"execution_attempt_v1\",\"lineage\",\"we_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"]",
+      "lineage_root": "ln_4da205454f27d8c61685691971e701bf"
+    },
+    {
+      "name": "a2a plain",
+      "engine": "a2a",
+      "engine_ref": "task-42",
+      "root_execution_id": "we_00000000-0000-4000-8000-000000000001",
+      "attempt_canonical": "[\"execution_attempt_v1\",\"attempt\",\"a2a\",\"task-42\"]",
+      "attempt_id": "at_65120816d2eb1360ab52edd28e034562",
+      "lineage_canonical": "[\"execution_attempt_v1\",\"lineage\",\"we_00000000-0000-4000-8000-000000000001\"]",
+      "lineage_root": "ln_b486e0d50107b37de8309f06843e91f5"
+    },
+    {
+      "name": "hash suffix stripped",
+      "engine": "temporal",
+      "engine_ref": "dev-loop-mctlhq-mctl-api-896#xr_0123",
+      "root_execution_id": "we_11111111-2222-3333-4444-555555555555",
+      "attempt_canonical": "[\"execution_attempt_v1\",\"attempt\",\"temporal\",\"dev-loop-mctlhq-mctl-api-896\"]",
+      "attempt_id": "at_51bb99e5798efe45a5d58538edf7bf5c",
+      "lineage_canonical": "[\"execution_attempt_v1\",\"lineage\",\"we_11111111-2222-3333-4444-555555555555\"]",
+      "lineage_root": "ln_d1d0c87df62123c766325befd276df5e"
+    },
+    {
+      "name": "empty suffix after hash",
+      "engine": "argo",
+      "engine_ref": "wf-9#",
+      "root_execution_id": "we_11111111-2222-3333-4444-555555555555",
+      "attempt_canonical": "[\"execution_attempt_v1\",\"attempt\",\"argo\",\"wf-9\"]",
+      "attempt_id": "at_b9ab1a9fc888be81a474012ea83c1c47",
+      "lineage_canonical": "[\"execution_attempt_v1\",\"lineage\",\"we_11111111-2222-3333-4444-555555555555\"]",
+      "lineage_root": "ln_d1d0c87df62123c766325befd276df5e"
+    },
+    {
+      "name": "only first hash splits",
+      "engine": "temporal",
+      "engine_ref": "wf-1#a#b",
+      "root_execution_id": "we_11111111-2222-3333-4444-555555555555",
+      "attempt_canonical": "[\"execution_attempt_v1\",\"attempt\",\"temporal\",\"wf-1\"]",
+      "attempt_id": "at_0b06b857976c37b8b4d9f79834b92bfa",
+      "lineage_canonical": "[\"execution_attempt_v1\",\"lineage\",\"we_11111111-2222-3333-4444-555555555555\"]",
+      "lineage_root": "ln_d1d0c87df62123c766325befd276df5e"
+    },
+    {
+      "name": "non-ascii",
+      "engine": "a2a",
+      "engine_ref": "t\u00e4sk-\u65e5\u672c",
+      "root_execution_id": "we_c0ffee00-0000-4000-8000-0000000000aa",
+      "attempt_canonical": "[\"execution_attempt_v1\",\"attempt\",\"a2a\",\"t\\u00e4sk-\\u65e5\\u672c\"]",
+      "attempt_id": "at_7c98c8cb77aa0f2f728d277195b6bb6f",
+      "lineage_canonical": "[\"execution_attempt_v1\",\"lineage\",\"we_c0ffee00-0000-4000-8000-0000000000aa\"]",
+      "lineage_root": "ln_9e957713ad68468ec0b41adf11e213e0"
+    },
+    {
+      "name": "astral and escapes",
+      "engine": "temporal",
+      "engine_ref": "run\"\\\n\t\ud83d\ude00",
+      "root_execution_id": "we_c0ffee00-0000-4000-8000-0000000000bb",
+      "attempt_canonical": "[\"execution_attempt_v1\",\"attempt\",\"temporal\",\"run\\\"\\\\\\n\\t\\ud83d\\ude00\"]",
+      "attempt_id": "at_424aa7001216a8579c37004e3efe553f",
+      "lineage_canonical": "[\"execution_attempt_v1\",\"lineage\",\"we_c0ffee00-0000-4000-8000-0000000000bb\"]",
+      "lineage_root": "ln_c12254297b4972909e85cf153d85fc0e"
+    },
+    {
+      "name": "hyphenated uuid root",
+      "engine": "argo",
+      "engine_ref": "wf-2",
+      "root_execution_id": "we_123e4567-e89b-12d3-a456-426614174000",
+      "attempt_canonical": "[\"execution_attempt_v1\",\"attempt\",\"argo\",\"wf-2\"]",
+      "attempt_id": "at_b0dff4eb57bb8cbdd4b3a1c3b7531a25",
+      "lineage_canonical": "[\"execution_attempt_v1\",\"lineage\",\"we_123e4567-e89b-12d3-a456-426614174000\"]",
+      "lineage_root": "ln_0490462764eb61820c97daec8a2bcb09"
+    }
+  ]
+}
