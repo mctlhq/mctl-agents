@@ -459,6 +459,7 @@ def test_request_bounds_hold_in_seal_and_from_dict(kwargs):
         ("store-uuid-misplaced-hyphen", "we_7ea4cf0cd-8ba-4825-9191-888e17a47eec", False),
         ("store-uuid-braced", "we_{7ea4cf0c-d8ba-4825-9191-888e17a47eec}", False),
         ("store-uuid-urn-prefix", "urn:uuid:7ea4cf0c-d8ba-4825-9191-888e17a47eec", False),
+        ("store-uuid-we-urn-prefix", "we_urn:uuid:7ea4cf0c-d8ba-4825-9191-888e17a47eec", False),
         ("store-uuid-trailing-newline", "we_7ea4cf0c-d8ba-4825-9191-888e17a47eec\n", False),
     ],
 )
