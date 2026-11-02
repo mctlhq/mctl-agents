@@ -446,3 +446,25 @@ def test_request_bounds_hold_in_seal_and_from_dict(kwargs):
     with pytest.raises(rr.ReviewError) as exc:
         rr.ReviewRequest.from_dict(good)
     assert exc.value.code == rr.CODE_MALFORMED
+
+
+@pytest.mark.parametrize(
+    "form,value,ok",
+    [
+        ("store-uuid", "we_7ea4cf0c-d8ba-4825-9191-888e17a47eec", True),
+        ("legacy-we-16-hex", "we_" + "1" * 16, True),
+        ("legacy-we-64-hex", "we_" + "a" * 64, True),
+        ("runtime-ex", "ex-0123456789abcdef", True),
+        ("store-uuid-uppercase", "we_7EA4CF0C-D8BA-4825-9191-888E17A47EEC", False),
+        ("store-uuid-misplaced-hyphen", "we_7ea4cf0cd-8ba-4825-9191-888e17a47eec", False),
+        ("store-uuid-braced", "we_{7ea4cf0c-d8ba-4825-9191-888e17a47eec}", False),
+        ("store-uuid-urn-prefix", "urn:uuid:7ea4cf0c-d8ba-4825-9191-888e17a47eec", False),
+        ("store-uuid-trailing-newline", "we_7ea4cf0c-d8ba-4825-9191-888e17a47eec\n", False),
+    ],
+)
+def test_authoring_execution_id_forms(form, value, ok):
+    if ok:
+        assert request(execution=value).authoring_execution_id == value, form
+    else:
+        with pytest.raises(ValueError):
+            request(execution=value)

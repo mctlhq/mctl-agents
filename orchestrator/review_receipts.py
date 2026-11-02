@@ -113,7 +113,8 @@ _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
 _SLUG_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 _SERVICE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_EXECUTION_ID_RE = re.compile(r"(?:we_[0-9a-f]{16,64}|ex-[0-9a-f]{16})")
+_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_EXECUTION_ID_RE = re.compile(rf"(?:we_{_UUID}|we_[0-9a-f]{{16,64}}|ex-[0-9a-f]{{16}})")
 _EVIDENCE_ID_RE = re.compile(r"ev-[0-9a-f]{16}")
 _CREATED_AT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z")
 
