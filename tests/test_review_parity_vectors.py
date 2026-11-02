@@ -38,6 +38,8 @@ SHA_C = "c" * 40
 EXEC_AUTHOR = "we_" + "1" * 16
 EXEC_REVIEW = "we_" + "2" * 16
 EXEC_REVIEW_2 = "we_" + "3" * 16
+EXEC_AUTHOR_UUID = "we_7ea4cf0c-d8ba-4825-9191-888e17a47eec"
+EXEC_REVIEW_UUID = "we_a11b5572-fed2-482b-bedf-2b4160476cb9"
 AUTHOR = "operator"
 REVIEWER = "reviewer-bot"
 NONCE = "nonce-0001"
@@ -142,6 +144,9 @@ def _documents() -> dict[str, Any]:
         "spike_worker_request": _request(spike),
         "proposal_worker_request": _request(proposal),
         "proposal_manual_request": _request(proposal, mode="manual", nonce="nonce-manual"),
+        "proposal_worker_request_store_execution_id": _request(
+            proposal, execution=EXEC_AUTHOR_UUID, nonce="nonce-store-uuid"
+        ),
         "spike_two_authors_request": _request(spike, actors=("zed", "Alice", "alice"), attempts=("b", "a", "a")),
     }
     receipts = {
@@ -158,6 +163,9 @@ def _documents() -> dict[str, Any]:
             criteria=_with_unobserved(requests["proposal_worker_request"].subject),
         ),
         "proposal_manual_pass": _receipt(requests["proposal_manual_request"]),
+        "proposal_worker_pass_store_execution_id": _receipt(
+            requests["proposal_worker_request_store_execution_id"], execution=EXEC_REVIEW_UUID
+        ),
     }
     return {
         "requests": [
@@ -213,6 +221,30 @@ def _refusals() -> list[dict[str, Any]]:
             rr.CODE_MALFORMED,
         ),
         ("request_bad_authoring_execution_id", "request", alter(rd, authoring_execution_id="nope"), rr.CODE_MALFORMED),
+        (
+            "request_uppercase_store_execution_id",
+            "request",
+            alter(rd, authoring_execution_id=EXEC_AUTHOR_UUID.upper().replace("WE_", "we_")),
+            rr.CODE_MALFORMED,
+        ),
+        (
+            "request_store_execution_id_misplaced_hyphen",
+            "request",
+            alter(rd, authoring_execution_id="we_7ea4cf0cd-8ba-4825-9191-888e17a47eec"),
+            rr.CODE_MALFORMED,
+        ),
+        (
+            "request_braced_store_execution_id",
+            "request",
+            alter(rd, authoring_execution_id="we_{" + EXEC_AUTHOR_UUID[3:] + "}"),
+            rr.CODE_MALFORMED,
+        ),
+        (
+            "request_store_execution_id_trailing_newline",
+            "request",
+            alter(rd, authoring_execution_id=EXEC_AUTHOR_UUID + "\n"),
+            rr.CODE_MALFORMED,
+        ),
         ("request_bad_created_at", "request", alter(rd, created_at="yesterday"), rr.CODE_MALFORMED),
         ("request_rubric_mismatch", "request", alter(rd, rubric="spike_v1"), rr.CODE_RUBRIC_MISMATCH),
         ("request_altered_nonce_keeps_hash", "request", alter(rd, nonce="nonce-forged"), rr.CODE_BAD_IDENTITY),
@@ -512,6 +544,19 @@ def _gate() -> list[dict[str, Any]]:
         ],
     )
     # Independence (rules 3 and 4)
+    store_req = _request(prop, execution=EXEC_AUTHOR_UUID, nonce="nonce-store-uuid")
+    add(
+        "store_execution_ids_are_independent",
+        rr.GATE_SATISFIED,
+        request=store_req,
+        receipts=[_receipt(store_req, execution=EXEC_REVIEW_UUID)],
+    )
+    add(
+        "same_store_execution_is_not_independent",
+        rr.GATE_NOT_INDEPENDENT,
+        request=store_req,
+        receipts=[_receipt(store_req, execution=EXEC_AUTHOR_UUID)],
+    )
     add("same_actor_is_not_independent", rr.GATE_NOT_INDEPENDENT, receipts=[_receipt(prop_req, actor=AUTHOR)])
     add("actor_compare_is_case_insensitive", rr.GATE_NOT_INDEPENDENT, receipts=[_receipt(prop_req, actor="Operator")])
     add("empty_reviewer_actor_is_not_independent", rr.GATE_NOT_INDEPENDENT, receipts=[_receipt(prop_req, actor="")])
@@ -632,6 +677,8 @@ def test_every_gate_outcome_and_the_four_971_rules_are_covered():
         "worker_receipt_without_attempt_is_not_independent",
         "worker_receipt_without_lineage_is_not_independent",
         "actor_compare_is_case_insensitive",
+        "store_execution_ids_are_independent",
+        "same_store_execution_is_not_independent",
         "mixed_case_author_actor_blocks_a_lowercase_reviewer",
     } <= names
 

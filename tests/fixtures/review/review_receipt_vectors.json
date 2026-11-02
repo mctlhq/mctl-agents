@@ -291,6 +291,66 @@
           "id": "rc_728e159e76434ea1"
         },
         "name": "proposal_manual_pass"
+      },
+      {
+        "document": {
+          "api_version": "review.mctl.ai/v1alpha1",
+          "assurance": "independent",
+          "attempt_id": "attempt-review",
+          "content_hash": "sha256:00ff9a2d968b06ef48ab7641cf971a9fa846c97a9d7de9b88840acbefa3105f6",
+          "created_at": "2026-11-01T12:00:00Z",
+          "criteria": [
+            {
+              "id": "scope_bounded",
+              "status": "met"
+            },
+            {
+              "id": "contracts_specified",
+              "status": "met"
+            },
+            {
+              "id": "acceptance_testable",
+              "status": "met"
+            },
+            {
+              "id": "rollback_defined",
+              "status": "met"
+            },
+            {
+              "id": "matches_issue",
+              "status": "met"
+            }
+          ],
+          "evidence_ref": "",
+          "findings_ref": {
+            "content_hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "kind": "review-findings",
+            "name": "findings"
+          },
+          "kind": "ReviewReceipt",
+          "lineage_root": "lineage-review",
+          "mode": "worker",
+          "nonce": "nonce-store-uuid",
+          "outcome": "PASS",
+          "receipt_id": "rc_00ff9a2d968b06ef",
+          "request_id": "rr_44d2abb4b79bb40b",
+          "reviewer_actor": "reviewer-bot",
+          "reviewer_execution_id": "we_a11b5572-fed2-482b-bedf-2b4160476cb9",
+          "rubric": "proposal_v1",
+          "subject": {
+            "approval_ref": "aar_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "content_digest": "sha256:c37b934bdc3faf4bdddc2d1967848bd01f532811c614302c63b7b26baf8ee031",
+            "gitops_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "proposal",
+            "service": "mctl-api",
+            "slug": "issue-895-demo"
+          }
+        },
+        "expected": {
+          "content_hash": "sha256:00ff9a2d968b06ef48ab7641cf971a9fa846c97a9d7de9b88840acbefa3105f6",
+          "id": "rc_00ff9a2d968b06ef"
+        },
+        "name": "proposal_worker_pass_store_execution_id"
       }
     ],
     "requests": [
@@ -393,6 +453,39 @@
           "id": "rr_0490877fca87f2bc"
         },
         "name": "proposal_manual_request"
+      },
+      {
+        "document": {
+          "api_version": "review.mctl.ai/v1alpha1",
+          "author_actors": [
+            "operator"
+          ],
+          "authoring_attempt_ids": [
+            "attempt-author"
+          ],
+          "authoring_execution_id": "we_7ea4cf0c-d8ba-4825-9191-888e17a47eec",
+          "authoring_lineage_root": "lineage-author",
+          "content_hash": "sha256:44d2abb4b79bb40bb6c95d3181ef4837ee8387ee3f4aab9fa85513b3d9b5384f",
+          "created_at": "2026-11-01T12:00:00Z",
+          "kind": "ReviewRequest",
+          "mode": "worker",
+          "nonce": "nonce-store-uuid",
+          "request_id": "rr_44d2abb4b79bb40b",
+          "rubric": "proposal_v1",
+          "subject": {
+            "approval_ref": "aar_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "content_digest": "sha256:c37b934bdc3faf4bdddc2d1967848bd01f532811c614302c63b7b26baf8ee031",
+            "gitops_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "proposal",
+            "service": "mctl-api",
+            "slug": "issue-895-demo"
+          }
+        },
+        "expected": {
+          "content_hash": "sha256:44d2abb4b79bb40bb6c95d3181ef4837ee8387ee3f4aab9fa85513b3d9b5384f",
+          "id": "rr_44d2abb4b79bb40b"
+        },
+        "name": "proposal_worker_request_store_execution_id"
       },
       {
         "document": {
@@ -2428,6 +2521,190 @@
         "mode": "worker",
         "nonce": "nonce-0001",
         "request_id": "rr_344e3179f1d1d963",
+        "rubric": "proposal_v1",
+        "subject": {
+          "content_digest": "sha256:c37b934bdc3faf4bdddc2d1967848bd01f532811c614302c63b7b26baf8ee031",
+          "gitops_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "proposal",
+          "service": "mctl-api",
+          "slug": "issue-895-demo"
+        }
+      },
+      "required_assurance": "independent"
+    },
+    {
+      "expected": "satisfied",
+      "live": {
+        "content_digest": "sha256:c37b934bdc3faf4bdddc2d1967848bd01f532811c614302c63b7b26baf8ee031",
+        "gitops_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "kind": "proposal",
+        "service": "mctl-api",
+        "slug": "issue-895-demo"
+      },
+      "name": "store_execution_ids_are_independent",
+      "note": "",
+      "receipts": [
+        {
+          "api_version": "review.mctl.ai/v1alpha1",
+          "assurance": "independent",
+          "attempt_id": "attempt-review",
+          "content_hash": "sha256:5a711387a4474f7025eaaec770996ccb561c03c9ed26aa826df24ed34fe5a244",
+          "created_at": "2026-11-01T12:00:00Z",
+          "criteria": [
+            {
+              "id": "scope_bounded",
+              "status": "met"
+            },
+            {
+              "id": "contracts_specified",
+              "status": "met"
+            },
+            {
+              "id": "acceptance_testable",
+              "status": "met"
+            },
+            {
+              "id": "rollback_defined",
+              "status": "met"
+            },
+            {
+              "id": "matches_issue",
+              "status": "met"
+            }
+          ],
+          "evidence_ref": "",
+          "findings_ref": {
+            "content_hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "kind": "review-findings",
+            "name": "findings"
+          },
+          "kind": "ReviewReceipt",
+          "lineage_root": "lineage-review",
+          "mode": "worker",
+          "nonce": "nonce-store-uuid",
+          "outcome": "PASS",
+          "receipt_id": "rc_5a711387a4474f70",
+          "request_id": "rr_074485759f183982",
+          "reviewer_actor": "reviewer-bot",
+          "reviewer_execution_id": "we_a11b5572-fed2-482b-bedf-2b4160476cb9",
+          "rubric": "proposal_v1",
+          "subject": {
+            "content_digest": "sha256:c37b934bdc3faf4bdddc2d1967848bd01f532811c614302c63b7b26baf8ee031",
+            "gitops_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "proposal",
+            "service": "mctl-api",
+            "slug": "issue-895-demo"
+          }
+        }
+      ],
+      "request": {
+        "api_version": "review.mctl.ai/v1alpha1",
+        "author_actors": [
+          "operator"
+        ],
+        "authoring_attempt_ids": [
+          "attempt-author"
+        ],
+        "authoring_execution_id": "we_7ea4cf0c-d8ba-4825-9191-888e17a47eec",
+        "authoring_lineage_root": "lineage-author",
+        "content_hash": "sha256:074485759f183982d2d47d9998c5e239e5259f2192731628eab86134440982c1",
+        "created_at": "2026-11-01T12:00:00Z",
+        "kind": "ReviewRequest",
+        "mode": "worker",
+        "nonce": "nonce-store-uuid",
+        "request_id": "rr_074485759f183982",
+        "rubric": "proposal_v1",
+        "subject": {
+          "content_digest": "sha256:c37b934bdc3faf4bdddc2d1967848bd01f532811c614302c63b7b26baf8ee031",
+          "gitops_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "proposal",
+          "service": "mctl-api",
+          "slug": "issue-895-demo"
+        }
+      },
+      "required_assurance": "independent"
+    },
+    {
+      "expected": "not_independent",
+      "live": {
+        "content_digest": "sha256:c37b934bdc3faf4bdddc2d1967848bd01f532811c614302c63b7b26baf8ee031",
+        "gitops_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "kind": "proposal",
+        "service": "mctl-api",
+        "slug": "issue-895-demo"
+      },
+      "name": "same_store_execution_is_not_independent",
+      "note": "",
+      "receipts": [
+        {
+          "api_version": "review.mctl.ai/v1alpha1",
+          "assurance": "independent",
+          "attempt_id": "attempt-review",
+          "content_hash": "sha256:634623a4f704a74de3c5c4e9600f2f590318b0d03f5aaa24d3bd1e0603bba4c2",
+          "created_at": "2026-11-01T12:00:00Z",
+          "criteria": [
+            {
+              "id": "scope_bounded",
+              "status": "met"
+            },
+            {
+              "id": "contracts_specified",
+              "status": "met"
+            },
+            {
+              "id": "acceptance_testable",
+              "status": "met"
+            },
+            {
+              "id": "rollback_defined",
+              "status": "met"
+            },
+            {
+              "id": "matches_issue",
+              "status": "met"
+            }
+          ],
+          "evidence_ref": "",
+          "findings_ref": {
+            "content_hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "kind": "review-findings",
+            "name": "findings"
+          },
+          "kind": "ReviewReceipt",
+          "lineage_root": "lineage-review",
+          "mode": "worker",
+          "nonce": "nonce-store-uuid",
+          "outcome": "PASS",
+          "receipt_id": "rc_634623a4f704a74d",
+          "request_id": "rr_074485759f183982",
+          "reviewer_actor": "reviewer-bot",
+          "reviewer_execution_id": "we_7ea4cf0c-d8ba-4825-9191-888e17a47eec",
+          "rubric": "proposal_v1",
+          "subject": {
+            "content_digest": "sha256:c37b934bdc3faf4bdddc2d1967848bd01f532811c614302c63b7b26baf8ee031",
+            "gitops_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "proposal",
+            "service": "mctl-api",
+            "slug": "issue-895-demo"
+          }
+        }
+      ],
+      "request": {
+        "api_version": "review.mctl.ai/v1alpha1",
+        "author_actors": [
+          "operator"
+        ],
+        "authoring_attempt_ids": [
+          "attempt-author"
+        ],
+        "authoring_execution_id": "we_7ea4cf0c-d8ba-4825-9191-888e17a47eec",
+        "authoring_lineage_root": "lineage-author",
+        "content_hash": "sha256:074485759f183982d2d47d9998c5e239e5259f2192731628eab86134440982c1",
+        "created_at": "2026-11-01T12:00:00Z",
+        "kind": "ReviewRequest",
+        "mode": "worker",
+        "nonce": "nonce-store-uuid",
+        "request_id": "rr_074485759f183982",
         "rubric": "proposal_v1",
         "subject": {
           "content_digest": "sha256:c37b934bdc3faf4bdddc2d1967848bd01f532811c614302c63b7b26baf8ee031",
@@ -4604,6 +4881,126 @@
       },
       "kind": "request",
       "name": "request_bad_authoring_execution_id"
+    },
+    {
+      "code": "review_malformed",
+      "document": {
+        "api_version": "review.mctl.ai/v1alpha1",
+        "author_actors": [
+          "operator"
+        ],
+        "authoring_attempt_ids": [
+          "attempt-author"
+        ],
+        "authoring_execution_id": "we_7EA4CF0C-D8BA-4825-9191-888E17A47EEC",
+        "authoring_lineage_root": "lineage-author",
+        "content_hash": "sha256:344e3179f1d1d96399b94121c79bdd4eb000bfb61fc41cff8843549219e03a36",
+        "created_at": "2026-11-01T12:00:00Z",
+        "kind": "ReviewRequest",
+        "mode": "worker",
+        "nonce": "nonce-0001",
+        "request_id": "rr_344e3179f1d1d963",
+        "rubric": "proposal_v1",
+        "subject": {
+          "content_digest": "sha256:c37b934bdc3faf4bdddc2d1967848bd01f532811c614302c63b7b26baf8ee031",
+          "gitops_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "proposal",
+          "service": "mctl-api",
+          "slug": "issue-895-demo"
+        }
+      },
+      "kind": "request",
+      "name": "request_uppercase_store_execution_id"
+    },
+    {
+      "code": "review_malformed",
+      "document": {
+        "api_version": "review.mctl.ai/v1alpha1",
+        "author_actors": [
+          "operator"
+        ],
+        "authoring_attempt_ids": [
+          "attempt-author"
+        ],
+        "authoring_execution_id": "we_7ea4cf0cd-8ba-4825-9191-888e17a47eec",
+        "authoring_lineage_root": "lineage-author",
+        "content_hash": "sha256:344e3179f1d1d96399b94121c79bdd4eb000bfb61fc41cff8843549219e03a36",
+        "created_at": "2026-11-01T12:00:00Z",
+        "kind": "ReviewRequest",
+        "mode": "worker",
+        "nonce": "nonce-0001",
+        "request_id": "rr_344e3179f1d1d963",
+        "rubric": "proposal_v1",
+        "subject": {
+          "content_digest": "sha256:c37b934bdc3faf4bdddc2d1967848bd01f532811c614302c63b7b26baf8ee031",
+          "gitops_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "proposal",
+          "service": "mctl-api",
+          "slug": "issue-895-demo"
+        }
+      },
+      "kind": "request",
+      "name": "request_store_execution_id_misplaced_hyphen"
+    },
+    {
+      "code": "review_malformed",
+      "document": {
+        "api_version": "review.mctl.ai/v1alpha1",
+        "author_actors": [
+          "operator"
+        ],
+        "authoring_attempt_ids": [
+          "attempt-author"
+        ],
+        "authoring_execution_id": "we_{7ea4cf0c-d8ba-4825-9191-888e17a47eec}",
+        "authoring_lineage_root": "lineage-author",
+        "content_hash": "sha256:344e3179f1d1d96399b94121c79bdd4eb000bfb61fc41cff8843549219e03a36",
+        "created_at": "2026-11-01T12:00:00Z",
+        "kind": "ReviewRequest",
+        "mode": "worker",
+        "nonce": "nonce-0001",
+        "request_id": "rr_344e3179f1d1d963",
+        "rubric": "proposal_v1",
+        "subject": {
+          "content_digest": "sha256:c37b934bdc3faf4bdddc2d1967848bd01f532811c614302c63b7b26baf8ee031",
+          "gitops_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "proposal",
+          "service": "mctl-api",
+          "slug": "issue-895-demo"
+        }
+      },
+      "kind": "request",
+      "name": "request_braced_store_execution_id"
+    },
+    {
+      "code": "review_malformed",
+      "document": {
+        "api_version": "review.mctl.ai/v1alpha1",
+        "author_actors": [
+          "operator"
+        ],
+        "authoring_attempt_ids": [
+          "attempt-author"
+        ],
+        "authoring_execution_id": "we_7ea4cf0c-d8ba-4825-9191-888e17a47eec\n",
+        "authoring_lineage_root": "lineage-author",
+        "content_hash": "sha256:344e3179f1d1d96399b94121c79bdd4eb000bfb61fc41cff8843549219e03a36",
+        "created_at": "2026-11-01T12:00:00Z",
+        "kind": "ReviewRequest",
+        "mode": "worker",
+        "nonce": "nonce-0001",
+        "request_id": "rr_344e3179f1d1d963",
+        "rubric": "proposal_v1",
+        "subject": {
+          "content_digest": "sha256:c37b934bdc3faf4bdddc2d1967848bd01f532811c614302c63b7b26baf8ee031",
+          "gitops_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "proposal",
+          "service": "mctl-api",
+          "slug": "issue-895-demo"
+        }
+      },
+      "kind": "request",
+      "name": "request_store_execution_id_trailing_newline"
     },
     {
       "code": "review_malformed",

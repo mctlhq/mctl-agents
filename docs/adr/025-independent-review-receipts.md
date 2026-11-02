@@ -4,7 +4,8 @@
 > **Date:** 2026-11-01
 > **Issue:** mctlhq/mctl-agents#905 (epic: mctlhq/.github#281, graph: mctlhq/.github#282)
 > **Implements (Tier A, pure):** `orchestrator/review_receipts.py`
-> **Pinned by:** `tests/test_review_receipts.py`, `tests/fixtures/review/spike_digest_vectors.json`
+> **Amended:** mctlhq/mctl-agents#977 (execution-id grammar; Tier B change in the linked mctl-api PR)
+> **Pinned by:** `tests/test_review_receipts.py`, `tests/fixtures/review/spike_digest_vectors.json`, `tests/fixtures/review/review_receipt_vectors.json`
 
 ## Decision
 
@@ -32,6 +33,19 @@ prefix + `content_hash[7:23]`, unknown keys rejected, strings bounded, `created_
 - `findings_ref` is an `ArtifactRef`-shaped hash pointer to private findings, never inline text.
 - `reviewer_actor`, `reviewer_execution_id` and `assurance` are authoritative only as filled by the Tier B
   server. Tier A validates shape.
+
+### Execution ids
+
+`authoring_execution_id`, when non-empty, must full-match exactly one of:
+
+- `we_<uuid>`: `we_` + lowercase canonical 8-4-4-4-12 hyphenated UUID, a work-item store execution as mctl-api
+  mints it (`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`);
+- `we_[0-9a-f]{16,64}`: legacy hex form, kept unchanged;
+- `ex-[0-9a-f]{16}`: runtime execution identity (ADR 011, `execution_identity.seal()`).
+
+Ids are never normalised and are compared byte-exact in the gate, so uppercase, braced, `urn:uuid:`-prefixed or
+misplaced-hyphen UUID text is refused with `review_malformed`. Tier A (`_EXECUTION_ID_RE`) and Tier B
+(`executionIDRE` in mctl-api) change only together; the shared vectors in `review_receipt_vectors.json` prove it.
 
 ## Subjects and digests
 
