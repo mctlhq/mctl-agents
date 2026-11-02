@@ -22,6 +22,18 @@ wiring the gate into shepherd or DevLoop is a separately approved slice.
 sealed like ADR 018: canonical JSON via `context_snapshot.canonical_json`, `content_hash` = `hash_bytes`, id =
 prefix + `content_hash[7:23]`, unknown keys rejected, strings bounded, `created_at` excluded from the hash.
 
+- `outcome` is one of `PASS`, `CHANGES_REQUESTED`, `NEEDS_HUMAN`, `UNOBSERVABLE`.
+- Criteria use the closed ids of the rubric the subject kind selects: `spike_v1` for `spike_report`
+  (`hypothesis_stated`, `method_described`, `measurements_present`, `measurements_reproducible`,
+  `claims_traceable_to_measurements`, `limitations_stated`), `proposal_v1` for `proposal` (`scope_bounded`,
+  `contracts_specified`, `acceptance_testable`, `rollback_defined`, `matches_issue`).
+- `PASS` needs every rubric criterion present and `met`. An `unobserved` criterion forces `UNOBSERVABLE` or
+  `NEEDS_HUMAN`.
+- `mode: manual` forces `assurance: advisory`; `mode: worker` is `independent`.
+- `findings_ref` is an `ArtifactRef`-shaped hash pointer to private findings, never inline text.
+- `reviewer_actor`, `reviewer_execution_id` and `assurance` are authoritative only as filled by the Tier B
+  server. Tier A validates shape.
+
 ### Execution ids
 
 `authoring_execution_id`, when non-empty, must full-match exactly one of:
@@ -34,18 +46,6 @@ prefix + `content_hash[7:23]`, unknown keys rejected, strings bounded, `created_
 Ids are never normalised and are compared byte-exact in the gate, so uppercase, braced, `urn:uuid:`-prefixed or
 misplaced-hyphen UUID text is refused with `review_malformed`. Tier A (`_EXECUTION_ID_RE`) and Tier B
 (`executionIDRE` in mctl-api) change only together; the shared vectors in `review_receipt_vectors.json` prove it.
-
-- `outcome` is one of `PASS`, `CHANGES_REQUESTED`, `NEEDS_HUMAN`, `UNOBSERVABLE`.
-- Criteria use the closed ids of the rubric the subject kind selects: `spike_v1` for `spike_report`
-  (`hypothesis_stated`, `method_described`, `measurements_present`, `measurements_reproducible`,
-  `claims_traceable_to_measurements`, `limitations_stated`), `proposal_v1` for `proposal` (`scope_bounded`,
-  `contracts_specified`, `acceptance_testable`, `rollback_defined`, `matches_issue`).
-- `PASS` needs every rubric criterion present and `met`. An `unobserved` criterion forces `UNOBSERVABLE` or
-  `NEEDS_HUMAN`.
-- `mode: manual` forces `assurance: advisory`; `mode: worker` is `independent`.
-- `findings_ref` is an `ArtifactRef`-shaped hash pointer to private findings, never inline text.
-- `reviewer_actor`, `reviewer_execution_id` and `assurance` are authoritative only as filled by the Tier B
-  server. Tier A validates shape.
 
 ## Subjects and digests
 

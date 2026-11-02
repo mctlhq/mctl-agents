@@ -466,5 +466,6 @@ def test_authoring_execution_id_forms(form, value, ok):
     if ok:
         assert request(execution=value).authoring_execution_id == value, form
     else:
-        with pytest.raises(ValueError):
+        with pytest.raises(rr.ReviewError) as exc:
             request(execution=value)
+        assert exc.value.code == rr.CODE_MALFORMED, form
