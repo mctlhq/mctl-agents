@@ -12,6 +12,10 @@ one outcome. Order, and no step runs after one refuses:
 The service credential and the run token meet only in this process. The
 model session sees neither, and holds no GitHub credential.
 
+The reviewer execution this run attaches is always advanced to a terminal
+phase before the run ends, whatever the outcome: ``Succeeded`` only when the
+receipt is stored, ``Failed`` otherwise (best effort, see ``_finish``).
+
 Exit codes: 0 stored; 2 refused; 3 disabled (the route answers 501
 `review_worker_ingest_disabled`); 4 unobserved. Anything but 0 means no
 receipt was observed, and none of them is a PASS or "no receipt".
@@ -27,6 +31,7 @@ import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from config.settings import AGENTS_DIR, SERVICE_AGENT_MODEL
 from orchestrator import evidence_producer
@@ -85,8 +90,48 @@ def _subject_and_material(args: RunArgs) -> tuple[rr.ReviewSubject, session.Mate
     return subject, spike
 
 
+async def sdk_runner(options: Any, prompt: str) -> str:
+    """The reviewer session: one traced SDK query. Its final
+    ``ResultMessage.result``, else the assistant text seen."""
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, query
+
+    from orchestrator import tracing
+
+    texts: list[str] = []
+    result = ""
+    with tracing.agent_run(c.AGENT_NAME, options.model or "") as trace_run:
+        async for message in query(prompt=prompt, options=options):
+            trace_run.observe(message)
+            if isinstance(message, AssistantMessage):
+                texts.extend(b.text for b in message.content if isinstance(b, TextBlock))
+            elif isinstance(message, ResultMessage) and isinstance(message.result, str):
+                result = message.result
+    return result or "\n".join(texts)
+
+
+def _finish(api: ReviewApi, item_id: str, run: wx.EngineRun, outcome: c.Outcome | None) -> None:
+    """Advance the reviewer execution this run attached to its terminal
+    phase: ``Succeeded`` only for a stored receipt, ``Failed`` for every other
+    end, an unexpected exception included (``outcome`` None). Best effort: a
+    refusal or an unreachable store is logged and never changes the outcome.
+
+    Unlike the investigator's ``_OwnExecution.finish`` this does NOT leave a
+    failed execution ``Running`` when ``MCTL_ENGINE_FINAL_ATTEMPT=false``.
+    The investigator's retry re-attaches the same engine run to the same work
+    item and needs that execution open; a review-worker retry opens a fresh
+    request with a fresh nonce, so it attaches to a different
+    ``review:<request_id>`` item, and nothing would ever end this one."""
+    phase = wx.PHASE_SUCCEEDED if outcome is not None and outcome.stored else wx.PHASE_FAILED
+    why = api.finish_reviewer(item_id, run, phase)
+    where = f"{run.engine}/{run.engine_ref} of {item_id}"
+    if why:
+        print(f"{LOG_PREFIX} warn: could not advance the reviewer execution {where} to {phase}: {why}", flush=True)
+    else:
+        print(f"{LOG_PREFIX} info: reviewer execution {where} -> {phase}", flush=True)
+
+
 def _flow(
-    args: RunArgs, api: ReviewApi, ev: evidence_producer.RunEvidence, runner: session.Runner | None,
+    args: RunArgs, api: ReviewApi, ev: evidence_producer.RunEvidence, runner: session.Runner,
 ) -> c.Outcome:
     facts = api.authoring_facts(args.authoring_execution_id)  # Stop: review_authoring_unresolved
     try:
@@ -108,8 +153,26 @@ def _flow(
     engine_run, _why = wx.engine_ref_from_env()
     if engine_run is None:
         raise c.Stop(c.refused("engine_ref_missing", 0))
-    execution_id, provenance = api.attach_reviewer(item_id, reviewer_engine_run(engine_run.engine_ref.split("#", 1)[0]))
-    ev.note_work_execution(execution_id, item_id)
+    reviewer_run = reviewer_engine_run(engine_run.engine_ref.split("#", 1)[0])
+    execution_id = api.attach_reviewer(item_id, reviewer_run)
+    # From here this run owns a Running execution: every end advances it.
+    outcome: c.Outcome | None = None
+    try:
+        ev.note_work_execution(execution_id, item_id)
+        outcome = _review_and_submit(args, api, ev, runner, request, material, execution_id)
+        return outcome
+    except c.Stop as stop:
+        outcome = stop.outcome
+        raise
+    finally:
+        _finish(api, item_id, reviewer_run, outcome)
+
+
+def _review_and_submit(
+    args: RunArgs, api: ReviewApi, ev: evidence_producer.RunEvidence, runner: session.Runner,
+    request: rr.ReviewRequest, material: session.Material, execution_id: str,
+) -> c.Outcome:
+    provenance = api.reviewer_provenance(execution_id)
     not_independent = c.check_independent(request, provenance)
     if not_independent:
         raise c.Stop(c.refused(not_independent))
@@ -152,7 +215,7 @@ def run(
     try:
         with evidence_producer.run(evidence_producer.STAGE_REVIEWER) as ev:
             try:
-                outcome = _flow(args, api, ev, runner)
+                outcome = _flow(args, api, ev, runner or sdk_runner)
             except c.Stop as stop:
                 outcome = stop.outcome
             _evidence_outcome(ev, outcome)

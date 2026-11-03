@@ -1452,20 +1452,35 @@ REVIEW_WORKER_TOOLS = ("Read", "Grep", "Glob")
 _REVIEW_WORKER_BLANKED_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "MCTL_TOKEN")
 
 
-def build_review_worker_options(agent_dir: Path, model: str) -> ClaudeAgentOptions:
+def build_review_worker_options(
+    agent_dir: Path,
+    model: str,
+    *,
+    subject_dir: Path | None = None,
+    system_prompt: str | None = None,
+) -> ClaudeAgentOptions:
     """Options for the review-worker's reviewer session (#986, ADR 025):
     read-only tools over the materialized subject, no MCP, no GitHub or
     mctl-api credential in the env, and the `independent-review` policy
-    checkpoint on every MCP-named call (none can be made)."""
+    checkpoint on every MCP-named call (none can be made).
+
+    `tools` (not only `allowed_tools`) is the closed set, so no other tool,
+    `Task` included, exists in the session. The working directory is the
+    subject copy (`subject_dir`; `agent_dir` only when none is given, as in
+    the manifest validator), and NO setting source is loaded: the subject is
+    untrusted and could carry a `CLAUDE.md` or `.claude/settings.json`. The
+    reviewer's instructions come in as `system_prompt` instead."""
     from orchestrator.policy_checkpoint import REVIEW_WORKER_POLICY
 
     allowed = list(REVIEW_WORKER_TOOLS)
     return _scrubbed(ClaudeAgentOptions(
-        cwd=str(agent_dir),
+        cwd=str(subject_dir or agent_dir),
         model=model,
+        tools=list(REVIEW_WORKER_TOOLS),
         allowed_tools=allowed,
+        system_prompt=system_prompt,
         mcp_servers={},
-        setting_sources=["project"],
+        setting_sources=[],
         permission_mode="default",
         max_budget_usd=REVIEW_WORKER_BUDGET_USD,
         env={**os.environ, **{name: "" for name in _REVIEW_WORKER_BLANKED_ENV}},

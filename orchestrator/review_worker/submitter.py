@@ -7,6 +7,7 @@ carry the HTTP status and mctl-api's typed ``code`` only.
 """
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -50,25 +51,47 @@ def _mint(api: ReviewApi, execution_id: str) -> tuple[run_token.RunToken | None,
     return minted, None
 
 
+def _as_submit_answer(item: Mapping[str, Any]) -> dict[str, Any]:
+    """One pool entry in the shape of a 201 submit answer, for ``classify``.
+
+    ``GET /api/v1/review-receipts`` (mctl-api ``ListReviewReceipts``) answers
+    ``{"receipts": [<stored receipt document>, ...], "count", "complete"}``:
+    each entry is the flat sealed receipt, with ``receipt_id``,
+    ``request_id``, ``mode``, ``assurance`` and ``content_hash`` at its top
+    level. The submit answer instead wraps that same document as
+    ``receipt`` next to envelope fields. An entry in the envelope shape is
+    read the same way: envelope fields from the entry, the document's own
+    fields only where the entry has none, and ``content_hash`` from the
+    document."""
+    inner = item.get("receipt")
+    doc: Mapping[str, Any] = inner if isinstance(inner, Mapping) else {}
+
+    def field(name: str) -> Any:
+        value = item.get(name)
+        return value if value is not None else doc.get(name)
+
+    content_hash = doc.get("content_hash") if isinstance(inner, Mapping) else item.get("content_hash")
+    return {
+        "request_id": field("request_id"), "mode": field("mode"), "assurance": field("assurance"),
+        "receipt_id": field("receipt_id"), "receipt": {"content_hash": content_hash},
+    }
+
+
 def _reconcile(api: ReviewApi, request_id: str) -> c.Outcome:
     """After an unobserved submit and a consumed nonce: ``stored`` only if the
-    pool holds an independent worker receipt for this request."""
+    pool holds an independent worker receipt for this request. An unreadable
+    pool is ``unobserved``, never an empty one."""
     pool = api.receipt_pool(request_id)
     for item in pool or []:
-        inner = item.get("receipt")
-        doc: Mapping[str, Any] = inner if isinstance(inner, Mapping) else item
-        outcome = c.classify(
-            201,
-            {
-                "request_id": doc.get("request_id"), "mode": doc.get("mode"), "assurance": doc.get("assurance"),
-                "receipt_id": item.get("receipt_id") or doc.get("receipt_id"),
-                "receipt": {"content_hash": doc.get("content_hash")},
-            },
-            request_id=request_id,
-        )
+        outcome = c.classify(201, _as_submit_answer(item), request_id=request_id)
         if outcome.stored:
             return outcome
     return c.unobserved(c.CODE_RECEIPT_UNOBSERVED)
+
+
+#: The pause before the one same-nonce retry. A 429 or a store blip answered
+#: again at once almost always repeats itself.
+RETRY_DELAY_SECONDS = 2.0
 
 
 def mint_and_submit(
@@ -77,7 +100,7 @@ def mint_and_submit(
     request: rr.ReviewRequest,
     draft: rr.ReviewReceipt,
     *,
-    sleep: Callable[[float], None] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> c.Outcome:
     """Submit ``draft`` as the reviewer execution ``execution_id``.
 
@@ -98,8 +121,8 @@ def mint_and_submit(
             outcome = c.classify(status, payload, request_id=request.request_id)
             if outcome.state != c.STATE_UNOBSERVED:
                 break
-            if attempt == 1 and sleep is not None:
-                sleep(1.0)
+            if attempt == 1:
+                sleep(RETRY_DELAY_SECONDS)
         # `outcome` is from the last attempt. A consumed nonce after an
         # unobserved first attempt may be our own receipt: only the pool says.
         if outcome.code == c.CODE_NONCE_CONSUMED and attempt == 2:

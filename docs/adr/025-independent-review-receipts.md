@@ -136,13 +136,23 @@ no step running after one refuses:
    attach target: mctl-api allows one non-terminal execution per item and refuses an attach to a terminal one;
 4. check independence locally (`attached_direct_service`, execution id, attempt id and lineage root differ from
    the authoring ones) before any token is minted;
-5. run a read-only session (`Read`, `Grep`, `Glob`; no MCP, no GitHub credential) over a read-only copy of the
-   subject, whose digest is re-verified first; the findings text stays in a private artifact and only its sha256
-   leaves the process;
+5. run a read-only session over a read-only copy of the subject, whose digest is re-verified first. The copy is
+   the session's working directory; `Read`, `Grep` and `Glob` are the only tools that exist in it (no `Task`, no
+   MCP, no GitHub credential); no setting source is loaded, because the subject is untrusted; the reviewer's
+   rules (`agents/_review_worker/.claude/agents/review-worker.md`) are the system prompt. The answer is one JSON
+   verdict, bare or in one surrounding code fence. The findings text stays in a private artifact and only its
+   sha256 leaves the process;
 6. mint a `review`-scoped run token (900 s) bound to the reviewer execution, submit exactly `request_id`,
    `subject`, `nonce`, `outcome`, `criteria`, `findings_ref`, `evidence_ref`, and revoke the token;
 7. seal `ExecutionEvidence` for stage `reviewer` with `ArtifactRef(kind="review-receipt")` (the receipt id and
    content hash) and no text.
+
+Once step 3 attached the reviewer execution, every end of the run advances it to a terminal phase (best effort,
+never changing the outcome): `Succeeded` only for a stored receipt, `Failed` otherwise. That holds on a non-final
+engine attempt too: a retry opens a fresh request, so it attaches to a different `review:<request_id>` item and
+would never end this execution. mctl-api keys executions on `(work_item_id, engine, engine_ref)`, which is also
+why a retry of the same Workflow (engine ref `<workflow>#review`) gets a new execution rather than
+`EXECUTION_EXISTING`; an existing execution on the run's own item is refused, never reused.
 
 Outcomes. `stored` only for a 201 that says `mode=worker`, `assurance=independent` and the submitted
 `request_id`. `disabled` is `501 review_worker_ingest_disabled`. `unobserved` is a 5xx, a typed unavailable code
@@ -154,8 +164,10 @@ Outcomes. `stored` only for a 201 that says `mode=worker`, `assurance=independen
 `review_request_not_found`, `review_binding_mismatch`, `review_execution_unproven`, `review_request_conflict`,
 `review_not_permitted`, `agent_unknown`, and the Tier A codes). None of `disabled`, `unobserved` or `refused` is
 a PASS, and none is "no receipt". After one `unobserved` submit, one retry with the same nonce is allowed; a
-`review_nonce_consumed` answer to that retry is reconciled through `GET /api/v1/review-receipts` and is `stored`
-only if the pool holds an independent worker receipt for the request.
+`review_nonce_consumed` answer to that retry is reconciled through `GET /api/v1/review-receipts` (the complete
+pool, each entry the flat stored receipt document) and is `stored` only if the pool holds an independent worker
+receipt for the request; an unreadable pool is `unobserved`. A failed or crashed reviewer session, an unreadable
+subject and a report path outside the report root are typed refusals, never an uncaught exception.
 
 Decision on `evidence_ref`: the submit sends `evidence_ref=""` (Tier A permits it). The envelope's
 `review-receipt` artifact is the authoritative link from run to receipt; a two-envelope scheme was rejected

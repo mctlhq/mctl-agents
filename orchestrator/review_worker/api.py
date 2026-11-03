@@ -192,10 +192,17 @@ class ReviewApi:
             raise c.Stop(c.refused(answer.code or "work_item_refused", status))
         raise c.Stop(c.classify_failure(status, payload) if status else c.unobserved("work_item_unobserved"))
 
-    def attach_reviewer(self, work_item_id: str, run: wx.EngineRun) -> tuple[str, c.Provenance]:
-        """Attach a NEW execution for the reviewer run to ``work_item_id``.
-        Only ``EXECUTION_ATTACHED`` is usable: an existing execution means an
-        earlier review reused this engine run and is never reused."""
+    def attach_reviewer(self, work_item_id: str, run: wx.EngineRun) -> str:
+        """Attach a NEW execution for the reviewer run to ``work_item_id`` and
+        return its id. Only ``EXECUTION_ATTACHED`` is usable: an existing
+        execution is never reused.
+
+        mctl-api keys an execution on ``(work_item_id, engine, engine_ref)``
+        and every run opens a fresh request (a fresh nonce, so a fresh
+        ``request_id`` and its own ``review:<request_id>`` item). An Argo
+        retry of the same Workflow therefore attaches to a new item and gets
+        ``EXECUTION_ATTACHED``; an existing execution on this item was put
+        there by someone else, and is refused as the design says."""
         body = wx.attach_body(run, PHASE_RUNNING)
         if not self._governed(wx.ATTACH_EXECUTION_OPERATION, work_item_id, body):
             raise c.Stop(c.refused("policy_denied"))
@@ -212,19 +219,42 @@ class ReviewApi:
             raise c.Stop(c.refused(c.code_of(payload) or "execution_attach_refused", status))
         if answer.verdict != wx.EXECUTION_ATTACHED:
             raise c.Stop(c.unobserved("execution_attach_unobserved", status))
-        execution_id = answer.execution_id
+        return answer.execution_id
+
+    def reviewer_provenance(self, execution_id: str) -> c.Provenance:
+        """What mctl-api recorded for the reviewer execution just attached."""
         pstatus, record = self._provenance(execution_id)
         if pstatus == 404:
             raise c.Stop(c.refused(c.CODE_EXECUTION_UNPROVEN, pstatus))
         if pstatus != 200:
             raise c.Stop(c.classify_failure(pstatus, record))
         attempt, lineage = record.get("attempt_id"), record.get("lineage_root")
-        return execution_id, c.Provenance(
+        return c.Provenance(
             execution_id=execution_id,
             attempt_id=attempt if isinstance(attempt, str) else "",
             lineage_root=lineage if isinstance(lineage, str) else "",
             attached_direct_service=record.get("attached_direct_service") is True,
         )
+
+    def finish_reviewer(self, work_item_id: str, run: wx.EngineRun, phase: str) -> str:
+        """Advance the reviewer execution to the terminal ``phase``. Best
+        effort: returns "" when the store confirmed it, else why not. Never
+        raises, and never changes the run's outcome."""
+        body = wx.attach_body(run, phase)
+        try:
+            if not self._governed(wx.ATTACH_EXECUTION_OPERATION, work_item_id, body):
+                return "policy_denied"
+            status, payload = self.request(
+                "POST", f"/api/v1/work-items/{_q(work_item_id)}/executions", json=body,
+            )
+        except c.Stop as stop:  # no service credential
+            return stop.outcome.label
+        except Exception as exc:  # noqa: BLE001 - best effort, never the run's outcome
+            return type(exc).__name__
+        answer = wx.answer_from_attach(
+            status, payload if isinstance(payload, dict) else {}, work_item_id=work_item_id, run=run, phase=phase,
+        )
+        return "" if answer.usable else (c.code_of(payload) or answer.verdict)
 
     # -- reconciliation ------------------------------------------------------
     def receipt_pool(self, request_id: str) -> list[Mapping[str, Any]] | None:

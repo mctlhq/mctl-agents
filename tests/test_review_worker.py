@@ -36,6 +36,7 @@ TOKEN = "art_" + "S3cretTokenValue" * 3
 RECEIPT_ID = "rc_" + "1" * 16
 RECEIPT_HASH = "sha256:" + "2" * 64
 GITOPS_COMMIT = "b" * 40
+TERMINAL_PHASES = frozenset({"Succeeded", "Failed"})
 
 
 def _attempt(ref: str) -> str:
@@ -61,6 +62,10 @@ class FakeApi:
         self.pool: list[dict[str, Any]] = []
         self.minted_tokens: list[str] = []
         self.revoked: list[str] = []
+        self.phases: list[tuple[str, str]] = []  # (execution id, phase) per accepted attach
+
+    def final_phases(self) -> dict[str, str]:
+        return {eid: ex["phase"] for eid, ex in self.executions.items()}
 
     def on(self, method: str, pattern: str, fn: Callable[[httpx.Request, Any], httpx.Response]) -> None:
         self.overrides.insert(0, (method, re.compile(pattern), fn))
@@ -115,12 +120,31 @@ class FakeApi:
             return httpx.Response(201, json={"schema_version": "workitem/v1", "work_item": {
                 "id": item_id, "tenant": body["tenant"], "external_key": body["external_key"], "state": "active"}})
         if method == "POST" and (m := re.fullmatch(r"/api/v1/work-items/([^/]+)/executions", path)):
+            # mctl-api: an execution is keyed on (work_item_id, engine,
+            # engine_ref); re-attaching it moves its phase (200), and an item
+            # holds one non-terminal execution at a time.
             item_id = m.group(1)
+            key = (item_id, body["engine"], body["engine_ref"])
+            existing = next((eid for eid, ex in self.executions.items()
+                             if (ex["work_item_id"], ex["engine"], ex["engine_ref"]) == key), None)
+            if existing is not None:
+                ex = self.executions[existing]
+                if ex["phase"] in TERMINAL_PHASES and body["phase"] != ex["phase"]:
+                    return httpx.Response(409, json={"code": "execution_terminal"})
+                ex["phase"] = body["phase"]
+                self.phases.append((existing, body["phase"]))
+                if body["phase"] in TERMINAL_PHASES:
+                    self.busy_items.discard(item_id)
+                return httpx.Response(200, json={"schema_version": "workitem/v1", "execution": {
+                    "id": existing, "work_item_id": item_id, "engine": body["engine"],
+                    "engine_ref": body["engine_ref"], "phase": body["phase"], "attempt": 1}})
             if item_id in self.busy_items:
                 return httpx.Response(409, json={"code": "execution_active"})
             execution_id = "we_" + format(len(self.executions) + 1, "x").rjust(32, "0")
             self.executions[execution_id] = {**body, "work_item_id": item_id}
-            self.busy_items.add(item_id)
+            self.phases.append((execution_id, body["phase"]))
+            if body["phase"] not in TERMINAL_PHASES:
+                self.busy_items.add(item_id)
             return httpx.Response(201, json={"schema_version": "workitem/v1", "execution": {
                 "id": execution_id, "work_item_id": item_id, "engine": body["engine"],
                 "engine_ref": body["engine_ref"], "phase": body["phase"], "attempt": 1}})
@@ -150,6 +174,12 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> FakeApi:
     monkeypatch.delenv("MCTL_ENGINE_REF", raising=False)
     monkeypatch.delenv("MCTL_ENGINE", raising=False)
     return FakeApi()
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_pause(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The production default pauses before the one retry; tests do not wait.
+    monkeypatch.setattr(submitter, "RETRY_DELAY_SECONDS", 0.0)
 
 
 @pytest.fixture
@@ -249,6 +279,7 @@ EXPECTED_ORDER = [
     ("POST", "/agent-run-tokens", "service"),
     ("POST", "/review-receipts", "art"),
     ("POST", "/self/revoke", "art"),
+    ("POST", "/executions", "service"),  # the reviewer execution's terminal phase
 ]
 
 
@@ -413,13 +444,60 @@ def _request_id(fake: FakeApi) -> str:
     return next(b for _m, p, _a, b in fake.calls if p == "/api/v1/review-requests")["request_id"]
 
 
-def test_t5_consumed_nonce_reconciled_from_the_pool(fake: FakeApi, tmp_path: Path) -> None:
+def _stored_document(request_id: str, **over: Any) -> dict[str, Any]:
+    """A stored receipt document as mctl-api keeps it (`ReviewReceipt.to_dict`
+    keys, server fields filled): the element of `GET /review-receipts`."""
+    doc = {
+        "api_version": rr.API_VERSION, "kind": rr.RECEIPT_KIND, "request_id": request_id,
+        "subject": {"kind": rr.SUBJECT_PROPOSAL}, "rubric": rr.RUBRIC_PROPOSAL, "outcome": "PASS",
+        "criteria": [], "findings_ref": {"name": "f", "kind": "review-findings", "content_hash": RECEIPT_HASH},
+        "mode": "worker", "assurance": "independent", "reviewer_actor": "agent:review-worker",
+        "reviewer_execution_id": "we_" + "1" * 32, "attempt_id": "a", "lineage_root": "l", "nonce": "n",
+        "evidence_ref": "", "receipt_id": RECEIPT_ID, "content_hash": RECEIPT_HASH,
+        "created_at": "2026-11-03T00:00:00Z",
+    }
+    return {**doc, **over}
+
+
+def _pool_answer(entries: list[dict[str, Any]]) -> httpx.Response:
+    # mctl-api ListReviewReceipts: the complete pool, every element the flat document.
+    return httpx.Response(200, json={"receipts": entries, "count": len(entries), "complete": True})
+
+
+def test_t5_consumed_nonce_reconciled_from_the_real_pool_shape(fake: FakeApi, tmp_path: Path) -> None:
     _consumed_after_unobserved(fake)
-    fake.on("GET", "^/api/v1/review-receipts$", lambda _r, _b: httpx.Response(200, json={"receipts": [{
-        "receipt_id": RECEIPT_ID, "request_id": _request_id(fake), "mode": "worker",
-        "assurance": "independent", "content_hash": RECEIPT_HASH}]}))
+    fake.on("GET", "^/api/v1/review-receipts$", lambda _r, _b: _pool_answer([
+        _stored_document("rr_" + "9" * 16, receipt_id="rc_" + "9" * 16),  # someone else's, first
+        _stored_document(_request_id(fake)),
+    ]))
     outcome = run(fake, proposal_args(tmp_path))
-    assert outcome.stored and outcome.receipt_id == RECEIPT_ID
+    assert outcome.stored and outcome.receipt_id == RECEIPT_ID and outcome.content_hash == RECEIPT_HASH
+
+
+def test_t5_pool_entry_in_the_submit_envelope_shape_is_read_from_the_right_level(
+    fake: FakeApi, tmp_path: Path,
+) -> None:
+    """agy P2 on #990: an entry shaped like the 201 submit answer (envelope
+    fields beside a nested `receipt` that holds only `content_hash`) used to
+    be read entirely from the nested level, lost `mode`, `assurance` and
+    `request_id`, and ended `unobserved` despite a stored receipt."""
+    _consumed_after_unobserved(fake)
+    fake.on("GET", "^/api/v1/review-receipts$", lambda _r, _b: _pool_answer([{
+        "receipt_id": RECEIPT_ID, "request_id": _request_id(fake), "mode": "worker", "assurance": "independent",
+        "tenant": AUTHORING_TENANT, "receipt": {"content_hash": RECEIPT_HASH}}]))
+    outcome = run(fake, proposal_args(tmp_path))
+    assert outcome.stored and outcome.content_hash == RECEIPT_HASH
+
+
+@pytest.mark.parametrize("over", [{"assurance": "advisory"}, {"mode": "manual"}, {"content_hash": "x"}])
+def test_t5_pool_entry_that_is_not_our_independent_receipt_is_not_stored(
+    fake: FakeApi, tmp_path: Path, over: dict[str, Any],
+) -> None:
+    _consumed_after_unobserved(fake)
+    fake.on("GET", "^/api/v1/review-receipts$",
+            lambda _r, _b: _pool_answer([_stored_document(_request_id(fake), **over)]))
+    outcome = run(fake, proposal_args(tmp_path))
+    assert outcome.state == c.STATE_UNOBSERVED and outcome.code == c.CODE_RECEIPT_UNOBSERVED
 
 
 @pytest.mark.parametrize("pool", [[], [{"receipt_id": RECEIPT_ID, "request_id": "rr_other", "mode": "worker",
@@ -879,3 +957,286 @@ def test_t12_manifest_validates_and_matches_the_companion_profile(
     (profiles / "profile.yaml").write_text(COMPANION_PROFILE)
     monkeypatch.setattr(vm, "GITOPS_CATALOG_PROFILES_DIR", profiles.parent)
     assert vm.check_catalog_profiles_match_builders({"review-worker": manifest}) == []
+
+
+# ---------------------------------------------------------------------------
+# The reviewer execution always ends in a terminal phase (claude P2 on #990)
+# ---------------------------------------------------------------------------
+def _reviewer_phases(fake: FakeApi) -> dict[str, str]:
+    return {eid: phase for eid, phase in fake.final_phases().items()}
+
+
+def test_terminal_phase_succeeded_when_stored(fake: FakeApi, tmp_path: Path) -> None:
+    assert run(fake, proposal_args(tmp_path)).stored
+    (eid,) = fake.executions
+    assert _reviewer_phases(fake) == {eid: "Succeeded"}
+    assert [ph for e, ph in fake.phases if e == eid] == ["Running", "Succeeded"]
+    item = fake.executions[eid]["work_item_id"]
+    assert item not in fake.busy_items  # the item holds no non-terminal execution any more
+
+
+@pytest.mark.parametrize(
+    ("arrange", "state"),
+    [
+        (lambda f: f.respond("POST", "^/api/v1/review-receipts$", 409, {"code": "review_reviewer_not_independent"}),
+         c.STATE_REFUSED),
+        (lambda f: f.respond("POST", "^/api/v1/review-receipts$", 501, {"code": "review_worker_ingest_disabled"}),
+         c.STATE_DISABLED),
+        (lambda f: f.respond("POST", "^/api/v1/review-receipts$", 503, {"code": "review_store_unavailable"}),
+         c.STATE_UNOBSERVED),
+        (lambda f: f.respond("POST", "^/api/v1/agent-run-tokens$", 400, {"code": "agent_unknown"}),
+         c.STATE_REFUSED),
+    ],
+)
+def test_terminal_phase_failed_for_every_end_without_a_receipt(
+    fake: FakeApi, tmp_path: Path, arrange: Callable[[FakeApi], None], state: str,
+) -> None:
+    arrange(fake)
+    outcome = run(fake, proposal_args(tmp_path))
+    assert outcome.state == state
+    assert list(_reviewer_phases(fake).values()) == ["Failed"]
+
+
+def test_terminal_phase_failed_when_a_stop_ends_the_run_after_the_attach(fake: FakeApi, tmp_path: Path) -> None:
+    # The session refuses (malformed verdict): no mint, but the execution still ends.
+    outcome = run(fake, proposal_args(tmp_path), Runner("not json"))
+    assert outcome.code == c.CODE_VERDICT_MALFORMED
+    assert list(_reviewer_phases(fake).values()) == ["Failed"]
+
+
+def test_terminal_phase_failed_when_the_reviewer_provenance_is_unreadable(fake: FakeApi, tmp_path: Path) -> None:
+    def provenance(request: httpx.Request, _body: Any) -> httpx.Response:
+        if request.url.path.split("/")[4] == AUTHORING_EXEC:
+            return httpx.Response(200, json={"provenance": AUTHORING_PROVENANCE})
+        return httpx.Response(503, json={"code": "execution_provenance_unavailable"})
+
+    fake.on("GET", r"/provenance$", provenance)
+    outcome = run(fake, proposal_args(tmp_path))
+    assert outcome.state == c.STATE_UNOBSERVED
+    assert list(_reviewer_phases(fake).values()) == ["Failed"]
+
+
+def test_terminal_phase_failed_on_an_unexpected_exception(fake: FakeApi, tmp_path: Path,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_a: Any, **_k: Any) -> c.Outcome:
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(submitter, "mint_and_submit", boom)
+    with pytest.raises(RuntimeError):
+        run(fake, proposal_args(tmp_path))
+    assert list(_reviewer_phases(fake).values()) == ["Failed"]
+
+
+def test_terminal_phase_failed_even_when_the_engine_will_retry(fake: FakeApi, tmp_path: Path,
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unlike the investigator, a non-final attempt still ends its execution:
+    the retry opens a new request and attaches to a different item."""
+    monkeypatch.setenv("MCTL_ENGINE_FINAL_ATTEMPT", "false")
+    run(fake, proposal_args(tmp_path), Runner("not json"))
+    assert list(_reviewer_phases(fake).values()) == ["Failed"]
+
+
+def test_an_argo_retry_of_the_same_workflow_attaches_a_new_execution(fake: FakeApi, tmp_path: Path) -> None:
+    """claude P2 on #990 feared a retry would meet its first attempt's
+    execution (EXECUTION_EXISTING -> refused). Executions are keyed per work
+    item and each run opens its own `review:<request_id>` item, so the retry
+    attaches anew and can store; the first attempt's execution ended Failed."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    first = run(fake, proposal_args(tmp_path / "a"), Runner("not json"))
+    assert first.code == c.CODE_VERDICT_MALFORMED
+    second = run(fake, proposal_args(tmp_path / "b"))
+    assert second.stored
+    assert sorted(_reviewer_phases(fake).values()) == ["Failed", "Succeeded"]
+    items = {ex["work_item_id"] for ex in fake.executions.values()}
+    assert len(items) == 2
+    assert {ex["engine_ref"] for ex in fake.executions.values()} == {f"{REVIEW_WORKFLOW}#review"}
+
+
+def test_no_terminal_attach_for_an_execution_this_run_did_not_attach(fake: FakeApi, tmp_path: Path) -> None:
+    fake.respond("POST", r"/executions$", 409, {"code": "execution_active"})
+    outcome = run(fake, proposal_args(tmp_path))
+    assert outcome.code == "execution_active"
+    assert len([p for m, p, _a, _b in fake.calls if m == "POST" and p.endswith("/executions")]) == 1
+
+
+def test_a_refused_terminal_attach_never_changes_the_outcome(fake: FakeApi, tmp_path: Path,
+                                                             capsys: pytest.CaptureFixture[str]) -> None:
+    calls = {"n": 0}
+    real = fake._default
+
+    def attach(request: httpx.Request, body: Any) -> httpx.Response:
+        calls["n"] += 1
+        if body["phase"] != "Running":
+            return httpx.Response(503, json={"code": "work_items_unavailable"})
+        return real(request, request.url.path, body, "service")
+
+    fake.on("POST", r"/executions$", attach)
+    assert run(fake, proposal_args(tmp_path)).stored
+    assert calls["n"] == 2
+    assert "could not advance the reviewer execution" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Session: a workable read-only reviewer (agy P2 on #990)
+# ---------------------------------------------------------------------------
+def test_session_runs_in_the_subject_copy_with_its_instructions(fake: FakeApi, tmp_path: Path) -> None:
+    runner = Runner()
+    assert run(fake, proposal_args(tmp_path), runner).stored
+    options, prompt = runner.options[0], runner.prompts[0]
+    cwd = Path(options.cwd)
+    assert cwd.name == session.SUBJECT_DIRNAME
+    assert options.setting_sources == []  # nothing from the untrusted subject is loaded as config
+    assert options.tools == list(REVIEW_WORKER_TOOLS) == options.allowed_tools  # no Task, no sub-agent
+    assert options.system_prompt and "independent reviewer" in options.system_prompt
+    assert not options.system_prompt.startswith("---")  # frontmatter stripped
+    assert "sub-agent" not in prompt and "current working directory" in prompt
+    for name in ("requirements.md", "design.md", "tasks.md"):
+        assert f"- {name}" in prompt
+
+
+def test_reviewer_instructions_missing_stops_before_the_model(fake: FakeApi, tmp_path: Path,
+                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rrw, "REVIEW_WORKER_DIR", tmp_path / "nowhere")
+    runner = Runner()
+    outcome = run(fake, proposal_args(tmp_path), runner)
+    assert outcome.code == session.CODE_INSTRUCTIONS_MISSING and runner.prompts == []
+    assert fake.count("agent-run-tokens") == 0
+
+
+def test_a_failing_sdk_session_is_a_typed_refusal(fake: FakeApi, tmp_path: Path) -> None:
+    class Crashing(Runner):
+        async def __call__(self, options: Any, prompt: str) -> str:
+            raise ConnectionError("cli died")
+
+    outcome = run(fake, proposal_args(tmp_path), Crashing())
+    assert outcome.state == c.STATE_REFUSED and outcome.code == session.CODE_SESSION_FAILED
+    assert fake.count("agent-run-tokens") == 0
+    assert list(_reviewer_phases(fake).values()) == ["Failed"]
+
+
+def test_sdk_runner_returns_the_result_and_traces(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import claude_agent_sdk as sdk
+
+    from orchestrator import tracing
+
+    seen: list[str] = []
+
+    class Trace:
+        def observe(self, message: Any) -> None:
+            seen.append(type(message).__name__)
+
+    class Ctx:
+        def __enter__(self) -> Trace:
+            return Trace()
+
+        def __exit__(self, *_exc: Any) -> None:
+            return None
+
+    agents: list[str] = []
+    monkeypatch.setattr(tracing, "agent_run", lambda name, model: agents.append(name) or Ctx())
+    assistant = sdk.AssistantMessage(content=[sdk.TextBlock(text="thinking")], model="m")
+    result = sdk.ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=1,
+                               session_id="s", result=json.dumps(PASS_VERDICT))
+
+    async def query(*, prompt: str, options: Any) -> Any:
+        assert prompt == "p" and options.model == "m"
+        for message in (assistant, result):
+            yield message
+
+    monkeypatch.setattr(sdk, "query", query)
+    options = build_review_worker_options(tmp_path, "m", subject_dir=tmp_path)
+    assert json.loads(asyncio.run(rrw.sdk_runner(options, "p"))) == PASS_VERDICT
+    assert agents == ["review-worker"] and seen == ["AssistantMessage", "ResultMessage"]
+
+    async def text_only(*, prompt: str, options: Any) -> Any:
+        yield assistant
+
+    monkeypatch.setattr(sdk, "query", text_only)
+    assert asyncio.run(rrw.sdk_runner(options, "p")) == "thinking"
+
+
+def test_run_uses_the_sdk_runner_by_default(fake: FakeApi, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    async def fake_sdk(options: Any, prompt: str) -> str:
+        calls.append(prompt)
+        return json.dumps(PASS_VERDICT)
+
+    monkeypatch.setattr(rrw, "sdk_runner", fake_sdk)
+    assert rrw.run(proposal_args(tmp_path), api=make_api(fake)).stored
+    assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Verdict parsing: one surrounding fence, nothing looser (claude P3 on #990)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("fence", ["```json\n{}\n```", "```\n{}\n```", "  ```json\n{}\n```\n"])
+def test_parse_verdict_accepts_one_surrounding_fence(fence: str) -> None:
+    outcome, criteria, findings = session.parse_verdict(fence.replace("{}", json.dumps(PASS_VERDICT)))
+    assert outcome == "PASS" and findings == PASS_VERDICT["findings"] and len(criteria) == len(PASS_VERDICT["criteria"])
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Here is my verdict:\n```json\n{}\n```",
+        "```json\n{}\n```\nThanks.",
+        "```json\n```json\n{}\n```\n```",
+        "```json {} ```",
+        "```json\n{\"outcome\": \"PASS\", \"criteria\": [], \"findings\": \"x\", \"extra\": 1}\n```",
+    ],
+)
+def test_parse_verdict_rejects_anything_but_one_clean_fence(text: str) -> None:
+    with pytest.raises(session.SessionError) as info:
+        session.parse_verdict(text.replace("{}", json.dumps(PASS_VERDICT)))
+    assert info.value.code == c.CODE_VERDICT_MALFORMED
+
+
+def test_a_fenced_verdict_is_stored_through_the_run(fake: FakeApi, tmp_path: Path) -> None:
+    assert run(fake, proposal_args(tmp_path), Runner(f"```json\n{json.dumps(PASS_VERDICT)}\n```")).stored
+
+
+# ---------------------------------------------------------------------------
+# Retry pause (claude P3 / agy P3 on #990)
+# ---------------------------------------------------------------------------
+def test_the_retry_pauses_by_default() -> None:
+    import inspect
+    import time
+
+    assert inspect.signature(submitter.mint_and_submit).parameters["sleep"].default is time.sleep
+
+
+def test_the_one_retry_pauses_once_before_it_fires(fake: FakeApi, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(submitter, "RETRY_DELAY_SECONDS", 2.0)
+    fake.respond("POST", "^/api/v1/review-receipts$", 503, {"code": "review_store_unavailable"})
+    request = _sealed_request()
+    draft = rr.seal_receipt(request=request, outcome="UNOBSERVABLE", criteria=[])
+    pauses: list[float] = []
+    outcome = submitter.mint_and_submit(make_api(fake), "we_" + "1" * 32, request, draft, sleep=pauses.append)
+    assert outcome.state == c.STATE_UNOBSERVED
+    assert pauses == [2.0] and fake.count("/review-receipts") == 2
+
+
+# ---------------------------------------------------------------------------
+# Spike subject paths stay inside the report root (agy P3 on #990)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("report_path", ["/etc/passwd", "../outside.md", "measurements/../../outside.md", ""])
+def test_a_report_path_outside_the_root_is_a_typed_refusal(fake: FakeApi, tmp_path: Path, report_path: str) -> None:
+    (tmp_path / "outside.md").write_text("x")
+    outcome = run(fake, spike_args(tmp_path, report_path=report_path), Runner(SPIKE_PASS_VERDICT))
+    assert outcome.state == c.STATE_REFUSED and outcome.code == rr.CODE_BAD_SUBJECT
+    assert fake.paths("POST") == []  # nothing was opened
+
+
+def test_a_symlinked_measurements_dir_is_refused(tmp_path: Path) -> None:
+    root = tmp_path / "spike"
+    root.mkdir()
+    (root / "report.md").write_text("# r\n")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "secret.txt").write_text("s")
+    (root / "measurements").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(session.SessionError) as info:
+        session.read_spike_dir(root, "report.md")
+    assert info.value.code == c.CODE_SUBJECT_MISMATCH
