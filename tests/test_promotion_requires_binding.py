@@ -51,7 +51,6 @@ _BOUND_AGENTS = frozenset(
         "incident-responder",
         "issue-investigator",
         "mentor",
-        "review-worker",  # mctlhq/mctl-agents#986: binding comes with the mctl-gitops companion
         "scout",
         "service-agent",
         "shepherd",
@@ -253,11 +252,12 @@ def test_listing_an_agent_as_unbound_quiets_only_its_missing_binding(registry, u
     assert outcome.fails_release
 
 
-def test_no_shipped_agent_is_listed_as_unbound():
-    """Every shipped agent has a binding since mctl-gitops#1683, so the real
-    set is empty and a missing binding is loud for all of them. Listing an
-    agent again is a decision: change this test in the same commit."""
-    assert publish_agent_release.UNBOUND_AGENTS == frozenset()
+def test_only_review_worker_is_listed_as_unbound():
+    """Every shipped agent has had a binding since mctl-gitops#1683, so a
+    missing binding is loud for all of them. review-worker (#986) ships its
+    manifest ahead of the mctl-gitops companion that binds it. Listing or
+    unlisting an agent is a decision: change this test in the same commit."""
+    assert publish_agent_release.UNBOUND_AGENTS == frozenset({"review-worker"})
 
 
 def test_every_manifest_is_classified_as_bound():
@@ -268,7 +268,6 @@ def test_every_manifest_is_classified_as_bound():
     real = {p.parent.name for p in _MANIFESTS.glob("*/agent.yaml")}
     assert real == _BOUND_AGENTS | publish_agent_release.UNBOUND_AGENTS
     assert not (_BOUND_AGENTS & publish_agent_release.UNBOUND_AGENTS)
-    assert real == _BOUND_AGENTS
 
 
 def test_every_refusal_points_at_the_runbook(registry):
