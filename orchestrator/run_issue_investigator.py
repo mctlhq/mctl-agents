@@ -192,7 +192,10 @@ def _commerce_runtime() -> Any:
     from orchestrator import action_approvals
     from orchestrator.commerce_gateway import CommerceRuntime
 
-    return CommerceRuntime.from_env(approvals=action_approvals.ActionApprovalClient())
+    # scoped=False: the investigate scope does not admit the action-approval
+    # routes and this path has always used MCTL_TOKEN; the implement-scope
+    # change (mctlhq/mctl-agents#717) must not move it in enforce mode.
+    return CommerceRuntime.from_env(approvals=action_approvals.ActionApprovalClient(scoped=False))
 
 
 def _capability_mode() -> str:

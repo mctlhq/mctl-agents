@@ -153,7 +153,15 @@ from config.settings import (
     SERVICES,
     TYPECHECK_COMMANDS,
 )
-from orchestrator import action_approvals, evidence_producer, policy_checkpoint, spike_issue, tracing, usage_ledger
+from orchestrator import (
+    action_approvals,
+    evidence_producer,
+    policy_checkpoint,
+    run_token,
+    spike_issue,
+    tracing,
+    usage_ledger,
+)
 from orchestrator import approval_evidence as ae
 from orchestrator import implementation_completion as ic
 from orchestrator.auth import ensure_auth_for_sdk
@@ -6001,6 +6009,32 @@ def _max_proposals_error(max_proposals: int, dry_run: bool) -> str | None:
     return None
 
 
+RUN_TOKEN_SCOPE = "implement"  # noqa: S105 -- a scope name (what mctl-api registers for `implementer`)
+EXECUTION_ID_ENV = "WORKFLOW_EXECUTION_ID"  # cwft-mctl-agents-implement: parameter execution_id
+
+
+def _setup_run_token() -> None:
+    """Acquire the implementer's run token per MCTL_RUN_TOKEN_MODE
+    (mctlhq/mctl-agents#717), before the first mctl-api call.
+
+    off: a no-op. observe: setup logs a failed exchange and goes on. enforce:
+    the exchange is bound to the run's execution, so a pod without an
+    execution_id (a manual or sweep trigger leaves the CWFT parameter empty)
+    is refused here, by name, instead of surfacing as an opaque exchange
+    refusal -- and never degrades to MCTL_TOKEN. Exits 2 on any failure that
+    enforce must not survive, the same as an unusable argument."""
+    try:
+        if run_token.mode() == run_token.MODE_ENFORCE and not os.environ.get(EXECUTION_ID_ENV, "").strip():
+            raise run_token.RunTokenError(
+                f"{run_token.MODE_ENV}=enforce needs an execution_id ({EXECUTION_ID_ENV} is empty): "
+                "the implement run token is bound to an execution; this run has none"
+            )
+        run_token.setup(shadow_scope=RUN_TOKEN_SCOPE)
+    except run_token.RunTokenError as exc:
+        print(f"run token: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
 def main() -> None:
     # Authenticate the first gh/git call from GITHUB_TOKEN_FILE without an env seed.
     refresh_github_token()
@@ -6089,6 +6123,12 @@ def main() -> None:
         sys.exit(2)
 
     state_dir = Path(args.state_dir)
+
+    # Before any options are built or mctl-api is called: the MCP connection
+    # and the action-approval client take their credential from here. Not in
+    # dry-run, which discovers proposals and calls nothing.
+    if not args.dry_run:
+        _setup_run_token()
 
     # Review-feedback mode: drive the existing PR's branch with codex findings.
     if args.review_feedback:
