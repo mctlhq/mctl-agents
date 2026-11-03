@@ -978,6 +978,9 @@ class _PolicyCheckpointHook:
     # and the builder refuses a gateway without a real one when the sealed
     # set holds anything consequential. Empty for every other builder.
     delegated_prefix: str = ""
+    # A named policy other than BUILTIN_POLICY (the review-worker's
+    # `independent-review`). None keeps today's behaviour for every builder.
+    policy: Any = None
 
     async def __call__(self, input_data: Any, tool_use_id: str | None, _context: Any) -> dict[str, Any]:
         from orchestrator import policy_checkpoint
@@ -1008,6 +1011,7 @@ class _PolicyCheckpointHook:
                 tool_name.split("__")[1] if tool_name.count("__") >= 2 else "",
                 tool_input if tool_input is not None else {},
                 grants=self.grants,
+                **({"policy": self.policy} if self.policy is not None else {}),
             ))
         except Exception as exc:  # noqa: BLE001 — fail closed
             return _deny(f"policy checkpoint failed ({type(exc).__name__}); the call was not made")
@@ -1071,6 +1075,7 @@ class _DecisionAttemptHook:
 
 def _policy_hooks(
     allowed_tools: list[str], *, delegated_prefix: str = "", extra_grants: list[str] | None = None,
+    policy: Any = None,
 ) -> dict[HookEventName, list[HookMatcher]]:
     """Every MCP tool call, whatever the server, meets the checkpoint; the
     builder's own allow-list is the grant set it evaluates against.
@@ -1081,7 +1086,9 @@ def _policy_hooks(
 
     With `MCTL_DECISION_RECORDS` on, the PostToolUse pair that closes each
     permitted call's attempt record is added; off, the map is unchanged."""
-    hook = _PolicyCheckpointHook((*allowed_tools, *(extra_grants or ())), delegated_prefix=delegated_prefix)
+    hook = _PolicyCheckpointHook(
+        (*allowed_tools, *(extra_grants or ())), delegated_prefix=delegated_prefix, policy=policy
+    )
     hooks: dict[HookEventName, list[HookMatcher]] = {
         "PreToolUse": [
             HookMatcher(matcher="mcp__.*", hooks=[cast(Any, hook)]),
@@ -1434,6 +1441,35 @@ def build_authoring_canary_options(agent_dir: Path, model: str) -> ClaudeAgentOp
         allowed_tools=list(AUTHORING_CANARY_TOOLS),
         setting_sources=[],
         max_budget_usd=AUTHORING_CANARY_BUDGET_USD,
+    ))
+
+
+# mctlhq/mctl-agents#986: the review-worker's reviewer session. A plain
+# constant (no env knob): the budget is the profile's, and the capability is
+# a closed set. No Bash, Write, Edit, WebFetch or MCP server, no GitHub token.
+REVIEW_WORKER_BUDGET_USD = 2.00
+REVIEW_WORKER_TOOLS = ("Read", "Grep", "Glob")
+_REVIEW_WORKER_BLANKED_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "MCTL_TOKEN")
+
+
+def build_review_worker_options(agent_dir: Path, model: str) -> ClaudeAgentOptions:
+    """Options for the review-worker's reviewer session (#986, ADR 025):
+    read-only tools over the materialized subject, no MCP, no GitHub or
+    mctl-api credential in the env, and the `independent-review` policy
+    checkpoint on every MCP-named call (none can be made)."""
+    from orchestrator.policy_checkpoint import REVIEW_WORKER_POLICY
+
+    allowed = list(REVIEW_WORKER_TOOLS)
+    return _scrubbed(ClaudeAgentOptions(
+        cwd=str(agent_dir),
+        model=model,
+        allowed_tools=allowed,
+        mcp_servers={},
+        setting_sources=["project"],
+        permission_mode="default",
+        max_budget_usd=REVIEW_WORKER_BUDGET_USD,
+        env={**os.environ, **{name: "" for name in _REVIEW_WORKER_BLANKED_ENV}},
+        hooks=_policy_hooks(allowed, policy=REVIEW_WORKER_POLICY),
     ))
 
 

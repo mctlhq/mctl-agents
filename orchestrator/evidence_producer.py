@@ -119,7 +119,10 @@ READ_TIMEOUT_SECONDS = 5.0
 STAGE_INVESTIGATOR = "investigator"
 STAGE_IMPLEMENTER = "implementer"
 STAGE_SHEPHERD = "shepherd"
-STAGES = frozenset({STAGE_INVESTIGATOR, STAGE_IMPLEMENTER, STAGE_SHEPHERD})
+#: The review-worker (mctlhq/mctl-agents#986). `reviewer` is already a
+#: `USAGE_DEVLOOP_STAGES` value.
+STAGE_REVIEWER = "reviewer"
+STAGES = frozenset({STAGE_INVESTIGATOR, STAGE_IMPLEMENTER, STAGE_SHEPHERD, STAGE_REVIEWER})
 
 # Delivery results, also the keys of `stats()`.
 CREATED = "created"
@@ -444,6 +447,20 @@ class RunEvidence:
         ref = ee.ArtifactRef(name=name or path.name, kind=slug(kind, fallback="file"), content_hash=digest)
         with self._lock:
             self.artifacts.append(ref)
+
+    def note_artifact_ref(self, name: str, kind: str, content_hash: str) -> None:
+        """An artifact that is a server document, not a local file (a stored
+        review receipt), by name and sha256. The hash-only twin of
+        `note_artifact_file`: a malformed hash is an unobserved artifact, not
+        a stored one."""
+        self.expected.add("artifacts")
+        if not (isinstance(content_hash, str) and _SHA256_RE.fullmatch(content_hash)) or not isinstance(name, str):
+            self._add_gap(ee.Gap(block="artifacts", code="observation_failed", required=True))
+            return
+        with self._lock:
+            self.artifacts.append(
+                ee.ArtifactRef(name=name, kind=slug(kind, fallback="file"), content_hash=content_hash)
+            )
 
     # -- subject (Amendment 2) -------------------------------------------
     def note_proposal_status(self, service: str, slug_: str, status_path: Path) -> None:

@@ -1,0 +1,35 @@
+# AgentManifest for review-worker (mctlhq/mctl-agents#986, ADR 025 "Producer").
+# Read-only reviewer session under the `independent-review` execution profile
+# (mctl-gitops companion, drafted separately). The deterministic producer
+# (request, reviewer execution, run token, submit, evidence) lives in
+# orchestrator/run_review_worker.py and orchestrator/review_worker/; only the
+# review itself is a Claude SDK run. Nothing schedules it yet.
+apiVersion: agents.mctl.ai/v1alpha1
+kind: Agent
+metadata:
+  name: review-worker
+  owner: mctl-agents
+spec:
+  runtime:
+    type: claude-agent-sdk
+    entrypoint: orchestrator.run_review_worker:main
+    optionsBuilder: orchestrator.options:build_review_worker_options
+  prompt:
+    sources:
+      - inline: orchestrator/review_worker/session.py:build_prompt
+      - file: agents/_review_worker/.claude/agents/review-worker.md
+  triggers: []          # informational; no CWFT exists until the mctl-gitops companion lands
+  modelPolicy:
+    task: service_agent
+  toolPolicy:
+    allow:
+      - Read
+      - Grep
+      - Glob
+  execution:
+    budgetUsd: 2.00     # REVIEW_WORKER_BUDGET_USD
+    sandbox:
+      backend: argo
+      # Nominal until the companion cwft-mctl-agents-review.yaml is merged in
+      # mctl-gitops; repoint it then (validate_manifest checks the name).
+      clusterWorkflowTemplate: mctl-agents-run

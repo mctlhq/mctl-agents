@@ -51,6 +51,7 @@ _BOUND_AGENTS = frozenset(
         "incident-responder",
         "issue-investigator",
         "mentor",
+        "review-worker",  # mctlhq/mctl-agents#986: binding comes with the mctl-gitops companion
         "scout",
         "service-agent",
         "shepherd",
