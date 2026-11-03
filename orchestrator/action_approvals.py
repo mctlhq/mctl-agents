@@ -319,12 +319,25 @@ def _refusal(status: int, payload: dict[str, Any]) -> ApprovalAnswer:
 
 class ActionApprovalClient:
     """Synchronous client for mctl-api's action-approval routes, with the
-    same auth and transport rules as `work_context/client.py`: `MCTL_TOKEN`
-    bearer, https only, no redirects, uncertainty as a value."""
+    same auth and transport rules as `work_context/client.py`: the bearer
+    `run_token.mctl_api_bearer` picks (`MCTL_TOKEN`, or the run token in
+    enforce mode), https only, no redirects, uncertainty as a value.
 
-    def __init__(self, base_url: str | None = None, token: str | None = None, timeout: int = DEFAULT_TIMEOUT_S) -> None:
+    `scoped=False` keeps the static `MCTL_TOKEN` in every mode. It is for a
+    flow whose scope does not admit the action-approval routes and that has
+    always used the static credential here (the investigator's commerce
+    path); it must not be used to dodge a scope refusal."""
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        token: str | None = None,
+        timeout: int = DEFAULT_TIMEOUT_S,
+        scoped: bool = True,
+    ) -> None:
         self._base = (base_url or _api_base()).rstrip("/")
         self._injected_token = token
+        self._scoped = scoped
         self._timeout = timeout
         self._opener = _no_redirect_opener()
 
@@ -332,12 +345,27 @@ class ActionApprovalClient:
         # Resolved per request so a rotated MCTL_TOKEN_FILE takes effect.
         if self._injected_token is not None:
             return self._injected_token
-        return read_credential("MCTL_TOKEN")
+        if not self._scoped:
+            return read_credential("MCTL_TOKEN")
+        # Deferred: run_token pulls in httpx and settings, which this module
+        # otherwise avoids. Off: MCTL_TOKEN. Observe: MCTL_TOKEN (the shadow
+        # header is MCP-only). Enforce: the run token, or "" -- never the
+        # static token (mctlhq/mctl-agents#717).
+        from orchestrator import run_token
+
+        try:
+            return run_token.mctl_api_bearer()
+        except run_token.RunTokenError as exc:
+            # A mistyped MCTL_RUN_TOKEN_MODE: the mode could not be read, so
+            # no credential is chosen -- unknown, not the static token.
+            raise ApprovalStoreUnavailable(str(exc)) from exc
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
         token = self._current_token()
         if not token:
-            raise ApprovalStoreUnavailable("MCTL_TOKEN is not set")
+            raise ApprovalStoreUnavailable(
+                "no mctl-api credential: MCTL_TOKEN is not set, or enforce mode has no run token"
+            )
         url = f"{self._base}{path}"
         if not url.startswith("https://"):
             raise ApprovalStoreUnavailable(f"refusing non-https MCTL_API_BASE_URL: {self._base}")

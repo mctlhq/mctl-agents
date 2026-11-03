@@ -16,7 +16,7 @@ are recorded here, never a value.
 
 | Variable | File variable | Consumers | Binding | Class | Lifetime |
 |---|---|---|---|---|---|
-| `MCTL_TOKEN` | `MCTL_TOKEN_FILE` | REST clients (`action_approvals`, `commerce`, `lifecycle/client`, `lifecycle/claim`, `temporal/mctl_client`, `run_shepherd`, `pr_adoption`, `run_token`); MCP header in `options.mctl_mcp_config` and `capability_gateway` | per request; per SDK session for the MCP header | in-process | long-lived, operator-rotated (exact lifetime: not observed) |
+| `MCTL_TOKEN` | `MCTL_TOKEN_FILE` | REST clients (`action_approvals`, through `run_token.mctl_api_bearer`: the run token in enforce, `commerce`, `lifecycle/client`, `lifecycle/claim`, `temporal/mctl_client`, `run_shepherd`, `pr_adoption`, `run_token`); MCP header in `options.mctl_mcp_config` and `capability_gateway` | per request; per SDK session for the MCP header | in-process | long-lived, operator-rotated (exact lifetime: not observed) |
 | `MCTL_USAGE_WRITER_TOKEN` | `MCTL_USAGE_WRITER_TOKEN_FILE` | `usage_ledger`, `run_usage_collector` | per delivery | in-process | long-lived, operator-rotated (exact lifetime: not observed) |
 | `MCTL_EVIDENCE_WRITER_TOKEN` | `MCTL_EVIDENCE_WRITER_TOKEN_FILE` | `evidence_producer`, `decision_records` | per call | in-process | long-lived, operator-rotated (exact lifetime: not observed) |
 | `SCOUT_TELEGRAM_BOT_TOKEN` | `SCOUT_TELEGRAM_BOT_TOKEN_FILE` | `run_scout` | per run | in-process | long-lived, operator-rotated (exact lifetime: not observed) |
