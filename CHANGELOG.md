@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.117.0](https://github.com/mctlhq/mctl-agents/compare/1.116.0...1.117.0) (2026-11-03)
+
+
+### Features
+
+* **implementer:** scoped run token for the implement run ([#717](https://github.com/mctlhq/mctl-agents/issues/717) S5) ([16c3c7f](https://github.com/mctlhq/mctl-agents/commit/16c3c7f7e3da1710a83689803dc78c2194040e2f))
+* **implementer:** scoped run token for the implement run ([#717](https://github.com/mctlhq/mctl-agents/issues/717) S5) ([8a81fed](https://github.com/mctlhq/mctl-agents/commit/8a81fed96eed0a1fda3c7df4f78cb43c20236bbc))
+
 ## [1.116.0](https://github.com/mctlhq/mctl-agents/compare/1.115.0...1.116.0) (2026-11-02)
 
 
