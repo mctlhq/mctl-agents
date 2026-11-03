@@ -5406,10 +5406,9 @@ class TestLaunchCorrelation:
         # implementer is told which one (the same id the grant is bound to).
         assert params_log[0]["work_item_id"] == "wi_test"
 
-    async def test_neither_submit_carries_an_execution_id(self, env):
-        """T4: pins the deliberate omission argued in design.md -- an
-        implementer or shepherd invocation is not the investigator's `we_`,
-        and reusing it would misattribute spend across three invocations."""
+    async def test_only_the_implement_submit_carries_the_execution_id(self, env):
+        """#717 S5: the implement submit names the loop's canonical `we_` so its
+        run token binds; the shepherd tick stays without an execution id."""
         implement_log: list[dict] = []
         shepherd_log: list[dict] = []
         open_pr = PRState(
@@ -5442,7 +5441,7 @@ class TestLaunchCorrelation:
             await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
             await handle.result()
 
-        assert "execution_id" not in implement_log[0]
+        assert implement_log[0]["execution_id"] == "we_test_own"
         assert "execution_id" not in shepherd_log[0]
 
     async def test_the_flip_runs_no_approve_cwft_and_carries_no_identity(self, env):

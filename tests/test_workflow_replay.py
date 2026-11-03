@@ -411,6 +411,7 @@ async def test_todays_dev_loop_full_carries_the_launch_correlation_marker() -> N
         "the implement/shepherd correlation params are unguarded, so a "
         "rollback could not be replayed."
     )
+    assert "implement-execution-id" in _patch_ids(events)
     implement_submits = _submit_params(events, "mctl-agents-implement")
     assert implement_submits, "no mctl-agents-implement submit was recorded"
     for params in implement_submits:
@@ -420,7 +421,7 @@ async def test_todays_dev_loop_full_carries_the_launch_correlation_marker() -> N
         # only `issue_url`); since #636 the loop resolves its own, so the
         # implementer is told which, and still no execution id.
         assert params.get("work_item_id") == "wi_test"
-        assert "execution_id" not in params
+        assert params.get("execution_id") == "we_test_own"
     # The flip is the delegated operation now (#636): the workflow submits no
     # approve CWFT itself, so no `approver` is left to travel.
     assert not _submit_params(events, "mctl-agents-approve")
