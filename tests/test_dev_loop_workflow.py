@@ -5476,6 +5476,458 @@ class TestLaunchCorrelation:
         }
 
 
+async def _poll(predicate: Callable[[], bool]) -> None:
+    """Wait for a fake's call list to reach a state; there is no event to await."""
+    with anyio.fail_after(10):
+        while not predicate():  # noqa: ASYNC110 — polling a fake's call list; no event to await
+            await anyio.sleep(0.05)
+
+
+def _without_activities(activities: list, *names: str) -> list:
+    """`activities` minus the fakes registered under `names`, so a test can
+    put its own in their place."""
+    return [a for a in activities if getattr(a, "__temporal_activity_definition").name not in names]
+
+
+class TestImplementExecutionId:
+    """mctlhq/mctl-agents#991 (#717 S5): the implement submit names the loop's
+    canonical `we_`, which is held open from the approve flip until the
+    implement run returns (`IMPLEMENT_EXECUTION_PATCH`).
+
+    Every test here drives a fresh execution, so `workflow.patched` is True:
+    the marker branch. The pre-marker branch is pinned by the recorded
+    histories in `tests/test_workflow_replay.py`.
+    """
+
+    ISSUE = "https://github.com/mctlhq/mctl-telegram/issues/991"
+
+    @staticmethod
+    def _advance_into(calls: list[str], advances: list[AdvanceInput]):
+        """An `advance_dispatched_execution` fake that writes into the same
+        ordered log as the submits, so a test can assert WHEN the `we_` ends
+        relative to the implement run."""
+
+        @activity.defn(name="advance_dispatched_execution")
+        async def advance(inp: AdvanceInput) -> str:
+            advances.append(inp)
+            calls.append(f"advance:{inp.phase}")
+            return "execution-existing we_test_own"
+
+        return advance
+
+    @staticmethod
+    def _submit(
+        calls: list[str],
+        investigate_ran: anyio.Event,
+        *,
+        implement_log: list[dict] | None = None,
+        implement_results: list[WorkflowResult] | None = None,
+        on_implement: Callable[[], Awaitable[None]] | None = None,
+    ):
+        """A `submit_and_wait` fake: every operation succeeds, except that the
+        implement submit is logged, may block or signal through `on_implement`,
+        and answers `implement_results` in order (the last one repeating)."""
+
+        @activity.defn(name="submit_and_wait")
+        async def submit(input: SubmitAndWaitInput) -> WorkflowResult:
+            calls.append(input.operation)
+            if input.operation == "mctl-agents-investigate":
+                investigate_ran.set()
+            if input.operation == "mctl-agents-implement":
+                if implement_log is not None:
+                    implement_log.append(dict(input.params))
+                if on_implement is not None:
+                    await on_implement()
+                if implement_results:
+                    return implement_results.pop(0) if len(implement_results) > 1 else implement_results[0]
+            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+        return submit
+
+    def _worker(self, env, activities):
+        return Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities)
+
+    async def _start(self, env, investigate_ran, *, issue: IssueRef | None = None, approve: bool = True):
+        handle = await env.client.start_workflow(
+            DevLoopWorkflow.run,
+            issue or IssueRef(issue_url=self.ISSUE),
+            id=f"dev-loop-test-{uuid.uuid4()}",
+            task_queue=TASK_QUEUE,
+        )
+        with anyio.fail_after(10):
+            await investigate_ran.wait()
+        if approve:
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+        return handle
+
+    # -- T1: the id is the loop's own `we_`, the same one the grant and flip name
+
+    async def test_the_implement_submit_names_the_same_we_as_the_grant_and_the_flip(self, env):
+        implement_log: list[dict] = []
+        requests: list[ApprovalRequestInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        activities, _calls, investigate_ran, _ownership = _fake_activities(
+            released=True,
+            implement_params_log=implement_log,
+            approval_requests=requests,
+            delegated_log=delegated,
+            ensure_result=EnsuredExecution(ok=True, work_item_id="wi_x", execution_id="we_canon_991", sequence=1),
+        )
+        async with self._worker(env, activities):
+            handle = await self._start(env, investigate_ran)
+            await handle.result()
+
+        assert [d.execution_id for d in delegated] == ["we_canon_991"]
+        assert {r.execution_id for r in requests} == {"we_canon_991"}
+        assert implement_log[0]["execution_id"] == "we_canon_991"
+
+    # -- T2: a dispatched loop uses the execution its request was bound to
+
+    async def test_a_dispatched_loop_implements_under_the_dispatched_execution(self, env):
+        from orchestrator.temporal.activities.execution_requests import BOUND, BoundExecution
+
+        implement_log: list[dict] = []
+        delegated: list[DelegatedApproveInput] = []
+        activities, _calls, investigate_ran, _ownership = _fake_activities(
+            released=True,
+            implement_params_log=implement_log,
+            delegated_log=delegated,
+            # What a non-dispatched loop would have been given: it must not
+            # be what a dispatched one names.
+            ensure_result=EnsuredExecution(ok=True, work_item_id="wi_x", execution_id="we_ensured", sequence=1),
+        )
+
+        @activity.defn(name="bind_dispatched_execution")
+        async def fake_bind(input):
+            return BoundExecution(BOUND, execution_id="we_ctx_test", sequence=1)
+
+        async with self._worker(env, [*activities, fake_bind]):
+            handle = await self._start(
+                env,
+                investigate_ran,
+                issue=IssueRef(issue_url=self.ISSUE, work_item_id="wi-991", execution_request_id="xr-991"),
+            )
+            await handle.result()
+
+        assert [d.execution_id for d in delegated] == ["we_ctx_test"]
+        assert implement_log[0]["execution_id"] == "we_ctx_test"
+
+    async def test_a_delivered_resume_does_not_change_the_execution_the_implement_names(self, env):
+        """A resume records another execution (`e2`); the grant, the flip and
+        the run token all name the loop's own `we_` (the same rule as
+        `_canonical_execution_id`'s docstring), so `_executions[-1]` is the
+        wrong source for the implement submit."""
+        implement_log: list[dict] = []
+        requests: list[ApprovalRequestInput] = []
+        activities, _calls, investigate_ran, _ownership = _fake_activities(
+            released=True,
+            implement_params_log=implement_log,
+            approval_requests=requests,
+            ensure_result=EnsuredExecution(ok=True, work_item_id="wi-1", execution_id="we_own", sequence=1),
+        )
+        async with self._worker(env, activities):
+            handle = await self._start(env, investigate_ran, approve=False)
+            await _poll(lambda: len(requests) == 1)
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            await _poll(lambda: len(requests) == 2)
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": f"aar_test_a{requests[-1].attempt}"})
+            await handle.result()
+
+        assert implement_log[0]["execution_id"] == "we_own"
+
+    # -- T3: ordering and phase of the one advance
+
+    async def test_the_we_ends_once_after_the_implement_submit_and_succeeded(self, env):
+        advances: list[AdvanceInput] = []
+        activities, calls, investigate_ran, _ownership = _fake_activities(released=True)
+
+        @activity.defn(name="get_pr_state")
+        async def polling_pr_state(service: str, slug: str) -> PRState:
+            calls.append("pr-poll")
+            return MERGED_PR
+
+        activities = [
+            *_without_activities(activities, "advance_dispatched_execution", "get_pr_state"),
+            self._advance_into(calls, advances), polling_pr_state,
+        ]
+        async with self._worker(env, activities):
+            handle = await self._start(env, investigate_ran)
+            await handle.result()
+
+        # Not at the flip: nothing between the delegated flip and the implement,
+        # and the end lands before the merge watch's first poll.
+        assert calls == [
+            "mctl-agents-investigate", "delegated-approve", "mctl-agents-implement",
+            "advance:Succeeded", "pr-poll",
+        ]
+        assert len(advances) == 1
+
+    async def test_a_failed_implement_ends_the_we_once_failed_after_the_submit(self, env):
+        advances: list[AdvanceInput] = []
+        activities, calls, investigate_ran, _ownership = _fake_activities(released=True)
+        submit = self._submit(calls, investigate_ran, implement_results=[_implement_result("Failed")])
+        activities = [
+            *_without_activities(activities, "advance_dispatched_execution", "submit_and_wait"),
+            self._advance_into(calls, advances), submit,
+        ]
+        async with self._worker(env, activities):
+            handle = await self._start(env, investigate_ran)
+            with pytest.raises(WorkflowFailureError) as failure:
+                await handle.result()
+
+        assert isinstance(failure.value.cause, ApplicationError)
+        assert failure.value.cause.type == "ImplementationFailed"
+        assert calls == [
+            "mctl-agents-investigate", "delegated-approve", "mctl-agents-implement", "advance:Failed",
+        ]
+        assert len(advances) == 1
+
+    async def test_a_requeued_pre_start_failure_resubmits_with_the_same_execution_id(self, env):
+        implement_log: list[dict] = []
+        advances: list[AdvanceInput] = []
+        activities, calls, investigate_ran, _ownership = _fake_activities(
+            released=True,
+            ensure_result=EnsuredExecution(ok=True, work_item_id="wi_x", execution_id="we_canon_991", sequence=1),
+        )
+        submit = self._submit(
+            calls, investigate_ran, implement_log=implement_log,
+            implement_results=[_implement_result("Failed", ran=False), _implement_result()],
+        )
+        activities = [
+            *_without_activities(activities, "advance_dispatched_execution", "submit_and_wait"),
+            self._advance_into(calls, advances), submit,
+        ]
+        async with self._worker(env, activities):
+            handle = await self._start(env, investigate_ran)
+            await handle.result()
+
+        assert [p["execution_id"] for p in implement_log] == ["we_canon_991", "we_canon_991"]
+        # The requeue is not an end: one advance, after the second submit.
+        assert calls.count("advance:Succeeded") == 1 and len(advances) == 1
+        assert calls[-1] == "advance:Succeeded"
+
+    async def test_the_we_ends_before_the_abandon_check_that_follows_the_implement(self, env):
+        """An `abandon` that arrives while the implement runs ends the loop
+        without a merge watch, and the `we_` must already have ended."""
+        advances: list[AdvanceInput] = []
+        activities, calls, investigate_ran, _ownership = _fake_activities(released=True)
+        holder: dict[str, Any] = {}
+
+        async def abandon_during_implement() -> None:
+            await holder["handle"].signal(DevLoopWorkflow.abandon, "operator cleanup")
+
+        submit = self._submit(calls, investigate_ran, on_implement=abandon_during_implement)
+        activities = [
+            *_without_activities(activities, "advance_dispatched_execution", "submit_and_wait"),
+            self._advance_into(calls, advances), submit,
+        ]
+        async with self._worker(env, activities):
+            handle = await self._start(env, investigate_ran, approve=False)
+            holder["handle"] = handle
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            result = await handle.result()
+
+        assert result.ended == "abandoned: operator cleanup"
+        assert calls[-2:] == ["mctl-agents-implement", "advance:Succeeded"]
+        assert len(advances) == 1
+
+    # -- T4: exits between the flip and the end of the implement run
+
+    async def test_a_resolve_failure_after_the_flip_ends_the_we_once_failed(self, env):
+        advances: list[AdvanceInput] = []
+        activities, calls, investigate_ran, _ownership = _fake_activities(
+            released=True, resolve_unavailable={"implementer"}
+        )
+        activities = [*_without_activities(activities, "advance_dispatched_execution"),
+                      self._advance_into(calls, advances)]
+        async with self._worker(env, activities):
+            handle = await self._start(env, investigate_ran)
+            with pytest.raises(WorkflowFailureError):
+                await handle.result()
+
+        assert calls == ["mctl-agents-investigate", "delegated-approve", "advance:Failed"]
+        assert len(advances) == 1
+
+    def _park_after_the_flip(self, env, *, advances, calls, activities, investigate_ran, requests):
+        """Start a loop, approve it, and hold it in the implementer resolve
+        right after the flip; there a resume lands and clears the decision, so
+        the loop then parks at the re-approval gate before the implement."""
+        resolving = anyio.Event()
+        release = anyio.Event()
+
+        @activity.defn(name="resolve_agent_release")
+        async def gated_resolve(agent: str, environment: str) -> ResolvedRelease | None:
+            if agent == "implementer":
+                resolving.set()
+                await release.wait()
+            return ResolvedRelease(
+                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+            )
+
+        activities = [
+            *_without_activities(activities, "advance_dispatched_execution", "resolve_agent_release"),
+            self._advance_into(calls, advances), gated_resolve,
+        ]
+        return activities, resolving, release
+
+    async def test_an_abandon_during_the_post_flip_reapproval_ends_the_we_once(self, env):
+        advances: list[AdvanceInput] = []
+        requests: list[ApprovalRequestInput] = []
+        activities, calls, investigate_ran, _ownership = _fake_activities(
+            released=True, approval_requests=requests,
+            ensure_result=EnsuredExecution(ok=True, work_item_id="wi-1", execution_id="we_own", sequence=1),
+        )
+        activities, resolving, release = self._park_after_the_flip(
+            env, advances=advances, calls=calls, activities=activities,
+            investigate_ran=investigate_ran, requests=requests,
+        )
+        async with self._worker(env, activities):
+            handle = await self._start(env, investigate_ran)
+            with anyio.fail_after(10):
+                await resolving.wait()
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            await handle.signal(DevLoopWorkflow.abandon, {"reason": "wrong actor"})
+            release.set()
+            result = await handle.result()
+
+        assert result.ended.startswith("abandoned:")
+        assert result.implement is None
+        assert "mctl-agents-implement" not in calls
+        assert [a.phase for a in advances] == ["Succeeded"]
+        assert len(advances) == 1
+
+    async def test_a_cancellation_during_the_post_flip_reapproval_ends_the_we_once(self, env):
+        advances: list[AdvanceInput] = []
+        requests: list[ApprovalRequestInput] = []
+        activities, calls, investigate_ran, _ownership = _fake_activities(
+            released=True, approval_requests=requests,
+            ensure_result=EnsuredExecution(ok=True, work_item_id="wi-1", execution_id="we_own", sequence=1),
+        )
+        activities, resolving, release = self._park_after_the_flip(
+            env, advances=advances, calls=calls, activities=activities,
+            investigate_ran=investigate_ran, requests=requests,
+        )
+        async with self._worker(env, activities):
+            handle = await self._start(env, investigate_ran)
+            with anyio.fail_after(10):
+                await resolving.wait()
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            release.set()
+            await _poll(lambda: len(requests) == 2)  # parked at the re-approval gate
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError):
+                await handle.result()
+
+        assert "mctl-agents-implement" not in calls
+        assert [a.phase for a in advances] == ["Failed"]
+
+    async def test_a_cancellation_during_the_implement_ends_the_we_once_after_the_submit(self, env):
+        advances: list[AdvanceInput] = []
+        activities, calls, investigate_ran, _ownership = _fake_activities(released=True)
+        implementing = anyio.Event()
+
+        async def hang() -> None:
+            implementing.set()
+            await anyio.sleep(3600)
+
+        submit = self._submit(calls, investigate_ran, on_implement=hang)
+        activities = [
+            *_without_activities(activities, "advance_dispatched_execution", "submit_and_wait"),
+            self._advance_into(calls, advances), submit,
+        ]
+        async with self._worker(env, activities):
+            handle = await self._start(env, investigate_ran)
+            with anyio.fail_after(10):
+                await implementing.wait()
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError):
+                await handle.result()
+
+        assert calls[-2:] == ["mctl-agents-implement", "advance:Failed"]
+        assert len(advances) == 1
+
+    # -- the after-flip gate binds to the still-open `we_` (design point 4)
+
+    async def test_a_resume_between_the_flip_and_the_implement_does_not_wedge_the_loop(self, env):
+        """The canonical `we_` is still open, so mctl-api would refuse the
+        resume a new execution: the gate must not wait for `opened()` and
+        asks the fresh grant on the loop's own `we_`, then implements under
+        that same `we_`."""
+        advances: list[AdvanceInput] = []
+        requests: list[ApprovalRequestInput] = []
+        implement_log: list[dict] = []
+        activities, calls, investigate_ran, _ownership = _fake_activities(
+            released=True, approval_requests=requests, implement_params_log=implement_log,
+            ensure_result=EnsuredExecution(ok=True, work_item_id="wi-1", execution_id="we_own", sequence=1),
+        )
+        activities, resolving, release = self._park_after_the_flip(
+            env, advances=advances, calls=calls, activities=activities,
+            investigate_ran=investigate_ran, requests=requests,
+        )
+        async with self._worker(env, activities):
+            handle = await self._start(env, investigate_ran)
+            with anyio.fail_after(10):
+                await resolving.wait()
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            release.set()
+            await _poll(lambda: len(requests) == 2)
+            assert requests[-1].execution_id == "we_own"
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": f"aar_test_a{requests[-1].attempt}"})
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.succeeded
+        assert implement_log[0]["execution_id"] == "we_own"
+        assert calls[-2:] == ["mctl-agents-implement", "advance:Succeeded"]
+        assert len(advances) == 1
+
+    # -- T5: an empty canonical id is a loud, non-retryable failure
+
+    async def test_an_empty_canonical_execution_id_fails_the_loop_without_an_implement_submit(self, env):
+        advances: list[AdvanceInput] = []
+        activities, calls, investigate_ran, _ownership = _fake_activities(
+            released=True,
+            ensure_result=EnsuredExecution(ok=True, work_item_id="wi_x", execution_id="", sequence=1),
+        )
+        activities = [*_without_activities(activities, "advance_dispatched_execution"),
+                      self._advance_into(calls, advances)]
+        async with self._worker(env, activities):
+            handle = await self._start(env, investigate_ran)
+            with pytest.raises(WorkflowFailureError) as failure:
+                await handle.result()
+
+        cause = failure.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == dev_loop.IMPLEMENT_EXECUTION_MISSING_ERROR_TYPE == "ImplementExecutionMissing"
+        assert cause.non_retryable is True
+        assert "mctl-agents-implement" not in calls
+        # It went through `run`'s exception path: the open `we_` ends Failed.
+        assert [a.phase for a in advances] == ["Failed"]
+
+
 class TestWorkContextResume:
     """mctlhq/mctl-agents#267, ADR 011 — T9/T10/T11 in the proposal's
     tasks.md."""

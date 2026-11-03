@@ -253,7 +253,7 @@ async def test_an_unlisted_workflow_type_records_nothing_down_to_the_pod(env, ex
     assert not tracing.init_tracing("pod", environ=pod_env)
 
 
-_REPLAY_CASES = [(s, kind) for s in SCENARIOS for kind in ("prepatch", "patched")]
+_REPLAY_CASES = [(s, kind) for s in SCENARIOS for kind in s.kinds]
 
 
 @pytest.mark.parametrize(

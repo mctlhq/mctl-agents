@@ -91,7 +91,10 @@ ISSUE_KEYED_HISTORY = HISTORY_DIR / "dev_loop_issue_keyed.json"
 # the canonical approval: own `we_`, `aar_`, the delegated flip.
 DELEGATED_HISTORY = HISTORY_DIR / "dev_loop_delegated.json"
 ISSUE_STARTED_HISTORY = HISTORY_DIR / "dev_loop_issue_started_delegated.json"
-CANONICAL_HISTORIES = (DELEGATED_HISTORY, ISSUE_STARTED_HISTORY)
+# mctlhq/mctl-agents#991: recorded from tests/replay_scenarios.py (a canonical
+# loop that passes the flip with `implement-execution-id`).
+IMPLEMENT_EXECUTION_HISTORY = HISTORY_DIR / "dev_loop_implement_execution.patched.json"
+CANONICAL_HISTORIES = (DELEGATED_HISTORY, ISSUE_STARTED_HISTORY, IMPLEMENT_EXECUTION_HISTORY)
 #: Recorded before #461 option A; today's code cannot record them again.
 PRE_ISSUE_KEYED_HISTORIES = (DISPATCHED_HISTORY, RESUMED_HISTORY)
 
