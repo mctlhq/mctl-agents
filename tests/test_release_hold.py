@@ -1,7 +1,7 @@
-"""The release hold (`release-hold.json`) is fail-closed and cannot be wired out.
+"""The release hold (`.github/release/hold.json`) is fail-closed and cannot be wired out.
 
 Two halves, because a correct checker nobody runs holds nothing:
-- `tools/check_release_hold.py` passes only for an explicit boolean `false`;
+- `.github/release/check_hold.py` passes only for an explicit boolean `false`;
 - `.github/workflows/release-please.yml` makes the `release-please` job (the
   one that tags, publishes and dispatches the deploy) depend on the
   `release-hold` job, and keeps that job from being skipped around or
@@ -21,8 +21,8 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "release-please.yml"
-CHECKER = ROOT / "tools" / "check_release_hold.py"
-HOLD_FILE = ROOT / "release-hold.json"
+CHECKER = ROOT / ".github" / "release" / "check_hold.py"
+HOLD_FILE = ROOT / ".github" / "release" / "hold.json"
 
 
 def _run(path: Path) -> subprocess.CompletedProcess[str]:
@@ -101,11 +101,11 @@ def test_the_hold_gate_cannot_be_softened():
     gate = _jobs()["release-hold"]
     assert not gate.get("continue-on-error")
     assert "if" not in gate, "a job-level condition would let a skipped gate stand for a pass"
-    checks = [s for s in gate["steps"] if "check_release_hold.py" in str(s.get("run", ""))]
+    checks = [s for s in gate["steps"] if "check_hold.py" in str(s.get("run", ""))]
     assert len(checks) == 1
     (check,) = checks
     assert not check.get("continue-on-error")
-    assert check["run"].strip() == "python3 tools/check_release_hold.py"
+    assert check["run"].strip() == "python3 .github/release/check_hold.py"
     # The only condition allowed is "a release would be cut".
     assert check.get("if") == "${{ steps.pending.outputs.cut == 'true' }}"
 

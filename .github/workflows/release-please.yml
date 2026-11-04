@@ -160,7 +160,7 @@ jobs:
             --data-urlencode "text=${MESSAGE}" \
             -d disable_web_page_preview=true
 
-  # A release hold (release-hold.json) stops a release from being CUT, not a
+  # A release hold (.github/release/hold.json) stops a release from being CUT, not a
   # release PR from being opened or reviewed. It sits at the point of effect:
   # `release-please` below needs this job, so a failed or skipped hold gate
   # means no tag, no image and no deploy dispatch, however the release PR got
@@ -201,9 +201,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: release-hold.json must say hold is false
+      - name: .github/release/hold.json must say hold is false
         if: ${{ steps.pending.outputs.cut == 'true' }}
-        run: python3 tools/check_release_hold.py
+        run: python3 .github/release/check_hold.py
 
       - name: Notify Telegram that the release hold stopped a release
         if: ${{ failure() }}
@@ -216,7 +216,7 @@ jobs:
             exit 0
           fi
           MESSAGE=$(printf '%s\n' \
-            "mctl-agents release held by release-hold.json" \
+            "mctl-agents release held by .github/release/hold.json" \
             "A release PR was merged while the hold is on (or the hold file could not be read). No tag, image or promotion was made. Lift the hold with a reviewed PR." \
             "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
           curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \

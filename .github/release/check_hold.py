@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail unless `release-hold.json` says, in so many words, that no hold is on.
+"""Fail unless `.github/release/hold.json` says, in so many words, that no hold is on.
 
 A merged release PR is what cuts a tag, publishes the image and dispatches the
 deploy (`.github/workflows/release-please.yml`). Holding that PR back by hand
@@ -14,7 +14,7 @@ boolean `false` passes. A missing file, unreadable file, malformed JSON, a
 non-object, a missing key, `"false"` as a string, `0`, `null` and `true` all
 stop the release: "could not tell" is never "no hold".
 
-    python3 tools/check_release_hold.py [--file release-hold.json]
+    python3 .github/release/check_hold.py [--file .github/release/hold.json]
 
 Exit 0: no hold. Exit 1: hold on, or the file could not be read as an answer.
 Standard library only, so the gate needs no `uv sync`.
@@ -27,7 +27,7 @@ import json
 import sys
 from pathlib import Path
 
-DEFAULT_FILE = "release-hold.json"
+DEFAULT_FILE = ".github/release/hold.json"
 
 
 def evaluate(path: Path) -> tuple[bool, str]:
