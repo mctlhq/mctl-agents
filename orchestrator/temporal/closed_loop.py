@@ -11,6 +11,7 @@ import asyncio
 import base64
 from dataclasses import dataclass
 from typing import Literal, Protocol
+from urllib.parse import quote
 
 import httpx
 
@@ -121,7 +122,7 @@ async def read_branch(repo: str, branch: str, *, transport: httpx.AsyncBaseTrans
             repo_response = await client.get(f"{GITHUB_API}/repos/{repo}", headers=_headers(token))
             if repo_response.status_code != 200:
                 return BranchRead("unknown", reason=f"repository HTTP {repo_response.status_code}")
-            response = await client.get(f"{GITHUB_API}/repos/{repo}/branches/{branch}", headers=_headers(token))
+            response = await client.get(f"{GITHUB_API}/repos/{repo}/branches/{quote(branch, safe='')}", headers=_headers(token))
     except httpx.HTTPError as exc:
         return BranchRead("unknown", reason=f"{type(exc).__name__}")
     if response.status_code == 200:
