@@ -55,6 +55,9 @@ pytestmark = pytest.mark.anyio
 #: Stands in for the production 60 s wait; the outage cases only need it to be
 #: shorter than the test, not equal to the real value.
 SHORT_WAIT = 3.0
+#: Where the test needs the delivery to succeed, not to time out: generous so a
+#: slow CI runner cannot turn a positive case red.
+LONG_WAIT = 30.0
 
 
 @pytest.fixture
@@ -90,6 +93,16 @@ async def _scheduled(client, wid: str, activity_type: str) -> int:
     )
 
 
+async def _wait_for_async(read, want: int, limit: float) -> None:
+    import anyio
+
+    for _ in range(int(limit / 0.25)):
+        if await read() >= want:
+            return
+        await anyio.sleep(0.25)
+    raise AssertionError(f"{want} not reached within {limit}s")
+
+
 async def _park_loop(client, acts, seen):
     """Start the loop and wait until it parks at its approval gate."""
     handle = await start_dev_loop_workflow(URL, client=client)
@@ -98,7 +111,7 @@ async def _park_loop(client, acts, seen):
 
 
 async def test_positive_control_delivery_is_accepted_with_a_live_worker(api: Any, live, monkeypatch):
-    monkeypatch.setattr(dx, "DELIVERY_TIMEOUT_SECONDS", SHORT_WAIT)
+    monkeypatch.setattr(dx, "DELIVERY_TIMEOUT_SECONDS", LONG_WAIT)  # no timeout wanted here
     client = live.client
     submit, seen = _investigate_log()
     acts = _loop_activities(submit)
@@ -131,12 +144,17 @@ async def test_late_update_after_outage_is_deferred_then_executes_exactly_once(a
     disp = dx.Dispatcher(WorkItemClient(), dx.TemporalClientPort(client), lease=60)
     out = await disp.dispatch_once()
     assert out.action == dx.DEFERRED, (out.action, getattr(out, "reason", None))
+    # The documented deferral (fixed reason), not the generic crash path: the
+    # SDK reports the cancelled wait as WorkflowUpdateRPCTimeoutOrCancelledError.
+    assert out.reason == f"delivery to {wid}: {dx.DELIVERY_TIMED_OUT}", out.reason
     assert api.executions == []  # nothing minted for an undelivered request
-    assert api.request_state(rid).get("state") != "rejected"
+    assert api.request_state(rid).get("state") == "claimed"
     api.now += 500  # the store's clock: the deferred claim's lease lapses
     # -- restore ------------------------------------------------------------
     async with _worker(client, acts):
-        # The admitted Update is executed by the restored worker.
+        # The Update admitted during the outage is accepted by the restored
+        # worker on its own, before any re-dispatch sends it again.
+        await _wait_for_async(lambda: _accepted_updates(client, wid), 1, 30)
         outcomes = []
         for _ in range(6):
             o = await disp.dispatch_once()
@@ -152,6 +170,9 @@ async def test_late_update_after_outage_is_deferred_then_executes_exactly_once(a
         assert (await client.get_workflow_handle(wid).describe()).run_id == run_id
         assert len(api.executions) == 1 and len(seen) == 1
         assert api.executions[0]["engine_ref"] == request_engine_ref(wid, rid)
+        # Running, not just not-Succeeded: the phase is Pending right after
+        # the fulfil, where "not Succeeded" cannot fail.
+        await _wait_for(lambda: api.executions[0]["phase"] == "Running", 30)
         assert api.executions[0]["phase"] != "Succeeded"  # never a false success
         api.now += 500
         third = await disp.dispatch_once()
@@ -164,8 +185,12 @@ async def test_late_update_after_outage_is_deferred_then_executes_exactly_once(a
 
 async def test_repeated_delivery_of_one_request_is_absorbed(api: Any, live, monkeypatch):
     """Same request id, a DIFFERENT update id: Temporal's own update-id dedup
-    cannot help, only `_accepted_request_ids` does (the mutation target)."""
-    monkeypatch.setattr(dx, "DELIVERY_TIMEOUT_SECONDS", SHORT_WAIT)
+    cannot help, only `_accepted_request_ids` does (the mutation target).
+    Both guards (validator and handler) are on this path; removing either one
+    turns it red, though the validator guard is caught through the
+    `resume-already-pending` refusal rather than in isolation. The same set
+    carried across continue-as-new is NOT exercised here."""
+    monkeypatch.setattr(dx, "DELIVERY_TIMEOUT_SECONDS", LONG_WAIT)
     client = live.client
     submit, seen = _investigate_log()
     acts = _loop_activities(submit)
