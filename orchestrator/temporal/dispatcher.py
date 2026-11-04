@@ -275,7 +275,7 @@ class TemporalClientPort:
         self._client = client
 
     async def deliver(self, issue: Any, delivery: Any) -> DeliveryAnswer:
-        from temporalio.client import WorkflowUpdateFailedError
+        from temporalio.client import WorkflowUpdateFailedError, WorkflowUpdateRPCTimeoutOrCancelledError
         from temporalio.exceptions import ApplicationError
 
         from orchestrator.temporal.start import dispatch_start_operation
@@ -319,7 +319,11 @@ class TemporalClientPort:
             # a handler bug) says nothing permanent about the request:
             # rejecting it would destroy a request a fixed build can serve.
             return DeliveryAnswer(DELIVERY_DEFERRED, f"update failed: {reason}")
-        except TimeoutError:
+        except (TimeoutError, WorkflowUpdateRPCTimeoutOrCancelledError):
+            # `asyncio.wait_for` cancels the in-flight RPC, and the SDK reports
+            # that as `WorkflowUpdateRPCTimeoutOrCancelledError`, which is NOT a
+            # `TimeoutError`: against a real server it used to fall through to
+            # the generic crash path (free-text reason, logged exception).
             # (`asyncio.TimeoutError` is `TimeoutError` since 3.11.) Says
             # nothing about the request: defer, and let the next claim re-send.
             return DeliveryAnswer(DELIVERY_DEFERRED, DELIVERY_TIMED_OUT)
