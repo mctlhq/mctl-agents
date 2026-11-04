@@ -62,9 +62,11 @@ from orchestrator.temporal.workflows.dev_loop import (
     DELIVERY_EXIT_GRACE,
     FULFILMENT_WAIT,
     LOOP_ACTIVE_ERROR_TYPE,
+    RESUME_DEFERRAL_REASONS,
     RESUME_DEFERRED_ERROR_TYPE,
     RESUME_REFUSED_ERROR_TYPE,
     DevLoopWorkflow,
+    ImplementExecutionState,
     IssueRef,
     MergeWatchResume,
     OpenDelivery,
@@ -496,6 +498,7 @@ async def test_a_repeated_delivery_is_a_no_op_under_either_update_id(api, env):
     assert len(api.executions) == 2
 
 
+# Carries a delivery accepted BEFORE M1 (mctlhq/mctl-agents#996): it still lands as before.
 async def test_a_delivery_carried_across_continue_as_new_is_bound_once_by_the_next_run(api, env):
     """The run a merge watch hopped into: it carries one accepted, unbound
     delivery. It binds it itself; the next claim's re-sent Update reaches
@@ -543,6 +546,7 @@ async def test_a_delivery_carried_across_continue_as_new_is_bound_once_by_the_ne
     assert [e.execution_id for e in ctx.executions] == [_row(api, f"{loop}#{rid}")["id"]]
 
 
+# Carries a delivery accepted BEFORE M1 (mctlhq/mctl-agents#996): it still lands as before.
 async def test_a_delivery_carried_with_a_pending_terminal_phase_is_landed_by_the_next_run(api, env):
     """The previous run decided the resumed execution's phase but its
     advance never landed, and it hopped: the next run lands the carried
@@ -577,10 +581,18 @@ async def test_a_delivery_carried_with_a_pending_terminal_phase_is_landed_by_the
     assert _binds_for(events, rid) == 0
 
 
-async def test_a_resume_delivered_after_the_implement_step_succeeds_at_once(api, env):
-    """No approval gate is left in a merge watch: a fresh resume that
-    changes the actor clears the approval, but its execution has no decision
-    to wait for, and succeeds as soon as it is bound."""
+@pytest.mark.parametrize(
+    ("contract", "intent_id", "reason"),
+    [(False, None, "legacy-loop"), (True, 7, "feedback-not-ready")],
+)
+async def test_a_resume_delivered_after_the_implement_step_is_deferred_not_succeeded(
+    api, env, contract, intent_id, reason
+):
+    """No approval gate is left in a merge watch, but the loop has no
+    feedback handling yet (mctlhq/mctl-agents#996, DevLoop M1): a NEW resume
+    delivered now is deferred with a typed reason, never fulfilled, so no
+    `we_` is minted and no execution reaches `Succeeded`. (Before M1 it
+    succeeded at once, doing no work.)"""
     submit, _ = _submit_log()
     loop = workflow_id_for(URL)
     _ledger_entry(api, "temporal", loop, "Succeeded")
@@ -591,6 +603,7 @@ async def test_a_resume_delivered_after_the_implement_step_succeeds_at_once(api,
         investigate=WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase="Succeeded"),
         implement=WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded"),
         work_item_id=WID,
+        deferred_resume_contract=contract,
     )
     async with _worker(env, submit):
         handle = await env.client.start_workflow(
@@ -601,9 +614,46 @@ async def test_a_resume_delivered_after_the_implement_step_succeeds_at_once(api,
         )
         await handle.query(DevLoopWorkflow.work_context)  # the run has its state
         rid = api.create_request("resume")
+        if intent_id is not None:
+            api.xrs[rid]["intent_id"] = intent_id
         outcome = await _dispatcher(env).dispatch_once()
-        assert outcome.action == dx.FULFILLED and outcome.engine_ref == f"{loop}#{rid}"
-        await _wait_for(lambda: _row(api, f"{loop}#{rid}")["phase"] == "Succeeded")
+        assert outcome.action == dx.DEFERRED
+        assert outcome.reason == f"delivery to {loop}: {reason}"
+        assert api.request_state(rid)["state"] == "claimed"
+        await _stop(env, loop)
+
+
+async def test_a_delivery_accepted_after_the_gates_fails_closed_in_deliver(api, env):
+    """Defence in depth: the validator should never let it in, but an
+    `OpenDelivery(accepted_after_gates=True)` that reaches `_deliver` lands
+    `Failed` with `feedback-not-ready`, never `Succeeded`."""
+    submit, _ = _submit_log()
+    loop = workflow_id_for(URL)
+    rid = api.create_request("resume")
+    ref = f"{loop}#{rid}"
+    _ledger_entry(api, "temporal", loop, "Succeeded")
+    carried = MergeWatchResume(
+        service="mctl-telegram",
+        slug="issue-431-dispatch-acceptance",
+        deadline="2099-01-01T00:00:00Z",
+        investigate=WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase="Succeeded"),
+        implement=WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded"),
+        work_item_id=WID,
+        accepted_request_ids=(rid,),
+        deferred_resume_contract=True,
+        open_deliveries=(OpenDelivery(delivery=_delivery(rid), accepted_after_gates=True),),
+    )
+    async with _worker(env, submit):
+        await env.client.start_workflow(
+            DevLoopWorkflow.run,
+            IssueRef(issue_url=URL, work_item_id=WID, resume=carried),
+            id=loop,
+            task_queue=TASK_QUEUE,
+        )
+        outcome = await _dispatcher(env).dispatch_once()
+        assert outcome.action == dx.FULFILLED
+        await _wait_for(lambda: _row(api, ref)["phase"] == "Failed")
+        assert _row(api, ref)["phase"] != "Succeeded"
         await _stop(env, loop)
 
 
@@ -1201,3 +1251,81 @@ async def test_an_update_that_times_out_defers_with_a_fixed_reason_and_an_audit_
     assert api.request_state(rid)["state"] == "claimed" and api.fulfils() == []
     deliver = [a for a in _audit(capsys.readouterr().out) if a["event"] == "deliver"]
     assert [(a["verdict"], a["reason"]) for a in deliver] == [(dx.DELIVERY_DEFERRED, dx.DELIVERY_TIMED_OUT)]
+
+
+def _ivalidate(wf: DevLoopWorkflow, delivery: ResumeDelivery) -> tuple[str, str]:
+    with pytest.raises(ApplicationError) as exc:
+        wf._validate_execution_request(delivery)
+    return exc.value.type or "", str(exc.value.details[0])
+
+
+_OPEN = PRState(found=True, state="OPEN")
+_MERGED = PRState(found=True, state="MERGED", merged=True)
+_CLOSED = PRState(found=True, state="CLOSED")
+_RUNNING = ImplementExecutionState(stage="implementer")
+_FAILED = ImplementExecutionState(stage="implementer", outcome="failed")
+_WITH_INTENT = dataclasses.replace(_delivery("xr_1"), intent_id=7)
+
+
+@pytest.mark.parametrize(
+    ("state", "delivery", "error_type", "reason"),
+    [
+        # Arm 1 wins over everything, also on a legacy loop.
+        ({"_last_pr": _MERGED, "_implement_state": _RUNNING}, _WITH_INTENT, RESUME_REFUSED_ERROR_TYPE, "work-merged"),
+        (
+            {"_last_pr": _MERGED, "_deferred_resume_contract": False},
+            _WITH_INTENT,
+            RESUME_REFUSED_ERROR_TYPE,
+            "work-merged",
+        ),
+        (
+            {"_deferred_resume_contract": False, "_implement_state": _RUNNING},
+            _WITH_INTENT,
+            RESUME_DEFERRED_ERROR_TYPE,
+            "legacy-loop",
+        ),
+        ({"_implement_state": _RUNNING}, _WITH_INTENT, RESUME_DEFERRED_ERROR_TYPE, "implement-running"),
+        ({}, _delivery("xr_1"), RESUME_REFUSED_ERROR_TYPE, "nothing-to-resume"),
+        ({"_implement_state": _FAILED}, _WITH_INTENT, RESUME_DEFERRED_ERROR_TYPE, "recovery-not-ready"),
+        ({"_last_pr": _CLOSED}, _WITH_INTENT, RESUME_DEFERRED_ERROR_TYPE, "recovery-not-ready"),
+        ({"_last_pr": _OPEN}, _WITH_INTENT, RESUME_DEFERRED_ERROR_TYPE, "feedback-not-ready"),
+        ({}, _WITH_INTENT, RESUME_DEFERRED_ERROR_TYPE, "feedback-not-ready"),
+        # Existing reasons keep precedence.
+        ({"_resume_pending": True}, _WITH_INTENT, RESUME_REFUSED_ERROR_TYPE, "resume-already-pending"),
+    ],
+)
+def test_the_validator_fences_a_resume_after_the_gates(state, delivery, error_type, reason):
+    wf = _validator(_gates_passed=True, _deferred_resume_contract=True)
+    for name, value in state.items():
+        setattr(wf, name, value)
+    assert _ivalidate(wf, delivery) == (error_type, reason)
+    if error_type == RESUME_REFUSED_ERROR_TYPE:
+        assert reason in xr.RESUME_REFUSAL_REASONS
+    else:
+        assert reason in RESUME_DEFERRAL_REASONS
+
+
+def test_a_resume_before_the_gates_is_still_accepted_by_the_validator():
+    _validator(_gates_passed=False)._validate_execution_request(_WITH_INTENT)
+
+
+async def test_the_dispatcher_hands_the_loop_the_requests_identity(api):
+    loop = workflow_id_for(URL)
+    rid = api.create_request("resume", resumed_from="we_1")
+    api.xrs[rid]["intent_id"] = 7
+    temporal = FakeTemporal({loop: dx.LOOP_RUNNING}, delivery=dx.DeliveryAnswer(dx.DELIVERY_DEFERRED, "legacy-loop"))
+    await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+    (_, delivery) = temporal.delivered[0]
+    assert (delivery.intent_id, delivery.expected_state_version, delivery.resumed_from_execution_id) == (
+        7,
+        api.state_version,
+        "we_1",
+    )
+    assert delivery.execution_request_id == rid and delivery.kind == "resume"
+
+
+def test_a_pre_m1_payload_decodes_with_the_identity_defaults():
+    decoded = ResumeDelivery(execution_request_id="xr_1", work_item_id=WID)
+    assert (decoded.intent_id, decoded.expected_state_version, decoded.resumed_from_execution_id) == (None, 0, "")
+    assert MergeWatchResume().deferred_resume_contract is False
+    assert OpenDelivery(delivery=decoded).accepted_after_gates is False

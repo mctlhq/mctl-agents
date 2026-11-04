@@ -68,7 +68,9 @@ RESUME_REFUSED = "resume_refused"
 #: The closed vocabulary after `resume_refused:`. The loop's own (its
 #: `accept_execution_request` validator, the `resume` signal's rules):
 #: `malformed-delivery`, `work-item-mismatch`, `resume-already-pending`,
-#: `surface-or-actor-missing`, `surface-or-actor-unrecognised`.
+#: `surface-or-actor-missing`, `surface-or-actor-unrecognised`; and, for a
+#: resume delivered after the approval gates (mctlhq/mctl-agents#996),
+#: `work-merged` and `nothing-to-resume`.
 #: `engine-ref-too-long` is retained read-side vocabulary only: rows the
 #: dispatcher rejected this way before mctlhq/mctl-agents#488 still read back
 #: with it, but this build never mints it again (see `ENGINE_REF_TOO_LONG`).
@@ -83,6 +85,8 @@ RESUME_REFUSAL_REASONS = frozenset(
         "resume-already-pending",
         "surface-or-actor-missing",
         "surface-or-actor-unrecognised",
+        "work-merged",
+        "nothing-to-resume",
         "engine-ref-too-long",
         RESUME_REFUSAL_UNSPECIFIED,
     }
@@ -160,6 +164,10 @@ class ExecutionRequest:
     #: request still parses (claiming, fulfilling and rejecting never read
     #: it); only the intent source refuses it, and only when it is on.
     intent_id_malformed: bool = False
+    #: When mctl-api created the request (its `created_at`, as sent), or ""
+    #: when absent. The dispatcher reads it to report how long a deferred
+    #: request has waited.
+    created_at: str = ""
 
     @staticmethod
     def from_payload(data: Any) -> ExecutionRequest | None:
@@ -205,6 +213,7 @@ class ExecutionRequest:
             claim_expires_at=_str(data.get("claim_expires_at")),
             intent_id=intent_id,
             intent_id_malformed=intent_id_malformed,
+            created_at=_str(data.get("created_at")),
         )
 
 

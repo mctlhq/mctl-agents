@@ -70,6 +70,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from orchestrator.temporal.issue_ref import (
@@ -86,6 +87,24 @@ from orchestrator.work_context import execution_requests as xr
 from orchestrator.work_context.contract import WORK_ITEM_FOUND
 
 logger = logging.getLogger(__name__)
+
+#: A deferral reason outside the loop's closed vocabulary is normalised to this.
+RESUME_DEFERRAL_UNSPECIFIED = "unspecified"
+#: Deferral reasons the audit records as `resume_deferred:<reason>`: the
+#: loop's closed vocabulary (dev_loop.RESUME_DEFERRAL_REASONS) and `unspecified`.
+DEFERRAL_AUDITED = frozenset(
+    {
+        "loop-not-ready",
+        "loop-ending",
+        "legacy-loop",
+        "implement-running",
+        "recovery-not-ready",
+        "feedback-not-ready",
+        RESUME_DEFERRAL_UNSPECIFIED,
+    }
+)
+#: A deferred request older than this by its `created_at` is WARNed about.
+DEFERRED_AGE_WARN_SECONDS = 24 * 3600
 
 ENABLED_ENV_VAR = "EXECUTION_REQUEST_DISPATCHER"
 LEASE_ENV_VAR = "EXECUTION_REQUEST_LEASE_SECONDS"
@@ -264,6 +283,7 @@ class TemporalClientPort:
             ACCEPT_EXECUTION_REQUEST_UPDATE,
             DELIVERY_ACCEPTED,
             LOOP_ACTIVE_ERROR_TYPE,
+            RESUME_DEFERRAL_REASONS,
             RESUME_DEFERRED_ERROR_TYPE,
             RESUME_REFUSED_ERROR_TYPE,
         )
@@ -291,6 +311,9 @@ class TemporalClientPort:
                     reason = xr.RESUME_REFUSAL_UNSPECIFIED
                 return DeliveryAnswer(DELIVERY_REFUSED, reason)
             if isinstance(cause, ApplicationError) and cause.type == RESUME_DEFERRED_ERROR_TYPE:
+                # Same rule as the refusal path: a closed vocabulary only.
+                if reason not in RESUME_DEFERRAL_REASONS:
+                    reason = RESUME_DEFERRAL_UNSPECIFIED
                 return DeliveryAnswer(DELIVERY_DEFERRED, reason)
             # Anything else (a worker without the handler during a rollout,
             # a handler bug) says nothing permanent about the request:
@@ -438,6 +461,9 @@ class Dispatcher:
             actor_kind=RESUME_ACTOR_KIND,
             actor_id=request.requested_by,
             kind=request.kind,
+            intent_id=request.intent_id,
+            expected_state_version=request.expected_state_version,
+            resumed_from_execution_id=request.resumed_from_execution_id,
         )
         # The same work item id in both halves of the one operation: the
         # loop's own-start check compares them and fails closed.
@@ -452,7 +478,13 @@ class Dispatcher:
         if answer.verdict == DELIVERY_REFUSED:
             return await self._reject(request, token, loop, f"{xr.RESUME_REFUSED}:{answer.reason}", live_loop=loop)
         if answer.verdict != DELIVERED:
-            return self._defer(request, loop, f"delivery to {loop}: {answer.reason}")
+            self._warn_if_deferred_long(request, answer.reason)
+            return self._defer(
+                request,
+                loop,
+                f"delivery to {loop}: {answer.reason}",
+                audit_reason=f"resume_deferred:{answer.reason}" if answer.reason in DEFERRAL_AUDITED else "",
+            )
         # Accepted by a run that may have closed since: nothing would bind the
         # execution a fulfil mints now. Leave the request claimed; the next
         # claim re-sends it, and Update-with-Start either finds a running
@@ -636,13 +668,41 @@ class Dispatcher:
             return DispatchOutcome(CLOSED, **ids, execution_id=answer.execution_id, reason=answer.reason)
         return DispatchOutcome(DEFERRED, **ids, reason=f"reject {answer.verdict}: {answer.reason}")
 
-    def _defer(self, request: xr.ExecutionRequest, loop: str, reason: str) -> DispatchOutcome:
+    @staticmethod
+    def _warn_if_deferred_long(request: xr.ExecutionRequest, reason: str) -> None:
+        """WARN, once per claim, when a deferred request is older than
+        DEFERRED_AGE_WARN_SECONDS by the `created_at` mctl-api sent. Reads
+        only the row, so it is right after a dispatcher restart; a missing
+        or unparsable value is reported UNKNOWN, never as age zero."""
+        age: str
+        try:
+            created = datetime.fromisoformat(request.created_at.replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            seconds = (datetime.now(UTC) - created).total_seconds()
+        except (ValueError, AttributeError):
+            age = "UNKNOWN"
+        else:
+            if seconds <= DEFERRED_AGE_WARN_SECONDS:
+                return
+            age = f"{int(seconds)}s"
+        logger.warning(
+            "deferred execution request %s (work item %s) reason=%s age=%s",
+            request.request_id,
+            request.work_item_id,
+            reason,
+            age,
+        )
+
+    def _defer(
+        self, request: xr.ExecutionRequest, loop: str, reason: str, *, audit_reason: str = ""
+    ) -> DispatchOutcome:
         audit(
             "defer",
             execution_request_id=request.request_id,
             work_item_id=request.work_item_id,
             workflow_id=loop,
-            reason=reason,
+            reason=audit_reason or reason,
         )
         return DispatchOutcome(
             DEFERRED,
