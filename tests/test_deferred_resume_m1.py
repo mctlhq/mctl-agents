@@ -138,7 +138,8 @@ async def test_a_resume_deferred_then_deliverable_is_fulfilled_exactly_once(api)
     further dispatch finds nothing. No second delivery, no second execution."""
     loop = workflow_id_for(URL)
     rid = api.create_request("resume")
-    temporal = FakeTemporal({loop: dx.LOOP_RUNNING}, delivery=dx.DeliveryAnswer(dx.DELIVERY_DEFERRED, "feedback-not-ready"))
+    deferred = dx.DeliveryAnswer(dx.DELIVERY_DEFERRED, "feedback-not-ready")
+    temporal = FakeTemporal({loop: dx.LOOP_RUNNING}, delivery=deferred)
     dispatcher = dx.Dispatcher(WorkItemClient(), temporal, lease=60)
     assert (await dispatcher.dispatch_once()).action == dx.DEFERRED
     api.now += 120  # the lease lapses; the request is claimable again

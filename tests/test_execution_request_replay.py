@@ -374,7 +374,8 @@ def test_no_older_dev_loop_history_records_the_dispatch_marker():
     it must carry neither the marker nor either new activity — otherwise it
     was re-recorded and no longer proves that old histories replay."""
     for path in sorted(HISTORY_DIR.glob("dev_loop_*.json")):
-        if path in (DISPATCHED_HISTORY, RESUMED_HISTORY, ISSUE_KEYED_HISTORY, DEFERRED_RESUME_HISTORY, *CANONICAL_HISTORIES):
+        known = (DISPATCHED_HISTORY, RESUMED_HISTORY, ISSUE_KEYED_HISTORY, DEFERRED_RESUME_HISTORY)
+        if path in (*known, *CANONICAL_HISTORIES):
             continue
         events = _events(json.loads(path.read_text(encoding="utf-8")))
         assert EXECUTION_REQUEST_PATCH not in _patch_ids(events), path.name
