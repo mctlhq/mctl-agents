@@ -403,3 +403,43 @@ async def test_a_legacy_spelling_still_decodes_and_is_not_rewritten(api, legacy)
     await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
     # Neither normalised to `unspecified` nor renamed to the canonical spelling.
     assert api.request_state(rid)["reason"] == f"{xr.RESUME_REFUSED}:{legacy}"
+
+
+# -- legacy refusal spellings through the production decode -------------------
+#
+# `test_a_legacy_spelling_still_decodes_and_is_not_rewritten` above feeds a
+# `DeliveryAnswer` straight from `FakeTemporal`, so it never reaches the code
+# that turns a Temporal `ApplicationError` into a reason
+# (`TemporalClientPort.deliver`). Removing the legacy spellings from the
+# accepted vocabulary left it green. These go through the real port.
+
+
+@pytest.mark.parametrize("legacy", ["work-merged", "nothing-to-resume"])  # literals: the rows already written
+async def test_a_legacy_refusal_error_keeps_its_reason_through_the_real_port(api, legacy):  # noqa: F811
+    from temporalio.client import WorkflowUpdateFailedError
+
+    from orchestrator.temporal.workflows.dev_loop import RESUME_REFUSED_ERROR_TYPE
+
+    loop = workflow_id_for(URL)
+    rid = api.create_request("resume")
+    cause = ApplicationError("execution request refused: a sentence", legacy, type=RESUME_REFUSED_ERROR_TYPE)
+    port = _RunningPort(_UpdateClient(WorkflowUpdateFailedError(cause)), loop)
+
+    outcome = await dx.Dispatcher(WorkItemClient(), port, lease=60).dispatch_once()
+    assert outcome.action == dx.REJECTED
+    assert api.request_state(rid)["reason"] == f"{xr.RESUME_REFUSED}:{legacy}"
+    assert api.fulfils() == []
+
+
+async def test_an_unknown_refusal_error_still_collapses_to_unspecified_through_the_real_port(api):  # noqa: F811
+    from temporalio.client import WorkflowUpdateFailedError
+
+    from orchestrator.temporal.workflows.dev_loop import RESUME_REFUSED_ERROR_TYPE
+
+    loop = workflow_id_for(URL)
+    rid = api.create_request("resume")
+    cause = ApplicationError("x", "work_merged-typo", type=RESUME_REFUSED_ERROR_TYPE)
+    port = _RunningPort(_UpdateClient(WorkflowUpdateFailedError(cause)), loop)
+    outcome = await dx.Dispatcher(WorkItemClient(), port, lease=60).dispatch_once()
+    assert outcome.action == dx.REJECTED
+    assert api.request_state(rid)["reason"] == f"{xr.RESUME_REFUSED}:{xr.RESUME_REFUSAL_UNSPECIFIED}"
