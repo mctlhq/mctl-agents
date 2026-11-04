@@ -1,0 +1,5 @@
+{
+  "hold": true,
+  "reason": "DevLoop M1 (mctl-agents#996) must not ship before M2/M3 and release blockers B1-B4 of mctl-agents#993 are closed. Rollback below M1 is blocked (mctl-api#935).",
+  "lift": "Open a reviewed PR that sets hold to false (the boolean, nothing else) and states which gates closed. Until then no release is cut from main."
+}

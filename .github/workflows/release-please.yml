@@ -164,6 +164,51 @@ jobs:
     needs: binding-gate
     runs-on: ubuntu-latest
     steps:
+      # Release hold (.github/release/hold.json). It stops a release from being
+      # CUT, not a release PR from being opened, updated or reviewed. The
+      # decision is made HERE, in the job that runs the action, as the step
+      # right before it, and it does not depend on whether a release PR looked
+      # pending earlier: an earlier probe in another job (the binding gate can
+      # run for 45 min) is a time-of-check/time-of-use gap, because a release
+      # PR merged inside that gap is cut by the action below. The hold feeds
+      # `skip-github-release` instead, which is the only place release-please
+      # v5 creates tags and GitHub Releases (Manifest.createReleases). Skipped,
+      # the action sets no `release_created`, so every dispatch, publish and
+      # promotion step below (all gated on it) stays off. Release PR creation
+      # and updating (`skip-github-pull-request`, left false) goes on until a
+      # release PR is merged under the hold; after that the action itself
+      # aborts PR work while a merged `autorelease: pending` PR is untagged.
+      #
+      # Fail-closed in both directions. Only the exact string 'false' lets a
+      # release through; every other value of the output, an empty one
+      # included, becomes 'true'. The step passes only when hold.json is an
+      # explicit `hold: false` BOTH on the tip of main (so a queued run for an
+      # older commit cannot release past a hold added since) AND in this run's
+      # own checkout. A failed read of either, a missing or malformed file, or
+      # a missing checker is a hold. A merged release PR keeps its pending
+      # label, so the first push to main after the hold is lifted cuts it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the release hold
+        id: hold
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          skip=true
+          tip="$(mktemp)"
+          if gh api -H "Accept: application/vnd.github.raw" \
+               "repos/${GITHUB_REPOSITORY}/contents/.github/release/hold.json?ref=main" > "$tip" \
+             && python3 .github/release/check_hold.py --file "$tip" \
+             && python3 .github/release/check_hold.py; then
+            skip=false
+          else
+            echo "::warning::Release hold is on or unreadable: skip-github-release is set, no tag or GitHub Release will be created by this run."
+            echo "Release hold ON or unreadable: this run creates no tag and no GitHub Release." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "skip=${skip}" >> "$GITHUB_OUTPUT"
       # Uses mctl-agents, the backend-only automation App — deliberately NOT
       # MCTL App (APP_CLIENT_ID), which this used to read. MCTL App is the
       # App customers install themselves from mctl.ai/#request-access, and it
@@ -185,9 +230,12 @@ jobs:
           permission-pull-requests: write
           permission-issues: write
 
-      - uses: googleapis/release-please-action@v5
+      # Pinned to the commit v5 pointed at on 2026-11-04 (v5.0.0), so the
+      # `skip-github-release` semantics relied on above cannot move under us.
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
+          skip-github-release: ${{ steps.hold.outputs.skip == 'false' && 'false' || 'true' }}
           token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
