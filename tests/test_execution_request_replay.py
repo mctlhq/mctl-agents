@@ -87,6 +87,11 @@ HISTORY_DIR = Path(__file__).resolve().parent / "fixtures" / "histories"
 DISPATCHED_HISTORY = HISTORY_DIR / "dev_loop_dispatched.json"
 RESUMED_HISTORY = HISTORY_DIR / "dev_loop_resumed.json"
 ISSUE_KEYED_HISTORY = HISTORY_DIR / "dev_loop_issue_keyed.json"
+# mctl-agents#996 (DevLoop M1): a loop that passed its gates under the
+# deferred-resume contract. Recorded by `record_issue_keyed` (the scenario is
+# the same; what is new is the marker), so it carries exactly one
+# `deferred-resume-contract` marker.
+DEFERRED_RESUME_HISTORY = HISTORY_DIR / "dev_loop_deferred_resume.json"
 # #636: a dispatched loop and an ordinary (issue-started) one, each through
 # the canonical approval: own `we_`, `aar_`, the delegated flip.
 DELEGATED_HISTORY = HISTORY_DIR / "dev_loop_delegated.json"
@@ -369,7 +374,7 @@ def test_no_older_dev_loop_history_records_the_dispatch_marker():
     it must carry neither the marker nor either new activity — otherwise it
     was re-recorded and no longer proves that old histories replay."""
     for path in sorted(HISTORY_DIR.glob("dev_loop_*.json")):
-        if path in (DISPATCHED_HISTORY, RESUMED_HISTORY, ISSUE_KEYED_HISTORY, *CANONICAL_HISTORIES):
+        if path in (DISPATCHED_HISTORY, RESUMED_HISTORY, ISSUE_KEYED_HISTORY, DEFERRED_RESUME_HISTORY, *CANONICAL_HISTORIES):
             continue
         events = _events(json.loads(path.read_text(encoding="utf-8")))
         assert EXECUTION_REQUEST_PATCH not in _patch_ids(events), path.name
@@ -425,7 +430,7 @@ def test_no_history_without_a_delivery_records_the_resume_marker():
     """The resume marker is recorded where a delivery starts, so no other
     history — the dispatched one included — may carry it."""
     for path in sorted(HISTORY_DIR.glob("*.json")):
-        if path in (RESUMED_HISTORY, ISSUE_KEYED_HISTORY, DELEGATED_HISTORY):
+        if path in (RESUMED_HISTORY, ISSUE_KEYED_HISTORY, DEFERRED_RESUME_HISTORY, DELEGATED_HISTORY):
             continue
         events = _events(json.loads(path.read_text(encoding="utf-8")))
         assert EXECUTION_REQUEST_RESUME_PATCH not in _patch_ids(events), path.name
@@ -468,7 +473,7 @@ def test_no_pre_option_a_history_records_the_issue_keyed_marker():
     """The pre-option-A fixtures prove that loops already in flight at the
     upgrade replay; carrying the marker would mean they were re-recorded."""
     for path in sorted(HISTORY_DIR.glob("*.json")):
-        if path in (ISSUE_KEYED_HISTORY, DELEGATED_HISTORY):
+        if path in (ISSUE_KEYED_HISTORY, DEFERRED_RESUME_HISTORY, DELEGATED_HISTORY):
             continue
         events = _events(json.loads(path.read_text(encoding="utf-8")))
         assert ISSUE_KEYED_DISPATCH_PATCH not in _patch_ids(events), path.name
@@ -495,6 +500,55 @@ async def test_todays_resumed_loop_replays_its_own_history(routed_api):
     )
 
 
+async def test_the_deferred_resume_history_replays_against_current_definitions():
+    """A NondeterminismError here means today's edit would wedge a loop that
+    already recorded the M1 marker. Guard the change with `workflow.patched()`;
+    do not re-record to make it pass."""
+    history = WorkflowHistory.from_json(
+        "replay-dev-loop-deferred-resume", DEFERRED_RESUME_HISTORY.read_text(encoding="utf-8")
+    )
+    await Replayer(workflows=[DevLoopWorkflow]).replay_workflow(history)
+
+
+def test_the_deferred_resume_history_records_the_m1_marker_exactly_once():
+    from orchestrator.temporal.workflows.dev_loop import DEFERRED_RESUME_PATCH
+
+    events = _events(json.loads(DEFERRED_RESUME_HISTORY.read_text(encoding="utf-8")))
+    count = 0
+    for event in events:
+        attrs = event.get("markerRecordedEventAttributes") or {}
+        if attrs.get("markerName") != "core_patch":
+            continue
+        for payload in attrs.get("details", {}).get("patch-data", {}).get("payloads", []):
+            count += json.loads(base64.b64decode(payload["data"]))["id"] == DEFERRED_RESUME_PATCH
+    assert count == 1
+
+
+def test_no_history_recorded_before_m1_carries_the_marker():
+    """The older fixtures prove loops already in flight at the upgrade replay
+    (tests above and in test_workflow_replay.py); carrying the marker would
+    mean one of them was re-recorded to turn red green."""
+    from orchestrator.temporal.workflows.dev_loop import DEFERRED_RESUME_PATCH
+
+    for path in sorted(HISTORY_DIR.glob("*.json")):
+        if path == DEFERRED_RESUME_HISTORY:
+            continue
+        assert DEFERRED_RESUME_PATCH not in _patch_ids(_events(json.loads(path.read_text(encoding="utf-8")))), path.name
+
+
+async def test_todays_loop_replays_its_own_deferred_resume_history(routed_api):
+    """Ties the M1 guard to the CODE: a fresh recording must replay and must
+    record the marker."""
+    from orchestrator.temporal.workflows.dev_loop import DEFERRED_RESUME_PATCH
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        history = await record_issue_keyed(env)
+    assert DEFERRED_RESUME_PATCH in _patch_ids(_events(history))
+    await Replayer(workflows=[DevLoopWorkflow]).replay_workflow(
+        WorkflowHistory.from_json("replay-dev-loop-deferred-resume-fresh", history)
+    )
+
+
 def _regenerate(names: list[str]) -> None:  # pragma: no cover — a maintenance entry point, not a test
     """Re-record the named fixtures (today only `issue_keyed`; every one when
     none is named), each against a fresh fake mctl-api. The pre-option-A
@@ -504,6 +558,7 @@ def _regenerate(names: list[str]) -> None:  # pragma: no cover — a maintenance
 
     recorders = {
         "issue_keyed": (ISSUE_KEYED_HISTORY, record_issue_keyed),
+        "deferred_resume": (DEFERRED_RESUME_HISTORY, record_issue_keyed),
         "delegated": (DELEGATED_HISTORY, record_delegated),
         "issue_started": (ISSUE_STARTED_HISTORY, record_issue_started),
     }
@@ -673,7 +728,7 @@ def test_no_older_history_records_the_canonical_approval_marker():
     longer proves that in-flight loops keep their legacy approval."""
     canonical = {"ensure_issue_execution", "request_devloop_approval", "submit_delegated_approve"}
     for path in sorted(HISTORY_DIR.glob("*.json")):
-        if path in CANONICAL_HISTORIES:
+        if path in (*CANONICAL_HISTORIES, DEFERRED_RESUME_HISTORY):
             continue
         events = _events(json.loads(path.read_text(encoding="utf-8")))
         assert dev_loop.CANONICAL_APPROVAL_PATCH not in _patch_ids(events), path.name
