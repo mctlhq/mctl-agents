@@ -99,11 +99,10 @@ RESUME_REFUSAL_REASONS = frozenset(
         "surface-or-actor-unrecognised",
         WORK_MERGED,
         NO_ACTIONABLE_INTENT,
-        "work-merged",
-        "nothing-to-resume",
         "engine-ref-too-long",
         RESUME_REFUSAL_UNSPECIFIED,
     }
+    | LEGACY_RESUME_REFUSAL_REASONS
 )
 #: The run this request's workflow id named already ended without the
 #: request being fulfilled. Written by the per-request `dev-loop-xr_<id>`
