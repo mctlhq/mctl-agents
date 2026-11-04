@@ -68,7 +68,11 @@ RESUME_REFUSED = "resume_refused"
 #: The closed vocabulary after `resume_refused:`. The loop's own (its
 #: `accept_execution_request` validator, the `resume` signal's rules):
 #: `malformed-delivery`, `work-item-mismatch`, `resume-already-pending`,
-#: `surface-or-actor-missing`, `surface-or-actor-unrecognised`.
+#: `surface-or-actor-missing`, `surface-or-actor-unrecognised`; and, for a
+#: resume delivered after the approval gates (mctlhq/mctl-agents#996),
+#: `work_merged` and `no_actionable_intent` (the canonical spellings; the
+#: hyphenated `work-merged` and `nothing-to-resume` of the first M1 draft stay
+#: in the vocabulary as read-side aliases only, see WORK_MERGED below).
 #: `engine-ref-too-long` is retained read-side vocabulary only: rows the
 #: dispatcher rejected this way before mctlhq/mctl-agents#488 still read back
 #: with it, but this build never mints it again (see `ENGINE_REF_TOO_LONG`).
@@ -76,6 +80,16 @@ RESUME_REFUSED = "resume_refused"
 #: (a loop built with a reason this build does not know), normalised so a
 #: surface never sees free text.
 RESUME_REFUSAL_UNSPECIFIED = "unspecified"
+#: Canonical refusal reasons for a resume delivered after the approval gates
+#: (mctlhq/mctl-agents#993 owner decisions of 2026-11-04). Every writer, test,
+#: document and serialised outcome uses these two spellings.
+WORK_MERGED = "work_merged"
+NO_ACTIONABLE_INTENT = "no_actionable_intent"
+#: The hyphenated spellings the first M1 draft used. This build never mints
+#: them; they stay in RESUME_REFUSAL_REASONS only so a row or a history that
+#: already carries one still decodes. They are never rewritten: a stored
+#: `resume_refused:work-merged` keeps reading back as written.
+LEGACY_RESUME_REFUSAL_REASONS = frozenset({"work-merged", "nothing-to-resume"})
 RESUME_REFUSAL_REASONS = frozenset(
     {
         "malformed-delivery",
@@ -83,9 +97,12 @@ RESUME_REFUSAL_REASONS = frozenset(
         "resume-already-pending",
         "surface-or-actor-missing",
         "surface-or-actor-unrecognised",
+        WORK_MERGED,
+        NO_ACTIONABLE_INTENT,
         "engine-ref-too-long",
         RESUME_REFUSAL_UNSPECIFIED,
     }
+    | LEGACY_RESUME_REFUSAL_REASONS
 )
 #: The run this request's workflow id named already ended without the
 #: request being fulfilled. Written by the per-request `dev-loop-xr_<id>`
@@ -160,6 +177,10 @@ class ExecutionRequest:
     #: request still parses (claiming, fulfilling and rejecting never read
     #: it); only the intent source refuses it, and only when it is on.
     intent_id_malformed: bool = False
+    #: When mctl-api created the request (its `created_at`, as sent), or ""
+    #: when absent. The dispatcher reads it to report how long a deferred
+    #: request has waited.
+    created_at: str = ""
 
     @staticmethod
     def from_payload(data: Any) -> ExecutionRequest | None:
@@ -205,6 +226,7 @@ class ExecutionRequest:
             claim_expires_at=_str(data.get("claim_expires_at")),
             intent_id=intent_id,
             intent_id_malformed=intent_id_malformed,
+            created_at=_str(data.get("created_at")),
         )
 
 

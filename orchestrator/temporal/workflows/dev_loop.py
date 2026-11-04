@@ -421,6 +421,15 @@ ACCEPT_EXECUTION_REQUEST_UPDATE = "accept_execution_request"
 # a history recorded before it bound under its own workflow id, and replays
 # that way. Consulted only on the dispatched path.
 ISSUE_KEYED_DISPATCH_PATCH = "issue-keyed-dispatch"
+#: Marks a loop that passed its approval gates under the deferred-resume
+#: contract (mctlhq/mctl-agents#996, DevLoop M1): a `resume` delivered after
+#: the gates is refused or deferred by the validator instead of landing a
+#: false `Succeeded`. Evaluated once in `run`, immediately before
+#: `_gates_passed` is set, and carried across continue-as-new in
+#: `MergeWatchResume.deferred_resume_contract` (never re-evaluated). A history
+#: that passed that point before this marker replays it as False and stays a
+#: `legacy-loop` for its whole life. The marker is the only command added.
+DEFERRED_RESUME_PATCH = "deferred-resume-contract"
 # Also option A: a dispatched run that ends having run nothing (its request
 # was rejected, refused at fulfil, never fulfilled, or its bind refused) ends
 # the workflow FAILED instead of COMPLETED. Its id is the issue's now, and the
@@ -485,6 +494,18 @@ RESUME_REFUSED_ERROR_TYPE = "ResumeRefused"
 #: The validator's transient refusal (the loop is not ready, or is ending):
 #: the dispatcher defers, and a later claim delivers or starts a continuation.
 RESUME_DEFERRED_ERROR_TYPE = "ResumeDeferred"
+#: The closed vocabulary of `ResumeDeferred` reasons; the dispatcher
+#: normalises anything else to `unspecified`.
+RESUME_DEFERRAL_REASONS = frozenset(
+    {
+        "loop-not-ready",
+        "loop-ending",
+        "legacy-loop",
+        "implement-running",
+        "recovery-not-ready",
+        "feedback-not-ready",
+    }
+)
 #: The validator's answer to a `start` request delivered onto a loop that was
 #: not started for it: the issue already has a DevLoop, so the dispatcher
 #: rejects the request `loop_active`, as it always has.
@@ -1047,6 +1068,12 @@ class ResumeDelivery:
     #: `resume`, the only kind delivered before #461 option A, so a payload
     #: recorded then still decodes to what it was.
     kind: str = DELIVERY_KIND_RESUME
+    #: The request's identity (mctlhq/mctl-agents#996, DevLoop M1), carried
+    #: for a later slice; recorded only. Defaulted so a payload recorded
+    #: before M1 decodes unchanged.
+    intent_id: int | None = None
+    expected_state_version: int = 0
+    resumed_from_execution_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -1065,6 +1092,10 @@ class OpenDelivery:
     pending_phase: str = ""
     #: What `_end_delivery` records once that advance lands.
     pending_refusal: str = ""
+    #: Accepted while the gates had passed under the deferred-resume
+    #: contract (M1). The validator already blocks that; `_deliver` fails
+    #: such a delivery closed (`feedback-not-ready`) if one ever gets here.
+    accepted_after_gates: bool = False
 
 
 @dataclass(frozen=True)
@@ -1588,6 +1619,10 @@ class MergeWatchResume:
     # different answer than the run it replaces just because
     # `workflow.patched` was re-evaluated on a fresh history.
     proposal_terminal_end: bool = False
+    # Whether this loop passed its gates under DEFERRED_RESUME_PATCH
+    # (mctlhq/mctl-agents#996). Carried, never re-evaluated: a record from
+    # before M1 decodes as False, i.e. a legacy loop.
+    deferred_resume_contract: bool = False
     # Whether an OPEN pull request has been resolved at any point earlier in
     # THIS watch. Guards the terminal-status check above: a PR that was
     # OPEN and then becomes unresolvable (a transient 404, lost token
@@ -1893,6 +1928,11 @@ class DevLoopWorkflow:
         # Set once the implement step is submitted: no approval gate is left
         # ahead, so a delivered resume has no decision left to wait for.
         self._gates_passed = False
+        # True when this loop passed its gates under DEFERRED_RESUME_PATCH
+        # (set in `run`, restored by `_resume_merge_watch`); see the patch.
+        self._deferred_resume_contract = False
+        # The last PR state the merge watch observed, for the validator.
+        self._last_pr: PRState | None = None
         # Set by `_settle_deliveries` right before this run ends (`_exiting`)
         # or continues as new (`_hopping`).
         self._exiting = False
@@ -2687,7 +2727,11 @@ class DevLoopWorkflow:
         surface, actor, _ = self._resume_provenance(delivery.surface, delivery.actor_kind, delivery.actor_id)
         self._accepted_request_ids.add(rid)
         self._work_item_id = self._work_item_id or delivery.work_item_id
-        opened = OpenDelivery(delivery=delivery, surface_transition=self._take_resume_provenance(surface, actor))
+        opened = OpenDelivery(
+            delivery=delivery,
+            surface_transition=self._take_resume_provenance(surface, actor),
+            accepted_after_gates=self._gates_passed and self._deferred_resume_contract,
+        )
         self._open_deliveries[rid] = opened
         self._start_delivery(opened)
         return DELIVERY_ACCEPTED
@@ -2745,6 +2789,21 @@ class DevLoopWorkflow:
         _, _, refusal = self._resume_provenance(delivery.surface, delivery.actor_kind, delivery.actor_id)
         if refusal:
             raise refuse(RESUME_REFUSED_ERROR_TYPE, refusal)
+        if self._gates_passed:
+            # One ordered list, first match wins (mctlhq/mctl-agents#996).
+            pr = self._last_pr
+            st = self._implement_state
+            if pr is not None and pr.merged:
+                raise refuse(RESUME_REFUSED_ERROR_TYPE, "work_merged")
+            if not self._deferred_resume_contract:
+                raise refuse(RESUME_DEFERRED_ERROR_TYPE, "legacy-loop")
+            if st.stage == "implementer" and st.outcome is None:
+                raise refuse(RESUME_DEFERRED_ERROR_TYPE, "implement-running")
+            if delivery.intent_id is None:
+                raise refuse(RESUME_REFUSED_ERROR_TYPE, "no_actionable_intent")
+            if (st.outcome not in (None, "success")) or (pr is not None and pr.state == "CLOSED"):
+                raise refuse(RESUME_DEFERRED_ERROR_TYPE, "recovery-not-ready")
+            raise refuse(RESUME_DEFERRED_ERROR_TYPE, "feedback-not-ready")
 
     def _start_delivery(self, opened: OpenDelivery) -> None:
         rid = opened.delivery.execution_request_id
@@ -2825,6 +2884,12 @@ class DevLoopWorkflow:
                     surface_transition=opened.surface_transition,
                 )
             )
+        if opened.accepted_after_gates:
+            # Defence in depth (M1): the validator defers a post-gates
+            # resume, so this is unreachable; if reached, fail closed
+            # rather than land a false `Succeeded`.
+            await self._land_delivery(opened, "Failed", "feedback-not-ready", engine_ref)
+            return
         # A canonical loop's decision is a grant (#636): a bare or legacy
         # `approver` signal decides no delivery either.
         await workflow.wait_condition(
@@ -4231,6 +4296,7 @@ class DevLoopWorkflow:
 
         # No approval gate is left from here on: a resume delivered from now
         # (mctlhq/mctl-agents#461) has no decision to wait for.
+        self._deferred_resume_contract = workflow.patched(DEFERRED_RESUME_PATCH)
         self._gates_passed = True
         implement_result = await self._implement(implementer_release, implement_params, target_repo)
 
@@ -4300,6 +4366,7 @@ class DevLoopWorkflow:
             resume_pending=self._resume_pending,
             accepted_request_ids=tuple(sorted(self._accepted_request_ids)),
             open_deliveries=tuple(self._open_deliveries[rid] for rid in sorted(self._open_deliveries)),
+            deferred_resume_contract=self._deferred_resume_contract,
         )
 
     def _rehydrate_work_context(self, resume: MergeWatchResume) -> None:
@@ -4449,6 +4516,8 @@ class DevLoopWorkflow:
         # them), and from here its state is whole: the Update validator may
         # decide, and the deliveries the previous run left open resume
         # waiting for their fulfilment (#461).
+        self._deferred_resume_contract = resume.deferred_resume_contract
+        self._last_pr = resume.last_pr
         self._gates_passed = True
         self._initialized = True
         for rid in sorted(self._open_deliveries):
@@ -6506,6 +6575,7 @@ class DevLoopWorkflow:
                     continue
                 if state.found:
                     last = state
+                    self._last_pr = state
                     polls_without_pr = 0
                     terminal_status_polls = 0
                     if state.state not in ("MERGED", "CLOSED"):

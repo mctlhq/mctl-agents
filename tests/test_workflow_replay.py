@@ -581,6 +581,8 @@ _STANDALONE_FIXTURES = {
     "dev_loop_dispatched.json",
     "dev_loop_resumed.json",
     "dev_loop_issue_keyed.json",
+    # mctlhq/mctl-agents#996 (DevLoop M1), replayed by tests/test_execution_request_replay.py.
+    "dev_loop_deferred_resume.json",
     # mctlhq/mctl-agents#198, replayed by tests/test_action_approval_wait.py.
     "action_approval_wait.json",
     # #636: recorded by tests/test_execution_request_replay.py
