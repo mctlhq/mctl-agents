@@ -273,3 +273,26 @@ flowchart LR
   бы вечно голодать его при стабильном порядке листинга. Retention-окно
   сбрасывается неделями, 12 ранов набираются за час пересабмитов — так что на
   практике бьёт именно второе.
+
+## DevLoop Part M, slice M2a (mctl-agents#1006)
+
+M2a adds state, read primitives and read-only surfaces. It changes no live dispatch decision.
+
+- `DevLoopWorkflow._feedback_done` / `_pending_feedback`: empty, carried in `MergeWatchResume.feedback_done` /
+  `pending_feedback` and restored on a hop. Nothing writes to them yet (the feedback tick is a later slice).
+- `contract_state` query (`ContractState`) and `python -m orchestrator.temporal.cli contract-drain-check`: read-only;
+  classify running loops as `contract`, `legacy`, `pre-gates` or `UNKNOWN` (exit 2 on any UNKNOWN or a failed listing).
+- `orchestrator/temporal/closed_loop.py`: tri-state PR, branch and gates reads and the pure `closed_loop_decision`.
+  NOT called from `Dispatcher._dispatch`; wiring is M2c. `closed-loop-unobserved` is in `DEFERRAL_AUDITED` only.
+
+Still open (not done in M2a):
+
+- task 4: replacing the `feedback-not-ready` / `recovery-not-ready` deferrals with the accept path (M2c, after the
+  feedback tick, tasks 5-8; recovery is #1005, M3).
+- task 4b: wiring `closed_loop_decision` and the reads into `Dispatcher._dispatch`, and the per-claim audit counter (M2c).
+- task 4b: `WorkItemClient.list_execution_requests`. DEPENDENCY: mctl-api execution-request list
+  (route/envelope/completeness/principal) unconfirmed. `GET /api/v1/work-items/{id}/execution-requests` exists and
+  answers `{schema_version, execution_requests}` newest first, but the store caps it at 100 rows with no
+  `truncated` flag or cursor (`internal/workitems/execution_requests.go`, `ExecutionRequests`), so a full page cannot be
+  proven complete, and the service principal's visibility through `visibleWorkItem` is not confirmed. The read is not
+  added; its test is a strict xfail.
