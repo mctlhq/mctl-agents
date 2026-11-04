@@ -111,7 +111,7 @@ def test_the_identity_fields_survive_an_encode_decode_round_trip():
 # -- T4: refused and deferred resumes mint no execution -------------------------
 
 
-@pytest.mark.parametrize("reason", ["work-merged", "nothing-to-resume"])
+@pytest.mark.parametrize("reason", ["work_merged", "no_actionable_intent"])
 async def test_a_refused_post_gates_resume_is_rejected_and_mints_no_execution(api, reason):  # noqa: F811
     loop = workflow_id_for(URL)
     rid = api.create_request("resume")
@@ -375,3 +375,31 @@ def test_created_at_is_parsed_from_the_request_body_with_an_empty_default():
         "2026-11-04T00:00:00Z"
     )
     assert xr.ExecutionRequest.from_payload(base).created_at == ""
+
+
+# -- canonical refusal names and the legacy read-side aliases (#993, 2026-11-04) --
+
+
+def test_the_canonical_reasons_are_the_ones_the_loop_raises_and_the_vocabulary_holds():
+    import inspect
+
+    from orchestrator.temporal.workflows import dev_loop
+
+    src = inspect.getsource(dev_loop)
+    assert xr.WORK_MERGED == "work_merged" and xr.NO_ACTIONABLE_INTENT == "no_actionable_intent"
+    for reason in (xr.WORK_MERGED, xr.NO_ACTIONABLE_INTENT):
+        assert reason in xr.RESUME_REFUSAL_REASONS
+        assert f'refuse(RESUME_REFUSED_ERROR_TYPE, "{reason}")' in src
+    # The loop never mints a hyphenated spelling any more.
+    for legacy in xr.LEGACY_RESUME_REFUSAL_REASONS:
+        assert f'"{legacy}")' not in src
+
+
+@pytest.mark.parametrize("legacy", sorted(xr.LEGACY_RESUME_REFUSAL_REASONS))
+async def test_a_legacy_spelling_still_decodes_and_is_not_rewritten(api, legacy):  # noqa: F811
+    loop = workflow_id_for(URL)
+    rid = api.create_request("resume")
+    temporal = FakeTemporal({loop: dx.LOOP_RUNNING}, delivery=dx.DeliveryAnswer(dx.DELIVERY_REFUSED, legacy))
+    await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+    # Neither normalised to `unspecified` nor renamed to the canonical spelling.
+    assert api.request_state(rid)["reason"] == f"{xr.RESUME_REFUSED}:{legacy}"

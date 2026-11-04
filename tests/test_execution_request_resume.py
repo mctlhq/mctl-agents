@@ -1271,12 +1271,12 @@ _WITH_INTENT = dataclasses.replace(_delivery("xr_1"), intent_id=7)
     ("state", "delivery", "error_type", "reason"),
     [
         # Arm 1 wins over everything, also on a legacy loop.
-        ({"_last_pr": _MERGED, "_implement_state": _RUNNING}, _WITH_INTENT, RESUME_REFUSED_ERROR_TYPE, "work-merged"),
+        ({"_last_pr": _MERGED, "_implement_state": _RUNNING}, _WITH_INTENT, RESUME_REFUSED_ERROR_TYPE, "work_merged"),
         (
             {"_last_pr": _MERGED, "_deferred_resume_contract": False},
             _WITH_INTENT,
             RESUME_REFUSED_ERROR_TYPE,
-            "work-merged",
+            "work_merged",
         ),
         (
             {"_deferred_resume_contract": False, "_implement_state": _RUNNING},
@@ -1285,7 +1285,7 @@ _WITH_INTENT = dataclasses.replace(_delivery("xr_1"), intent_id=7)
             "legacy-loop",
         ),
         ({"_implement_state": _RUNNING}, _WITH_INTENT, RESUME_DEFERRED_ERROR_TYPE, "implement-running"),
-        ({}, _delivery("xr_1"), RESUME_REFUSED_ERROR_TYPE, "nothing-to-resume"),
+        ({}, _delivery("xr_1"), RESUME_REFUSED_ERROR_TYPE, "no_actionable_intent"),
         ({"_implement_state": _FAILED}, _WITH_INTENT, RESUME_DEFERRED_ERROR_TYPE, "recovery-not-ready"),
         ({"_last_pr": _CLOSED}, _WITH_INTENT, RESUME_DEFERRED_ERROR_TYPE, "recovery-not-ready"),
         ({"_last_pr": _OPEN}, _WITH_INTENT, RESUME_DEFERRED_ERROR_TYPE, "feedback-not-ready"),

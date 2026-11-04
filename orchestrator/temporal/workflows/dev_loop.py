@@ -2794,13 +2794,13 @@ class DevLoopWorkflow:
             pr = self._last_pr
             st = self._implement_state
             if pr is not None and pr.merged:
-                raise refuse(RESUME_REFUSED_ERROR_TYPE, "work-merged")
+                raise refuse(RESUME_REFUSED_ERROR_TYPE, "work_merged")
             if not self._deferred_resume_contract:
                 raise refuse(RESUME_DEFERRED_ERROR_TYPE, "legacy-loop")
             if st.stage == "implementer" and st.outcome is None:
                 raise refuse(RESUME_DEFERRED_ERROR_TYPE, "implement-running")
             if delivery.intent_id is None:
-                raise refuse(RESUME_REFUSED_ERROR_TYPE, "nothing-to-resume")
+                raise refuse(RESUME_REFUSED_ERROR_TYPE, "no_actionable_intent")
             if (st.outcome not in (None, "success")) or (pr is not None and pr.state == "CLOSED"):
                 raise refuse(RESUME_DEFERRED_ERROR_TYPE, "recovery-not-ready")
             raise refuse(RESUME_DEFERRED_ERROR_TYPE, "feedback-not-ready")

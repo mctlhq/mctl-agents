@@ -70,7 +70,9 @@ RESUME_REFUSED = "resume_refused"
 #: `malformed-delivery`, `work-item-mismatch`, `resume-already-pending`,
 #: `surface-or-actor-missing`, `surface-or-actor-unrecognised`; and, for a
 #: resume delivered after the approval gates (mctlhq/mctl-agents#996),
-#: `work-merged` and `nothing-to-resume`.
+#: `work_merged` and `no_actionable_intent` (the canonical spellings; the
+#: hyphenated `work-merged` and `nothing-to-resume` of the first M1 draft stay
+#: in the vocabulary as read-side aliases only, see WORK_MERGED below).
 #: `engine-ref-too-long` is retained read-side vocabulary only: rows the
 #: dispatcher rejected this way before mctlhq/mctl-agents#488 still read back
 #: with it, but this build never mints it again (see `ENGINE_REF_TOO_LONG`).
@@ -78,6 +80,16 @@ RESUME_REFUSED = "resume_refused"
 #: (a loop built with a reason this build does not know), normalised so a
 #: surface never sees free text.
 RESUME_REFUSAL_UNSPECIFIED = "unspecified"
+#: Canonical refusal reasons for a resume delivered after the approval gates
+#: (mctlhq/mctl-agents#993 owner decisions of 2026-11-04). Every writer, test,
+#: document and serialised outcome uses these two spellings.
+WORK_MERGED = "work_merged"
+NO_ACTIONABLE_INTENT = "no_actionable_intent"
+#: The hyphenated spellings the first M1 draft used. This build never mints
+#: them; they stay in RESUME_REFUSAL_REASONS only so a row or a history that
+#: already carries one still decodes. They are never rewritten: a stored
+#: `resume_refused:work-merged` keeps reading back as written.
+LEGACY_RESUME_REFUSAL_REASONS = frozenset({"work-merged", "nothing-to-resume"})
 RESUME_REFUSAL_REASONS = frozenset(
     {
         "malformed-delivery",
@@ -85,6 +97,8 @@ RESUME_REFUSAL_REASONS = frozenset(
         "resume-already-pending",
         "surface-or-actor-missing",
         "surface-or-actor-unrecognised",
+        WORK_MERGED,
+        NO_ACTIONABLE_INTENT,
         "work-merged",
         "nothing-to-resume",
         "engine-ref-too-long",
