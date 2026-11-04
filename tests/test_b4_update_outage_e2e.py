@@ -23,6 +23,8 @@ Skips (loudly) when the dev server cannot be started, e.g. offline CI.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from temporalio.client import WorkflowUpdateFailedError
 
@@ -37,12 +39,14 @@ from orchestrator.temporal.workflows.dev_loop import (
 )
 from orchestrator.work_context.client import WorkItemClient
 from tests.temporal_harness import Worker
-from tests.test_execution_request_dispatch import (  # noqa: F401  (api: fixture)
+from tests.test_execution_request_dispatch import (
     _delivery,
     _investigate_log,
     _loop_activities,
     _wait_for,
-    api,
+)
+from tests.test_execution_request_dispatch import (
+    api as api,
 )
 from tests.test_work_context_resume_acceptance import URL, WID
 
@@ -93,7 +97,7 @@ async def _park_loop(client, acts, seen):
     return handle, (await handle.describe()).run_id
 
 
-async def test_positive_control_delivery_is_accepted_with_a_live_worker(api, live, monkeypatch):
+async def test_positive_control_delivery_is_accepted_with_a_live_worker(api: Any, live, monkeypatch):
     monkeypatch.setattr(dx, "DELIVERY_TIMEOUT_SECONDS", SHORT_WAIT)
     client = live.client
     submit, seen = _investigate_log()
@@ -114,7 +118,7 @@ async def test_positive_control_delivery_is_accepted_with_a_live_worker(api, liv
         await handle.result()
 
 
-async def test_late_update_after_outage_is_deferred_then_executes_exactly_once(api, live, monkeypatch):
+async def test_late_update_after_outage_is_deferred_then_executes_exactly_once(api: Any, live, monkeypatch):
     monkeypatch.setattr(dx, "DELIVERY_TIMEOUT_SECONDS", SHORT_WAIT)
     client = live.client
     submit, seen = _investigate_log()
@@ -158,7 +162,7 @@ async def test_late_update_after_outage_is_deferred_then_executes_exactly_once(a
         await handle.result()
 
 
-async def test_repeated_delivery_of_one_request_is_absorbed(api, live, monkeypatch):
+async def test_repeated_delivery_of_one_request_is_absorbed(api: Any, live, monkeypatch):
     """Same request id, a DIFFERENT update id: Temporal's own update-id dedup
     cannot help, only `_accepted_request_ids` does (the mutation target)."""
     monkeypatch.setattr(dx, "DELIVERY_TIMEOUT_SECONDS", SHORT_WAIT)
