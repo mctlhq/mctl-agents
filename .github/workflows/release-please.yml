@@ -160,8 +160,72 @@ jobs:
             --data-urlencode "text=${MESSAGE}" \
             -d disable_web_page_preview=true
 
+  # A release hold (release-hold.json) stops a release from being CUT, not a
+  # release PR from being opened or reviewed. It sits at the point of effect:
+  # `release-please` below needs this job, so a failed or skipped hold gate
+  # means no tag, no image and no deploy dispatch, however the release PR got
+  # merged (by hand, by --admin, by a green-gate merger). There is no window
+  # between "the PR exists" and "someone drafts it". A merged release PR keeps
+  # its `autorelease: pending` label, so the release is cut by the first push to
+  # main after the hold is lifted by a reviewed PR.
+  release-hold:
+    name: release hold
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Find whether a release would be cut
+        id: pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          if SHAS=$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged \
+                      --label "autorelease: pending" \
+                      --json mergeCommit --jq '.[].mergeCommit.oid | select(. != null)'); then
+            if [ -z "$SHAS" ]; then
+              echo "No merged release PR is pending: this run cuts no release, nothing to hold."
+              echo "cut=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            # Could not observe is not observed absent: check the hold.
+            echo "::warning::Could not list pending release PRs; applying the hold check."
+          fi
+          echo "cut=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ steps.pending.outputs.cut == 'true' }}
+        with:
+          persist-credentials: false
+
+      - name: release-hold.json must say hold is false
+        if: ${{ steps.pending.outputs.cut == 'true' }}
+        run: python3 tools/check_release_hold.py
+
+      - name: Notify Telegram that the release hold stopped a release
+        if: ${{ failure() }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "${TELEGRAM_BOT_TOKEN}" ] || [ -z "${TELEGRAM_CHAT_ID}" ]; then
+            echo "Telegram notification skipped: secrets are not configured"
+            exit 0
+          fi
+          MESSAGE=$(printf '%s\n' \
+            "mctl-agents release held by release-hold.json" \
+            "A release PR was merged while the hold is on (or the hold file could not be read). No tag, image or promotion was made. Lift the hold with a reviewed PR." \
+            "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
+          curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}" \
+            -d disable_web_page_preview=true
+
   release-please:
-    needs: binding-gate
+    needs: [binding-gate, release-hold]
     runs-on: ubuntu-latest
     steps:
       # Uses mctl-agents, the backend-only automation App — deliberately NOT
