@@ -160,74 +160,55 @@ jobs:
             --data-urlencode "text=${MESSAGE}" \
             -d disable_web_page_preview=true
 
-  # A release hold (.github/release/hold.json) stops a release from being CUT, not a
-  # release PR from being opened or reviewed. It sits at the point of effect:
-  # `release-please` below needs this job, so a failed or skipped hold gate
-  # means no tag, no image and no deploy dispatch, however the release PR got
-  # merged (by hand, by --admin, by a green-gate merger). There is no window
-  # between "the PR exists" and "someone drafts it". A merged release PR keeps
-  # its `autorelease: pending` label, so the release is cut by the first push to
-  # main after the hold is lifted by a reviewed PR.
-  release-hold:
-    name: release hold
+  release-please:
+    needs: binding-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      pull-requests: read
     steps:
-      - name: Find whether a release would be cut
-        id: pending
+      # Release hold (.github/release/hold.json). It stops a release from being
+      # CUT, not a release PR from being opened, updated or reviewed. The
+      # decision is made HERE, in the job that runs the action, as the step
+      # right before it, and it does not depend on whether a release PR looked
+      # pending earlier: an earlier probe in another job (the binding gate can
+      # run for 45 min) is a time-of-check/time-of-use gap, because a release
+      # PR merged inside that gap is cut by the action below. The hold feeds
+      # `skip-github-release` instead, which is the only place release-please
+      # v5 creates tags and GitHub Releases (Manifest.createReleases). Skipped,
+      # the action sets no `release_created`, so every dispatch, publish and
+      # promotion step below (all gated on it) stays off. Release PR creation
+      # and updating (`skip-github-pull-request`, left false) goes on until a
+      # release PR is merged under the hold; after that the action itself
+      # aborts PR work while a merged `autorelease: pending` PR is untagged.
+      #
+      # Fail-closed in both directions. Only the exact string 'false' lets a
+      # release through; every other value of the output, an empty one
+      # included, becomes 'true'. The step passes only when hold.json is an
+      # explicit `hold: false` BOTH on the tip of main (so a queued run for an
+      # older commit cannot release past a hold added since) AND in this run's
+      # own checkout. A failed read of either, a missing or malformed file, or
+      # a missing checker is a hold. A merged release PR keeps its pending
+      # label, so the first push to main after the hold is lifted cuts it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the release hold
+        id: hold
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          if SHAS=$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged \
-                      --label "autorelease: pending" \
-                      --json mergeCommit --jq '.[].mergeCommit.oid | select(. != null)'); then
-            if [ -z "$SHAS" ]; then
-              echo "No merged release PR is pending: this run cuts no release, nothing to hold."
-              echo "cut=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+          skip=true
+          tip="$(mktemp)"
+          if gh api -H "Accept: application/vnd.github.raw" \
+               "repos/${GITHUB_REPOSITORY}/contents/.github/release/hold.json?ref=main" > "$tip" \
+             && python3 .github/release/check_hold.py --file "$tip" \
+             && python3 .github/release/check_hold.py; then
+            skip=false
           else
-            # Could not observe is not observed absent: check the hold.
-            echo "::warning::Could not list pending release PRs; applying the hold check."
+            echo "::warning::Release hold is on or unreadable: skip-github-release is set, no tag or GitHub Release will be created by this run."
+            echo "Release hold ON or unreadable: this run creates no tag and no GitHub Release." >> "$GITHUB_STEP_SUMMARY"
           fi
-          echo "cut=true" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ steps.pending.outputs.cut == 'true' }}
-        with:
-          persist-credentials: false
-
-      - name: .github/release/hold.json must say hold is false
-        if: ${{ steps.pending.outputs.cut == 'true' }}
-        run: python3 .github/release/check_hold.py
-
-      - name: Notify Telegram that the release hold stopped a release
-        if: ${{ failure() }}
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ -z "${TELEGRAM_BOT_TOKEN}" ] || [ -z "${TELEGRAM_CHAT_ID}" ]; then
-            echo "Telegram notification skipped: secrets are not configured"
-            exit 0
-          fi
-          MESSAGE=$(printf '%s\n' \
-            "mctl-agents release held by .github/release/hold.json" \
-            "A release PR was merged while the hold is on (or the hold file could not be read). No tag, image or promotion was made. Lift the hold with a reviewed PR." \
-            "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
-          curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${MESSAGE}" \
-            -d disable_web_page_preview=true
-
-  release-please:
-    needs: [binding-gate, release-hold]
-    runs-on: ubuntu-latest
-    steps:
+          echo "skip=${skip}" >> "$GITHUB_OUTPUT"
       # Uses mctl-agents, the backend-only automation App — deliberately NOT
       # MCTL App (APP_CLIENT_ID), which this used to read. MCTL App is the
       # App customers install themselves from mctl.ai/#request-access, and it
@@ -249,9 +230,12 @@ jobs:
           permission-pull-requests: write
           permission-issues: write
 
-      - uses: googleapis/release-please-action@v5
+      # Pinned to the commit v5 pointed at on 2026-11-04 (v5.0.0), so the
+      # `skip-github-release` semantics relied on above cannot move under us.
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
+          skip-github-release: ${{ steps.hold.outputs.skip == 'false' && 'false' || 'true' }}
           token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json

@@ -5,9 +5,9 @@ A merged release PR is what cuts a tag, publishes the image and dispatches the
 deploy (`.github/workflows/release-please.yml`). Holding that PR back by hand
 (Draft, a watcher) leaves a window between its creation and the hold, and any
 automation that merges green PRs closes the window for good. This check sits at
-the point of effect instead: the `release-hold` job runs it before the
-`release-please` job may start, so a held release is not cut however its PR got
-merged.
+the point of effect instead: the `release-please` job runs it right before the
+release action and feeds the result to `skip-github-release`, so a held release
+is not cut however its PR got merged or when.
 
 Fail-closed. Only a file that parses to an object whose `hold` is the JSON
 boolean `false` passes. A missing file, unreadable file, malformed JSON, a
@@ -34,7 +34,7 @@ def evaluate(path: Path) -> tuple[bool, str]:
     """(released, message). `released` is True only for an explicit `false`."""
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:  # ValueError: not UTF-8
         return False, f"cannot read {path}: {exc}; treating as a hold"
     try:
         data = json.loads(raw)
