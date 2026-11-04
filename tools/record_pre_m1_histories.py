@@ -338,7 +338,7 @@ async def test_action_approval_wait(env, monkeypatch):
     monkeypatch.setenv("MCTL_TOKEN", "test-token")
     monkeypatch.setenv("MCTL_API_BASE_URL", "https://api.example.test")
     monkeypatch.delenv(t.aa.TTL_ENV, raising=False)
-    fake = t.FakeMctlApi(t._Clock())  # type: ignore[arg-type]
+    fake = t.FakeMctlApi(t._Clock())
     monkeypatch.setattr(t.aa, "_no_redirect_opener", lambda: fake)
     t.WORLD.clear()
     t.WORLD.update({"head": "sha-1", "effects": 0, "calls": [], "reads": 0, "api": fake})
