@@ -408,7 +408,10 @@ def test_release_please_cannot_start_before_the_binding_gate():
     the registry promotion all happen inside the release-please job, so
     `needs` on that job is what puts the gate in front of all three."""
     jobs = _workflow("release-please.yml")["jobs"]
-    assert jobs["release-please"]["needs"] in ("binding-gate", ["binding-gate"])
+    needs = jobs["release-please"]["needs"]
+    # Other gates may sit beside this one (the release hold, tests/test_release_hold.py);
+    # this one may never be dropped.
+    assert "binding-gate" in ([needs] if isinstance(needs, str) else needs)
     gate_steps = " ".join(str(step.get("run", "")) for step in jobs["binding-gate"]["steps"])
     # Every agent's binding, not issue-investigator's alone (#582).
     assert "tools/check_agent_bindings.py" in gate_steps
