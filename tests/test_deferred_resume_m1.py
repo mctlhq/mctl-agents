@@ -25,10 +25,14 @@ from temporalio.converter import DataConverter
 from temporalio.exceptions import ApplicationError
 
 from orchestrator.temporal import dispatcher as dx
+from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.issue_ref import workflow_id_for
 from orchestrator.temporal.workflows.dev_loop import (
+    DELIVERY_ACCEPTED,
     RESUME_DEFERRAL_REASONS,
     RESUME_DEFERRED_ERROR_TYPE,
+    DevLoopWorkflow,
+    ImplementExecutionState,
     MergeWatchResume,
     OpenDelivery,
     ResumeDelivery,
@@ -36,7 +40,7 @@ from orchestrator.temporal.workflows.dev_loop import (
 from orchestrator.work_context import execution_requests as xr
 from orchestrator.work_context.client import WorkItemClient
 from tests.test_execution_request_dispatch import FakeTemporal, _audit, api  # noqa: F401  (api: fixture)
-from tests.test_execution_request_resume import _RunningPort, _UpdateClient
+from tests.test_execution_request_resume import _RunningPort, _UpdateClient, _validator
 from tests.test_work_context_resume_acceptance import URL, WID
 
 pytestmark = pytest.mark.anyio
@@ -149,6 +153,101 @@ async def test_a_resume_deferred_then_deliverable_is_fulfilled_exactly_once(api)
     assert len(api.executions) == 1
     assert (await dispatcher.dispatch_once()).action == dx.NOTHING
     assert len(temporal.delivered) == 2 and {d.execution_request_id for _, d in temporal.delivered} == {rid}
+
+
+class _ValidatorClient(_UpdateClient):
+    """A Temporal client double AT THE VALIDATOR BOUNDARY: Update-with-Start
+    runs the loop's real `_validate_execution_request` on `wf`, turns a
+    rejection into the `WorkflowUpdateFailedError` Temporal would raise, and
+    counts the Updates the loop would have accepted."""
+
+    def __init__(self, wf: DevLoopWorkflow) -> None:
+        super().__init__(None)
+        self.wf = wf
+        self.accepted: list[str] = []
+
+    async def execute_update_with_start_workflow(self, update, delivery, **kwargs):  # type: ignore[override]
+        try:
+            self.wf._validate_execution_request(delivery)
+        except ApplicationError as exc:
+            raise WorkflowUpdateFailedError(exc) from exc
+        self.accepted.append(delivery.execution_request_id)
+        return DELIVERY_ACCEPTED
+
+
+def _as_m2(wf: DevLoopWorkflow) -> None:
+    """Simulate the future M2 replacing ONLY the `feedback-not-ready` arm: the
+    final deferral becomes an acceptance. Every earlier arm stays the real
+    one. No M2 production logic exists in this PR."""
+    real = wf._validate_execution_request
+
+    def validate(delivery):
+        try:
+            real(delivery)
+        except ApplicationError as exc:
+            if exc.type == RESUME_DEFERRED_ERROR_TYPE and exc.details and exc.details[0] == "feedback-not-ready":
+                return
+            raise
+
+    wf._validate_execution_request = validate  # type: ignore[method-assign]
+
+
+_OPEN_PR = PRState(found=True, state="OPEN")
+
+
+async def _claim_with_validator(api, wf):  # noqa: F811
+    client = _ValidatorClient(wf)
+    port = _RunningPort(client, workflow_id_for(URL))
+    return client, await dx.Dispatcher(WorkItemClient(), port, lease=60).dispatch_once()
+
+
+async def test_when_m2_replaces_only_feedback_not_ready_the_deferred_request_is_served_exactly_once(api):  # noqa: F811
+    """T7 (a)+(d): a contract-True, intentful request is deferred
+    `feedback-not-ready` by M1, stays claimed with zero fulfils; once only that
+    arm is replaced, the re-claim is accepted and fulfilled exactly once, with
+    no duplicate fulfil, execution or delivery afterwards."""
+    rid = api.create_request("resume")
+    api.xrs[rid]["intent_id"] = 7
+    wf = _validator(_gates_passed=True, _deferred_resume_contract=True, _last_pr=_OPEN_PR)
+    client, first = await _claim_with_validator(api, wf)
+    assert first.action == dx.DEFERRED and client.accepted == []
+    assert api.request_state(rid)["state"] == "claimed" and api.fulfils() == [] and api.executions == []
+
+    _as_m2(wf)
+    api.now += 120  # the lease lapses; the request is claimable again
+    second = await dx.Dispatcher(WorkItemClient(), _RunningPort(client, workflow_id_for(URL)), lease=60).dispatch_once()
+    assert second.action == dx.FULFILLED
+    assert client.accepted == [rid] and len(api.fulfils()) == 1 and len(api.executions) == 1
+
+    third = await dx.Dispatcher(WorkItemClient(), _RunningPort(client, workflow_id_for(URL)), lease=60).dispatch_once()
+    assert third.action == dx.NOTHING
+    assert client.accepted == [rid] and len(api.fulfils()) == 1 and len(api.executions) == 1
+
+
+@pytest.mark.parametrize(
+    ("state", "reason"),
+    [
+        ({"_deferred_resume_contract": False}, "legacy-loop"),  # (b)
+        ({"_implement_state": ImplementExecutionState(stage="implementer", outcome="failed")}, "recovery-not-ready"),
+        ({"_last_pr": PRState(found=True, state="CLOSED")}, "recovery-not-ready"),  # (c)
+        ({"_implement_state": ImplementExecutionState(stage="implementer")}, "implement-running"),
+    ],
+    ids=["legacy-loop", "failed-implement", "closed-pr", "implement-running"],
+)
+async def test_the_m2_arm_swap_leaves_every_other_deferral_in_force(api, capsys, state, reason):  # noqa: F811
+    """T7 (b)+(c): with only `feedback-not-ready` replaced, a legacy loop still
+    defers `legacy-loop`, recovery still defers `recovery-not-ready` (until M3),
+    and nothing is accepted or fulfilled."""
+    rid = api.create_request("resume")
+    api.xrs[rid]["intent_id"] = 7
+    wf = _validator(_gates_passed=True, _deferred_resume_contract=True, _last_pr=_OPEN_PR)
+    for name, value in state.items():
+        setattr(wf, name, value)
+    _as_m2(wf)
+    client, outcome = await _claim_with_validator(api, wf)
+    assert outcome.action == dx.DEFERRED and outcome.reason.endswith(reason)
+    assert client.accepted == [] and api.fulfils() == [] and api.executions == []
+    assert api.request_state(rid)["state"] == "claimed"
 
 
 @pytest.mark.parametrize(
