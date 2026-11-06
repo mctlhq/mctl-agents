@@ -365,13 +365,15 @@ def _mctl_tool_patterns(names: tuple[str, ...], *, prefix: bool) -> tuple[str, .
 AGENT_MUTATION_TOOLS = _mctl_tool_patterns(_ALLOWED_MUTATIONS, prefix=False)
 
 
-#: The two operations of `GITHUB_PR_MERGE`. Every merge path picks one from
-#: the PR's changed paths (`run_shepherd.merge_operation_for`); the second is
-#: for a PR that touches agent definitions, or whose changed paths could not
-#: be fully read.
+#: The three operations of `GITHUB_PR_MERGE`. Every merge path picks one
+#: through `run_shepherd.merge_operation_for`: the second is for a PR that
+#: touches agent definitions, or whose changed paths could not be fully read;
+#: the third is for a PR whose merge the owner reserved with a label, or whose
+#: labels could not be fully read.
 MERGE_OPERATION = "merge"
 MERGE_OPERATION_AGENT_DEFINITION = "merge:agent-definition"
-_MERGE_RULE_IDS = frozenset({"github-pr-merge", "github-pr-merge-agent-definition"})
+MERGE_OPERATION_OWNER_GO = "merge:owner-go"
+_MERGE_RULE_IDS = frozenset({"github-pr-merge", "github-pr-merge-agent-definition", "github-pr-merge-owner-go"})
 
 BUILTIN_POLICY = Policy(
     version="mctl-agents/policy/v1",
@@ -393,6 +395,9 @@ BUILTIN_POLICY = Policy(
         # shadow it. With no approval store this always blocks.
         Rule("github-pr-merge-agent-definition", GITHUB_PR_MERGE, MERGE_OPERATION_AGENT_DEFINITION,
              REQUIRE_APPROVAL),
+        # A merge the owner reserved with `merge:owner-go` (ADR 016 amendment
+        # 3). Same shape and same reasons as the rule above.
+        Rule("github-pr-merge-owner-go", GITHUB_PR_MERGE, MERGE_OPERATION_OWNER_GO, REQUIRE_APPROVAL),
         # `gh pr merge --merge --match-head-commit`: bound to the reviewed head.
         Rule("github-pr-merge", GITHUB_PR_MERGE, MERGE_OPERATION, ALLOW),
         # The shepherd's `@claude review` trigger after a fix-up push.
@@ -452,8 +457,8 @@ MERGE_APPROVAL_ENV = "MCTL_POLICY_MERGE_APPROVAL"
 MERGE_APPROVAL_REQUIRE = "require"
 
 #: `BUILTIN_POLICY` with `github-pr-merge` (ALLOW) replaced by a
-#: REQUIRE_APPROVAL rule of its own (the agent-definition rule is carried
-#: over unchanged: it requires an approval under every variant), under a
+#: REQUIRE_APPROVAL rule of its own (the agent-definition and owner-go rules
+#: are carried over unchanged: they require an approval under every variant), under a
 #: distinct policy version: since
 #: `policy_version` is a field of the approval intent hash, a receipt
 #: approved under one rule set can never be spent under the other.
@@ -481,8 +486,8 @@ def configured_policy() -> Policy:
     # The raw value is NOT put into the version: it reaches the intent hash,
     # the POLICY_DECISION line and a span attribute, which carry only
     # bounded fields. The DENY rule id already names the misconfiguration.
-    # Both merge operations: "refuse every merge" must hold for an
-    # agent-definition merge too, which has a rule of its own.
+    # Every merge operation: "refuse every merge" must hold for an
+    # agent-definition or owner-go merge too, which have rules of their own.
     return Policy(
         version="mctl-agents/policy/v1-merge-approval-misconfigured",
         rules=tuple(

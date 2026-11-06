@@ -449,3 +449,48 @@ matched files the classifier would let through.
 On release, a PR that touches any path under `agents/` waits for a human
 to merge it, whoever authored it. In the measured window that is one PR in
 sixty. No gitops change is needed, and none can turn the gate off.
+
+## Amendment 3: a merge the owner reserved (`merge:owner-go`)
+
+### Why
+
+`mctlhq/mctl-agents#1013` was approved and clean, and the shepherd merged it
+15 minutes later. The owner's approval said to return for a separate
+GO-MERGE, but that sentence was prose in a proposal discussion. The shepherd
+reads none of it, and a Draft state set by a watching session only holds for
+as long as that session is alive.
+
+### The rule
+
+The label `merge:owner-go` on the PR, or on the source issue named by the
+proposal's `.status.yaml`, sends the merge through the same human gate as
+amendment 1, under its own operation `merge:owner-go` and rule
+`github-pr-merge-owner-go`, `REQUIRE_APPROVAL` in every policy variant. The
+shepherd keeps doing everything short of the merge: review fix-ups continue,
+no attempt counter moves, and `status` stays where it is. One
+`MERGE_NEEDS_HUMAN` line per head and reason, as in amendment 1.
+
+| `merge_needs_human` | when |
+| --- | --- |
+| `owner-go` | the label was seen on the PR or the source issue |
+| `merge-labels-truncated` | more than 100 labels on the PR |
+| `merge-labels-unreadable` | a label read failed or was malformed; cleared by the next good read |
+
+A proposal with no source link is observed absent, so its PR's labels alone
+decide. An unlabelled PR with a readable or absent source issue merges exactly
+as before. The source issue is read only when `decide()` already says `merge`.
+
+The owner ends a hold by merging the PR by hand, which the next tick reads as
+`flip-to-merged`, or by removing the label, which hands the merge back to the
+shepherd.
+
+### What it does not cover
+
+- **`merge_pull_request_gated`** reads the PR's labels but not the source
+  issue, because it has no proposal in hand. Every merge it makes carries a
+  human approval, so nothing reaches `main` unattended on that path.
+- **Timing.** The hold exists only in a running shepherd image, so it binds
+  from the release that carries it, not from the merge of this change.
+- **Who may set it.** Anyone with triage on the repository can add or remove
+  the label, the `mctl-agents` App included. It stops the automatic merge; it
+  is not an access control.

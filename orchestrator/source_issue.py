@@ -64,6 +64,23 @@ class SourceIssueVerdict:
     issue_ref: str | None = None
     closed_at: str | None = None
     state_reason: str | None = None
+    #: The issue's label names. `None` means they were not read or could not
+    #: be interpreted, never "no labels", which is `()`.
+    labels: tuple[str, ...] | None = None
+
+
+def _issue_labels(issue: dict[str, Any]) -> tuple[str, ...] | None:
+    """The label names of a REST issue payload, or None if malformed."""
+    raw = issue.get("labels")
+    if not isinstance(raw, list):
+        return None
+    names: list[str] = []
+    for label in raw:
+        name = label.get("name") if isinstance(label, dict) else None
+        if not isinstance(name, str) or not name:
+            return None
+        names.append(name)
+    return tuple(names)
 
 
 def read_source_issue(
@@ -114,8 +131,9 @@ def read_source_issue(
         # "open" would be a guess dressed up as a fact.
         print(f"warn: unreadable source issue payload for {repo}#{number}")
         return SourceIssueVerdict(known=False, failure=None, issue_ref=issue_ref)
+    labels = _issue_labels(issue)
     if issue["state"] != "closed":
-        return SourceIssueVerdict(known=True, failure=None, issue_ref=issue_ref)
+        return SourceIssueVerdict(known=True, failure=None, issue_ref=issue_ref, labels=labels)
 
     # state_reason is null on issues closed before GitHub introduced it, and
     # on some API paths. Treat "closed, reason unknown" as completed: the
@@ -130,6 +148,7 @@ def read_source_issue(
         issue_ref=issue_ref,
         closed_at=issue.get("closed_at"),
         state_reason=state_reason,
+        labels=labels,
         failure={
             "code": code,
             "stage": stage,

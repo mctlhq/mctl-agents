@@ -41,7 +41,8 @@ prompt files (AGENT_DEFINITION_PATH_PREFIXES), or whose changed paths could
 not be read in full, is never merged here: its merge is decided under the
 `github-pr-merge-agent-definition` policy rule and left to a human, with one
 MERGE_NEEDS_HUMAN line per head (mctlhq/mctl-agents#470, ADR 016 amendments
-1 and 2).
+1 and 2). The same holds for a PR or source issue labelled `merge:owner-go`,
+or whose labels could not be read in full (ADR 016 amendment 3).
 
 The Claude SDK is used for one specific decision: parsing review
 findings into "merge-ready vs. needs-fix" and shaping the followup
@@ -106,7 +107,7 @@ import urllib.request
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -764,6 +765,53 @@ def touches_agent_definitions(pr: PRSnapshot) -> bool:
     return bool(agent_definition_paths(changed))
 
 
+# The label that reserves a merge for the owner (ADR 016 amendment 3), on the
+# PR or on the proposal's source issue. Prose such as "return for a separate
+# GO-MERGE" binds nothing here: that is how #1013 merged without one. Removing
+# the label hands the merge back to the shepherd on its next tick.
+OWNER_GO_LABEL = "merge:owner-go"
+# What is known about the labels. Three states, as for `ChangedPaths`.
+MERGE_LABELS_COMPLETE = "complete"
+MERGE_LABELS_TRUNCATED = "truncated"
+MERGE_LABELS_UNREADABLE = "unreadable"
+_MERGE_LABELS_SEVERITY = {MERGE_LABELS_COMPLETE: 0, MERGE_LABELS_TRUNCATED: 1, MERGE_LABELS_UNREADABLE: 2}
+
+
+@dataclass(frozen=True)
+class MergeLabels:
+    """The labels that can reserve this merge, with how much of them is known.
+
+    The default is UNREADABLE on purpose, as for `ChangedPaths`: a snapshot
+    built without reading them must not be mistaken for a PR that has none.
+    """
+
+    state: str = MERGE_LABELS_UNREADABLE
+    names: tuple[str, ...] = ()
+    #: Why the state is not COMPLETE; bounded, for the log line only.
+    detail: str = "labels were never read"
+
+    @classmethod
+    def complete(cls, names: Iterable[str] = ()) -> MergeLabels:
+        return cls(MERGE_LABELS_COMPLETE, tuple(names), "")
+
+    def including(self, other: MergeLabels) -> MergeLabels:
+        """Both reads as one: every name seen, and the worse of the states."""
+        worse = other if _MERGE_LABELS_SEVERITY[other.state] > _MERGE_LABELS_SEVERITY[self.state] else self
+        return MergeLabels(worse.state, (*self.names, *other.names), worse.detail)
+
+
+def _names_owner_go(names: Iterable[str]) -> bool:
+    """GitHub label names are case-insensitive, so `Merge:Owner-Go` is the same
+    label to anyone reading the UI and must hold the same."""
+    return any(name.casefold() == OWNER_GO_LABEL for name in names)
+
+
+def requires_owner_go(pr: PRSnapshot) -> bool:
+    """True unless the labels are COMPLETE and none reserves the merge."""
+    labels = pr.merge_labels
+    return labels.state != MERGE_LABELS_COMPLETE or _names_owner_go(labels.names)
+
+
 def merge_operation_for(pr: PRSnapshot) -> str:
     """The `GITHUB_PR_MERGE` operation a merge of this PR is decided under.
 
@@ -774,11 +822,15 @@ def merge_operation_for(pr: PRSnapshot) -> str:
     """
     if touches_agent_definitions(pr):
         return policy_checkpoint.MERGE_OPERATION_AGENT_DEFINITION
+    if requires_owner_go(pr):
+        return policy_checkpoint.MERGE_OPERATION_OWNER_GO
     return policy_checkpoint.MERGE_OPERATION
 
 
 #: `needs_human_kind` when a protected path was SEEN among the changed paths.
 NEEDS_HUMAN_AGENT_DEFINITION = "agent-definition"
+#: `needs_human_kind` when `OWNER_GO_LABEL` was SEEN.
+NEEDS_HUMAN_OWNER_GO = "owner-go"
 
 
 def needs_human_kind(pr: PRSnapshot) -> str:
@@ -796,6 +848,10 @@ def needs_human_kind(pr: PRSnapshot) -> str:
         return NEEDS_HUMAN_AGENT_DEFINITION
     if pr.changed_paths.state != CHANGED_PATHS_COMPLETE:
         return f"changed-paths-{pr.changed_paths.state}"
+    if _names_owner_go(pr.merge_labels.names):
+        return NEEDS_HUMAN_OWNER_GO
+    if pr.merge_labels.state != MERGE_LABELS_COMPLETE:
+        return f"merge-labels-{pr.merge_labels.state}"
     return ""
 
 
@@ -808,7 +864,11 @@ def _needs_human_reason(pr: PRSnapshot) -> str:
         shown = ",".join(json.dumps(p) for p in hits[:5])
         more = f" more={len(hits) - 5}" if len(hits) > 5 else ""
         return f"reason={kind} paths_state={changed.state} paths={shown}{more}"
-    return f"reason={kind} detail={json.dumps(changed.detail[:200])}"
+    if changed.state != CHANGED_PATHS_COMPLETE:
+        return f"reason={kind} detail={json.dumps(changed.detail[:200])}"
+    # A COMPLETE read carries no detail, so only the PR's own label is left.
+    detail = pr.merge_labels.detail or "label on the PR"
+    return f"reason={kind} detail={json.dumps(detail[:200])}"
 
 
 # Per-service mode: FULL discovers/fixes/merges; FIX_ONLY discovers and fixes
@@ -1326,6 +1386,10 @@ class PRSnapshot:
     # exactly this head. Defaults to UNREADABLE, never to "no paths": see
     # `ChangedPaths`. Consumed by `merge_operation_for`.
     changed_paths: ChangedPaths = ChangedPaths()
+    # The PR's labels, read in the same query; `process_one` adds the source
+    # issue's before it merges (ADR 016 amendment 3). Defaults to UNREADABLE,
+    # never to "no labels": see `MergeLabels`.
+    merge_labels: MergeLabels = MergeLabels()
 
 
 @dataclass
@@ -1656,6 +1720,45 @@ def _source_issue_state(status_data: dict[str, Any]) -> SourceIssueVerdict:
     return read_source_issue(status_data, stage="reconcile", gh_api_json=_gh_api_json)
 
 
+def _source_status_for_merge(ref: ProposalRef) -> dict[str, Any]:
+    """`.status.yaml` for the source-link read. A file that is gone or empty
+    raises rather than reading as "this proposal has no source link"."""
+    data = _load_status(ref.status_path)
+    if not data:
+        raise ValueError(f"{ref.status_path} is missing or empty")
+    return data
+
+
+def _with_source_issue_labels(ref: ProposalRef, pr: PRSnapshot) -> PRSnapshot:
+    """`pr` with its proposal's source issue labels added to `merge_labels`.
+
+    Read here, not in `_fetch_pr_snapshot`, because only the proposal knows
+    its source issue, and only right before a merge, so an ordinary tick
+    costs no extra call. The gated activity has no proposal in hand and sees
+    the PR's labels only: every merge it makes carries a human approval.
+
+    A proposal with no source link is observed absent. A link whose issue or
+    labels could not be read holds the merge for this tick.
+    """
+    def unreadable(detail: str) -> PRSnapshot:
+        failed = MergeLabels(MERGE_LABELS_UNREADABLE, (), detail)
+        return replace(pr, merge_labels=pr.merge_labels.including(failed))
+
+    try:
+        data = _source_status_for_merge(ref)
+    except Exception as exc:  # noqa: BLE001 — any failed read is an unknown link
+        return unreadable(f"could not read the source link: {exc}")
+    verdict = _source_issue_state(data)
+    if not verdict.linked:
+        return pr
+    if verdict.labels is None:
+        return unreadable(f"could not read the labels of source issue {verdict.issue_ref}")
+    detail = f"label on source issue {verdict.issue_ref}" if _names_owner_go(verdict.labels) else ""
+    source = MergeLabels(MERGE_LABELS_COMPLETE, verdict.labels, detail)
+    merged = pr.merge_labels.including(source)
+    return replace(pr, merge_labels=replace(merged, detail=merged.detail or detail))
+
+
 # ---------------------------------------------------------------------------
 # PR + review readers
 # ---------------------------------------------------------------------------
@@ -1722,6 +1825,37 @@ def _fetch_required_status_check_contexts(
 
 def _unreadable_paths(detail: str) -> ChangedPaths:
     return ChangedPaths(CHANGED_PATHS_UNREADABLE, (), detail)
+
+
+def _read_merge_labels(pr: dict[str, Any]) -> MergeLabels:
+    """The labels of the PR node the snapshot query just returned.
+
+    COMPLETE only when GitHub said the page is the whole list and every node
+    is well formed. A missing or malformed field is a failed read, never an
+    empty list.
+    """
+    def unreadable(detail: str) -> MergeLabels:
+        return MergeLabels(MERGE_LABELS_UNREADABLE, (), detail)
+
+    labels = pr.get("labels")
+    if not isinstance(labels, dict):
+        return unreadable("labels connection missing from the snapshot")
+    nodes = labels.get("nodes")
+    if not isinstance(nodes, list):
+        return unreadable("labels.nodes is not a list")
+    names: list[str] = []
+    for node in nodes:
+        name = node.get("name") if isinstance(node, dict) else None
+        if not isinstance(name, str) or not name:
+            return unreadable("a labels node carries no name")
+        names.append(name)
+    page_info = labels.get("pageInfo")
+    has_next = page_info.get("hasNextPage") if isinstance(page_info, dict) else None
+    if not isinstance(has_next, bool):
+        return unreadable("labels.pageInfo.hasNextPage missing from the snapshot")
+    if has_next:
+        return MergeLabels(MERGE_LABELS_TRUNCATED, tuple(names), f"read {len(names)} labels and GitHub has more")
+    return MergeLabels.complete(names)
 
 
 def _read_changed_paths(repo: str, number: int, pr: dict[str, Any]) -> ChangedPaths:
@@ -1823,7 +1957,7 @@ def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
     try:
         view = _gh_api_json([
             "graphql", "-f",
-            "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){number state merged mergedAt mergeStateStatus reviewDecision isDraft headRefOid headRefName isCrossRepository headRepositoryOwner{login} baseRepository{owner{login}} baseRefName mergeCommit{oid} changedFiles files(first:100){nodes{path changeType} pageInfo{hasNextPage}} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){nodes{__typename ... on PullRequestCommit{commit{oid committedDate}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}}}} commits(last:1){nodes{commit{oid committedDate pushedDate statusCheckRollup{state contexts(last:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl isRequired(pullRequestNumber:$number) title summary databaseId checkSuite{databaseId workflowRun{databaseId url workflow{name}}}} ... on StatusContext{context state targetUrl isRequired(pullRequestNumber:$number)}}}}}}} statusCheckRollup{state}}}}",  # noqa: E501 — single-line GraphQL query, not the kind of prose the line-length limit is meant to keep readable
+            "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){number state merged mergedAt mergeStateStatus reviewDecision isDraft headRefOid headRefName isCrossRepository headRepositoryOwner{login} baseRepository{owner{login}} baseRefName mergeCommit{oid} labels(first:100){nodes{name} pageInfo{hasNextPage}} changedFiles files(first:100){nodes{path changeType} pageInfo{hasNextPage}} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){nodes{__typename ... on PullRequestCommit{commit{oid committedDate}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}}}} commits(last:1){nodes{commit{oid committedDate pushedDate statusCheckRollup{state contexts(last:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl isRequired(pullRequestNumber:$number) title summary databaseId checkSuite{databaseId workflowRun{databaseId url workflow{name}}}} ... on StatusContext{context state targetUrl isRequired(pullRequestNumber:$number)}}}}}}} statusCheckRollup{state}}}}",  # noqa: E501 — single-line GraphQL query, not the kind of prose the line-length limit is meant to keep readable
             "-F", f"owner={repo.split('/')[0]}",
             "-F", f"repo={repo.split('/')[1]}",
             "-F", f"number={number}",
@@ -1960,6 +2094,7 @@ def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
         check_contexts=tuple(check_contexts),
         required_contexts=required_contexts,
         changed_paths=_read_changed_paths(repo, number, pr),
+        merge_labels=_read_merge_labels(pr),
     )
 
 
@@ -4386,6 +4521,7 @@ def process_one(
         # untouched, so the proposal is never flipped to review-stuck or
         # rejected for waiting on a person. When that person merges, the
         # next tick reads MERGED and takes the ordinary `flip-to-merged` arm.
+        pr = _with_source_issue_labels(ref, pr)
         kind = needs_human_kind(pr)
         if kind:
             recorded = _load_status(ref.status_path)
