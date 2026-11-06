@@ -42,8 +42,9 @@ have been handled.
 
 The single exception is an agent listed in UNBOUND_AGENTS, for which an
 absent binding is a warning and the step stays green: the expected state of
-an agent deliberately shipped before anyone bound it. That set is empty
-since mctl-gitops#1683 gave every shipped agent a binding, so today every
+an agent deliberately shipped before anyone bound it. That set was empty
+from mctl-gitops#1683, which gave every shipped agent a binding, until
+review-worker (#986) shipped ahead of its binding; for every other agent a
 refusal fails the step. Every agent's outcome is printed, and written to
 $GITHUB_STEP_SUMMARY when it is set.
 
@@ -120,7 +121,12 @@ class PublishError(RuntimeError):
 # on #574). An agent left here after it is bound only loses the loud failure
 # for a later deletion, never its gate. A test pins this set against the real
 # manifest directories.
-UNBOUND_AGENTS: frozenset[str] = frozenset()
+#
+# review-worker (mctlhq/mctl-agents#986): its manifest ships with the producer,
+# ahead of the mctl-gitops companion (the `independent-review` profile, the
+# review CWFT) and of its release binding. Remove it here in the change that
+# follows its binding.
+UNBOUND_AGENTS: frozenset[str] = frozenset({"review-worker"})
 
 PROMOTED = "promoted"
 REFUSED = "refused"

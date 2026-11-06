@@ -121,3 +121,70 @@ GitHub write, merge, label, lifecycle approval or approval signal; the policy ch
 Implementation approval; reusable-review dedup (.github#283); inline-comment re-anchoring (#336); same-head
 finding dispute (mctl-gitops#1176); OAuth model inference (#891); changing `run_shepherd`; the explainer
 (#670/#846/#847), which stays advisory.
+
+## Amendment: Producer (mctlhq/mctl-agents#986)
+
+The canonical producer name is `review-worker`. A run (`orchestrator/run_review_worker.py`, building blocks in
+`orchestrator/review_worker/`) reviews one proposal or spike subject and ends in exactly one outcome. Order, with
+no step running after one refuses:
+
+1. read the authoring execution's attempt ids and lineage root from `GET /api/v1/executions/{we_}/provenance`
+   (never from the caller; an empty or `ex-` id is `review_authoring_unresolved`);
+2. seal a `mode="worker"` request with a CSPRNG nonce held in memory only, and `POST /api/v1/review-requests`;
+3. create the reviewer's own work item (`external_key=review:<request_id>`, in the authoring item's tenant) and
+   attach a NEW execution to it with the service credential acting directly. The authoring item is never the
+   attach target: mctl-api allows one non-terminal execution per item and refuses an attach to a terminal one;
+4. check independence locally (`attached_direct_service`, execution id, attempt id and lineage root differ from
+   the authoring ones) before any token is minted;
+5. run a read-only session over a read-only copy of the subject, whose digest is re-verified first. The copy is
+   the session's working directory; `Read`, `Grep` and `Glob` are the only tools that exist in it (no `Task`, no
+   MCP, no GitHub credential); no setting source is loaded, because the subject is untrusted; the reviewer's
+   rules (`agents/_review_worker/.claude/agents/review-worker.md`) are the system prompt. The answer is one JSON
+   verdict, bare or in one surrounding code fence. The findings text stays in a private artifact and only its
+   sha256 leaves the process;
+6. mint a `review`-scoped run token (900 s) bound to the reviewer execution, submit exactly `request_id`,
+   `subject`, `nonce`, `outcome`, `criteria`, `findings_ref`, `evidence_ref`, and revoke the token;
+7. seal `ExecutionEvidence` for stage `reviewer` with `ArtifactRef(kind="review-receipt")` (the receipt id and
+   content hash) and no text.
+
+Once step 3 attached the reviewer execution, every end of the run advances it to a terminal phase (best effort,
+never changing the outcome): `Succeeded` only for a stored receipt, `Failed` otherwise. That holds on a non-final
+engine attempt too: a retry opens a fresh request, so it attaches to a different `review:<request_id>` item and
+would never end this execution. mctl-api keys executions on `(work_item_id, engine, engine_ref)`, which is also
+why a retry of the same Workflow (engine ref `<workflow>#review`) gets a new execution rather than
+`EXECUTION_EXISTING`; an existing execution on the run's own item is refused, never reused.
+
+Outcomes. `stored` only for a 201 that says `mode=worker`, `assurance=independent` and the submitted
+`request_id`. `disabled` is `501 review_worker_ingest_disabled`. `unobserved` is a 5xx, a typed unavailable code
+(`review_store_unavailable`, `review_provenance_unavailable`, `review_principal_unavailable`,
+`review_evidence_unavailable`, `agent_run_tokens_unavailable`), a transport error, an unreadable body, 401, 408,
+425 or 429. Any other typed 4xx is `refused(<code>)`, known or not (`review_nonce_consumed`,
+`review_nonce_mismatch`, `review_reviewer_ineligible`, `review_reviewer_not_independent`,
+`review_run_token_required`, `review_request_mode_manual`, `review_request_closed`,
+`review_request_not_found`, `review_binding_mismatch`, `review_execution_unproven`, `review_request_conflict`,
+`review_not_permitted`, `agent_unknown`, and the Tier A codes). None of `disabled`, `unobserved` or `refused` is
+a PASS, and none is "no receipt". After one `unobserved` submit, one retry with the same nonce is allowed; a
+`review_nonce_consumed` answer to that retry is reconciled through `GET /api/v1/review-receipts` (the complete
+pool, each entry the flat stored receipt document) and is `stored` only if the pool holds an independent worker
+receipt for the request; an unreadable pool is `unobserved`. A failed or crashed reviewer session, an unreadable
+subject and a report path outside the report root are typed refusals, never an uncaught exception.
+
+Decision on `evidence_ref`: the submit sends `evidence_ref=""` (Tier A permits it). The envelope's
+`review-receipt` artifact is the authoritative link from run to receipt; a two-envelope scheme was rejected
+because the first envelope cannot yet contain the outcome it would vouch for.
+
+The execution profile `independent-review` and its workflow template live in mctl-gitops. The switch
+`REVIEW_WORKER_INGEST_ENABLED` is an operator change and is not part of any mctl-agents change.
+
+### Live-acceptance runbook (#905 task 9)
+
+This amendment claims no live acceptance: nothing here shows that a receipt was ever stored.
+
+Preconditions, all owner-gated: the producer is released and deployed; an admin registered `review-worker` in
+the mctl-api agent registry (otherwise the mint answers `400 agent_unknown` and the run ends `refused`); the
+mctl-gitops profile and workflow template are merged; the operator set `REVIEW_WORKER_INGEST_ENABLED=true`.
+
+Run the workflow for a proposal subject, then expect: one stored `assurance=independent` receipt whose
+`reviewer_execution_id` is not the authoring execution; an `EXECUTION_EVIDENCE` line for stage `reviewer` with a
+`review-receipt` artifact; and `mctl_get_review_gate` answering `satisfied` for that revision. Any other outcome
+is recorded as observed, not as a pass.
