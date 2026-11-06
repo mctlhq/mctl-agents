@@ -1,0 +1,111 @@
+{
+  "_comment": "Dataclass field names at a99c888 (pre-M1), extracted with ast from `git show a99c888:<path>`. Only the classes M1 changed, plus IssueRef, which carries MergeWatchResume across continue-as-new. Do not regenerate from a post-M1 checkout.",
+  "recorded_from": "a99c8881403f2bbe64fea9864d252bed4fe58a4d",
+  "classes": {
+    "ResumeDelivery": {
+      "path": "orchestrator/temporal/workflows/dev_loop.py",
+      "fields": [
+        "execution_request_id",
+        "work_item_id",
+        "surface",
+        "actor_kind",
+        "actor_id",
+        "kind"
+      ]
+    },
+    "OpenDelivery": {
+      "path": "orchestrator/temporal/workflows/dev_loop.py",
+      "fields": [
+        "delivery",
+        "surface_transition",
+        "pending_phase",
+        "pending_refusal"
+      ]
+    },
+    "MergeWatchResume": {
+      "path": "orchestrator/temporal/workflows/dev_loop.py",
+      "fields": [
+        "service",
+        "slug",
+        "deadline",
+        "last_pr",
+        "polls_without_pr",
+        "poll_index",
+        "shepherd_ticks",
+        "fast_cadence",
+        "shepherd_in_loop",
+        "concurrent_ticks",
+        "track_ownership",
+        "proposal_terminal_end",
+        "saw_open_pr",
+        "terminal_status_polls",
+        "owned_entity_id",
+        "owner_epoch",
+        "owned_head_sha",
+        "poll_index_for_heartbeat",
+        "claim_refused",
+        "claim_refused_until_poll",
+        "refused_by_type",
+        "refused_by_id",
+        "refusals_observed",
+        "unknown_acquires",
+        "unknown_progress",
+        "unknown_heartbeats",
+        "proposal_ref",
+        "policy_ref",
+        "merge_gate_execution_id",
+        "merge_gate_trace_id",
+        "merge_gate_settled_head",
+        "last_lifecycle_op",
+        "last_lifecycle_op_landed",
+        "claim_abandoned",
+        "abandoned",
+        "abandon_reason",
+        "work_item_id",
+        "executions",
+        "seen_execution_ids",
+        "current_surface",
+        "current_actor",
+        "resume_rejections",
+        "resume_pending",
+        "accepted_request_ids",
+        "open_deliveries",
+        "investigate",
+        "implement",
+        "approve",
+        "implement_state",
+        "approver",
+        "human_input",
+        "hops"
+      ]
+    },
+    "IssueRef": {
+      "path": "orchestrator/temporal/workflows/dev_loop.py",
+      "fields": [
+        "issue_url",
+        "work_item_id",
+        "resume",
+        "execution_request_id",
+        "requested_by"
+      ]
+    },
+    "ExecutionRequest": {
+      "path": "orchestrator/work_context/execution_requests.py",
+      "fields": [
+        "request_id",
+        "work_item_id",
+        "kind",
+        "state",
+        "expected_state_version",
+        "resumed_from_execution_id",
+        "surface",
+        "requested_by",
+        "execution_id",
+        "reason",
+        "claim_expires_at",
+        "intent_id",
+        "intent_id_malformed"
+      ]
+    }
+  }
+}

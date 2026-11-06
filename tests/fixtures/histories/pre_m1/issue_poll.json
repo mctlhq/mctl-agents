@@ -1,0 +1,352 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-11-04T22:10:43.984Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "workflowExecutionStartedEventAttributes": {
+        "attempt": 1,
+        "firstExecutionRunId": "a83c3680-ac87-4f24-baa6-308c70dca3d6",
+        "firstWorkflowTaskBackoff": "0s",
+        "identity": "",
+        "input": {
+          "payloads": [
+            {
+              "data": "eyJsYWJlbCI6ImFnZW50czppbnRha2UiLCJtYXhfZGlyZWN0aXZlcyI6NywibWF4X2lzc3VlcyI6NX0=",
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              }
+            }
+          ]
+        },
+        "originalExecutionRunId": "a83c3680-ac87-4f24-baa6-308c70dca3d6",
+        "priority": {},
+        "retryPolicy": {
+          "backoffCoefficient": 2.0,
+          "initialInterval": "1s",
+          "maximumAttempts": 1,
+          "maximumInterval": "100s"
+        },
+        "taskQueue": {
+          "name": "test-mctl-issue-poll"
+        },
+        "workflowExecutionTimeout": "315360000s",
+        "workflowRunTimeout": "315360000s",
+        "workflowTaskTimeout": "10s",
+        "workflowType": {
+          "name": "IssuePollWorkflow"
+        }
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-11-04T22:10:43.984Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "attempt": 1,
+        "startToCloseTimeout": "10s",
+        "taskQueue": {
+          "name": "test-mctl-issue-poll"
+        }
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-11-04T22:10:43.984Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "historySizeBytes": "353",
+        "identity": "",
+        "scheduledEventId": "2"
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-11-04T22:10:43.991Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "binaryChecksum": "3eda82c623f41ba7272df28ed7f24aeb",
+        "identity": "",
+        "meteringMetadata": {},
+        "scheduledEventId": "2",
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            2,
+            3,
+            1
+          ],
+          "sdkName": "temporal-python",
+          "sdkVersion": "1.34.0"
+        }
+      }
+    },
+    {
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "1",
+        "activityType": {
+          "name": "poll_issues_activity"
+        },
+        "header": {},
+        "heartbeatTimeout": "0s",
+        "input": {
+          "payloads": [
+            {
+              "data": "ImFnZW50czppbnRha2Ui",
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              }
+            },
+            {
+              "data": "NQ==",
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              }
+            }
+          ]
+        },
+        "priority": {},
+        "retryPolicy": {
+          "backoffCoefficient": 2.0,
+          "initialInterval": "1s",
+          "maximumAttempts": 3,
+          "maximumInterval": "100s"
+        },
+        "scheduleToCloseTimeout": "315360000s",
+        "scheduleToStartTimeout": "315360000s",
+        "startToCloseTimeout": "300s",
+        "taskQueue": {
+          "kind": "TASK_QUEUE_KIND_NORMAL",
+          "name": "test-mctl-issue-poll"
+        },
+        "workflowTaskCompletedEventId": "3"
+      },
+      "eventId": "5",
+      "eventTime": "2026-11-04T22:10:43.991Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED"
+    },
+    {
+      "activityTaskStartedEventAttributes": {
+        "attempt": 1,
+        "identity": "",
+        "scheduledEventId": "5"
+      },
+      "eventId": "6",
+      "eventTime": "2026-11-04T22:10:43.991Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED"
+    },
+    {
+      "activityTaskCompletedEventAttributes": {
+        "identity": "",
+        "result": {
+          "payloads": [
+            {
+              "data": "eyJmYWlsdXJlcyI6MCwic3RhcnRlZCI6MX0=",
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              }
+            }
+          ]
+        },
+        "scheduledEventId": "5",
+        "startedEventId": "6"
+      },
+      "eventId": "7",
+      "eventTime": "2026-11-04T22:10:43.992Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED"
+    },
+    {
+      "eventId": "8",
+      "eventTime": "2026-11-04T22:10:43.992Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "attempt": 1,
+        "startToCloseTimeout": "10s",
+        "taskQueue": {
+          "name": "test-mctl-issue-poll"
+        }
+      }
+    },
+    {
+      "eventId": "9",
+      "eventTime": "2026-11-04T22:10:43.992Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "historySizeBytes": "902",
+        "identity": "",
+        "scheduledEventId": "8"
+      }
+    },
+    {
+      "eventId": "10",
+      "eventTime": "2026-11-04T22:10:43.995Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "binaryChecksum": "3eda82c623f41ba7272df28ed7f24aeb",
+        "identity": "",
+        "meteringMetadata": {},
+        "scheduledEventId": "8",
+        "sdkMetadata": {}
+      }
+    },
+    {
+      "eventId": "11",
+      "eventTime": "2026-11-04T22:10:43.995Z",
+      "eventType": "EVENT_TYPE_MARKER_RECORDED",
+      "markerRecordedEventAttributes": {
+        "details": {
+          "patch-data": {
+            "payloads": [
+              {
+                "data": "eyJpZCI6ImRpcmVjdGl2ZS1zY2FuIiwiZGVwcmVjYXRlZCI6ZmFsc2V9",
+                "metadata": {
+                  "encoding": "anNvbi9wbGFpbg=="
+                }
+              }
+            ]
+          }
+        },
+        "markerName": "core_patch",
+        "workflowTaskCompletedEventId": "9"
+      }
+    },
+    {
+      "eventId": "12",
+      "eventTime": "2026-11-04T22:10:43.995Z",
+      "eventType": "EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES",
+      "upsertWorkflowSearchAttributesEventAttributes": {
+        "searchAttributes": {
+          "indexedFields": {
+            "TemporalChangeVersion": {
+              "data": "WyJkaXJlY3RpdmUtc2NhbiJd",
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg==",
+                "type": "S2V5d29yZExpc3Q="
+              }
+            }
+          }
+        },
+        "workflowTaskCompletedEventId": "9"
+      }
+    },
+    {
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "2",
+        "activityType": {
+          "name": "directive_scan_activity"
+        },
+        "header": {},
+        "heartbeatTimeout": "0s",
+        "input": {
+          "payloads": [
+            {
+              "data": "Nw==",
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              }
+            }
+          ]
+        },
+        "priority": {},
+        "retryPolicy": {
+          "backoffCoefficient": 2.0,
+          "initialInterval": "1s",
+          "maximumAttempts": 3,
+          "maximumInterval": "100s"
+        },
+        "scheduleToCloseTimeout": "315360000s",
+        "scheduleToStartTimeout": "315360000s",
+        "startToCloseTimeout": "300s",
+        "taskQueue": {
+          "kind": "TASK_QUEUE_KIND_NORMAL",
+          "name": "test-mctl-issue-poll"
+        },
+        "workflowTaskCompletedEventId": "9"
+      },
+      "eventId": "13",
+      "eventTime": "2026-11-04T22:10:43.995Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED"
+    },
+    {
+      "activityTaskStartedEventAttributes": {
+        "attempt": 1,
+        "identity": "",
+        "scheduledEventId": "13"
+      },
+      "eventId": "14",
+      "eventTime": "2026-11-04T22:10:43.995Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED"
+    },
+    {
+      "activityTaskCompletedEventAttributes": {
+        "identity": "",
+        "result": {
+          "payloads": [
+            {
+              "data": "eyJkZWZlcnJlZCI6MSwiZGlzcGF0Y2hlZCI6MiwiZmFpbGVkIjowLCJyZXBsaWVkIjoyfQ==",
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              }
+            }
+          ]
+        },
+        "scheduledEventId": "13",
+        "startedEventId": "14"
+      },
+      "eventId": "15",
+      "eventTime": "2026-11-04T22:10:43.995Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED"
+    },
+    {
+      "eventId": "16",
+      "eventTime": "2026-11-04T22:10:43.995Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "attempt": 1,
+        "startToCloseTimeout": "10s",
+        "taskQueue": {
+          "name": "test-mctl-issue-poll"
+        }
+      }
+    },
+    {
+      "eventId": "17",
+      "eventTime": "2026-11-04T22:10:43.995Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "historySizeBytes": "1645",
+        "identity": "",
+        "scheduledEventId": "16"
+      }
+    },
+    {
+      "eventId": "18",
+      "eventTime": "2026-11-04T22:10:43.997Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "binaryChecksum": "3eda82c623f41ba7272df28ed7f24aeb",
+        "identity": "",
+        "meteringMetadata": {},
+        "scheduledEventId": "16",
+        "sdkMetadata": {}
+      }
+    },
+    {
+      "eventId": "19",
+      "eventTime": "2026-11-04T22:10:43.997Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "data": "eyJkaXJlY3RpdmVzIjp7ImRlZmVycmVkIjoxLCJkaXNwYXRjaGVkIjoyLCJmYWlsZWQiOjAsInJlcGxpZWQiOjJ9LCJwb2xsIjp7ImZhaWx1cmVzIjowLCJzdGFydGVkIjoxfX0=",
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              }
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "17"
+      }
+    }
+  ]
+}

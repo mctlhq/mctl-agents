@@ -1,0 +1,65 @@
+{
+  "files": {
+    "action_approval_wait.json": {
+      "sha256": "6c47154fd6a0de25b8ae4822caebce9b11c5652f8242c10fa8cba23ccc7b1005",
+      "workflow_id": null
+    },
+    "dev_loop_full.json": {
+      "sha256": "0f6cef023d2124302f8513c184e3f18238da09561943ce4e91bb197fe91d5e4e",
+      "workflow_id": "replay-dev-loop-419e3834-1fe6-4bef-ba1e-a9e7a8dd9337"
+    },
+    "dev_loop_hop_run1.json": {
+      "sha256": "51cfc1e62a947095c54ccbd566e79d898c7a84a0832c92659e32e1774e7d1cc0",
+      "workflow_id": "dev-loop-pre-m1-hop-14994e54-6446-4efc-9312-ab73a4260d67"
+    },
+    "dev_loop_hop_run2.json": {
+      "sha256": "f6cd09cc53462dc967bf8765af3ef484668d10ebbbb59c36aff6c36e4a4abb2e",
+      "workflow_id": "dev-loop-pre-m1-hop-14994e54-6446-4efc-9312-ab73a4260d67"
+    },
+    "dev_loop_hop_run3.json": {
+      "sha256": "fdbe25c8a03b247ae4e40ae1f067d121a82daefa4fc6b12fa713c02ab2f3aaaf",
+      "workflow_id": "dev-loop-pre-m1-hop-14994e54-6446-4efc-9312-ab73a4260d67"
+    },
+    "dev_loop_post_gates_resume.json": {
+      "sha256": "736bce56e29972c1270ac92235d0c171c1388fa960527015e3e7c2fd6adfd2e6",
+      "workflow_id": "dev-loop-mctlhq-mctl-telegram-431"
+    },
+    "dev_loop_resumed.json": {
+      "sha256": "fe30b4dea666a82a14f735eece95c6c4794fd49f39d89083d77d8a01761278ca",
+      "workflow_id": "dev-loop-mctlhq-mctl-telegram-431"
+    },
+    "implement_sweep.json": {
+      "sha256": "860647192b32622196e8b8d6612b09df4b2773f42b846089e447cc37a5aeacae",
+      "workflow_id": null
+    },
+    "incident_loop.json": {
+      "sha256": "42e5ac59ee1073a82f91438a816d53a86f28dc18cb95a124f9484728ba4e9f8c",
+      "workflow_id": "replay-incidents-1b3eedd4-6984-48c3-b80f-7bbf61b659e0"
+    },
+    "issue_poll.json": {
+      "sha256": "b8a9ec152591622426ceeb80de20b62116f7d727a924b92e61af4d95aa2a8c70",
+      "workflow_id": null
+    },
+    "reconcile.json": {
+      "sha256": "03e124a54b9f72c3186a6af15734bdd784829318f18391af4e8c4c9e16555ac3",
+      "workflow_id": null
+    },
+    "scheduled_dispatch.json": {
+      "sha256": "2a5c3cb405b12a6d3cc11a1bac39a1f5fa7ead2b02a8761d5ea1f512c94a6ff4",
+      "workflow_id": null
+    },
+    "scheduled_dispatch_failure.json": {
+      "sha256": "e5e898e0aa19d9adfe197642096f2196fb558b0f77e6c31869c5d5314567e87b",
+      "workflow_id": "scheduled-dispatch-fail-pre-m1-d1f50af2-2785-49b8-afa0-b51db946ccf5"
+    },
+    "swept_implement.json": {
+      "sha256": "6e5949a2620cb7faad1009a7cf3d00b3de98739b2c75a3be6f75122683bf736c",
+      "workflow_id": "implement-sweep-mctl-web-issue-10-test"
+    }
+  },
+  "recorded_from": "a99c8881403f2bbe64fea9864d252bed4fe58a4d",
+  "scrubbed": "stackTrace and identity values blanked after recording (they carry the recording host's paths and pid@hostname; replay reads neither). The fixtures recorded at a99c888 were rewritten by exactly this scrub; the recorder now applies it itself.",
+  "sha256_note": "sha256 of the canonical JSON (sort_keys, separators=(',', ':')), so line-ending or indentation changes do not matter but any content change does.",
+  "temporalio": "1.34.0",
+  "workflow_id_note": "The id the history ran under, where any recorded command argument contains it; null where none does (then any id replays identically, which the argument test proves)."
+}
