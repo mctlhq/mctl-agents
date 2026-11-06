@@ -1,0 +1,9 @@
+# Temporary hold for the deferred-resume M2b slice (mctlhq/mctl-agents#993).
+#
+# The deployed shepherd predates #1016, so it does not honour merge:owner-go,
+# and the implementer opens PRs as ready for review. With the main ruleset's
+# require_code_owner_review on, a bot approval cannot satisfy this rule and the
+# mctl-agents App cannot bypass it, whichever session is alive.
+#
+# Remove this file and turn that rule off once the release carrying #1016 is live.
+* @mashkovd
