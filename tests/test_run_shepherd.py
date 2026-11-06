@@ -60,13 +60,15 @@ def make_pr(
     state: str | None = None,
     review_decision: str = "",
     changed_paths: run_shepherd.ChangedPaths | None = None,
+    merge_labels: run_shepherd.MergeLabels | None = None,
 ) -> PRSnapshot:
     """Build a PRSnapshot with sensible mergeable defaults.
 
     `changed_paths` defaults to a COMPLETE list with one ordinary path: the
     fixture states what it observed (mctlhq/mctl-agents#470). The dataclass
     default is UNREADABLE, which fails closed and would turn every merge
-    here into a human gate.
+    here into a human gate. `merge_labels` follows the same reasoning: the
+    default is a COMPLETE read that found no label.
     """
     if state is None:
         if merged:
@@ -95,6 +97,7 @@ def make_pr(
             changed_paths if changed_paths is not None
             else run_shepherd.ChangedPaths.complete(("orchestrator/example.py",))
         ),
+        merge_labels=merge_labels if merge_labels is not None else run_shepherd.MergeLabels.complete(),
     )
 
 
