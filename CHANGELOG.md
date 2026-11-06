@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.118.0](https://github.com/mctlhq/mctl-agents/compare/1.117.0...1.118.0) (2026-11-06)
+
+
+### Features
+
+* **agents:** issue-1006-devloop-part-m-m2a-extend-m1-state-and-p ([96b1f54](https://github.com/mctlhq/mctl-agents/commit/96b1f542b3a2e7b872e066c627742b0c1c3e7426))
+* **agents:** issue-1006-devloop-part-m-m2a-extend-m1-state-and-p ([70ef75c](https://github.com/mctlhq/mctl-agents/commit/70ef75c6a69b05b5787d4cafcc98d41fbce4c928))
+* **agents:** issue-996-feat-devloop-m1-deferred-resume-identity ([e346093](https://github.com/mctlhq/mctl-agents/commit/e346093d614933a4dfab1114ae45dd0782e148be))
+* **agents:** issue-996-feat-devloop-m1-deferred-resume-identity ([6f1d971](https://github.com/mctlhq/mctl-agents/commit/6f1d9715dcf44c9dad48729b1573450fec70b9b9))
+* **tools:** add read-only Temporal patch-marker scanner (B4 P-6) ([0c81de9](https://github.com/mctlhq/mctl-agents/commit/0c81de98e9196915147d2c262615586ae51cb825))
+* **tools:** add read-only Temporal patch-marker scanner (B4 P-6) ([c5caadc](https://github.com/mctlhq/mctl-agents/commit/c5caadc223dbeedca0021d0d6f5ba6cdbf193bc1))
+* **tools:** prove M1 replays pre-M1 histories (B4 P-5) ([6c99d35](https://github.com/mctlhq/mctl-agents/commit/6c99d359747d9fca9e049dce976789a71320031a))
+* **tools:** prove M1 replays pre-M1 histories (B4 P-5) ([a3d483d](https://github.com/mctlhq/mctl-agents/commit/a3d483d41d2661397be415c073b50f9c6df65ca0))
+
+
+### Bug Fixes
+
+* **agents:** canonical work_merged and no_actionable_intent refusal reasons ([990250a](https://github.com/mctlhq/mctl-agents/commit/990250acbb6d3b5bb6699540a37bc644354e7efb))
+* **ci:** fix failing required checks on issue-1006-devloop-part-m-m2a-extend-m1-state-and-p ([5c4ba9d](https://github.com/mctlhq/mctl-agents/commit/5c4ba9d66596e9286714d24d574275a3c0d057fc))
+* **dispatcher:** defer on the SDK update RPC timeout with the fixed reason ([5060a5f](https://github.com/mctlhq/mctl-agents/commit/5060a5f1c32842fd82bfa9fe6fcd501182c9b756))
+* **dispatcher:** defer on the SDK's update RPC timeout with the fixed reason ([d27a994](https://github.com/mctlhq/mctl-agents/commit/d27a9940d7d6a0e4d90b02a3dc97a74dd3db60a0))
+* **review:** address advisory reviewer items ([6ab2547](https://github.com/mctlhq/mctl-agents/commit/6ab2547edfe715ee824a73a8683c1c0247cc0b7c))
+* **shepherd:** honour a merge reserved with merge:owner-go ([80d79da](https://github.com/mctlhq/mctl-agents/commit/80d79da274da174e781797907076476ae3d73d71))
+* **shepherd:** honour a merge reserved with merge:owner-go ([842183c](https://github.com/mctlhq/mctl-agents/commit/842183cadadc0098b596dc7a70f3e832e8b642eb))
+* **shepherd:** match merge:owner-go in any case and say where it was ([2c19702](https://github.com/mctlhq/mctl-agents/commit/2c1970209c7ea5c2ec1668583a8d656b2a16f4bb))
+* **tools:** drop unused type-ignore flagged by mypy in the P-5 recorder ([23c2c39](https://github.com/mctlhq/mctl-agents/commit/23c2c39a422109f73789222572b400551bbbce2a))
+* **tools:** make the marker scanner usable on a real namespace ([fae9c8a](https://github.com/mctlhq/mctl-agents/commit/fae9c8a69ceb3d6687e89eac554e34eae04e59be))
+* **tools:** make the marker scanner usable on a real namespace ([1723e65](https://github.com/mctlhq/mctl-agents/commit/1723e655c07dc7ee589518b88b0f7e213261acc7))
+
 ## [1.117.0](https://github.com/mctlhq/mctl-agents/compare/1.116.0...1.117.0) (2026-11-03)
 
 
