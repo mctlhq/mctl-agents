@@ -144,12 +144,14 @@ _BY_NAME: dict[str, type] = {
     )
 }
 
-#: The fields M1 added, per class. `test_the_pre_m1_field_sets_are_m1_minus_exactly_these`
-#: proves this table against both the a99c888 extraction and today's classes.
+#: The fields added since a99c888 (M1 and M2a, mctl-agents#1006), per class.
+#: `test_the_pre_m1_field_sets_are_m1_minus_exactly_these` proves this table
+#: against both the a99c888 extraction and today's classes, so a later field
+#: added to a carried dataclass has to be listed here with its default.
 M1_ADDED: dict[str, set[str]] = {
     "ResumeDelivery": {"intent_id", "expected_state_version", "resumed_from_execution_id"},
     "OpenDelivery": {"accepted_after_gates"},
-    "MergeWatchResume": {"deferred_resume_contract"},
+    "MergeWatchResume": {"deferred_resume_contract", "feedback_done", "pending_feedback"},
     "IssueRef": set(),
     "ExecutionRequest": {"created_at"},
 }
@@ -162,6 +164,8 @@ M1_DEFAULTS: dict[str, Any] = {
     "resumed_from_execution_id": "",
     "accepted_after_gates": False,
     "deferred_resume_contract": False,
+    "feedback_done": (),
+    "pending_feedback": (),
     "created_at": "",
 }
 _M1_CLASSES: dict[str, type] = {
@@ -636,6 +640,8 @@ def _m1_values() -> dict[str, Any]:
         deadline="2099-01-01T00:00:00Z",
         work_item_id="wi-1",
         deferred_resume_contract=True,
+        feedback_done=("fb-1",),
+        pending_feedback=("fb-2",),
         open_deliveries=(opened,),
     )
     ref = IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1", work_item_id="wi-1", resume=resume)
