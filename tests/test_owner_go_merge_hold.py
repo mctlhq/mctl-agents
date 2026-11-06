@@ -33,7 +33,8 @@ SOURCE = {"type": "github_issue", "repo": "mctlhq/mctl-web", "issue": 7}
 HELD = [
     pytest.param(MergeLabels.complete((LABEL,)), "owner-go", id="label"),
     pytest.param(MergeLabels.complete(("bug", LABEL)), "owner-go", id="label-among-others"),
-    pytest.param(MergeLabels(run_shepherd.MERGE_LABELS_TRUNCATED, (), "more"), "merge-labels-truncated", id="truncated"),
+    pytest.param(MergeLabels(run_shepherd.MERGE_LABELS_TRUNCATED, (), "more"), "merge-labels-truncated",
+                 id="truncated"),
     pytest.param(MergeLabels(run_shepherd.MERGE_LABELS_UNREADABLE, (), "gh failed"), "merge-labels-unreadable",
                  id="unreadable"),
 ]
@@ -323,7 +324,9 @@ def test_an_approved_clean_pr_with_the_label_is_not_merged(
     assert capsys.readouterr().out.count(run_shepherd.MERGE_NEEDS_HUMAN + " ") == 1
 
 
-def test_the_label_on_the_source_issue_holds_a_pr_that_carries_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_label_on_the_source_issue_holds_a_pr_that_carries_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The slice case: the owner labels the child issue, and the implementer
     opens a PR that knows nothing about it."""
     calls = _stub_gh_merge(monkeypatch)
@@ -398,7 +401,9 @@ def test_a_proposal_with_no_source_link_merges_as_before(tmp_path: Path, monkeyp
     assert len(calls) == 1
 
 
-def test_a_failed_read_clears_on_a_later_tick_and_the_pr_merges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_failed_read_clears_on_a_later_tick_and_the_pr_merges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls = _stub_gh_merge(monkeypatch)
     ref = _ref_with_source(tmp_path)
 
@@ -439,7 +444,9 @@ def test_a_new_head_signals_again(
     assert read_status(ref)["merge_needs_human_head"] == HEAD_SHA
 
 
-def test_the_owner_merging_by_hand_closes_the_proposal_as_usual(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_owner_merging_by_hand_closes_the_proposal_as_usual(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls = _stub_gh_merge(monkeypatch)
     ref = make_ref(tmp_path)
     _tick(ref, make_pr(merge_labels=MergeLabels.complete((LABEL,))))
