@@ -5,6 +5,7 @@ validator boundary. M2a changes no live decision."""
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import dataclasses
 import inspect
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from temporalio import activity
 from temporalio.api.common.v1 import Payload
 from temporalio.converter import DataConverter
 
@@ -23,10 +25,12 @@ from orchestrator.temporal import cli as tcli
 from orchestrator.temporal import closed_loop as cl
 from orchestrator.temporal import dispatcher as dx
 from orchestrator.temporal.activities.pr_state import PRState
+from orchestrator.temporal.constants import TASK_QUEUE
 from orchestrator.temporal.issue_ref import workflow_id_for
 from orchestrator.temporal.workflows.dev_loop import (
     RESUME_DEFERRAL_REASONS,
     ContractState,
+    DevLoopWorkflow,
     ImplementExecutionState,
     MergeWatchResume,
     OpenDelivery,
@@ -34,9 +38,29 @@ from orchestrator.temporal.workflows.dev_loop import (
 )
 from orchestrator.work_context import execution_requests as xr
 from orchestrator.work_context.client import WorkItemClient
+from tests.temporal_harness import Worker
 from tests.test_deferred_resume_m1 import _ValidatorClient
-from tests.test_execution_request_dispatch import FakeTemporal, api  # noqa: F401  (api: fixture)
-from tests.test_execution_request_resume import _RunningPort, _validator
+from tests.test_dev_loop_workflow import MERGED_PR
+from tests.test_execution_request_dispatch import (
+    Crash,
+    FakeTemporal,
+    _dispatcher,
+    _Gate,
+    _loop_activities,
+    _replace,
+    _wait_for,
+    api,  # noqa: F401  (fixture)
+)
+from tests.test_execution_request_resume import (
+    _accepted_updates,
+    _events,
+    _park,
+    _RunningPort,
+    _submit_log,
+    _validator,
+    env,  # noqa: F401  (fixture)
+)
+from tests.test_execution_request_resume import api as resume_api  # noqa: F401  (fixture)
 from tests.test_work_context_resume_acceptance import URL, WID
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -155,14 +179,14 @@ def test_feedback_state_survives_carry_rehydrate_and_the_converter_in_order():
     assert dst._feedback_done == {"xr_a", "xr_b"} and dst._pending_feedback == ("xr_z", "xr_c")
 
 
-def test_an_unknown_key_in_a_merge_watch_payload_is_documented():
-    """Forward compatibility: whether Temporal's converter tolerates a key the
-    dataclass does not know decides if a rollback needs the hops drained."""
-    try:
-        decoded = _decode(MergeWatchResume, {"service": "s", "not_a_field": 1})
-    except Exception:  # noqa: BLE001 — the rollout note then requires draining hops before a rollback
-        return
+def test_an_unknown_key_in_a_merge_watch_payload_is_tolerated_and_dropped():
+    """Forward compatibility, and what the rollback note in #1006's design
+    depends on: a worker that does not know a field drops it instead of failing
+    the hop, so a rollback does not need hops drained first. If the converter
+    ever starts refusing unknown keys this fails, and that note has to change."""
+    decoded = _decode(MergeWatchResume, {"service": "s", "not_a_field": 1})
     assert decoded.service == "s"
+    assert not hasattr(decoded, "not_a_field")
 
 
 # -- T6: contract_state ------------------------------------------------------------
@@ -327,6 +351,22 @@ async def test_read_branch_answers_absent_only_after_the_repository_read(token, 
     assert (await cl.read_branch("mctlhq/svc", "b", transport=_transport(routes))).verdict == verdict
 
 
+@pytest.mark.anyio
+async def test_read_branch_encodes_the_slash_of_a_real_implementer_branch(token):
+    """The implementer's branch is `feat/agents-<slug>`. Unencoded, the slash
+    routes elsewhere, GitHub answers 404, and an existing branch reads `absent`."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.raw_path.decode())
+        return httpx.Response(200, json={})
+
+    read = await cl.read_branch("mctlhq/svc", "feat/agents-x", transport=httpx.MockTransport(handler))
+
+    assert read.verdict == "exists"
+    assert seen == ["/repos/mctlhq/svc", "/repos/mctlhq/svc/branches/feat%2Fagents-x"]
+
+
 def _status_file(status: str) -> tuple[int, dict]:
     return 200, {"content": base64.b64encode(f"status: {status}\n".encode()).decode()}
 
@@ -444,3 +484,73 @@ def test_r3_a_failed_implement_with_an_intent_is_not_deferred_recovery_not_ready
             actor_id="user:alice", kind="resume", intent_id=7,
         )
     )
+
+
+# -- T2 again, on the real workflow ------------------------------------------------
+
+
+class _CrashBeforeReject:
+    """A `WorkItemClient` whose process dies after the loop refused, before the
+    refusal reached mctl-api: the request stays claimed and its lease lapses."""
+
+    def __init__(self, inner: WorkItemClient) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def reject_execution_request(self, *_args: object, **_kwargs: object) -> object:
+        raise Crash("dispatcher died between the refusal and the reject")
+
+
+@pytest.mark.anyio
+async def test_the_real_loop_refuses_work_merged_and_the_same_request_gets_the_same_answer(
+    resume_api,  # noqa: F811
+    env,  # noqa: F811
+):
+    """Real `DevLoopWorkflow`, gates passed, `_last_pr` MERGED. The loop is held
+    right after the merge so the refusal comes from that state and not from a
+    loop that has ended. The second dispatch is the SAME request after its lease
+    lapses, which is the redelivery a crashed dispatcher really produces."""
+    api_ = resume_api
+    submit, _ = _submit_log()
+    gate = _Gate()
+    merged_seen = asyncio.Event()
+    leave = asyncio.Event()
+
+    @activity.defn(name="resolve_deploy_target")
+    async def held_deploy_target(repo: str) -> None:
+        merged_seen.set()
+        await leave.wait()
+
+    activities = _replace(
+        _loop_activities(submit, pr_states=[MERGED_PR], approval_requests=gate.requests),
+        gate.activity,
+        held_deploy_target,
+    )
+    async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+        loop = await _park(api_, env, gate)
+        await gate.release()
+        await _wait_for(merged_seen.is_set)
+
+        rid = api_.create_request("resume")
+        api_.xrs[rid]["intent_id"] = 7
+        before = {k: api_.xrs[rid].get(k) for k in ("intent_id", "surface", "requested_by")}
+        executions = len(api_.executions)
+        fulfils = len(api_.fulfils())
+
+        with pytest.raises(Crash):
+            await _dispatcher(env, _CrashBeforeReject(WorkItemClient())).dispatch_once()
+        assert api_.request_state(rid)["state"] == "claimed"
+        api_.now += 61  # the crashed holder's lease lapses
+
+        outcome = await _dispatcher(env).dispatch_once()
+
+        assert outcome.action == dx.REJECTED
+        assert api_.request_state(rid)["reason"] == f"{xr.RESUME_REFUSED}:work_merged"
+        assert len(api_.fulfils()) == fulfils and len(api_.executions) == executions
+        assert {k: api_.xrs[rid].get(k) for k in before} == before
+        assert rid not in _accepted_updates(await _events(env, loop))
+
+        leave.set()
+        await env.client.get_workflow_handle(loop).terminate("test over")

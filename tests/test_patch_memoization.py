@@ -50,13 +50,24 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import timedelta
+from typing import Any
 
 import pytest
 from temporalio import activity, workflow
+from temporalio.converter import DataConverter
 from temporalio.testing import WorkflowEnvironment
 
+from orchestrator.temporal.activities.argo import WorkflowResult
 from orchestrator.temporal.constants import EXECUTION_TASK_QUEUE
+from orchestrator.temporal.constants import TASK_QUEUE as DEV_LOOP_QUEUE
+from orchestrator.temporal.workflows.dev_loop import (
+    DEFERRED_RESUME_PATCH,
+    DevLoopWorkflow,
+    IssueRef,
+    MergeWatchResume,
+)
 from tests.temporal_harness import Worker
+from tests.test_dev_loop_workflow import _fake_activities
 
 pytestmark = pytest.mark.anyio
 
@@ -211,3 +222,64 @@ async def test_an_execution_that_predates_the_marker_never_adopts_it() -> None:
         f"a new execution scheduled onto {started_after}; the flip is not "
         "reaching new work at all"
     )
+
+
+# ---------------------------------------------------------------------------
+# DEFERRED_RESUME_PATCH on the real workflow (mctlhq/mctl-agents#1006, T4)
+# ---------------------------------------------------------------------------
+def _deferred_resume_markers(history: Any) -> int:
+    converter = DataConverter.default.payload_converter
+    count = 0
+    for event in history.events:
+        if not event.HasField("marker_recorded_event_attributes"):
+            continue
+        attrs = event.marker_recorded_event_attributes
+        if attrs.marker_name != "core_patch":
+            continue
+        for payload in attrs.details["patch-data"].payloads:
+            count += converter.from_payload(payload)["id"] == DEFERRED_RESUME_PATCH
+    return count
+
+
+async def test_the_deferred_resume_marker_is_recorded_once_fresh_and_never_on_a_merge_watch_hop() -> None:
+    """A hop carries the decision instead of asking `patched()` again: in a
+    new run the question is unmemoized, so it would answer True for a loop
+    that passed its gates without the patch and change that loop's contract."""
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        activities, _calls, investigate_ran, _ownership = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=DEV_LOOP_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            fresh = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=f"marker-fresh-{uuid.uuid4()}",
+                task_queue=DEV_LOOP_QUEUE,
+            )
+            await investigate_ran.wait()
+            await fresh.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            await fresh.result()
+            fresh_markers = _deferred_resume_markers(await fresh.fetch_history())
+
+            hopped = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(
+                    issue_url="https://github.com/mctlhq/mctl-telegram/issues/2",
+                    resume=MergeWatchResume(
+                        service="mctl-telegram",
+                        slug="issue-2-x",
+                        deadline="2027-01-01T00:00:00Z",
+                        deferred_resume_contract=True,
+                        investigate=WorkflowResult(workflow_name="i", phase="Succeeded"),
+                        implement=WorkflowResult(workflow_name="m", phase="Succeeded"),
+                        approve=WorkflowResult(workflow_name="a", phase="Succeeded"),
+                    ),
+                ),
+                id=f"marker-hop-{uuid.uuid4()}",
+                task_queue=DEV_LOOP_QUEUE,
+            )
+            await hopped.result()
+            hopped_markers = _deferred_resume_markers(await hopped.fetch_history())
+
+    assert fresh_markers == 1
+    assert hopped_markers == 0
