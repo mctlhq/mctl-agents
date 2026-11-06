@@ -90,6 +90,9 @@ logger = logging.getLogger(__name__)
 
 #: A deferral reason outside the loop's closed vocabulary is normalised to this.
 RESUME_DEFERRAL_UNSPECIFIED = "unspecified"
+#: The dispatcher's own deferral for a closed loop whose PR/intent state could
+#: not be observed (mctlhq/mctl-agents#1006, task 4b). Not wired in M2a.
+CLOSED_LOOP_UNOBSERVED = "closed-loop-unobserved"
 #: Deferral reasons the audit records as `resume_deferred:<reason>`: the
 #: loop's closed vocabulary (dev_loop.RESUME_DEFERRAL_REASONS) and `unspecified`.
 DEFERRAL_AUDITED = frozenset(
@@ -100,6 +103,10 @@ DEFERRAL_AUDITED = frozenset(
         "implement-running",
         "recovery-not-ready",
         "feedback-not-ready",
+        # Emitted by no code path in M2a (the closed-loop decision is not
+        # wired); the loop never raises it, so it is not in
+        # dev_loop.RESUME_DEFERRAL_REASONS.
+        CLOSED_LOOP_UNOBSERVED,
         RESUME_DEFERRAL_UNSPECIFIED,
     }
 )
