@@ -458,3 +458,31 @@ def test_the_owner_merging_by_hand_closes_the_proposal_as_usual(
     status = read_status(ref)
     assert status["status"] == "merged"
     assert "merge_needs_human" not in status
+
+
+# ---------------------------------------------------------------------------
+# Review of #1016: a label GitHub treats as the same must hold the same
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("name", ["Merge:owner-go", "merge:Owner-Go", "MERGE:OWNER-GO"])
+def test_the_label_matches_whatever_its_case(name: str) -> None:
+    """GitHub label names are case-insensitive, so this one looks right in the
+    UI. A hold that silently does not hold is the failure this gate exists for."""
+    pr = make_pr(merge_labels=MergeLabels.complete((name,)))
+    assert run_shepherd.merge_operation_for(pr) == pc.MERGE_OPERATION_OWNER_GO
+    assert run_shepherd.needs_human_kind(pr) == "owner-go"
+
+
+def test_the_signal_says_the_label_was_on_the_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stub_gh_merge(monkeypatch)
+    _tick(make_ref(tmp_path), make_pr(merge_labels=MergeLabels.complete((LABEL,))))
+    assert 'detail="label on the PR"' in capsys.readouterr().out
+
+
+def test_the_signal_names_the_source_issue_that_carries_the_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stub_gh_merge(monkeypatch)
+    _tick(_ref_with_source(tmp_path), make_pr(), issue=_issue("merge:Owner-Go"))
+    assert 'detail="label on source issue mctlhq/mctl-web#7"' in capsys.readouterr().out

@@ -800,10 +800,16 @@ class MergeLabels:
         return MergeLabels(worse.state, (*self.names, *other.names), worse.detail)
 
 
+def _names_owner_go(names: Iterable[str]) -> bool:
+    """GitHub label names are case-insensitive, so `Merge:Owner-Go` is the same
+    label to anyone reading the UI and must hold the same."""
+    return any(name.casefold() == OWNER_GO_LABEL for name in names)
+
+
 def requires_owner_go(pr: PRSnapshot) -> bool:
     """True unless the labels are COMPLETE and none reserves the merge."""
     labels = pr.merge_labels
-    return labels.state != MERGE_LABELS_COMPLETE or OWNER_GO_LABEL in labels.names
+    return labels.state != MERGE_LABELS_COMPLETE or _names_owner_go(labels.names)
 
 
 def merge_operation_for(pr: PRSnapshot) -> str:
@@ -842,7 +848,7 @@ def needs_human_kind(pr: PRSnapshot) -> str:
         return NEEDS_HUMAN_AGENT_DEFINITION
     if pr.changed_paths.state != CHANGED_PATHS_COMPLETE:
         return f"changed-paths-{pr.changed_paths.state}"
-    if OWNER_GO_LABEL in pr.merge_labels.names:
+    if _names_owner_go(pr.merge_labels.names):
         return NEEDS_HUMAN_OWNER_GO
     if pr.merge_labels.state != MERGE_LABELS_COMPLETE:
         return f"merge-labels-{pr.merge_labels.state}"
@@ -860,7 +866,9 @@ def _needs_human_reason(pr: PRSnapshot) -> str:
         return f"reason={kind} paths_state={changed.state} paths={shown}{more}"
     if changed.state != CHANGED_PATHS_COMPLETE:
         return f"reason={kind} detail={json.dumps(changed.detail[:200])}"
-    return f"reason={kind} detail={json.dumps(pr.merge_labels.detail[:200])}"
+    # A COMPLETE read carries no detail, so only the PR's own label is left.
+    detail = pr.merge_labels.detail or "label on the PR"
+    return f"reason={kind} detail={json.dumps(detail[:200])}"
 
 
 # Per-service mode: FULL discovers/fixes/merges; FIX_ONLY discovers and fixes
@@ -1745,7 +1753,10 @@ def _with_source_issue_labels(ref: ProposalRef, pr: PRSnapshot) -> PRSnapshot:
         return pr
     if verdict.labels is None:
         return unreadable(f"could not read the labels of source issue {verdict.issue_ref}")
-    return replace(pr, merge_labels=pr.merge_labels.including(MergeLabels.complete(verdict.labels)))
+    detail = f"label on source issue {verdict.issue_ref}" if _names_owner_go(verdict.labels) else ""
+    source = MergeLabels(MERGE_LABELS_COMPLETE, verdict.labels, detail)
+    merged = pr.merge_labels.including(source)
+    return replace(pr, merge_labels=replace(merged, detail=merged.detail or detail))
 
 
 # ---------------------------------------------------------------------------
