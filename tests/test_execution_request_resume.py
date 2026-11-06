@@ -1253,6 +1253,28 @@ async def test_an_update_that_times_out_defers_with_a_fixed_reason_and_an_audit_
     assert [(a["verdict"], a["reason"]) for a in deliver] == [(dx.DELIVERY_DEFERRED, dx.DELIVERY_TIMED_OUT)]
 
 
+async def test_the_sdk_s_rpc_timeout_error_defers_with_the_same_fixed_reason(api, capsys):
+    """Against a real server the cancelled wait surfaces as the SDK's own
+    `WorkflowUpdateRPCTimeoutOrCancelledError`, not a plain TimeoutError (the
+    test above only exercised the latter). Same contract: fixed reason, audit
+    line, no crash path."""
+    from temporalio.client import WorkflowUpdateRPCTimeoutOrCancelledError
+
+    async def sdk_timeout() -> str:
+        raise WorkflowUpdateRPCTimeoutOrCancelledError()
+
+    loop = workflow_id_for(URL)
+    rid = api.create_request("resume")
+    port = _RunningPort(_UpdateClient(sdk_timeout), loop)
+    outcome = await dx.Dispatcher(WorkItemClient(), port, lease=60).dispatch_once()
+
+    assert outcome.action == dx.DEFERRED
+    assert outcome.reason == f"delivery to {loop}: {dx.DELIVERY_TIMED_OUT}"
+    assert api.request_state(rid)["state"] == "claimed"
+    deliver = [a for a in _audit(capsys.readouterr().out) if a["event"] == "deliver"]
+    assert [(a["verdict"], a["reason"]) for a in deliver] == [(dx.DELIVERY_DEFERRED, dx.DELIVERY_TIMED_OUT)]
+
+
 def _ivalidate(wf: DevLoopWorkflow, delivery: ResumeDelivery) -> tuple[str, str]:
     with pytest.raises(ApplicationError) as exc:
         wf._validate_execution_request(delivery)
