@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from typing import Any
 
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
@@ -159,6 +160,57 @@ async def dispatch_once() -> None:
           f"workflow={outcome.workflow_id or '-'} execution={outcome.execution_id or '-'} {outcome.reason}".rstrip())
 
 
+CONTRACT_DRAIN_QUERY = 'WorkflowType="DevLoopWorkflow" AND ExecutionStatus="Running"'
+
+
+def classify_contract_state(state: object) -> str:
+    """`contract`, `legacy` (gates passed without the contract), or `pre-gates`."""
+    if getattr(state, "contract", False):
+        return "contract"
+    if getattr(state, "gates_passed", False):
+        return "legacy"
+    return "pre-gates"
+
+
+async def contract_drain_check(client: Any) -> tuple[list[str], int]:
+    """Classify every running DevLoop by its `contract_state` query. Read-only:
+    it lists and queries, and signals, updates and starts nothing. Returns the
+    output lines and the exit code: 2 when any loop is UNKNOWN (query failed,
+    timed out or unsupported by the worker) or the listing failed, else 0."""
+    from orchestrator.temporal.dispatcher import DELIVERY_TIMEOUT_SECONDS
+
+    counts = {"contract": 0, "legacy": 0, "pre-gates": 0, "UNKNOWN": 0}
+    lines: list[str] = []
+    listing_failed = False
+    try:
+        async for wf in client.list_workflows(CONTRACT_DRAIN_QUERY):
+            try:
+                handle = client.get_workflow_handle(wf.id)
+                state = await asyncio.wait_for(
+                    handle.query(DevLoopWorkflow.contract_state), timeout=DELIVERY_TIMEOUT_SECONDS
+                )
+                verdict = classify_contract_state(state)
+            except Exception as exc:  # noqa: BLE001 — an unanswered query is UNKNOWN, never a class
+                verdict = "UNKNOWN"
+                lines.append(f"{wf.id}: UNKNOWN ({type(exc).__name__})")
+            else:
+                lines.append(f"{wf.id}: {verdict}")
+            counts[verdict] += 1
+    except Exception as exc:  # noqa: BLE001 — a failed listing must never read as zero loops
+        listing_failed = True
+        lines.append(f"listing failed: UNKNOWN ({type(exc).__name__}: {exc})")
+    lines.append(", ".join(f"{name}={n}" for name, n in counts.items()))
+    return lines, 2 if listing_failed or counts["UNKNOWN"] else 0
+
+
+async def contract_drain_check_command() -> None:
+    client = await connect()
+    lines, code = await contract_drain_check(client)
+    print("\n".join(lines))
+    if code:
+        raise SystemExit(code)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The CLI's argument parser.
 
@@ -213,6 +265,12 @@ def build_parser() -> argparse.ArgumentParser:
              "needs EXECUTION_REQUEST_DISPATCHER=true)",
     )
 
+    sub.add_parser(
+        "contract-drain-check",
+        help="List running DevLoops as contract, legacy, pre-gates or UNKNOWN (read-only; "
+             "exit 2 when any is UNKNOWN or the listing failed)",
+    )
+
     return parser
 
 
@@ -228,6 +286,8 @@ def main() -> None:
         asyncio.run(status(args.workflow_id))
     elif args.command == "dispatch-once":
         asyncio.run(dispatch_once())
+    elif args.command == "contract-drain-check":
+        asyncio.run(contract_drain_check_command())
 
 
 if __name__ == "__main__":
