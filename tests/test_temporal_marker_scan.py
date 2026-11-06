@@ -173,6 +173,129 @@ def detector_checks(mod: ModuleType) -> None:
     mixed = _scan(mod, FakeClient([["a", "b"]], {"a": POS, "b": "{"}))
     assert mixed.exit_code() == 2 and mixed.exit_code(allow_present=True) == 2
     assert _scan(mod, FakeClient([[]], {})).exit_code() == 0  # an honest empty listing
+    _reason_checks(mod)
+    _completeness_checks(mod)
+    _connection_checks(mod)
+
+
+class NotFound(Exception):
+    status = type("Status", (), {"name": "NOT_FOUND"})()
+
+
+class Unavailable(Exception):
+    status = type("Status", (), {"name": "UNAVAILABLE"})()
+
+
+def _reason_checks(mod: ModuleType) -> None:
+    U = mod.UNKNOWN
+    clean = lambda cont=None: json.dumps(_synthetic(continued_from=cont))  # noqa: E731
+    # Retention gap: the server's absence signal on an ancestor still BLOCKS.
+    e = _chain(mod, "r1", {"r1": clean("r2"), "r2": NotFound("gone")})
+    assert e.verdict == U and e.reason == mod.R_RETENTION and "depth 2" in e.detail
+    r = _scan(mod, FakeClient([["w"]], {"w": clean("r1"), "w@r1": NotFound("gone")}))
+    assert r.exit_code() == 2 and r.exit_code(allow_present=True) == 2
+    assert r.unknown_reasons() == {mod.R_RETENTION: 1}
+    # Any other failure on an ancestor is not a retention gap.
+    assert _chain(mod, "r1", {"r1": Unavailable("x")}).reason == mod.R_ANCESTOR
+    assert _chain(mod, "r1", {"r1": RuntimeError("x")}).reason == mod.R_ANCESTOR
+    assert _chain(mod, "r1", {"r1": "{"}).reason == mod.R_ANCESTOR
+    # NOT_FOUND on a listed run itself is a failed fetch, not a retention gap of an ancestor.
+    r = _scan(mod, FakeClient([["w"]], {"w": NotFound("gone")}))
+    assert r.entries[0].verdict == U and r.entries[0].reason == mod.R_FETCH
+    # Every other UNKNOWN path has its own code, and known verdicts have none.
+    assert mod.classify(None).reason == mod.R_NO_HISTORY
+    assert mod.classify("{").reason == mod.R_CORRUPT
+    gap = _synthetic()
+    del gap["events"][2]
+    assert mod.classify(json.dumps(gap)).reason == mod.R_INCOMPLETE
+    assert mod.classify(clean()).reason == ""
+    # Non-list and non-dict shapes in a core_patch marker are UNKNOWN and do not raise.
+    for odd in (5, True, "x", {"a": 1}):
+        h = _synthetic(marker=mod.PATCH)
+        h["events"][-1]["markerRecordedEventAttributes"]["details"]["patch-data"]["payloads"] = odd
+        try:
+            v = mod.classify(json.dumps(h))
+        except TypeError as exc:
+            raise AssertionError(f"classify raised on payloads={odd!r}") from exc
+        assert v[0] == U and v.reason == mod.R_MARKER
+
+
+def _completeness_checks(mod: ModuleType) -> None:
+    clean = json.dumps(_synthetic())
+    hist = {k: clean for k in "abc"}
+
+    def run(counts: list[Any], max_workflows: int | None = None) -> Any:
+        it = iter(counts)
+
+        async def count_fn(query: str) -> int:
+            v = next(it)
+            if isinstance(v, Exception):
+                raise v
+            return v
+
+        return asyncio.run(mod.scan(FakeClient([["a", "b", "c"]], hist).list_fn, FakeClient([], hist).fetch_fn,
+                                    count_fn=count_fn, max_workflows=max_workflows))
+
+    assert run([3, 3]).exit_code() == 0
+    for bad in ([4, 4], [2, 2], [3, 4], [4, 3], [RuntimeError("no count")], [3, RuntimeError("no count")]):
+        r = run(bad)
+        assert not r.listing_complete and r.exit_code() == 2, bad
+    r = run([3, 3], max_workflows=2)
+    assert not r.listing_complete and r.exit_code() == 2 and len(r.entries) == 2
+    assert run([3, 3], max_workflows=3).exit_code() == 0
+
+
+def _connection_checks(mod: ModuleType) -> None:
+    import argparse
+    import contextlib
+    import io
+    import os
+
+    def ns(**kw: Any) -> argparse.Namespace:
+        base = {"tls": False, "tls_ca_file": None, "tls_cert_file": None, "tls_key_file": None,
+                "tls_server_name": None, "api_key_env": None}
+        return argparse.Namespace(**{**base, **kw})
+
+    assert mod._connection_options(ns()) == {}
+    assert mod._connection_options(ns(tls=True)) == {"tls": True}
+    for bad in (ns(tls=True, api_key_env="SCAN_KEY_NOT_SET"), ns(tls_ca_file="x"),
+                ns(tls=True, tls_cert_file="x"), ns(tls=True, tls_key_file="x"), ns(tls_server_name="x")):
+        try:
+            mod._connection_options(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"bad connection flags accepted: {bad}")
+
+    secret = "scan-secret-value"
+    os.environ["SCAN_KEY"] = secret
+    try:
+        assert mod._connection_options(ns(tls=True, api_key_env="SCAN_KEY")) == {"tls": True, "api_key": secret}
+        try:
+            mod._connection_options(ns(api_key_env="SCAN_KEY"))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("an API key was accepted without TLS")
+        seen: dict[str, Any] = {}
+
+        async def leaky(address: str, namespace: str, **options: Any) -> Any:
+            seen.update(options)
+            raise ConnectionError(f"refused with {options.get('api_key')}")
+
+        argv = ["--address", "x:1", "--namespace", "n", "--tls", "--api-key-env", "SCAN_KEY"]
+        for fmt in ([], ["--json"]):
+            seen.clear()
+            saved, mod._connect = mod._connect, leaky
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    code = mod.main([*argv, *fmt])
+            finally:
+                mod._connect = saved
+            assert seen["api_key"] == secret and code == 2
+            assert secret not in buf.getvalue() and "[REDACTED]" in buf.getvalue()
+    finally:
+        del os.environ["SCAN_KEY"]
 
 
 def _chain(mod: ModuleType, head_cont: str | None, ancestors: dict[str, Any]) -> Any:
@@ -230,7 +353,7 @@ def _cli_checks(mod: ModuleType) -> None:
             mod._connect = saved
         return code, buf.getvalue()
 
-    async def refuse(address: str, namespace: str) -> Any:
+    async def refuse(address: str, namespace: str, **options: Any) -> Any:
         raise ConnectionError("refused")
 
     code, out = run(refuse)
@@ -259,18 +382,24 @@ def _cli_checks(mod: ModuleType) -> None:
             def get_workflow_handle(self, wid: str, run_id: str | None = None) -> Handle:
                 return Handle()
 
+            async def count_workflows(self, query: str) -> Any:
+                return type("Count", (), {"count": 1})()
+
         return C()
 
-    async def failing_listing(address: str, namespace: str) -> Any:
+    async def failing_listing(address: str, namespace: str, **options: Any) -> Any:
         return client(True)
 
-    async def fine(address: str, namespace: str) -> Any:
+    async def fine(address: str, namespace: str, **options: Any) -> Any:
         return client(False)
 
     code, out = run(failing_listing)
     assert code == 2 and json.loads(out)["listing_complete"] is False
     code, out = run(fine)
-    assert code == 0 and json.loads(out)["counts"]["MARKER_ABSENT"] == 1
+    payload = json.loads(out)
+    assert code == 0 and payload["counts"]["MARKER_ABSENT"] == 1
+    # A retention lookup that fails is reported, and changes no verdict.
+    assert payload["namespace"] == "n" and payload["retention_seconds"] is None and payload["retention_error"]
 
 
 def test_real_tool_passes_detector_checks():
@@ -354,9 +483,9 @@ def test_render_reports_counts_version_and_continued_from():
     hist = {"a": json.dumps(_synthetic(continued_from="r0")), "a@r0": json.dumps(_synthetic()), "b": "{"}
     r = _scan(ms, FakeClient([["a", "b"]], hist))
     text = ms.render_text(r)
-    assert "scanner=MS-3" in text and "absent=1" in text and "unknown=1" in text and "continued_from=r0" in text
+    assert "scanner=MS-4" in text and "absent=1" in text and "unknown=1" in text and "continued_from=r0" in text
     payload = json.loads(ms.render_json(r, r.exit_code()))
-    assert payload["scanner_version"] == "MS-3" and payload["exit_code"] == 2
+    assert payload["scanner_version"] == "MS-4" and payload["exit_code"] == 2
     assert payload["counts"] == {"MARKER_PRESENT": 0, "MARKER_ABSENT": 1, "UNKNOWN": 1}
     assert payload["workflows"][0]["continued_from"] == "r0"
 
@@ -400,6 +529,8 @@ def test_source_has_no_mutating_temporal_calls():
     src = _TOOL.read_text()
     banned_calls = (".signal(", ".terminate(", ".cancel(", ".start_workflow(", ".execute_workflow(", ".execute_update(",
                     "execute_update_with_start_workflow", ".start_update(", "signal_with_start", "workflow_service.")
+    # The one direct RPC the tool makes, read-only. Anything else fails below.
+    src = src.replace("workflow_service.describe_namespace(", "")
     for banned in banned_calls:
         assert banned not in src
 
@@ -508,24 +639,37 @@ MUTATIONS: dict[str, tuple[str, str]] = {
     "unknown-does-not-block": ("if not self.listing_complete or c[UNKNOWN]:", "if not self.listing_complete:"),
     "listing-incomplete-does-not-block": ("if not self.listing_complete or c[UNKNOWN]:", "if c[UNKNOWN]:"),
     "unparseable-becomes-absent": ('return Verdict(UNKNOWN, f"unparseable', 'return Verdict(ABSENT, f"unparseable'),
-    "missing-history-becomes-absent": ('return Verdict(UNKNOWN, "no history")', 'return Verdict(ABSENT, "no history")'),
-    "empty-history-becomes-absent": ('return Verdict(UNKNOWN, "no events")', 'return Verdict(ABSENT, "no events")'),
+    "missing-history-becomes-absent": ('return Verdict(UNKNOWN, "no history"', 'return Verdict(ABSENT, "no history"'),
+    "empty-history-becomes-absent": ('return Verdict(UNKNOWN, "no events"', 'return Verdict(ABSENT, "no events"'),
     "patch-id-not-compared": ('["id"] == patch:', '["id"] is not None:'),
     "drop-continued-from": ('return attrs.get("continuedExecutionRunId") or None', "return None"),
-    "event-without-id-becomes-absent": ('return Verdict(UNKNOWN, "event without eventId", cont)',
-                                        'return Verdict(ABSENT, "event without eventId", cont)'),
+    "event-without-id-becomes-absent": ('return Verdict(UNKNOWN, "event without eventId", cont',
+                                        'return Verdict(ABSENT, "event without eventId", cont'),
     "weak-gap-check": ("if ids != list(range(1, len(ids) + 1)):", "if ids[-1] != len(ids):"),
     "connect-failure-marked-complete": ('ScanResult([], False, f"connect failed',
                                         'ScanResult([], True, f"connect failed'),
     "chain-not-walked": ("if own.verdict != ABSENT or not own.continued_from:", "if True:"),
     "ancestor-marker-ignored": ("if anc.verdict == PRESENT:", "if False:"),
-    "ancestor-fetch-failure-becomes-absent": ('return Verdict(UNKNOWN, f"ancestor {prev} fetch failed',
-                                              'return Verdict(ABSENT, f"ancestor {prev} fetch failed'),
+    "ancestor-fetch-failure-becomes-absent": ('{exc}"\n            return Verdict(UNKNOWN,',
+                                              '{exc}"\n            return Verdict(ABSENT,'),
     "unknown-ancestor-ignored": ("if anc.verdict != ABSENT:", "if False:"),
     "chain-stops-after-parent": ("prev = anc.continued_from", "prev = None"),
     "chain-depth-unbounded": ("if depth >= MAX_CHAIN_DEPTH:", "if False:"),
     "chain-cycle-undetected": ("if prev in seen:", "if False:"),
     "present-allowed-never-informational": ("if c[PRESENT] and not allow_present:", "if False:"),
+    "retention-gap-becomes-absent": ('return Verdict(UNKNOWN, detail, own.continued_from, R_RETENTION)',
+                                     'return Verdict(ABSENT, detail, own.continued_from, R_RETENTION)'),
+    "retention-gap-not-told-apart": ("if _not_found(exc):", "if False:"),
+    "any-failure-is-a-retention-gap": ('== "NOT_FOUND"', '!= "NOPE"'),
+    "non-list-payload-not-checked": (" or not isinstance(payloads, list)", ""),
+    "count-mismatch-ignored": ("if not expected == after == len(entries):", "if False:"),
+    "count-after-not-compared": ("if not expected == after == len(entries):", "if not expected == len(entries):"),
+    "count-before-not-compared": ("if not expected == after == len(entries):", "if not after == len(entries):"),
+    "workflow-limit-ignored": ("if max_workflows is not None and len(entries) >= max_workflows:", "if False:"),
+    "api-key-allowed-in-plaintext": ("if not args.tls:\n            raise ValueError(\"--api",
+                                     "if False:\n            raise ValueError(\"--api"),
+    "empty-api-key-accepted": ("if not key:", "if False:"),
+    "api-key-not-scrubbed": ('return text.replace(secret, "[REDACTED]") if secret else text', "return text"),
 }
 
 
