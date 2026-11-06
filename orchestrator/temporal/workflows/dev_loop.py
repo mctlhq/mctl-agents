@@ -1580,6 +1580,21 @@ class ImplementExecutionState:
 
 
 @dataclass(frozen=True)
+class ContractState:
+    """What the `contract_state` query returns (mctlhq/mctl-agents#1006)."""
+
+    contract: bool = False
+    gates_passed: bool = False
+    initialized: bool = False
+    implement_stage: str = ""
+    implement_outcome: str | None = None
+    last_pr_state: str = "unknown"
+    open_request_ids: tuple[str, ...] = ()
+    pending_feedback: tuple[str, ...] = ()
+    feedback_done: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class MergeWatchResume:
     """Everything a continue_as_new'd merge watch needs to pick up where the
     previous run left off (mctl-agents#404 v2).
@@ -1623,6 +1638,14 @@ class MergeWatchResume:
     # (mctlhq/mctl-agents#996). Carried, never re-evaluated: a record from
     # before M1 decodes as False, i.e. a legacy loop.
     deferred_resume_contract: bool = False
+    # Feedback-dedupe state (mctlhq/mctl-agents#1006, M2a). Carried and
+    # restored verbatim, never re-derived; nothing writes to them yet (the
+    # feedback tick is a later slice). `feedback_done` is sorted, as
+    # `seen_execution_ids` is: no hash order enters recorded state.
+    # `pending_feedback` keeps acceptance order. Defaulted so a record from
+    # before M2a decodes as empty.
+    feedback_done: tuple[str, ...] = ()
+    pending_feedback: tuple[str, ...] = ()
     # Whether an OPEN pull request has been resolved at any point earlier in
     # THIS watch. Guards the terminal-status check above: a PR that was
     # OPEN and then becomes unresolvable (a transient 404, lost token
@@ -1931,6 +1954,10 @@ class DevLoopWorkflow:
         # True when this loop passed its gates under DEFERRED_RESUME_PATCH
         # (set in `run`, restored by `_resume_merge_watch`); see the patch.
         self._deferred_resume_contract = False
+        # Feedback-dedupe state (M2a): empty until the feedback tick exists;
+        # only the hop carry and restore touch these.
+        self._feedback_done: set[str] = set()
+        self._pending_feedback: tuple[str, ...] = ()
         # The last PR state the merge watch observed, for the validator.
         self._last_pr: PRState | None = None
         # Set by `_settle_deliveries` right before this run ends (`_exiting`)
@@ -1940,6 +1967,25 @@ class DevLoopWorkflow:
         # True only while a `mctl-agents-investigate` CWFT is being awaited
         # (mctl-agents#799). Plain instance state: adds no command.
         self._investigate_in_flight = False
+
+    @workflow.query
+    def contract_state(self) -> ContractState:
+        """Read-only view of the deferred-resume contract state (M2a).
+
+        Schedules no command and records no history event. `last_pr_state`
+        is "unknown" when no PR was observed, never "absent"."""
+        last_pr = self._last_pr
+        return ContractState(
+            contract=self._deferred_resume_contract,
+            gates_passed=self._gates_passed,
+            initialized=self._initialized,
+            implement_stage=self._implement_state.stage,
+            implement_outcome=self._implement_state.outcome,
+            last_pr_state=(last_pr.state or "unknown") if last_pr is not None else "unknown",
+            open_request_ids=tuple(sorted(self._open_deliveries)),
+            pending_feedback=self._pending_feedback,
+            feedback_done=tuple(sorted(self._feedback_done)),
+        )
 
     @workflow.query
     def investigate_in_flight(self) -> bool:
@@ -4367,6 +4413,8 @@ class DevLoopWorkflow:
             accepted_request_ids=tuple(sorted(self._accepted_request_ids)),
             open_deliveries=tuple(self._open_deliveries[rid] for rid in sorted(self._open_deliveries)),
             deferred_resume_contract=self._deferred_resume_contract,
+            feedback_done=tuple(sorted(self._feedback_done)),
+            pending_feedback=self._pending_feedback,
         )
 
     def _rehydrate_work_context(self, resume: MergeWatchResume) -> None:
@@ -4400,6 +4448,10 @@ class DevLoopWorkflow:
         # defers until `_initialized`, so none was accepted in the gap.
         self._accepted_request_ids = set(resume.accepted_request_ids)
         self._open_deliveries = {d.delivery.execution_request_id: d for d in resume.open_deliveries}
+        # Restored exactly as carried; an inconsistency with `open_deliveries`
+        # is shown by `contract_state`, not silently dropped.
+        self._feedback_done = set(resume.feedback_done)
+        self._pending_feedback = tuple(resume.pending_feedback)
         # A gap `resume` ran against an EMPTY binding, so the
         # work-item-mismatch guard was vacuous for it: a resume naming a
         # foreign work item was accepted there. Re-applying it here would
