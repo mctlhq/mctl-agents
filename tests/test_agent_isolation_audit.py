@@ -359,6 +359,88 @@ def test_undecidable_peers_not_observed(tmp_path: Path) -> None:
         assert [r.status for r in _xns(tmp_path / str(i), peer)] == ["not-observed"]
 
 
+# --- #954: namespaceSelector={} is every namespace, not argo-workflows -------------------------
+
+_BROAD = {"namespaceSelector": {}, **_AGENT_POD}
+
+
+def _ew(*peers: dict[str, Any], ns: str | None = "mctl-agents-egress") -> list[aud.Row]:
+    """check_east_west with a clean in-namespace policy and one cross-namespace policy."""
+    pol = _allow_agent_ingress(*peers)
+    if ns is None:
+        del pol["metadata"]["namespace"]
+    else:
+        pol["metadata"]["namespace"] = ns
+    return aud.check_east_west([], {"infra/np.yaml": [pol]})
+
+
+def test_954_broad_namespace_is_partial_not_enforced_and_makes_no_namespace_claim() -> None:
+    rows = _ew(dict(_BROAD))
+    assert [(r.primitive, r.status) for r in rows] == [
+        ("NetworkPolicy/east-west", "enforced"), ("NetworkPolicy/cross-namespace", "partial")]
+    row = rows[1]
+    assert (row.scope, row.severity, row.source) == ("allow-agent-ingress", "medium", "infra/np.yaml")
+    assert row.field == "spec.ingress[].from[].namespaceSelector+podSelector"
+    assert "every namespace" in row.detail and "any namespace" in row.detail
+    assert "only agent pods" not in row.detail
+    assert "argo-workflows" in row.recommendation
+
+
+def test_954_restricted_argo_workflows_stays_enforced_with_namespace_claim() -> None:
+    rows = _ew({**_AW_NS, **_AGENT_POD})
+    assert [(r.primitive, r.status, r.severity) for r in rows[1:]] == [
+        ("NetworkPolicy/cross-namespace", "enforced", "low")]
+    assert rows[1].detail == "admits only agent pods (app.kubernetes.io/name=mctl-agents) from argo-workflows"
+
+
+def test_954_omitted_namespace_selector_resolves_to_the_policy_namespace() -> None:
+    assert [r.status for r in _ew(dict(_AGENT_POD), ns="argo-workflows")[1:]] == ["enforced"]
+    assert _ew(dict(_AGENT_POD), ns="vault")[1:] == []
+    assert [r.status for r in _ew(dict(_AGENT_POD), ns=None)[1:]] == ["not-observed"]
+
+
+def test_954_unsupported_selectors_stay_not_observed() -> None:
+    exprs = {"matchExpressions": [{"key": "a", "operator": "Exists"}]}
+    cases = [{"namespaceSelector": exprs, **_AGENT_POD},
+             {"namespaceSelector": {}, "podSelector": {"matchLabels": {"app": "other"}}},
+             {"namespaceSelector": {}, "podSelector": exprs},
+             {"namespaceSelector": {"matchLabels": {"team": "x"}}, **_AGENT_POD}]
+    for peer in cases:
+        assert [r.status for r in _ew(peer)[1:]] == ["not-observed"], peer
+
+
+def test_954_unrestricted_selections_are_partial_with_their_own_detail() -> None:
+    for peer in ({"namespaceSelector": {}}, {"namespaceSelector": {}, "podSelector": {}},
+                 {**_AW_NS, "podSelector": {}}):
+        rows = _ew(peer)[1:]
+        assert [r.status for r in rows] == ["partial"], peer
+        assert "whole argo-workflows namespace" in rows[0].detail
+
+
+def test_954_narrow_or_broad_is_broad_and_and_is_kept_inside_a_peer() -> None:
+    narrow = {**_AW_NS, **_AGENT_POD}
+    both = _ew(narrow, dict(_BROAD))[1:]
+    assert [r.status for r in both] == ["partial"] and "every namespace" in both[0].detail
+    assert [r.status for r in _ew(dict(_BROAD), narrow)[1:]] == ["partial"]
+    # A known broad peer is not hidden by an undecidable sibling, and vice versa.
+    undecidable = {"namespaceSelector": {"matchLabels": {"team": "x"}}}
+    assert [r.status for r in _ew(narrow, undecidable)[1:]] == ["not-observed"]
+    assert [r.status for r in _ew(dict(_BROAD), undecidable)[1:]] == ["partial"]
+    # Separate rules are ORed too.
+    pol = _allow_agent_ingress(narrow)
+    pol["metadata"]["namespace"] = "x"
+    pol["spec"]["ingress"].append({"from": [dict(_BROAD)]})
+    assert [r.status for r in aud.check_east_west([], {"p": [pol]})[1:]] == ["partial"]
+    # AND, not OR, inside one peer: namespace {} plus a non-agent pod is not "agents".
+    assert [r.status for r in _ew({"namespaceSelector": {}, "podSelector": {"matchLabels": {"a": "b"}}})[1:]] \
+        == ["not-observed"]
+
+
+def test_954_end_to_end_json_row(tmp_path: Path) -> None:
+    rows = _xns(tmp_path, dict(_BROAD))
+    assert [(r.status, r.severity) for r in rows] == [("partial", "medium")]
+
+
 def test_json_schema_version(tmp_path: Path) -> None:
     inp = aud.load_inputs(_tree(tmp_path, _cwft(), [INGRESS_ONLY]))
     out = json.loads(aud.render(aud.audit(inp), inp, "json"))
