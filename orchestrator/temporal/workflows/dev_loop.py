@@ -481,6 +481,12 @@ LAUNCH_CORRELATION_PATCH = "launch-correlation"
 #: this one keeps polling to `MERGE_WATCH_DEADLINE`, exactly as it always has
 #: (`tests/test_patch_memoization.py`).
 PROPOSAL_TERMINAL_PATCH = "proposal-terminal-end"
+#: Guards the terminal reconcile of the merge watch (mctlhq/mctl-agents#1021,
+#: slice M2b-1b). Evaluated once in `_watch_pr`'s `resume is None` arm and
+#: carried across a hop in `MergeWatchResume.terminal_reconcile`; NEVER
+#: evaluated in `_resume_merge_watch` or on a resumed run. Consumed by nothing
+#: until M2b-1d: this slice only records the decision.
+MERGE_WATCH_RECONCILE_PATCH = "merge-watch-terminal-reconcile"
 #: The kinds of mctl-api execution request a delivery can carry: the
 #: dispatcher's own vocabulary (`execution_requests.KINDS`), one source.
 DELIVERY_KIND_START = KIND_START
@@ -1634,6 +1640,10 @@ class MergeWatchResume:
     # different answer than the run it replaces just because
     # `workflow.patched` was re-evaluated on a fresh history.
     proposal_terminal_end: bool = False
+    # Whether this watch was started under MERGE_WATCH_RECONCILE_PATCH
+    # (mctlhq/mctl-agents#1021). Carried, never re-evaluated; nothing reads it
+    # yet. A record from before this field decodes as False.
+    terminal_reconcile: bool = False
     # Whether this loop passed its gates under DEFERRED_RESUME_PATCH
     # (mctlhq/mctl-agents#996). Carried, never re-evaluated: a record from
     # before M1 decodes as False, i.e. a legacy loop.
@@ -1753,6 +1763,25 @@ class MergeWatchResume:
     # --- Bookkeeping: how many times THIS watch has already hopped, so
     # MERGE_WATCH_MAX_HOPS bounds the whole watch, not just one run. ---
     hops: int = 0
+
+
+@dataclass
+class _MergeWatchRun:
+    """Mutable per-run poll state of `_watch_pr` (#1021 M2b-1b).
+
+    A plain attribute holder: never serialized, no methods, no `workflow.*`
+    calls, so it cannot introduce nondeterminism.
+    """
+
+    last: PRState | None
+    polls_without_pr: int
+    terminal_status_polls: int
+    saw_open_pr: bool
+    track_ownership: bool
+    poll_index: int
+    terminal_reconcile: bool
+    tick_task: asyncio.Task[None] | None = None
+    gate_task: asyncio.Task[ApprovalWaitResult | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -6345,6 +6374,49 @@ class DevLoopWorkflow:
             return True
         return info.get_current_history_length() >= MERGE_WATCH_HISTORY_FLOOR
 
+    async def _apply_found_state(self, state: PRState, watch: _MergeWatchRun) -> None:
+        """Book-keeping for a poll that resolved a pull request (#1021 M2b-1b).
+
+        A verbatim extraction of `_watch_pr`'s found branch; the statement
+        order, and so the command order, is unchanged.
+        """
+        watch.last = state
+        self._last_pr = state
+        watch.polls_without_pr = 0
+        watch.terminal_status_polls = 0
+        if state.state not in ("MERGED", "CLOSED"):
+            # mctlhq/mctl-agents#516: an OPEN PR resolved at any
+            # point in this watch guards the terminal-status
+            # check in the not-found branch below -- once seen, a
+            # later transient 404 (lost token access, a deleted
+            # status file) still rides the existing
+            # pr_lookup_grace_polls rule instead of ending the
+            # watch as if no PR had ever existed.
+            watch.saw_open_pr = True
+        if watch.track_ownership and state.repo and state.number is not None:
+            self._poll_index_for_heartbeat += 1
+            await self._track_ownership(state)
+
+    async def _terminal_claim(self, state: PRState, watch: _MergeWatchRun) -> None:
+        """The terminal lifecycle-ownership write for a MERGED/CLOSED PR
+        (#1021 M2b-1b); a verbatim extraction from `_watch_pr`."""
+        if watch.track_ownership and self._owned_entity_id:
+            done = await self._ownership(
+                "terminal",
+                # `or ""` like the head_sha below: the fields
+                # are Optional on PRState, and the block is
+                # guarded by _owned_entity_id, which is only
+                # set when repo was present. Narrowing it for
+                # the type checker rather than for the reader.
+                repo=state.repo or "",
+                number=state.number or 0,
+                head_sha=state.head_sha or "",
+                reason=f"pull request {(state.state or '').lower()}",
+            )
+            self._finish_claim(
+                "terminal", done, state.repo or "", state.number or 0
+            )
+
     async def _watch_pr(
         self, service: str, slug: str, resume: MergeWatchResume | None = None
     ) -> _WatchOutcome:
@@ -6410,6 +6482,7 @@ class DevLoopWorkflow:
             concurrent_ticks = resume.concurrent_ticks
             track_ownership = resume.track_ownership
             proposal_terminal_end = resume.proposal_terminal_end
+            terminal_reconcile = resume.terminal_reconcile
             saw_open_pr = resume.saw_open_pr
             terminal_status_polls = resume.terminal_status_polls
         else:
@@ -6468,6 +6541,7 @@ class DevLoopWorkflow:
             # this block. `saw_open_pr` starts False: no poll of this watch
             # has resolved an OPEN PR yet.
             proposal_terminal_end = workflow.patched(PROPOSAL_TERMINAL_PATCH)
+            terminal_reconcile = workflow.patched(MERGE_WATCH_RECONCILE_PATCH)
             saw_open_pr = False
             terminal_status_polls = 0
             # NOTE (ADR-010 phase 2, #352): there is deliberately no
@@ -6489,7 +6563,6 @@ class DevLoopWorkflow:
                 self._proposal_ref = f"{service}/{slug}"
                 self._policy_ref = f"devloop:{service}"
 
-        tick_task: asyncio.Task[None] | None = None
         # mctlhq/mctl-agents#519: evaluated once, like `hop_enabled` just
         # above -- NOT carried through `MergeWatchResume`, so a continued run
         # (a fresh history) re-evaluates it against the currently deployed
@@ -6497,8 +6570,16 @@ class DevLoopWorkflow:
         # predates this marker never enters the gate at all (migration by
         # attrition, tests/test_patch_memoization.py).
         gate_enabled = workflow.patched(MERGE_GATE_PATCH)
-        gate_task: asyncio.Task[ApprovalWaitResult | None] | None = None
         poll_index = resume.poll_index if resume is not None else 0
+        watch = _MergeWatchRun(
+            last=last,
+            polls_without_pr=polls_without_pr,
+            terminal_status_polls=terminal_status_polls,
+            saw_open_pr=saw_open_pr,
+            track_ownership=track_ownership,
+            poll_index=poll_index,
+            terminal_reconcile=terminal_reconcile,
+        )
         shepherd_ticks = resume.shepherd_ticks if resume is not None else 0
         hops = resume.hops if resume is not None else 0
         polls_this_run = 0
@@ -6521,21 +6602,21 @@ class DevLoopWorkflow:
             # the reason `abandon` is a signal and not a Temporal `terminate`.
             while workflow.now() < deadline and not self._abandoned:
                 if hop_enabled and self._merge_watch_hop_suggested(
-                    polls_this_run=polls_this_run, tick_task=tick_task, gate_task=gate_task, hops=hops
+                    polls_this_run=polls_this_run, tick_task=watch.tick_task, gate_task=watch.gate_task, hops=hops
                 ):
                     hopping = True
-                    if gate_task is not None:
+                    if watch.gate_task is not None:
                         # The hop predicate refuses while a gate attempt is in
                         # flight, so this one is done. Finish it BEFORE the
                         # resume record is built, so a settled head it
                         # records is carried into the continued run.
                         self._finish_gate(
-                            gate_task, service, slug,
-                            repo=(last.repo if last is not None else None) or "",
-                            number=(last.number if last is not None else None) or 0,
-                            poll_index=poll_index,
+                            watch.gate_task, service, slug,
+                            repo=(watch.last.repo if watch.last is not None else None) or "",
+                            number=(watch.last.number if watch.last is not None else None) or 0,
+                            poll_index=watch.poll_index,
                         )
-                        gate_task = None
+                        watch.gate_task = None
                     remaining = deadline - workflow.now()
                     workflow.logger.info(
                         "merge watch for %s/%s hopping via continue_as_new: "
@@ -6551,17 +6632,18 @@ class DevLoopWorkflow:
                         service=service,
                         slug=slug,
                         deadline=deadline.isoformat().replace("+00:00", "Z"),
-                        last_pr=last,
-                        polls_without_pr=polls_without_pr,
-                        poll_index=poll_index,
+                        last_pr=watch.last,
+                        polls_without_pr=watch.polls_without_pr,
+                        poll_index=watch.poll_index,
                         shepherd_ticks=shepherd_ticks,
                         fast_cadence=cadence is CADENCE,
                         shepherd_in_loop=shepherd_in_loop,
                         concurrent_ticks=concurrent_ticks,
-                        track_ownership=track_ownership,
+                        track_ownership=watch.track_ownership,
                         proposal_terminal_end=proposal_terminal_end,
-                        saw_open_pr=saw_open_pr,
-                        terminal_status_polls=terminal_status_polls,
+                        terminal_reconcile=watch.terminal_reconcile,
+                        saw_open_pr=watch.saw_open_pr,
+                        terminal_status_polls=watch.terminal_status_polls,
                         owned_entity_id=self._owned_entity_id,
                         owner_epoch=self._owner_epoch,
                         owned_head_sha=self._owned_head_sha,
@@ -6616,7 +6698,7 @@ class DevLoopWorkflow:
                             slug,
                             cause,
                         )
-                        return _WatchOutcome(last=last)
+                        return _WatchOutcome(last=watch.last)
                     workflow.logger.warning(
                         "get_pr_state failed after retries for %s/%s — retrying "
                         "next poll interval",
@@ -6626,56 +6708,26 @@ class DevLoopWorkflow:
                     await workflow.sleep(cadence.poll_interval)
                     continue
                 if state.found:
-                    last = state
-                    self._last_pr = state
-                    polls_without_pr = 0
-                    terminal_status_polls = 0
-                    if state.state not in ("MERGED", "CLOSED"):
-                        # mctlhq/mctl-agents#516: an OPEN PR resolved at any
-                        # point in this watch guards the terminal-status
-                        # check in the not-found branch below -- once seen, a
-                        # later transient 404 (lost token access, a deleted
-                        # status file) still rides the existing
-                        # pr_lookup_grace_polls rule instead of ending the
-                        # watch as if no PR had ever existed.
-                        saw_open_pr = True
-                    if track_ownership and state.repo and state.number is not None:
-                        self._poll_index_for_heartbeat += 1
-                        await self._track_ownership(state)
+                    await self._apply_found_state(state, watch)
                     if state.state in ("MERGED", "CLOSED"):
                         # A gate attempt that just merged this PR is finished
                         # by `_settle_gate` in the `finally` below, which logs
                         # MERGE_APPROVED on this exit as on every other.
-                        if track_ownership and self._owned_entity_id:
-                            done = await self._ownership(
-                                "terminal",
-                                # `or ""` like the head_sha below: the fields
-                                # are Optional on PRState, and the block is
-                                # guarded by _owned_entity_id, which is only
-                                # set when repo was present. Narrowing it for
-                                # the type checker rather than for the reader.
-                                repo=state.repo or "",
-                                number=state.number or 0,
-                                head_sha=state.head_sha or "",
-                                reason=f"pull request {(state.state or '').lower()}",
-                            )
-                            self._finish_claim(
-                                "terminal", done, state.repo or "", state.number or 0
-                            )
+                        await self._terminal_claim(state, watch)
                         return _WatchOutcome(last=state)
                     # Counted only on a successful read, so a transient
                     # get_pr_state failure delays the next tick instead of
                     # consuming its boundary and dropping it for a whole
                     # tick period.
-                    poll_index += 1
+                    watch.poll_index += 1
                     if (
                         shepherd_in_loop
                         # Poll 1 happens at t=0 (the sleep is at the bottom of
                         # the loop), so a tick on it would fire before claude
                         # review has started. Harmless — it would decide `wait`
                         # — but it burns a tick from the budget for nothing.
-                        and poll_index > 1
-                        and poll_index % cadence.shepherd_tick_every_polls == 0
+                        and watch.poll_index > 1
+                        and watch.poll_index % cadence.shepherd_tick_every_polls == 0
                         and shepherd_ticks < cadence.shepherd_ticks_max
                     ):
                         # The tick is the same one-shot the cron ran, scoped to
@@ -6691,7 +6743,7 @@ class DevLoopWorkflow:
                             # command mismatch on replay.
                             shepherd_ticks += 1
                             await self._shepherd_tick(service, slug)
-                        elif tick_task is not None and not tick_task.done():
+                        elif watch.tick_task is not None and not watch.tick_task.done():
                             # Never two shepherds on one proposal: they would
                             # race on the same .status.yaml, and the tick cap
                             # accounting assumes one at a time. A boundary that
@@ -6709,10 +6761,10 @@ class DevLoopWorkflow:
                             # rebind nothing else can retrieve its
                             # exception, and only the final task is
                             # guaranteed to reach _settle_tick.
-                            if tick_task is not None:
-                                _drain_tick(tick_task, service, slug)
+                            if watch.tick_task is not None:
+                                _drain_tick(watch.tick_task, service, slug)
                             shepherd_ticks += 1
-                            tick_task = asyncio.create_task(self._shepherd_tick(service, slug))
+                            watch.tick_task = asyncio.create_task(self._shepherd_tick(service, slug))
                     # The merge gate (mctlhq/mctl-agents#519): a background
                     # task beside this poll, never awaited inline -- see
                     # `_merge_gate`'s docstring. At most one in flight: while
@@ -6721,7 +6773,11 @@ class DevLoopWorkflow:
                     # internally), so a fresh attempt is never started on top
                     # of one already asking.
                     if gate_enabled and state.repo and state.number is not None and state.head_sha:
-                        if gate_task is not None and not gate_task.done() and state.head_sha != self._gate_head:
+                        if (
+                            watch.gate_task is not None
+                            and not watch.gate_task.done()
+                            and state.head_sha != self._gate_head
+                        ):
                             # The head moved under an attempt still waiting on
                             # a human: that approval would be for a commit that
                             # is no longer the PR (the activity would refuse to
@@ -6737,22 +6793,22 @@ class DevLoopWorkflow:
                                 state.head_sha,
                             )
                             await self._settle_gate(
-                                gate_task, service, slug,
-                                repo=state.repo, number=state.number, poll_index=poll_index,
+                                watch.gate_task, service, slug,
+                                repo=state.repo, number=state.number, poll_index=watch.poll_index,
                             )
-                            gate_task = None
-                        if gate_task is not None and gate_task.done():
+                            watch.gate_task = None
+                        if watch.gate_task is not None and watch.gate_task.done():
                             self._finish_gate(
-                                gate_task, service, slug,
-                                repo=state.repo, number=state.number, poll_index=poll_index,
+                                watch.gate_task, service, slug,
+                                repo=state.repo, number=state.number, poll_index=watch.poll_index,
                             )
-                            gate_task = None
+                            watch.gate_task = None
                         execution_id = trace_id = ""
-                        if gate_task is None and self._gate_may_start(
-                            head_sha=state.head_sha, poll_index=poll_index
+                        if watch.gate_task is None and self._gate_may_start(
+                            head_sha=state.head_sha, poll_index=watch.poll_index
                         ):
                             execution_id, trace_id = await self._merge_gate_identity()
-                        if gate_task is None and execution_id:
+                        if watch.gate_task is None and execution_id:
                             # Bounded by the watch's remaining budget AND the
                             # wait's own hard ceiling, which exists for the
                             # receipt whose expiry is unreadable.
@@ -6760,7 +6816,7 @@ class DevLoopWorkflow:
                                 (deadline - workflow.now()).total_seconds(), float(DEFAULT_MAX_WAIT_SECONDS)
                             )
                             self._gate_head = state.head_sha
-                            gate_task = asyncio.create_task(self._merge_gate(
+                            watch.gate_task = asyncio.create_task(self._merge_gate(
                                 repo=state.repo,
                                 number=state.number,
                                 head_sha=state.head_sha,
@@ -6771,15 +6827,15 @@ class DevLoopWorkflow:
                                 max_wait_seconds=remaining_budget,
                             ))
                 else:
-                    polls_without_pr += 1
-                    if last is None and state.number is not None:
+                    watch.polls_without_pr += 1
+                    if watch.last is None and state.number is not None:
                         # A PR link IS recorded but cannot be resolved right now
                         # (repo/PR deleted, token lost access, wrong-repo link).
                         # Preserve the reference in the result — it is the only
                         # diagnostic pointer an operator gets. Only when nothing
                         # better exists: a previously RESOLVED state must not be
                         # downgraded to a found=False reference by a later 404.
-                        last = state
+                        watch.last = state
                     # mctlhq/mctl-agents#516: end the watch here, before the
                     # grace-polls give-up below, when the proposal's own
                     # status has gone loop-terminal AND this same poll found
@@ -6800,10 +6856,10 @@ class DevLoopWorkflow:
                     # Confirmed over PROPOSAL_TERMINAL_CONFIRM_POLLS consecutive
                     # polls, never on one possibly-stale read: any poll that
                     # resolves a PR or reads a live status resets the count.
-                    terminal_status_polls = (
-                        terminal_status_polls + 1 if terminal_status and not saw_open_pr else 0
+                    watch.terminal_status_polls = (
+                        watch.terminal_status_polls + 1 if terminal_status and not watch.saw_open_pr else 0
                     )
-                    if terminal_status_polls >= PROPOSAL_TERMINAL_CONFIRM_POLLS:
+                    if watch.terminal_status_polls >= PROPOSAL_TERMINAL_CONFIRM_POLLS:
                         watch_ended = f"proposal {terminal_status}"
                         break
                     # Give up after GRACE consecutive unresolvable polls — this
@@ -6812,16 +6868,16 @@ class DevLoopWorkflow:
                     # once found (agy P3's zombie loop). The counter resets on
                     # every successful resolve, so one transient blip never
                     # ends the watch.
-                    if polls_without_pr >= cadence.pr_lookup_grace_polls:
+                    if watch.polls_without_pr >= cadence.pr_lookup_grace_polls:
                         workflow.logger.warning(
                             "merge watch for %s/%s giving up after %d consecutive "
                             "polls without a resolvable PR (last=%s)",
                             service,
                             slug,
-                            polls_without_pr,
-                            "none" if last is None else (last.pr_url or "unresolved"),
+                            watch.polls_without_pr,
+                            "none" if watch.last is None else (watch.last.pr_url or "unresolved"),
                         )
-                        return _WatchOutcome(last=last)
+                        return _WatchOutcome(last=watch.last)
                 # Counted only after a poll that reached here -- i.e. one
                 # that neither hopped nor returned above -- so "at least one
                 # completed poll in this run" (the hop predicate's own
@@ -6829,16 +6885,16 @@ class DevLoopWorkflow:
                 polls_this_run += 1
                 await workflow.sleep(cadence.poll_interval)
         finally:
-            await self._settle_tick(tick_task, service, slug)
+            await self._settle_tick(watch.tick_task, service, slug)
             # mctlhq/mctl-agents#519: same rule as the shepherd tick above --
             # every exit from this watch (MERGED/CLOSED, the #516 terminal
             # exit, the deadline, `abandon`, a hop) must leave no pending
             # merge-gate task behind.
             await self._settle_gate(
-                gate_task, service, slug,
-                repo=(last.repo if last is not None else None) or "",
-                number=(last.number if last is not None else None) or 0,
-                poll_index=poll_index,
+                watch.gate_task, service, slug,
+                repo=(watch.last.repo if watch.last is not None else None) or "",
+                number=(watch.last.number if watch.last is not None else None) or 0,
+                poll_index=watch.poll_index,
             )
             # A hop keeps the claim: this run is not the one relinquishing
             # it, the continued run is still watching, and the owner id
@@ -6848,7 +6904,7 @@ class DevLoopWorkflow:
             # (an ABANDON, which releases) independent of a HOP (which does
             # not) -- the two are mutually exclusive by construction, since
             # the hop predicate refuses to fire while `self._abandoned`.
-            if not hopping and track_ownership and self._owned_entity_id:
+            if not hopping and watch.track_ownership and self._owned_entity_id:
                 # The watch ended without the PR reaching a terminal state —
                 # the deadline expired, or the PR stopped resolving. RELEASE,
                 # not terminal: the work remains and somebody must be able to
@@ -6867,7 +6923,7 @@ class DevLoopWorkflow:
                 # PR — releasing it here would mark a finished entity as
                 # "somebody must take this", which is the one state this
                 # contract defines as work remaining.
-                terminal_state = last is not None and last.state in ("MERGED", "CLOSED")
+                terminal_state = watch.last is not None and watch.last.state in ("MERGED", "CLOSED")
                 # Non-terminal end: still a bare RELEASE, not "handoff-start".
                 # `handoff-start` writes a HOLDING `handing-off` state
                 # (contract.py) that only `/handoff/complete` can resolve —
@@ -6888,7 +6944,7 @@ class DevLoopWorkflow:
                     # the watch the only one carrying an empty one — and the
                     # version is what the row records about the entity it is
                     # letting go of.
-                    head_sha=(last.head_sha or "") if last is not None else "",
+                    head_sha=(watch.last.head_sha or "") if watch.last is not None else "",
                     # mctlhq/mctl-agents#516: `watch_ended` is a defensive
                     # fallback here only. The terminal-status break cannot
                     # reach this write today: a claim (`_owned_entity_id`) is
@@ -6897,8 +6953,8 @@ class DevLoopWorkflow:
                     # path combines them, the row names the status rather
                     # than the generic text.
                     reason=(
-                        f"pull request {(last.state or '').lower()}"
-                        if terminal_state and last is not None
+                        f"pull request {(watch.last.state or '').lower()}"
+                        if terminal_state and watch.last is not None
                         else (watch_ended or "merge watch ended without a terminal pull-request state")
                     ),
                 )
@@ -6919,9 +6975,9 @@ class DevLoopWorkflow:
             # a hop never attempts a relinquishing write, so `_claim_abandoned`
             # cannot have changed here, and reporting it again per hop would
             # turn a once-per-entity metric into one per continuation.
-            if not hopping and track_ownership:
+            if not hopping and watch.track_ownership:
                 self._report_claim_abandonment()
         if hopping:
             assert resume_record is not None  # noqa: S101 -- set right before every `break` above
-            return _WatchOutcome(last=last, resume=resume_record)
-        return _WatchOutcome(last=last, ended=watch_ended)
+            return _WatchOutcome(last=watch.last, resume=resume_record)
+        return _WatchOutcome(last=watch.last, ended=watch_ended)

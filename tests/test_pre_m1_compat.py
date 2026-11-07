@@ -151,7 +151,7 @@ _BY_NAME: dict[str, type] = {
 M1_ADDED: dict[str, set[str]] = {
     "ResumeDelivery": {"intent_id", "expected_state_version", "resumed_from_execution_id"},
     "OpenDelivery": {"accepted_after_gates"},
-    "MergeWatchResume": {"deferred_resume_contract", "feedback_done", "pending_feedback"},
+    "MergeWatchResume": {"deferred_resume_contract", "feedback_done", "pending_feedback", "terminal_reconcile"},
     "IssueRef": set(),
     "ExecutionRequest": {"created_at"},
 }
@@ -166,6 +166,7 @@ M1_DEFAULTS: dict[str, Any] = {
     "deferred_resume_contract": False,
     "feedback_done": (),
     "pending_feedback": (),
+    "terminal_reconcile": False,
     "created_at": "",
 }
 _M1_CLASSES: dict[str, type] = {
@@ -640,6 +641,7 @@ def _m1_values() -> dict[str, Any]:
         deadline="2099-01-01T00:00:00Z",
         work_item_id="wi-1",
         deferred_resume_contract=True,
+        terminal_reconcile=True,
         feedback_done=("fb-1",),
         pending_feedback=("fb-2",),
         open_deliveries=(opened,),

@@ -7459,6 +7459,200 @@ class TestMergeWatchAbandonGuard:
         assert outcome.resume is None
 
 
+def _continued_resume_inputs(history: Any) -> list[dict[str, Any]]:
+    """The `IssueRef.resume` payloads of every ContinuedAsNew event in a history."""
+    from temporalio.converter import DataConverter
+
+    converter = DataConverter.default.payload_converter
+    out: list[dict[str, Any]] = []
+    for event in history.events:
+        if not event.HasField("workflow_execution_continued_as_new_event_attributes"):
+            continue
+        for payload in event.workflow_execution_continued_as_new_event_attributes.input.payloads:
+            out.append(converter.from_payload(payload)["resume"])
+    return out
+
+
+class TestMergeWatchTerminalReconcileCarry:
+    """#1021 M2b-1b T2: `terminal_reconcile` crosses a hop verbatim, and the
+    absolute deadline is never recomputed."""
+
+    pytestmark = pytest.mark.anyio
+
+    async def test_hop_carries_the_flag_and_the_absolute_deadline(
+        self, env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_HISTORY_FLOOR", 1)
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        activities, _calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[open_pr, open_pr, MERGED_PR]
+        )
+        deadline = "2099-01-01T00:00:00Z"
+        resume = MergeWatchResume(
+            service="mctl-telegram",
+            slug="issue-1-x",
+            deadline=deadline,
+            terminal_reconcile=True,
+            investigate=WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase="Succeeded"),
+            implement=WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded"),
+            approve=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Succeeded"),
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1037", resume=resume),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                await handle.result()
+            first = env.client.get_workflow_handle(handle.id, run_id=handle.result_run_id)
+            carried = _continued_resume_inputs(await first.fetch_history())
+
+        assert carried, "the forced floor must have produced a hop"
+        assert carried[0]["terminal_reconcile"] is True
+        assert carried[0]["deadline"] == deadline
+
+    async def test_fresh_watch_carries_what_patched_returned(
+        self, env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_HISTORY_FLOOR", 1)
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[open_pr, open_pr, MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1038"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            with anyio.fail_after(30):
+                await handle.result()
+            first = env.client.get_workflow_handle(handle.id, run_id=handle.first_execution_run_id)
+            carried = _continued_resume_inputs(await first.fetch_history())
+
+        assert carried and carried[0]["terminal_reconcile"] is True
+
+    def test_a_record_without_the_key_decodes_false(self) -> None:
+        assert MergeWatchResume(service="s", slug="x", deadline="2099-01-01T00:00:00Z").terminal_reconcile is False
+
+
+class TestMergeWatchFoundHelpers:
+    """#1021 M2b-1b T3/T4: the extracted found-branch helpers and the
+    per-run record."""
+
+    pytestmark = pytest.mark.anyio
+
+    def _watch(self, *, track_ownership: bool = True) -> Any:
+        return dev_loop._MergeWatchRun(
+            last=None,
+            polls_without_pr=3,
+            terminal_status_polls=2,
+            saw_open_pr=False,
+            track_ownership=track_ownership,
+            poll_index=0,
+            terminal_reconcile=False,
+        )
+
+    async def test_apply_found_state_for_an_open_pr(self) -> None:
+        wf = _bare_loop()
+        tracked: list[PRState] = []
+
+        async def fake_track(state: PRState) -> None:
+            tracked.append(state)
+
+        wf._track_ownership = fake_track  # type: ignore[method-assign]
+        watch = self._watch()
+        state = PRState(found=True, repo="o/r", number=5, state="OPEN", head_sha="abc")
+        before = wf._poll_index_for_heartbeat
+        await wf._apply_found_state(state, watch)
+        assert watch.last is state and wf._last_pr is state
+        assert watch.polls_without_pr == 0 and watch.terminal_status_polls == 0
+        assert watch.saw_open_pr is True
+        assert wf._poll_index_for_heartbeat == before + 1
+        assert tracked == [state]
+
+    async def test_apply_found_state_for_a_merged_pr_does_not_set_saw_open_pr(self) -> None:
+        wf = _bare_loop()
+
+        async def fake_track(state: PRState) -> None:
+            return None
+
+        wf._track_ownership = fake_track  # type: ignore[method-assign]
+        watch = self._watch()
+        await wf._apply_found_state(PRState(found=True, repo="o/r", number=5, state="MERGED"), watch)
+        assert watch.saw_open_pr is False
+
+    async def test_terminal_claim_writes_once_only_when_owned(self) -> None:
+        wf = _bare_loop()
+        writes: list[str] = []
+        finished: list[str] = []
+
+        async def fake_ownership(op: str, **_kw: Any) -> Any:
+            writes.append(op)
+            return None
+
+        wf._ownership = fake_ownership  # type: ignore[method-assign]
+        wf._finish_claim = lambda op, *_a: finished.append(op)  # type: ignore[method-assign]
+        state = PRState(found=True, repo="o/r", number=5, state="MERGED", head_sha="abc")
+
+        wf._owned_entity_id = ""
+        await wf._terminal_claim(state, self._watch())
+        wf._owned_entity_id = "o/r#5"
+        await wf._terminal_claim(state, self._watch(track_ownership=False))
+        assert writes == [] and finished == []
+
+        await wf._terminal_claim(state, self._watch())
+        assert writes == ["terminal"] and finished == ["terminal"]
+
+    def test_merge_watch_run_shape(self) -> None:
+        params = dev_loop._MergeWatchRun.__dataclass_params__  # type: ignore[attr-defined]
+        assert params.frozen is False
+        assert [f.name for f in dataclasses.fields(dev_loop._MergeWatchRun)] == [
+            "last",
+            "polls_without_pr",
+            "terminal_status_polls",
+            "saw_open_pr",
+            "track_ownership",
+            "poll_index",
+            "terminal_reconcile",
+            "tick_task",
+            "gate_task",
+        ]
+        assert "_MergeWatchRun" not in {f.name for f in dataclasses.fields(MergeWatchResume)}
+
+
 class TestMergeWatchContinueAsNew:
     """T2/T3/T5/T7: end-to-end merge-watch hops through a real Temporal
     worker. `MERGE_WATCH_HISTORY_FLOOR` is forced low so a hop is
