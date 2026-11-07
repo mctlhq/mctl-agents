@@ -56,7 +56,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -129,7 +129,7 @@ def _activities(holder: _Holder) -> list[Any]:
 
 
 def _iso(moment: datetime) -> str:
-    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _resume_record(t0: datetime, offset: timedelta) -> MergeWatchResume:
@@ -170,7 +170,7 @@ def _worker(env: WorkflowEnvironment, holder: _Holder, identity: str) -> Worker:
 
 
 def _ts(event: Any) -> datetime:
-    return event.event_time.ToDatetime(tzinfo=timezone.utc)
+    return event.event_time.ToDatetime(tzinfo=UTC)
 
 
 def _of(events: list[Any], event_type: int) -> list[Any]:
