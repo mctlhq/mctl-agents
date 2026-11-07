@@ -346,12 +346,16 @@ def check_egress(netpol: list[dict[str, Any]] | None,
                "restrictive egress policy selects agent pods", rec)
 
 
-_ADMIT_ORDER = {"none": 0, "agents": 1, "unknown": 2, "all": 3}
+# "agents-any-ns": namespaceSelector={} (every namespace) with the agent podSelector.
+# It admits agent-labelled pods from ANY namespace, which is wider than "agents"
+# (argo-workflows only) and is never reported as the same enforcement. It ranks above
+# "unknown" so a known gap is not hidden behind an undecidable sibling peer.
+_ADMIT_ORDER = {"none": 0, "agents": 1, "unknown": 2, "agents-any-ns": 3, "all": 4}
 _NS_NAME_KEY = "kubernetes.io/metadata.name"
 
 
 def _peer_admits(peer: dict[str, Any], policy_ns: str | None) -> str:
-    """Which argo-workflows pods does one ingress peer admit: none|all|agents|unknown.
+    """Which argo-workflows pods does one ingress peer admit: none|all|agents|agents-any-ns|unknown.
 
     Kubernetes rule: selectors inside ONE peer are ANDed (pods matching
     podSelector within namespaces matching namespaceSelector); peers in a
@@ -377,7 +381,8 @@ def _peer_admits(peer: dict[str, Any], policy_ns: str | None) -> str:
     if not pod_sel:
         return "all"
     if (pod_sel.get("matchLabels") or {}).get(AGENT_LABEL[0]) == AGENT_LABEL[1]:
-        return "agents"
+        # An empty namespaceSelector matches every namespace, not just NS.
+        return "agents-any-ns" if ns_sel == {} else "agents"
     return "unknown"
 
 
@@ -422,6 +427,12 @@ def check_east_west(netpol: list[dict[str, Any]] | None, others: dict[str, list[
                                 "partial", "medium", path, "spec.ingress[].from[].namespaceSelector",
                                 f"admits the whole {NS} namespace, agent pods included",
                                 "Narrow the selector to non-agent pods."))
+            elif adm == "agents-any-ns":
+                rows.append(Row("NetworkPolicy/cross-namespace", name,
+                                "partial", "medium", path, "spec.ingress[].from[].namespaceSelector+podSelector",
+                                f"empty namespaceSelector selects every namespace: admits agent pods "
+                                f"({AGENT_LABEL[0]}={AGENT_LABEL[1]}) from any namespace, not only {NS}",
+                                f"Restrict namespaceSelector to {_NS_NAME_KEY}={NS}."))
             elif adm == "agents":
                 rows.append(Row("NetworkPolicy/cross-namespace", name,
                                 "enforced", "low", path,
