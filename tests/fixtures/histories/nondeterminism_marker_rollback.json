@@ -1,0 +1,202 @@
+{
+ "events": [
+  {
+   "eventId": "1",
+   "eventTime": "2026-11-07T23:14:38.981962Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+   "taskId": "1048587",
+   "workflowExecutionStartedEventAttributes": {
+    "attempt": 1,
+    "firstExecutionRunId": "01a1b84a-e705-7ea9-a6e2-29b7aed50a37",
+    "firstWorkflowTaskBackoff": "0s",
+    "identity": "worker-redacted",
+    "originalExecutionRunId": "01a1b84a-e705-7ea9-a6e2-29b7aed50a37",
+    "priority": {},
+    "taskQueue": {
+     "kind": "TASK_QUEUE_KIND_NORMAL",
+     "name": "tq-e51233544d9d44d3957418bac983b40e"
+    },
+    "workflowId": "w1",
+    "workflowTaskTimeout": "10s",
+    "workflowType": {
+     "name": "W"
+    }
+   }
+  },
+  {
+   "eventId": "2",
+   "eventTime": "2026-11-07T23:14:38.982027Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+   "taskId": "1048588",
+   "workflowTaskScheduledEventAttributes": {
+    "attempt": 1,
+    "startToCloseTimeout": "10s",
+    "taskQueue": {
+     "kind": "TASK_QUEUE_KIND_NORMAL",
+     "name": "tq-e51233544d9d44d3957418bac983b40e"
+    }
+   }
+  },
+  {
+   "eventId": "3",
+   "eventTime": "2026-11-07T23:14:39.009787Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+   "taskId": "1048593",
+   "workflowTaskStartedEventAttributes": {
+    "historySizeBytes": "262",
+    "identity": "worker-redacted",
+    "requestId": "f7ce37bf-bfac-40d0-b814-04943c2ee096",
+    "scheduledEventId": "2",
+    "workerVersion": {
+     "buildId": "7e933b5ca440d9d4f1f7451773d866f8"
+    }
+   }
+  },
+  {
+   "eventId": "4",
+   "eventTime": "2026-11-07T23:14:39.038488Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+   "taskId": "1048597",
+   "workflowTaskCompletedEventAttributes": {
+    "identity": "worker-redacted",
+    "meteringMetadata": {},
+    "scheduledEventId": "2",
+    "sdkMetadata": {
+     "coreUsedFlags": [
+      2,
+      1,
+      3
+     ],
+     "sdkName": "temporal-python",
+     "sdkVersion": "1.34.0"
+    },
+    "startedEventId": "3",
+    "workerVersion": {
+     "buildId": "7e933b5ca440d9d4f1f7451773d866f8"
+    }
+   }
+  },
+  {
+   "eventId": "5",
+   "eventTime": "2026-11-07T23:14:39.038679Z",
+   "eventType": "EVENT_TYPE_MARKER_RECORDED",
+   "markerRecordedEventAttributes": {
+    "details": {
+     "patch-data": {
+      "payloads": [
+       {
+        "data": "eyJpZCI6InAteCIsImRlcHJlY2F0ZWQiOmZhbHNlfQ==",
+        "metadata": {
+         "encoding": "anNvbi9wbGFpbg=="
+        }
+       }
+      ]
+     }
+    },
+    "markerName": "core_patch",
+    "workflowTaskCompletedEventId": "4"
+   },
+   "taskId": "1048598"
+  },
+  {
+   "eventId": "6",
+   "eventTime": "2026-11-07T23:14:39.039102Z",
+   "eventType": "EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES",
+   "taskId": "1048599",
+   "upsertWorkflowSearchAttributesEventAttributes": {
+    "searchAttributes": {
+     "indexedFields": {
+      "TemporalChangeVersion": {
+       "data": "WyJwLXgiXQ==",
+       "metadata": {
+        "encoding": "anNvbi9wbGFpbg==",
+        "type": "S2V5d29yZExpc3Q="
+       }
+      }
+     }
+    },
+    "workflowTaskCompletedEventId": "4"
+   }
+  },
+  {
+   "eventId": "7",
+   "eventTime": "2026-11-07T23:14:40.013096Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED",
+   "taskId": "1048602",
+   "workflowExecutionSignaledEventAttributes": {
+    "identity": "worker-redacted",
+    "requestId": "79ade978-938e-4712-97c0-b205462504a7",
+    "signalName": "poke"
+   }
+  },
+  {
+   "eventId": "8",
+   "eventTime": "2026-11-07T23:14:40.013145Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+   "taskId": "1048603",
+   "workflowTaskScheduledEventAttributes": {
+    "attempt": 1,
+    "startToCloseTimeout": "10s",
+    "taskQueue": {
+     "kind": "TASK_QUEUE_KIND_STICKY",
+     "name": "worker-redacted",
+     "normalName": "tq-e51233544d9d44d3957418bac983b40e"
+    }
+   }
+  },
+  {
+   "eventId": "9",
+   "eventTime": "2026-11-07T23:14:40.020181Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+   "taskId": "1048607",
+   "workflowTaskStartedEventAttributes": {
+    "historySizeBytes": "946",
+    "identity": "worker-redacted",
+    "requestId": "3aa97cb4-76d6-49dc-9378-c283d247d3fd",
+    "scheduledEventId": "8",
+    "workerVersion": {
+     "buildId": "7e933b5ca440d9d4f1f7451773d866f8"
+    }
+   }
+  },
+  {
+   "eventId": "10",
+   "eventTime": "2026-11-07T23:14:40.035157Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_FAILED",
+   "taskId": "1048611",
+   "workflowTaskFailedEventAttributes": {
+    "cause": "WORKFLOW_TASK_FAILED_CAUSE_NON_DETERMINISTIC_ERROR",
+    "failure": {
+     "applicationFailureInfo": {},
+     "message": "[TMPRL1100] Nondeterminism error: Non-deprecated patch marker encountered for change p-x, but there is no corresponding change command!"
+    },
+    "identity": "worker-redacted",
+    "scheduledEventId": "8",
+    "startedEventId": "9"
+   }
+  },
+  {
+   "eventId": "11",
+   "eventTime": "2026-11-07T23:14:40.035234Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+   "workflowTaskScheduledEventAttributes": {
+    "attempt": 2,
+    "startToCloseTimeout": "10s",
+    "taskQueue": {
+     "kind": "TASK_QUEUE_KIND_NORMAL",
+     "name": "tq-e51233544d9d44d3957418bac983b40e"
+    }
+   }
+  },
+  {
+   "eventId": "12",
+   "eventTime": "2026-11-07T23:14:40.039375Z",
+   "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+   "workflowTaskStartedEventAttributes": {
+    "historySizeBytes": "1266",
+    "requestId": "4885113c-37cb-474e-a710-278083c05038",
+    "scheduledEventId": "11"
+   }
+  }
+ ]
+}
