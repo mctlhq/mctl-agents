@@ -24,12 +24,14 @@ here.
 """
 from __future__ import annotations
 
+import dataclasses
 import re
 import types
 from pathlib import Path
 
 import anyio
 import pytest
+from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
 from orchestrator import mcp_guard, run_all
 from orchestrator import run_incident_responder as rir
@@ -262,6 +264,26 @@ def test_responder_has_no_shell():
     assert "Bash" not in opts.allowed_tools
     assert "Read" in opts.allowed_tools
     assert "Write" in opts.allowed_tools
+
+
+def test_responder_session_is_built_without_the_shell(monkeypatch):
+    """Leaving Bash out of `allowed_tools` does not remove it: the CLI keeps it
+    in the session and runs the commands its permission mode approves. Only the
+    `--tools` list removes a tool, so pin the command the CLI actually gets, and
+    that the mctl MCP tools are still permitted (mctlhq/mctl-gitops#1980)."""
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    opts = build_incident_responder_options(
+        agent_dir=Path("/tmp/agent"),
+        model="claude-sonnet-4-5",
+        state_dir=Path("/tmp/state"),
+    )
+
+    # cli_path only skips the binary lookup; no process is started.
+    transport = SubprocessCLITransport(prompt="x", options=dataclasses.replace(opts, cli_path="claude"))
+    cmd = transport._build_command()
+
+    assert cmd[cmd.index("--tools") + 1] == "Read,Write,Glob"
+    assert "mcp__mctl__*" in cmd[cmd.index("--allowedTools") + 1].split(",")
 
 
 def test_prompt_supplies_what_the_shell_used_to():

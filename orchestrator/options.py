@@ -1483,15 +1483,23 @@ def build_incident_responder_options(
     UTC timestamp is interpolated into the prompt, and the proposal slug is
     derived from the incident ID by string manipulation rather than by hashing
     it in a subprocess. See mctlhq/mctl-agents#183.
+
+    ``tools`` is what removes the shell. ``allowed_tools`` only grants
+    permission: a tool left out of it stays in the session, and the CLI's
+    permission mode then decides per command, which still ran some Bash
+    commands. This session also holds the mctl-api credential, so that decision
+    must not be left to the CLI (mctlhq/mctl-gitops#1980).
     """
     env = {**os.environ}
     if state_dir is not None:
         env["INCIDENT_STATE_DIR"] = str(state_dir)
-    allowed_tools = ["Read", "Write", "Glob", *_mctl_tool_globs()]
+    builtin_tools = ["Read", "Write", "Glob"]
+    allowed_tools = [*builtin_tools, *_mctl_tool_globs()]
     return _scrubbed(ClaudeAgentOptions(
         cwd=str(agent_dir),
         setting_sources=["project"],
         model=model,
+        tools=builtin_tools,
         allowed_tools=allowed_tools,
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
