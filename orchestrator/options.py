@@ -1489,6 +1489,13 @@ def build_incident_responder_options(
     permission mode then decides per command, which still ran some Bash
     commands. This session also holds the mctl-api credential, so that decision
     must not be left to the CLI (mctlhq/mctl-gitops#1980).
+
+    ``add_dirs`` is what lets ``Write`` reach the proposals. ``state_dir``
+    (agents-state in the gitops checkout) is outside ``cwd``, and the CLI
+    refuses a write outside its working directories. The shell used to write
+    there instead, so without this the responder stops producing proposals
+    and still exits successfully. Only ``state_dir`` is added, not the
+    checkout: the rest of it, including ``.git``, stays outside the session.
     """
     env = {**os.environ}
     if state_dir is not None:
@@ -1501,6 +1508,7 @@ def build_incident_responder_options(
         model=model,
         tools=builtin_tools,
         allowed_tools=allowed_tools,
+        add_dirs=[state_dir] if state_dir is not None else [],
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=INCIDENT_RESPONDER_BUDGET_USD,

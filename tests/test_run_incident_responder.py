@@ -286,6 +286,32 @@ def test_responder_session_is_built_without_the_shell(monkeypatch):
     assert "mcp__mctl__*" in cmd[cmd.index("--allowedTools") + 1].split(",")
 
 
+def _responder_command(state_dir):
+    opts = build_incident_responder_options(
+        agent_dir=Path("/tmp/agent"),
+        model="claude-sonnet-4-5",
+        state_dir=state_dir,
+    )
+    transport = SubprocessCLITransport(prompt="x", options=dataclasses.replace(opts, cli_path="claude"))
+    return transport._build_command()
+
+
+def test_responder_can_write_only_its_state_dir(monkeypatch):
+    """Without the shell, Write is the only way to the proposals, and the CLI
+    refuses a write outside its working directories. state_dir is outside cwd,
+    so it is added; nothing wider is, so the rest of the gitops checkout
+    (including .git) stays out of reach (mctlhq/mctl-gitops#1980)."""
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    cmd = _responder_command(Path("/workdir/mctl-gitops/platform-gitops/agents-state"))
+    added = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--add-dir"]
+    assert added == ["/workdir/mctl-gitops/platform-gitops/agents-state"]
+
+
+def test_responder_without_a_state_dir_adds_no_directory(monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    assert "--add-dir" not in _responder_command(None)
+
+
 def test_prompt_supplies_what_the_shell_used_to():
     """Removing Bash only works if the two things it was used for arrive some
     other way: the current time, and a slug that needs no hashing."""
