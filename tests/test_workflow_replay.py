@@ -588,6 +588,11 @@ _STANDALONE_FIXTURES = {
     # #636: recorded by tests/test_execution_request_replay.py
     "dev_loop_delegated.json",
     "dev_loop_issue_started_delegated.json",
+    # A real recorded history that FAILS replay on purpose (workflow task
+    # failed with a non-determinism cause). It is the positive input for the
+    # non-determinism detector, read as text by
+    # tests/test_temporal_nondeterminism_scan.py, never fed to a Replayer.
+    "nondeterminism_marker_rollback.json",
 }
 
 
