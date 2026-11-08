@@ -41,7 +41,6 @@ CASES = [
     ("command.string-too-long.json", "command", False, "note"),
     ("result.extra-field.json", "result", False, "customer_email"),
 ]
-_executed = {"positive": 0, "negative": 0}
 
 
 def _schema(name):
@@ -56,18 +55,33 @@ def test_fixture(fixture, schema, valid, reason):
     errors = list(_schema(schema).iter_errors(doc))
     if valid:
         assert errors == []
-        _executed["positive"] += 1
     else:
         assert errors, f"{fixture} unexpectedly validated"
         assert any(reason in str(e.message) + "/".join(map(str, e.absolute_path)) for e in errors), [
             e.message for e in errors
         ]
-        _executed["negative"] += 1
 
 
 def test_case_counts_nonzero():
-    # Runs after the parametrized cases (file order); a skipped run would leave 0.
-    assert _executed == {"positive": 2, "negative": 6}
+    # Derive expectations from fixtures, never from shared mutable test state.
+    assert sum(valid for _, _, valid, _ in CASES) == 2
+    assert sum(not valid for _, _, valid, _ in CASES) == 6
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("outcome", "paid"),
+        ("provider_effect", "charged"),
+        ("result_ref", "not-a-result-id"),
+        ("error_code", "secret_exposed"),
+    ],
+)
+def test_result_rejects_invalid_fields(field, invalid_value):
+    # Negative result-schema checks are order-independent and need no fixture mutations.
+    result = json.loads((FIX / "result.valid.json").read_text())
+    result[field] = invalid_value
+    assert list(_schema("result").iter_errors(result)), field
 
 
 def test_memo_status_line_is_one_allowed_outcome():
