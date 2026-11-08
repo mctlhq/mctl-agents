@@ -497,6 +497,10 @@ DELIVERY_ACCEPTED = "accepted"
 #: The validator's permanent refusal: the dispatcher rejects the request with
 #: `resume_refused:<reason>`, before any fulfil, so no `we_` is minted.
 RESUME_REFUSED_ERROR_TYPE = "ResumeRefused"
+#: A delivery landing refusal: a delivery of a loop whose merge watch needs
+#: reconciliation never lands `Succeeded`. Deliberately NOT in
+#: `RESUME_DEFERRAL_REASONS` (the validator's closed vocabulary).
+MERGE_WATCH_RECONCILE_REFUSAL = "merge-watch-reconcile-required"
 #: The validator's transient refusal (the loop is not ready, or is ending):
 #: the dispatcher defers, and a later claim delivers or starts a continuation.
 RESUME_DEFERRED_ERROR_TYPE = "ResumeDeferred"
@@ -1147,6 +1151,18 @@ class WorkContextState:
 #: which must stay byte-for-byte identical (mctl-api#640).
 ABANDONED_ENDED_PREFIX = "abandoned: "
 
+#: Values of `_WatchOutcome.watch_end` / `DevLoopResult.watch_end` (#1021,
+#: M2b-1d). `""` is every watch end that exists today. `cli.py` imports these
+#: so the producer and the reader cannot drift. Nothing sets them yet.
+WATCH_END_FINAL_READ = "final-read"
+WATCH_END_RECONCILE_REQUIRED = "reconcile-required"
+WATCH_END_NO_PR_CONFIRMED = "no-pr-confirmed"
+WATCH_END_ABANDONED_UNVERIFIED = "abandoned-unverified"
+#: `DevLoopResult.outcome` of a reconcile-required watch end.
+MERGE_WATCH_RECONCILE_REQUIRED_OUTCOME = "merge_watch_reconcile_required"
+#: `DevLoopResult.ended` when a reconcile-required end names no reason.
+MERGE_WATCH_RECONCILE_ENDED_FALLBACK = "merge watch: pull-request state not established; reconciliation required"
+
 #: How `DevLoopResult.ended` starts when a loop ends because its approval was
 #: refused / failed (#702). Together with ABANDONED_ENDED_PREFIX these mark a
 #: run that may be restarted on its own workflow id. mctl-api must mirror them
@@ -1178,8 +1194,10 @@ class DevLoopResult:
     # Stage 6.1 merge detection (ADR-006, #214): the last PR state observed
     # by the post-implement polling loop. None on pre-merge-detection
     # histories and when implement never produced a PR to watch; a PRState
-    # with state="OPEN" means the watch deadline expired with the PR still
-    # open (the workflow does not wait forever).
+    # with state="OPEN" is the last observed state: by itself it does not mean
+    # the deadline expired with the PR verified open. None also on
+    # reconcile-required (see `last_observed_pr`). On `abandoned-unverified`
+    # it is the last observed state, not verified current state.
     pr: PRState | None = None
     # Stages 6.2/6.3 (ADR-006, #215): what happened to the release this
     # merge produced. None on histories predating the stage and whenever
@@ -1208,6 +1226,16 @@ class DevLoopResult:
     # only moves an occurrence to `awaiting_verification`; it is never a
     # verification.
     security: list[dict[str, str]] | None = None
+    # Why the merge watch ended (`WATCH_END_*`), "" for every end that exists
+    # today. Defaulted so results recorded before this field existed still
+    # deserialize.
+    watch_end: str = ""
+    # On reconcile-required: the last PR state the watch observed (`pr` is
+    # None then). None otherwise. Defaulted like `watch_end`.
+    last_observed_pr: PRState | None = None
+    # On reconcile-required: the record of the reconciliation request, "" if
+    # none. Defaulted like `watch_end`.
+    reconcile_record: str = ""
 
 
 async def _resolve(agent: str) -> ResolvedRelease | None:
@@ -1806,6 +1834,11 @@ class _WatchOutcome:
     # deadline, grace-polls give-up, a hop): those already say everything
     # they need to through `last`/`resume`.
     ended: str = ""
+    # One of `WATCH_END_*` or "" (nothing sets it yet), and the record of a
+    # reconcile-required end. Mapped onto `DevLoopResult` by
+    # `_finish_after_watch`.
+    watch_end: str = ""
+    reconcile_record: str = ""
 
 
 @workflow.defn
@@ -1980,6 +2013,10 @@ class DevLoopWorkflow:
         # Set once the implement step is submitted: no approval gate is left
         # ahead, so a delivered resume has no decision left to wait for.
         self._gates_passed = False
+        # Plain instance state: True when the merge watch ended needing
+        # reconciliation, so no delivery may land `Succeeded`. Set by nothing
+        # yet (M2b-1d-3); not carried across a hop.
+        self._reconcile_required = False
         # True when this loop passed its gates under DEFERRED_RESUME_PATCH
         # (set in `run`, restored by `_resume_merge_watch`); see the patch.
         self._deferred_resume_contract = False
@@ -2965,11 +3002,19 @@ class DevLoopWorkflow:
             # rather than land a false `Succeeded`.
             await self._land_delivery(opened, "Failed", "feedback-not-ready", engine_ref)
             return
+        if self._reconcile_required:
+            await self._land_delivery(opened, "Failed", MERGE_WATCH_RECONCILE_REFUSAL, engine_ref)
+            return
         # A canonical loop's decision is a grant (#636): a bare or legacy
         # `approver` signal decides no delivery either.
         await workflow.wait_condition(
             lambda: self._abandoned or self._is_approved() or self._gates_passed or self._exiting or self._hopping
         )
+        if self._reconcile_required:
+            # wait_condition suspends even when already true: a flag set in the
+            # activation that resolves the wait is seen only here.
+            await self._land_delivery(opened, "Failed", MERGE_WATCH_RECONCILE_REFUSAL, engine_ref)
+            return
         decided = (self._is_approved() or self._gates_passed) and not self._abandoned
         if self._hopping and not decided and not self._abandoned:
             return  # still open, undecided: carried across the hop, re-bound by the next run
@@ -4653,7 +4698,10 @@ class DevLoopWorkflow:
         the way (mctl-agents#404 v2). Identical to the pre-#404-v2 tail of
         `run`, just factored out so the resume path does not duplicate it.
         """
-        pr_state = outcome.last
+        reconcile = outcome.watch_end == WATCH_END_RECONCILE_REQUIRED
+        # Gate the stages below through `pr_state`, never an early return: all
+        # three `workflow.patched` calls stay evaluated on every path.
+        pr_state = None if reconcile else outcome.last
 
         # Stages 6.2/6.3 (ADR-006, #215): only a merged PR produces a
         # release to observe. A closed-unmerged or still-open PR ends the
@@ -4696,6 +4744,18 @@ class DevLoopWorkflow:
         ):
             incidents = await self._watch_incidents(deploy.app, watch_since)
 
+        if reconcile:
+            ended = outcome.ended or MERGE_WATCH_RECONCILE_ENDED_FALLBACK
+            workflow.logger.warning(
+                "MERGE_WATCH_RECONCILE_REQUIRED repo=%s workflow=%s ended=%s record=%s",
+                target_repo,
+                workflow.info().workflow_id,
+                ended,
+                outcome.reconcile_record,
+            )
+        else:
+            ended = f"{ABANDONED_ENDED_PREFIX}{self._abandon_reason}" if self._abandoned else outcome.ended
+
         return DevLoopResult(
             investigate=investigate_result,
             implement=implement_result,
@@ -4718,7 +4778,12 @@ class DevLoopWorkflow:
             # check ever runs -- but if a future change made them race, an
             # operator's explicit abandon should still be what the result
             # reports.
-            ended=(f"{ABANDONED_ENDED_PREFIX}{self._abandon_reason}" if self._abandoned else outcome.ended),
+            # A reconcile-required end takes precedence over abandon.
+            ended=ended,
+            outcome=MERGE_WATCH_RECONCILE_REQUIRED_OUTCOME if reconcile else "",
+            watch_end=outcome.watch_end,
+            last_observed_pr=outcome.last if reconcile else None,
+            reconcile_record=outcome.reconcile_record if reconcile else "",
         )
 
     async def _record_security_landed(self, target_repo: str, pr_state: PRState) -> list[dict[str, str]] | None:
@@ -6427,7 +6492,9 @@ class DevLoopWorkflow:
 
         Observational, fail-open: a persistently failing read (GitHub outage
         outlasting the activity retries) returns the last known state
-        instead of failing a loop whose implement already succeeded. Returns
+        instead of failing a loop whose implement already succeeded. That
+        state is the last observed one, not a verified final answer; later
+        slices (#1021 M2b-1d) mark such ends in `_WatchOutcome.watch_end`. Returns
         a `last` of None when no PR link ever appeared within the grace
         polls -- UNLESS this is a resumed run carrying an abandon, in which
         case the carried `resume.last_pr` is returned instead: task 5a's

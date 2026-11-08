@@ -17,7 +17,13 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from orchestrator.temporal.issue_ref import parse_issue_url
 from orchestrator.temporal.start import connect, restart_if_restartable, start_dev_loop_workflow
-from orchestrator.temporal.workflows.dev_loop import DevLoopResult, DevLoopWorkflow
+from orchestrator.temporal.workflows.dev_loop import (
+    WATCH_END_ABANDONED_UNVERIFIED,
+    WATCH_END_NO_PR_CONFIRMED,
+    WATCH_END_RECONCILE_REQUIRED,
+    DevLoopResult,
+    DevLoopWorkflow,
+)
 
 
 async def start(issue_url: str) -> None:
@@ -105,14 +111,24 @@ async def status(workflow_id: str) -> None:
         # Merge-detection outcome (stage 6.1, #214). Absent on results from
         # pre-merge-detection histories and when implement never produced a
         # PR to watch.
-        if result.pr is not None:
+        if result.watch_end == WATCH_END_RECONCILE_REQUIRED:
+            print(f"  pr:          reconcile required ({result.reconcile_record or 'no record'})")
+        elif result.pr is not None:
+            unverified = (
+                " (last observed before abandon, not verified current)"
+                if result.watch_end == WATCH_END_ABANDONED_UNVERIFIED
+                else ""
+            )
             if result.pr.found:
-                print(f"  pr:          {result.pr.state} ({result.pr.pr_url})")
+                print(f"  pr:          {result.pr.state} ({result.pr.pr_url}){unverified}")
             else:
                 print(
                     "  pr:          unresolvable"
                     + (f" ({result.pr.pr_url})" if result.pr.pr_url else " (no PR link recorded)")
+                    + unverified
                 )
+        elif result.watch_end == WATCH_END_NO_PR_CONFIRMED:
+            print("  pr:          none (confirmed)")
         elif result.implement and result.implement.succeeded:
             print("  pr:          not watched (pre-merge-detection history, or no PR link appeared)")
         # Deploy observation (stages 6.2/6.3, #215). Absent unless the PR
