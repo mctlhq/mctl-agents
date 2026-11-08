@@ -87,7 +87,7 @@ def test_result_rejects_invalid_fields(field, invalid_value):
 
 def test_jsonschema_dev_lock_is_complete():
     """Prevent green CI when the mandatory jsonschema test tool is not fully locked."""
-    root = DIR.parent.parent
+    root = Path(__file__).resolve().parent.parent
     with (root / "uv.lock").open("rb") as fp:
         lock = tomllib.load(fp)
     with (root / "pyproject.toml").open("rb") as fp:
