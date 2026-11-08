@@ -2,9 +2,11 @@
 """Temporal patch-marker scanner, version MS-4 (mctl-agents#1007, P-6).
 
 Decides, for every workflow matched by a visibility query (default: running
-DevLoopWorkflow), whether its history contains the patch marker
-`deferred-resume-contract` (DEFERRED_RESUME_PATCH in
-orchestrator/temporal/workflows/dev_loop.py), with THREE states:
+DevLoopWorkflow), whether its history contains one patch marker, with THREE
+states. The patch id defaults to `deferred-resume-contract`
+(DEFERRED_RESUME_PATCH in orchestrator/temporal/workflows/dev_loop.py) and is
+chosen with --patch-id; one run scans one patch id and the text and JSON
+reports name it, so reports for several ids are separate runs:
 
   MARKER_PRESENT  the history is complete and records a core_patch marker
                   whose id is the patch.
@@ -25,6 +27,17 @@ ancestor records the marker; UNKNOWN if any ancestor fetch fails, is empty or
 undecodable, the chain is deeper than MAX_CHAIN_DEPTH (100) or loops; ABSENT
 only when the whole chain is ABSENT. `classify()` judges ONE history only; the
 chain verdict comes from `scan()`.
+
+Which run to look in. The chain walk above is right for a patch that every run
+of a watch records, such as the default id. A patch that is recorded only in the
+FIRST run of a watch, and not in continue-as-new hops, is looked for in that
+first run, and the chain walk reaches it through `continued_from`. The upcoming
+id `merge-watch-terminal-reconcile` is of this kind: it is recorded once per
+fresh watch history and not on hopped runs. No build carries it yet, so today
+every history scanned for it is MARKER_ABSENT by construction. That is a
+point-in-time result about what has been recorded so far, not evidence that a
+future build is safe to roll out; read it together with the UNKNOWN count and
+the listing state.
 
 Every UNKNOWN carries a stable `reason` code, and the summary counts them. An
 ancestor the server answers NOT_FOUND for is `retention_gap`: namespace retention
@@ -48,6 +61,7 @@ identifiers and verdicts, never payloads.
 
 Usage:
   python tools/temporal_marker_scan.py --address HOST:7233 --namespace NS \\
+      [--patch-id ID] \\
       [--query 'WorkflowType = "DevLoopWorkflow" AND ExecutionStatus = "Running"'] \\
       [--tls] [--tls-ca-file F] [--tls-cert-file F --tls-key-file F] \\
       [--tls-server-name NAME] [--api-key-env VAR] [--max-workflows N] \\
@@ -184,6 +198,7 @@ class ScanResult:
     listing_error: str | None = None
     query: str = ""
     namespace: str = ""
+    patch: str = PATCH
     retention_seconds: int | None = None
     retention_error: str | None = None
 
@@ -264,7 +279,7 @@ async def scan(
             expected = await count_fn(query)
         async for wf_id, run_id, wf_type in list_fn(query):
             if max_workflows is not None and len(entries) >= max_workflows:
-                return ScanResult(entries, False, f"stopped at --max-workflows {max_workflows}", query)
+                return ScanResult(entries, False, f"stopped at --max-workflows {max_workflows}", query, patch=patch)
             try:
                 v = await _resolve_chain(fetch_fn, wf_id, classify(await fetch_fn(wf_id, run_id), patch), patch)
             except Exception as exc:  # noqa: BLE001 - any fetch error is UNKNOWN, never ABSENT
@@ -274,11 +289,15 @@ async def scan(
             after = await count_fn(query)
             if not expected == after == len(entries):
                 return ScanResult(
-                    entries, False, f"count mismatch: before={expected} after={after} listed={len(entries)}", query
+                    entries,
+                    False,
+                    f"count mismatch: before={expected} after={after} listed={len(entries)}",
+                    query,
+                    patch=patch,
                 )
     except Exception as e:  # noqa: BLE001 - a failed page is a failed scan, not a shorter list
-        return ScanResult(entries, False, f"{type(e).__name__}: {e}", query)
-    return ScanResult(entries, True, None, query)
+        return ScanResult(entries, False, f"{type(e).__name__}: {e}", query, patch=patch)
+    return ScanResult(entries, True, None, query, patch=patch)
 
 
 def temporal_adapters(client: Any) -> tuple[ListFn, FetchFn]:
@@ -321,7 +340,7 @@ def render_text(result: ScanResult) -> str:
     if not result.listing_complete:
         lines.append(f"LISTING FAILED: {result.listing_error}")
     lines.append(
-        f"summary: scanner={VERSION} patch={PATCH} total={len(result.entries)} present={c[PRESENT]} "
+        f"summary: scanner={VERSION} patch={result.patch} total={len(result.entries)} present={c[PRESENT]} "
         f"absent={c[ABSENT]} unknown={c[UNKNOWN]} unknown_reasons={result.unknown_reasons()} "
         f"listing_complete={result.listing_complete} namespace={result.namespace!r} "
         f"retention_seconds={result.retention_seconds} query={result.query!r}"
@@ -333,7 +352,7 @@ def render_json(result: ScanResult, exit_code: int) -> str:
     return json.dumps(
         {
             "scanner_version": VERSION,
-            "patch": PATCH,
+            "patch": result.patch,
             "listing_complete": result.listing_complete,
             "listing_error": result.listing_error,
             "query": result.query,
@@ -398,11 +417,12 @@ async def _run(args: argparse.Namespace) -> int:
         key = options.get("api_key")
         client = await _connect(args.address, args.namespace, **options)
     except Exception as e:  # noqa: BLE001
-        result = ScanResult([], False, f"connect failed: {type(e).__name__}: {e}", args.query)
+        result = ScanResult([], False, f"connect failed: {type(e).__name__}: {e}", args.query, patch=args.patch_id)
     else:
         result = await scan(
             *temporal_adapters(client),
             query=args.query,
+            patch=args.patch_id,
             count_fn=temporal_count(client),
             max_workflows=args.max_workflows,
         )
@@ -417,9 +437,12 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Read-only scan for the deferred-resume-contract patch marker.")
+    p = argparse.ArgumentParser(
+        description="Read-only scan for one Temporal patch marker (default: deferred-resume-contract)."
+    )
     p.add_argument("--address", required=True, help="Temporal frontend host:port")
     p.add_argument("--namespace", required=True)
+    p.add_argument("--patch-id", default=PATCH, help=f"patch id to look for (default: {PATCH})")
     p.add_argument("--query", default=DEFAULT_QUERY, help="visibility query (default: running DevLoopWorkflow)")
     p.add_argument("--tls", action="store_true", help="connect with TLS (system roots unless --tls-ca-file)")
     p.add_argument("--tls-ca-file", help="PEM file with the server root CA")
@@ -430,7 +453,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-workflows", type=int, default=DEFAULT_MAX_WORKFLOWS, help="more than this blocks the scan")
     p.add_argument("--json", action="store_true")
     p.add_argument("--allow-present", action="store_true", help="exit 0 instead of 3 when only PRESENT is found")
-    return asyncio.run(_run(p.parse_args(argv)))
+    args = p.parse_args(argv)
+    if not args.patch_id.strip():
+        p.error("--patch-id must not be empty")
+    return asyncio.run(_run(args))
 
 
 if __name__ == "__main__":

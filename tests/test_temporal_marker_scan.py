@@ -108,6 +108,106 @@ def _scan(mod: ModuleType, client: FakeClient) -> Any:
     return asyncio.run(mod.scan(client.list_fn, client.fetch_fn))
 
 
+FIRST_RUN_PATCH = "merge-watch-terminal-reconcile"  # recorded in the first run of a watch, not on hops
+
+
+def _cli_with_patch_id(mod: ModuleType, history: dict[str, Any], extra: list[str]) -> tuple[int, dict[str, Any]]:
+    """Run main() against a one-workflow fake client; return (exit code, JSON payload)."""
+    import contextlib
+    import io
+
+    class Hist:
+        def to_json(self) -> str:
+            return json.dumps(history)
+
+    class Handle:
+        async def fetch_history(self) -> Hist:
+            return Hist()
+
+    class Wf:
+        id, run_id, workflow_type = "w", "r", "DevLoopWorkflow"
+
+    class C:
+        def list_workflows(self, query: str) -> AsyncIterator[Wf]:
+            async def gen() -> AsyncIterator[Wf]:
+                yield Wf()
+            return gen()
+
+        def get_workflow_handle(self, wid: str, run_id: str | None = None) -> Handle:
+            return Handle()
+
+        async def count_workflows(self, query: str) -> Any:
+            return type("Count", (), {"count": 1})()
+
+    async def connect(address: str, namespace: str, **options: Any) -> Any:
+        return C()
+
+    saved, mod._connect = mod._connect, connect
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            try:
+                code = mod.main(["--address", "x:1", "--namespace", "n", "--json", *extra])
+            except SystemExit as exc:  # an option the tool does not know is a failed check, not a crash
+                raise AssertionError(f"main() exited with {exc.code} for {extra}") from exc
+    finally:
+        mod._connect = saved
+    return code, json.loads(buf.getvalue())
+
+
+def _patch_id_checks(mod: ModuleType) -> None:
+    """--patch-id picks the id, the default is unchanged, and the report names the id."""
+    A, P, U = mod.ABSENT, mod.PRESENT, mod.UNKNOWN
+    new = FIRST_RUN_PATCH
+    assert mod.PATCH == "deferred-resume-contract"
+    clean = json.dumps(_synthetic())
+    with_new = json.dumps(_synthetic(marker=new))
+    with_default = json.dumps(_synthetic(marker=mod.PATCH))
+    gap = _synthetic()
+    del gap["events"][2]
+
+    def verdicts(patch: str | None, hist: dict[str, Any]) -> dict[str, str]:
+        client = FakeClient([sorted(k for k in hist if "@" not in k)], hist)
+        kw = {} if patch is None else {"patch": patch}
+        r = asyncio.run(mod.scan(client.list_fn, client.fetch_fn, **kw))
+        return {e.workflow_id: e.verdict for e in r.entries}
+
+    hist = {"new": with_new, "none": clean, "default": with_default, "gap": json.dumps(gap), "bad": "{"}
+    # an explicit id: present / absent (including a different patch) / unknown
+    assert verdicts(new, hist) == {"new": P, "none": A, "default": A, "gap": U, "bad": U}
+    # the default id is unchanged and does not see the other one
+    want_default = {"new": A, "none": A, "default": P, "gap": U, "bad": U}
+    assert verdicts(None, hist) == want_default
+    assert verdicts(mod.PATCH, hist) == want_default
+    # a patch recorded only in the first run: the hopped run is ABSENT alone, PRESENT through its ancestor
+    hopped = {"hop": json.dumps(_synthetic(continued_from="r1")), "hop@r1": with_new}
+    assert verdicts(new, hopped) == {"hop": P}
+    assert verdicts(new, {"hop": json.dumps(_synthetic(continued_from="r1")), "hop@r1": clean}) == {"hop": A}
+    # the report names the id that was scanned
+    client = FakeClient([["new"]], {"new": with_new})
+    r = asyncio.run(mod.scan(client.list_fn, client.fetch_fn, patch=new))
+    assert f"patch={new} " in mod.render_text(r) and json.loads(mod.render_json(r, 3))["patch"] == new
+    r = _scan(mod, client)
+    assert f"patch={mod.PATCH} " in mod.render_text(r) and json.loads(mod.render_json(r, 0))["patch"] == mod.PATCH
+    # the CLI: the option reaches the scan; without it the default id is scanned
+    code, out = _cli_with_patch_id(mod, json.loads(with_new), ["--patch-id", new])
+    assert code == 3 and out["patch"] == new and out["counts"]["MARKER_PRESENT"] == 1
+    code, out = _cli_with_patch_id(mod, json.loads(with_new), [])
+    assert code == 0 and out["patch"] == mod.PATCH and out["counts"]["MARKER_ABSENT"] == 1
+    code, out = _cli_with_patch_id(mod, json.loads(clean), ["--patch-id", new])
+    assert code == 0 and out["patch"] == new and out["counts"]["MARKER_ABSENT"] == 1
+    code, out = _cli_with_patch_id(mod, gap, ["--patch-id", new])
+    assert code == 2 and out["counts"]["UNKNOWN"] == 1
+    # an empty id would match nothing and read as ABSENT: refused
+    try:
+        mod.main(["--address", "x:1", "--namespace", "n", "--patch-id", " "])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("an empty --patch-id was accepted")
+
+
+
 # ---------------------------------------------------------------------------
 # Layer 1: the detector's defining assertions, runnable against any variant.
 # ---------------------------------------------------------------------------
@@ -152,6 +252,7 @@ def detector_checks(mod: ModuleType) -> None:
     assert c(json.dumps(dup))[0] == U  # ids [1,2,2,4]: last id equals the count, still a gap
     _chain_checks(mod)
     _cli_checks(mod)
+    _patch_id_checks(mod)
     # scan: fetch errors and bad bodies are UNKNOWN, never ABSENT
     pos = json.dumps(_synthetic(marker=mod.PATCH))
     cl = FakeClient([["ok", "boom", "bad", "pos"]], {"ok": clean, "boom": RuntimeError("rpc"), "bad": "{", "pos": pos})
@@ -641,6 +742,12 @@ MUTATIONS: dict[str, tuple[str, str]] = {
     "unparseable-becomes-absent": ('return Verdict(UNKNOWN, f"unparseable', 'return Verdict(ABSENT, f"unparseable'),
     "missing-history-becomes-absent": ('return Verdict(UNKNOWN, "no history"', 'return Verdict(ABSENT, "no history"'),
     "empty-history-becomes-absent": ('return Verdict(UNKNOWN, "no events"', 'return Verdict(ABSENT, "no events"'),
+    "patch-id-option-removed": (
+        'p.add_argument("--patch-id", default=PATCH, help=f"patch id to look for (default: {PATCH})")',
+        "p.set_defaults(patch_id=PATCH)",
+    ),
+    "patch-id-option-not-passed-to-scan": ("            patch=args.patch_id,\n", ""),
+    "patch-id-not-in-report": ('"patch": result.patch,', '"patch": PATCH,'),
     "patch-id-not-compared": ('["id"] == patch:', '["id"] is not None:'),
     "drop-continued-from": ('return attrs.get("continuedExecutionRunId") or None', "return None"),
     "event-without-id-becomes-absent": ('return Verdict(UNKNOWN, "event without eventId", cont',
