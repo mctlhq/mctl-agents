@@ -6,8 +6,8 @@ suite, it never skips. Run `uv sync` to install it.
 
 import base64
 import json
-import tomllib
 import re
+import tomllib
 from pathlib import Path
 
 try:
