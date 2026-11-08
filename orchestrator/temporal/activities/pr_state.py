@@ -41,6 +41,14 @@ _PR_FIELD_RE = re.compile(r"^pr:\s*['\"]?(\S+?)['\"]?\s*$", re.MULTILINE)
 # field already came from — no extra HTTP request.
 _STATUS_FIELD_RE = re.compile(r"^status:\s*['\"]?(\S+?)['\"]?\s*$", re.MULTILINE)
 
+# confirm_no_pr (M2b-1c, mctl-agents#1041): deliberately separate, stricter
+# patterns so get_pr_state stays byte-identical.
+_ANY_PR_KEY_RE = re.compile(r"""^\s*["']?pr["']?\s*:""", re.MULTILINE)
+_STRICT_STATUS_RE = re.compile(r"^status:\s*\S", re.MULTILINE)
+_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_GITHUB_API = "https://api.github.com"
+MAX_PULL_PAGES = 10
+
 
 @dataclass(frozen=True)
 class PRState:
@@ -216,3 +224,121 @@ async def get_pr_state(service: str, slug: str) -> PRState:
         "pr_state service=%s slug=%s pr=%s#%s state=%s", service, slug, repo, number, state
     )
     return result
+
+
+@dataclass(frozen=True)
+class NoPrProof:
+    """Proof-of-absence verdict. ``reason`` is ``no-link-no-pull`` when
+    confirmed, else the first thing that blocked the proof."""
+
+    confirmed: bool
+    reason: str
+
+
+def _strict_status_content(payload: object) -> str:
+    """Strictly decode a contents-API file payload, or raise."""
+    if not isinstance(payload, dict):
+        raise ProposalListingError("unexpected contents payload type")
+    if payload.get("encoding") != "base64":
+        raise ProposalListingError("contents payload is not base64-encoded")
+    content = payload.get("content")
+    if not isinstance(content, str):
+        raise ProposalListingError("contents payload has no string content")
+    try:
+        raw = base64.b64decode(content.replace("\n", ""), validate=True)
+        return raw.decode("utf-8")
+    except (ValueError, TypeError) as exc:  # binascii.Error and UnicodeDecodeError are ValueErrors
+        raise ProposalListingError("undecodable contents payload") from exc
+
+
+@activity.defn
+async def confirm_no_pr(service: str, slug: str) -> NoPrProof:
+    """Prove that ``service``/``slug`` has no implementation PR and no
+    implementation branch. Fails closed: any read that fails raises, and
+    ``confirmed=True`` is returned only when every read positively shows
+    absence."""
+    token = await asyncio.to_thread(_resolve_token)
+    if not token:
+        raise ProposalListingError(
+            "no GitHub token available (GITHUB_TOKEN_FILE unreadable and "
+            "GITHUB_TOKEN unset); refusing an unauthenticated lookup"
+        )
+    if not (
+        isinstance(service, str) and isinstance(slug, str)
+        and _NAME_RE.match(service) and _NAME_RE.match(slug)
+    ):
+        raise ProposalListingError("service and slug must be plain [A-Za-z0-9._-]+ names")
+
+    headers = _headers(token)
+    status_url = (
+        f"{_GITHUB_API}/repos/{GITOPS_REPO}/contents/"
+        f"{AGENTS_STATE_PREFIX}/{service}/proposals/{slug}/.status.yaml"
+    )
+    branch = f"feat/agents-{slug}"
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            response = await client.get(status_url, params={"ref": "main"}, headers=headers)
+        except httpx.RequestError as exc:
+            raise ProposalListingError(f"reading {status_url} failed: {exc}") from exc
+        if response.status_code == 404:
+            return NoPrProof(False, "status-file-missing")
+        if response.status_code != 200:
+            raise ProposalListingError(f"reading {status_url} returned HTTP {response.status_code}")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ProposalListingError(f"non-JSON contents payload from {status_url}") from exc
+        content = _strict_status_content(payload)
+        if not content.strip():
+            return NoPrProof(False, "status-file-empty")
+        if not _STRICT_STATUS_RE.search(content):
+            return NoPrProof(False, "status-line-missing")
+        if _ANY_PR_KEY_RE.search(content):
+            return NoPrProof(False, "pr-line-present")
+
+        pulls_url = f"{_GITHUB_API}/repos/mctlhq/{service}/pulls"
+        url: str | None = pulls_url
+        params: dict[str, str | int] | None = {
+            "head": f"mctlhq:{branch}", "state": "all", "per_page": 100,
+        }
+        pages = 0
+        while url:
+            pages += 1
+            if pages > MAX_PULL_PAGES:
+                raise ProposalListingError(f"listing {pulls_url} exceeded {MAX_PULL_PAGES} pages")
+            try:
+                page_resp = await client.get(url, params=params, headers=headers)
+            except httpx.RequestError as exc:
+                raise ProposalListingError(f"listing {pulls_url} failed: {exc}") from exc
+            if page_resp.status_code != 200:
+                raise ProposalListingError(
+                    f"listing {pulls_url} returned HTTP {page_resp.status_code}"
+                )
+            try:
+                items = page_resp.json()
+            except ValueError as exc:
+                raise ProposalListingError(f"non-JSON payload from {pulls_url}") from exc
+            if not isinstance(items, list):
+                raise ProposalListingError(f"unexpected payload shape from {pulls_url}")
+            if items:
+                return NoPrProof(False, "pull-request-listed")
+            nxt = page_resp.links.get("next", {}).get("url")
+            if nxt:
+                if not str(nxt).startswith(_GITHUB_API + "/"):
+                    raise ProposalListingError(f"next link outside the GitHub API: {nxt}")
+                url, params = str(nxt), None
+            else:
+                url = None
+
+        branch_url = f"{_GITHUB_API}/repos/mctlhq/{service}/branches/{branch}"
+        try:
+            branch_resp = await client.get(branch_url, headers=headers)
+        except httpx.RequestError as exc:
+            raise ProposalListingError(f"reading {branch_url} failed: {exc}") from exc
+        if branch_resp.status_code == 200:
+            return NoPrProof(False, "branch-exists")
+        if branch_resp.status_code != 404:
+            raise ProposalListingError(f"reading {branch_url} returned HTTP {branch_resp.status_code}")
+
+    activity.logger.info("confirm_no_pr service=%s slug=%s reason=no-link-no-pull", service, slug)
+    return NoPrProof(True, "no-link-no-pull")

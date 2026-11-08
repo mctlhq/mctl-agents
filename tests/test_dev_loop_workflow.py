@@ -52,9 +52,9 @@ from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTa
 from orchestrator.temporal.activities.execution_requests import AdvanceInput
 from orchestrator.temporal.activities.identity import MintedContext, MintRequest
 from orchestrator.temporal.activities.incidents import Incident, IncidentQueryResult
-from orchestrator.temporal.activities.issue_state import IssueState
+from orchestrator.temporal.activities.issue_state import IssueState, ReconcileRecordInput, ReconcileRecordResult
 from orchestrator.temporal.activities.lifecycle import _PATHS, OwnershipRequest, OwnershipResult
-from orchestrator.temporal.activities.pr_state import PRState
+from orchestrator.temporal.activities.pr_state import NoPrProof, PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
 from orchestrator.temporal.constants import (
@@ -812,6 +812,14 @@ def _fake_activities(
     async def fake_read_proposal_status(service: str, slug: str) -> str | None:
         return proposal_status
 
+    @activity.defn(name="record_merge_watch_reconcile")
+    async def fake_record_merge_watch_reconcile(inp: ReconcileRecordInput) -> ReconcileRecordResult:
+        return ReconcileRecordResult("recorded", "https://example.invalid/c/1")
+
+    @activity.defn(name="confirm_no_pr")
+    async def fake_confirm_no_pr(service: str, slug: str) -> NoPrProof:
+        return NoPrProof(False, "fake")
+
     activities = [
         *_canonical_activities(
             calls=calls,
@@ -844,6 +852,8 @@ def _fake_activities(
         fake_lifecycle_ownership,
         fake_mint_execution_context,
         fake_merge_pull_request_gated,
+        fake_record_merge_watch_reconcile,
+        fake_confirm_no_pr,
     ]
     return activities, calls, investigate_ran, ownership_ops
 
