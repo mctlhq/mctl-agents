@@ -141,3 +141,148 @@ async def post_issue_comment(repo: str, issue_number: int, body: str) -> bool:
     if response.status_code == 429 or response.status_code >= 500:
         raise IssueStateError(f"posting {url} returned HTTP {response.status_code}")
     return False
+
+
+# --- merge-watch reconcile record (M2b-1c, mctl-agents#1041) ----------------
+
+RECONCILE_MARKER_PREFIX = "merge-watch-reconcile-required"
+RECORD_WRITER_LOGIN = "mctl-agents[bot]"
+TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+MAX_COMMENT_PAGES = 50  # 5,000 comments at per_page=100
+GITHUB_API = "https://api.github.com"
+
+
+@dataclass(frozen=True)
+class ReconcileRecordInput:
+    repo: str
+    issue_number: int
+    workflow_id: str
+    deadline: str
+    exit_name: str
+    last_observed: str  # caller-formatted "<STATE> <url> head=<sha>" or ""
+    open_request_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReconcileRecordResult:
+    status: str  # "recorded" | "already-recorded" | "issue-gone"
+    url: str = ""
+
+
+def _marker_part(name: str, value: str) -> str:
+    if not isinstance(value, str) or not value or "--" in value or any(c.isspace() for c in value):
+        raise IssueStateError(f"invalid {name} for the reconcile marker")
+    return value
+
+
+def reconcile_marker(workflow_id: str, deadline: str) -> str:
+    """The HTML-comment marker identifying one watch's reconcile record."""
+    wf = _marker_part("workflow_id", workflow_id)
+    dl = _marker_part("deadline", deadline)
+    return f"<!-- {RECONCILE_MARKER_PREFIX} workflow={wf} deadline={dl} -->"
+
+
+def _is_trusted_author(comment: dict) -> bool:
+    user = comment["user"]
+    if user.get("login") == RECORD_WRITER_LOGIN and user.get("type") == "Bot":
+        return True
+    return comment.get("author_association") in TRUSTED_ASSOCIATIONS
+
+
+def reconcile_comment_body(inp: ReconcileRecordInput) -> str:
+    marker = reconcile_marker(inp.workflow_id, inp.deadline)
+    return (
+        f"{marker}\n"
+        "### Merge watch needs manual reconciliation\n\n"
+        f"- Workflow: {inp.workflow_id}\n"
+        f"- Exit: {inp.exit_name}\n"
+        f"- Last observed PR: {inp.last_observed or 'none'}\n"
+        f"- Open request ids: {', '.join(inp.open_request_ids) or 'none'}\n\n"
+        "Read the pull request by hand, then re-trigger or close this loop deliberately."
+    )
+
+
+def _read_comment_page(response: httpx.Response, url: str) -> list[dict] | str:
+    """Validate one comment page. Returns the items, or "gone" on 410."""
+    if response.status_code == 410:
+        return "gone"
+    if response.status_code != 200:
+        raise IssueStateError(f"listing {url} returned HTTP {response.status_code}")
+    try:
+        items = response.json()
+    except ValueError as exc:
+        raise IssueStateError(f"non-JSON payload from {url}") from exc
+    if not isinstance(items, list):
+        raise IssueStateError(f"unexpected payload shape from {url}")
+    for item in items:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("body"), str)
+            or not isinstance(item.get("user"), dict)
+        ):
+            raise IssueStateError(f"malformed comment item from {url}")
+    return items
+
+
+@activity.defn
+async def record_merge_watch_reconcile(inp: ReconcileRecordInput) -> ReconcileRecordResult:
+    """Write one idempotent "reconciliation required" comment on the source
+    issue. Every attempt lists all comments first, so a retry after a lost
+    answer finds its own marker. Any read it cannot trust raises."""
+    marker = reconcile_marker(inp.workflow_id, inp.deadline)
+    body = reconcile_comment_body(inp)
+    token = await asyncio.to_thread(_resolve_token)
+    if not token:
+        raise IssueStateError(
+            "no GitHub token available (GITHUB_TOKEN_FILE unreadable and "
+            "GITHUB_TOKEN unset); refusing an unauthenticated write"
+        )
+    base = f"{GITHUB_API}/repos/{inp.repo}/issues/{inp.issue_number}/comments"
+    headers = _headers(token)
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        url: str | None = base
+        params: dict[str, int] | None = {"per_page": 100}
+        pages = 0
+        while url:
+            pages += 1
+            if pages > MAX_COMMENT_PAGES:
+                raise IssueStateError(f"listing {base} exceeded {MAX_COMMENT_PAGES} pages")
+            try:
+                response = await client.get(url, params=params, headers=headers)
+            except httpx.RequestError as exc:
+                raise IssueStateError(f"listing {base} failed: {exc}") from exc
+            page = _read_comment_page(response, base)
+            if isinstance(page, str):  # "gone" (HTTP 410)
+                return ReconcileRecordResult("issue-gone")
+            for comment in page:
+                if marker in comment["body"] and _is_trusted_author(comment):
+                    found = comment.get("html_url")
+                    if not isinstance(found, str) or not found:
+                        raise IssueStateError(f"trusted marker comment at {base} has no html_url")
+                    return ReconcileRecordResult("already-recorded", found)
+            nxt = response.links.get("next", {}).get("url")
+            if nxt:
+                if not str(nxt).startswith(GITHUB_API + "/"):
+                    raise IssueStateError(f"next link outside the GitHub API: {nxt}")
+                url, params = str(nxt), None
+            else:
+                url = None
+
+        try:
+            post = await client.post(base, headers=headers, json={"body": body})
+        except httpx.RequestError as exc:
+            raise IssueStateError(f"posting {base} failed: {exc}") from exc
+    if post.status_code != 201:
+        activity.logger.warning(
+            "record_merge_watch_reconcile repo=%s issue=%s post returned HTTP %s",
+            inp.repo, inp.issue_number, post.status_code,
+        )
+        raise IssueStateError(f"posting {base} returned HTTP {post.status_code}")
+    try:
+        posted = post.json()
+    except ValueError as exc:
+        raise IssueStateError(f"non-JSON post answer from {base}") from exc
+    html_url = posted.get("html_url") if isinstance(posted, dict) else None
+    if not isinstance(html_url, str) or not html_url:
+        raise IssueStateError(f"post to {base} answered 201 without html_url")
+    return ReconcileRecordResult("recorded", html_url)
