@@ -6,6 +6,7 @@ suite, it never skips. Run `uv sync` to install it.
 
 import base64
 import json
+import tomllib
 import re
 from pathlib import Path
 
@@ -82,6 +83,24 @@ def test_result_rejects_invalid_fields(field, invalid_value):
     result = json.loads((FIX / "result.valid.json").read_text())
     result[field] = invalid_value
     assert list(_schema("result").iter_errors(result)), field
+
+
+def test_jsonschema_dev_lock_is_complete():
+    """Prevent green CI when the mandatory jsonschema test tool is not fully locked."""
+    root = DIR.parent.parent
+    with (root / "uv.lock").open("rb") as fp:
+        lock = tomllib.load(fp)
+    with (root / "pyproject.toml").open("rb") as fp:
+        project = tomllib.load(fp)
+
+    assert lock["revision"] == 5
+    packages = {p["name"]: p for p in lock["package"]}
+    required = {"jsonschema", "attrs", "jsonschema-specifications", "referencing", "rpds-py"}
+    assert required.issubset(packages), required - packages.keys()
+    assert packages["jsonschema"]["version"] == "4.26.0"
+    assert required - {"jsonschema"} <= {dep["name"] for dep in packages["jsonschema"]["dependencies"]}
+    assert any(d["name"] == "jsonschema" for d in packages["mctl-agents"]["dev-dependencies"]["dev"])
+    assert any(d.startswith("jsonschema==4.26.0") for d in project["dependency-groups"]["dev"])
 
 
 def test_memo_status_line_is_one_allowed_outcome():
