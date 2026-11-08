@@ -107,9 +107,14 @@ def test_status_file_failures_raise(monkeypatch, resp):
         run(monkeypatch, {STATUS_PATH: resp})
 
 
-def test_non_base64_encoding_raises(monkeypatch):
+@pytest.mark.parametrize("encoding", ["utf-8", "none", "", None])
+def test_non_base64_encoding_raises(monkeypatch, encoding):
+    # The content is VALID base64 holding a good status line, so only the
+    # explicit encoding guard can reject it; the strict base64 decoder would
+    # accept this payload (a failure from the decoder is not proof of the guard).
+    body = {"encoding": encoding, "content": b64("status: proposed\n")}
     with pytest.raises(ProposalListingError):
-        run(monkeypatch, {STATUS_PATH: httpx.Response(200, json={"encoding": "utf-8", "content": "status: x"})})
+        run(monkeypatch, {STATUS_PATH: httpx.Response(200, json=body)})
 
 
 @pytest.mark.parametrize("text", ["", "  \n\t\n"])
