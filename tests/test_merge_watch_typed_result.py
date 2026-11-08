@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import anyio
 import pytest
 from temporalio import workflow
 from temporalio.api.enums.v1 import EventType
@@ -326,6 +327,15 @@ async def _deliver_with(
         await _dispatcher(env_).dispatch_once()
         await _wait_for(lambda: _row(fake, ref)["phase"] in ("Succeeded", "Failed"))
         phase: str = _row(fake, ref)["phase"]
+        # The fake row turns terminal when the advance activity returns, one
+        # workflow task BEFORE `_end_delivery` pops the open delivery and
+        # records the refusal. Wait for that close so a query in the gap
+        # cannot read `[]` on a slow runner.
+        for _ in range(400):
+            if not (await handle.query(DevLoopWorkflow.contract_state)).open_request_ids:
+                break
+            await anyio.sleep(0.05)
+        assert not (await handle.query(DevLoopWorkflow.contract_state)).open_request_ids, "delivery never closed"
         state = await handle.query(DevLoopWorkflow.work_context)
         reasons = [r.reason for r in state.resume_rejections]
         await _stop(env_, loop)
