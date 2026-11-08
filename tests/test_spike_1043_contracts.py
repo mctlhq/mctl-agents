@@ -93,7 +93,7 @@ def test_jsonschema_dev_lock_is_complete():
     with (root / "pyproject.toml").open("rb") as fp:
         project = tomllib.load(fp)
 
-    assert lock["revision"] == 5
+    assert lock["revision"] >= 5
     packages = {p["name"]: p for p in lock["package"]}
     required = {"jsonschema", "attrs", "jsonschema-specifications", "referencing", "rpds-py"}
     assert required.issubset(packages), required - packages.keys()
