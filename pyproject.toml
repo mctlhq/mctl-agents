@@ -82,6 +82,7 @@ dev = [
     "pytest~=9.0",
     "ruff~=0.16",
     "mypy~=2.3",
+    "jsonschema==4.26.0",  # tests/test_spike_1043_contracts.py (required, never skipped)
     "types-pyyaml~=6.0",  # stub package — PyYAML ships no inline types
 ]
 
