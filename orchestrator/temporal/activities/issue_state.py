@@ -183,7 +183,7 @@ def reconcile_marker(workflow_id: str, deadline: str) -> str:
 
 
 def _is_trusted_author(comment: dict) -> bool:
-    user = comment.get("user") or {}
+    user = comment["user"]
     if user.get("login") == RECORD_WRITER_LOGIN and user.get("type") == "Bot":
         return True
     return comment.get("author_association") in TRUSTED_ASSOCIATIONS
@@ -218,8 +218,7 @@ def _read_comment_page(response: httpx.Response, url: str) -> list[dict] | str:
         if (
             not isinstance(item, dict)
             or not isinstance(item.get("body"), str)
-            or "user" not in item
-            or not (item["user"] is None or isinstance(item["user"], dict))
+            or not isinstance(item.get("user"), dict)
         ):
             raise IssueStateError(f"malformed comment item from {url}")
     return items
