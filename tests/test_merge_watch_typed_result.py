@@ -250,7 +250,52 @@ class _FlaggedLoop(DevLoopWorkflow):
         self._reconcile_required = True
 
 
-async def _deliver_with(fake, env_, *, flagged: bool, **open_kwargs: Any) -> str:
+def _in_delivery_wait() -> bool:
+    """True when the caller of `_is_approved` is the wait predicate of
+    `DevLoopWorkflow._deliver` (a lambda defined inside `_deliver`). Located by
+    code position, not by line number, so it follows edits of `_deliver`."""
+    lines, first = inspect.getsourcelines(DevLoopWorkflow._deliver)
+    caller = inspect.currentframe().f_back.f_back.f_code  # type: ignore[union-attr]
+    return caller.co_name == "<lambda>" and first < caller.co_firstlineno < first + len(lines)
+
+
+@workflow.defn(name="DevLoopWorkflow", sandboxed=False)
+class _FlagDuringWaitLoop(DevLoopWorkflow):
+    """Test-only (T6b): the flag turns true when the delivery's wait predicate
+    is evaluated, i.e. AFTER check 1 saw it false. Only check 2 can refuse."""
+
+    @workflow.run
+    async def run(self, issue: IssueRef) -> Any:
+        return await super().run(issue)
+
+    def _is_approved(self, *, needs_grant: bool = True) -> bool:
+        if _in_delivery_wait():
+            self._reconcile_required = True
+        return super()._is_approved(needs_grant=needs_grant)
+
+
+@workflow.defn(name="DevLoopWorkflow", sandboxed=False)
+class _FlagClearedAtWaitLoop(DevLoopWorkflow):
+    """Test-only (T6c): the flag is true at check 1 and false again by the time
+    the wait resolves. Only check 1 can refuse."""
+
+    @workflow.run
+    async def run(self, issue: IssueRef) -> Any:
+        return await super().run(issue)
+
+    @workflow.signal
+    def flag(self) -> None:
+        self._reconcile_required = True
+
+    def _is_approved(self, *, needs_grant: bool = True) -> bool:
+        if _in_delivery_wait():
+            self._reconcile_required = False
+        return super()._is_approved(needs_grant=needs_grant)
+
+
+async def _deliver_with(
+    fake, env_, *, flagged: bool, loop_cls: type | None = None, **open_kwargs: Any
+) -> tuple[str, list[str]]:
     submit, _ = _submit_log()
     loop = workflow_id_for(URL)
     rid = fake.create_request("resume")
@@ -268,10 +313,10 @@ async def _deliver_with(fake, env_, *, flagged: bool, **open_kwargs: Any) -> str
         open_deliveries=(OpenDelivery(delivery=_delivery(rid), **open_kwargs),),
     )
     activities = _loop_activities(submit, pr_states=[OPEN_PR])
-    cls = _FlaggedLoop if flagged else DevLoopWorkflow
+    cls = loop_cls or (_FlaggedLoop if flagged else DevLoopWorkflow)
     async with Worker(env_.client, task_queue=TASK_QUEUE, workflows=[cls], activities=activities):
         extra: dict[str, Any] = {"start_signal": "flag"} if flagged else {}
-        await env_.client.start_workflow(
+        handle = await env_.client.start_workflow(
             cls.run,
             IssueRef(issue_url=URL, work_item_id=WID, resume=carried),
             id=loop,
@@ -281,20 +326,40 @@ async def _deliver_with(fake, env_, *, flagged: bool, **open_kwargs: Any) -> str
         await _dispatcher(env_).dispatch_once()
         await _wait_for(lambda: _row(fake, ref)["phase"] in ("Succeeded", "Failed"))
         phase: str = _row(fake, ref)["phase"]
+        state = await handle.query(DevLoopWorkflow.work_context)
+        reasons = [r.reason for r in state.resume_rejections]
         await _stop(env_, loop)
-    return phase
+    return phase, reasons
+
+
+REFUSED = ["delivery-" + MERGE_WATCH_RECONCILE_REFUSAL]
 
 
 async def test_a_flagged_loop_refuses_a_bound_delivery(api, env):  # noqa: F811
-    assert await _deliver_with(api, env, flagged=True) == "Failed"
+    assert await _deliver_with(api, env, flagged=True) == ("Failed", REFUSED)
 
 
 async def test_an_unflagged_loop_still_lands_the_same_delivery_succeeded(api, env):  # noqa: F811
-    assert await _deliver_with(api, env, flagged=False) == "Succeeded"
+    assert await _deliver_with(api, env, flagged=False) == ("Succeeded", [])
 
 
 async def test_the_flag_does_not_change_accepted_after_the_gates(api, env):  # noqa: F811
-    assert await _deliver_with(api, env, flagged=True, accepted_after_gates=True) == "Failed"
+    # The pre-existing early exit returns before check 1: its reason stays
+    # `feedback-not-ready`, never the new refusal.
+    assert await _deliver_with(api, env, flagged=True, accepted_after_gates=True) == (
+        "Failed",
+        ["delivery-feedback-not-ready"],
+    )
+
+
+async def test_a_flag_set_while_the_delivery_waits_is_caught_by_the_check_after_the_wait(api, env):  # noqa: F811
+    # Check 1 saw the flag false; only check 2 (after `wait_condition`) can refuse.
+    assert await _deliver_with(api, env, flagged=False, loop_cls=_FlagDuringWaitLoop) == ("Failed", REFUSED)
+
+
+async def test_a_flag_that_is_gone_by_the_wait_is_still_refused_by_the_check_after_the_bind(api, env):  # noqa: F811
+    # The flag is true at check 1 and false again by check 2; only check 1 can refuse.
+    assert await _deliver_with(api, env, flagged=True, loop_cls=_FlagClearedAtWaitLoop) == ("Failed", REFUSED)
 
 
 # -- T7: CLI ---------------------------------------------------------------------
