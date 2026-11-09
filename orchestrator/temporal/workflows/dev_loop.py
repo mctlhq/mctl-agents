@@ -348,6 +348,8 @@ SUPERSEDE_REASON = "superseded: proposal rewritten"
 _MAX_SUPERSEDED_REFS = 16
 #: `request_devloop_approval`'s state for a grant a human already approved.
 APPROVAL_APPROVED = "approved"
+#: Its state for a grant that waits for a decision; the only one announced.
+APPROVAL_PENDING = "pending"
 #: mctlhq/mctl-api#964: once per pending grant, tell the operator through a
 #: Telegram URL button to mctl-api's decide page. The notification is
 #: best-effort and decides nothing; a history without the marker replays
@@ -2397,7 +2399,14 @@ class DevLoopWorkflow:
             # The decision's signal overtook the request's answer.
             self._approval_ref = requested.approval_ref
             self._approved = True
-        elif requested.approval_ref not in self._notified_refs and workflow.patched(DECIDE_NOTIFY_PATCH):
+        elif (
+            requested.state == APPROVAL_PENDING
+            and requested.approval_ref not in self._notified_refs
+            and workflow.patched(DECIDE_NOTIFY_PATCH)
+        ):
+            # Only a grant that waits is announced. `ok`, the ref and
+            # supersedes are checked above; the state is checked here too
+            # rather than inferred from `ok` (agy P2 on #1054).
             await self._notify_decision(issue, target_repo, slug, requested)
         return None
 

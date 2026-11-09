@@ -8825,6 +8825,24 @@ class TestDecideNotify:
         )
         assert notes == []
 
+    async def test_a_grant_in_any_other_state_is_not_announced(self, env):
+        notes: list[DecideNotifyInput] = []
+        requests: list[ApprovalRequestInput] = []
+
+        async def answered(_handle):
+            # Approve only once the answer is in, so the branch is reached.
+            await self._wait_for(lambda: len(requests) == 1)
+            await env.sleep(timedelta(minutes=5))
+
+        await self._run(
+            env, approve_with=["aar_odd"], before_approve=answered, notify_log=notes, approval_requests=requests,
+            approval_result=ApprovalRequestResult(
+                ok=True, approval_ref="aar_odd", state="unexpected",
+                content_digest=self.CONTENT, content_commit="c1", context_digest=self.CTX,
+            ),
+        )
+        assert notes == []
+
     async def test_a_failed_notification_decides_nothing_and_blocks_nothing(self, env):
         notes: list[DecideNotifyInput] = []
         delegated: list[DelegatedApproveInput] = []
