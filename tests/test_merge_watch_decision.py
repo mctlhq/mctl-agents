@@ -9,8 +9,8 @@ the wiring in `_watch_pr`, the `finally` guards, `_deliver`, any cancellation
 surface, or the real `ActionApprovalWaitWorkflow` (the standing-in gate is a
 plain task). Those are slice 1d-2b.
 
-`test_inertness_pin` (D17a) describes today's code; 1d-2b replaces it with an
-activation pin.
+`test_activation_pin` (D17) replaced the 1d-2a inertness pin in 1d-2b-i
+(#1055): `_watch_pr` now calls the decision from its `while ... else:` arm.
 """
 
 from __future__ import annotations
@@ -552,9 +552,9 @@ def test_a10_gate_result_that_did_not_run_leaves_the_head():
 # -- D17a: the inertness pin -------------------------------------------------------------
 
 HELPERS = {"_decide_watch_end", "_settle_watch_work", "_final_pr_read", "_wait_unless_abandoned"}
-FLAG_OWNERS = {"__init__", "_decide_watch_end", "_settled"}
+FLAG_OWNERS = {"__init__", "_decide_watch_end", "_settled", "_watch_pr", "_deliver"}
 # `workflow.patched(` calls on main 55b4633, counted from the AST.
-PATCHED_CALLS = 37
+PATCHED_CALLS = 38  # 37 at 1d-2a; main gained DECIDE_NOTIFY_PATCH (#1054); #1055 adds none
 FORBIDDEN = {
     "is_cancelled_exception",
     "_retain_claim",
@@ -578,7 +578,7 @@ def _mentions(node: ast.AST) -> set[str]:
     return out
 
 
-def test_inertness_pin():
+def test_activation_pin():
     path = Path(dev_loop.__file__)
     tree = ast.parse(path.read_text())
     owners: list[tuple[str, ast.AST]] = []
@@ -597,19 +597,34 @@ def test_inertness_pin():
     assert set(by_name) == {"_watch_pr", "_deliver"}
 
     helper_names = HELPERS | {"_settled"}
-    # Nothing outside the helpers mentions them (no production call site).
+    # The helpers are called only from each other and `_watch_pr`.
     for name, node in owners:
-        if name not in helper_names:
+        if name not in helper_names and name != "_watch_pr":
             assert not (_mentions(node) & HELPERS), f"{name} mentions a deadline-decision helper"
-    # `_watch_pr` is not wired: no `while ... else`, no flag, no helper; `_deliver` has no flag.
+    # `_watch_pr` has exactly one `while ... else`, and it calls the decision.
     watch_pr = by_name["_watch_pr"]
-    assert not any(isinstance(n, ast.While) and n.orelse for n in ast.walk(watch_pr))
-    assert not (_mentions(watch_pr) & (HELPERS | {"_watch_unrecorded", "_settled"}))
-    assert "_watch_unrecorded" not in _mentions(by_name["_deliver"])
-    # The flag lives only in `__init__`, the decision and `_settled`.
+    elses = [n for n in ast.walk(watch_pr) if isinstance(n, ast.While) and n.orelse]
+    assert len(elses) == 1
+    called = {
+        n.func.attr
+        for stmt in elses[0].orelse
+        for n in ast.walk(stmt)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+    }
+    assert "_decide_watch_end" in called
+    # The flag lives only where the design says (R9, R11, R12).
     for name, node in owners:
         if "_watch_unrecorded" in _mentions(node):
             assert name in FLAG_OWNERS, f"{name} mentions _watch_unrecorded"
+    # The unrecorded marker has readers beyond its definition.
+    readers = [
+        n
+        for name, node in owners
+        if name != "<module>"
+        for n in ast.walk(node)
+        if isinstance(n, ast.Name) and n.id == "MERGE_WATCH_RECONCILE_UNRECORDED"
+    ]
+    assert readers
     # Nothing of 1d-3/1d-4 exists yet.
     for name, node in owners:
         assert not (_mentions(node) & FORBIDDEN), f"{name} mentions a 1d-3/1d-4 name"

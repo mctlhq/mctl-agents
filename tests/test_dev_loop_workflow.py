@@ -4152,11 +4152,16 @@ class TestDevLoopWorkflow:
             with anyio.fail_after(10):
                 await investigate_ran.wait()
             await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
-            result = await handle.result()
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
 
-        assert result.implement is not None and result.implement.phase == "Succeeded"
-        assert result.pr is not None
-        assert result.pr.state == "OPEN"
+        # #1055: the deadline decision's final reads fail too, so the end is
+        # not established and fails closed with the claim retained.
+        cause = excinfo.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == "MergeWatchReconcileUnrecorded"
+        ops = [o.op for o in _ownership_ops]
+        assert ops[-1] not in ("release", "terminal")
 
     async def test_merge_detection_preserves_unresolvable_recorded_pr(self, env):
         """A recorded PR link that 404s (deleted repo, lost token access)

@@ -77,15 +77,14 @@ def test_the_flag_and_the_refusal_are_inert_plumbing():
 
 
 def test_nothing_in_production_sets_the_flag_or_a_watch_end():
-    """1d-1-only scan: 1d-2 and 1d-3 remove it explicitly."""
+    """The flag half of the 1d-1 scan: 1d-3 removes it explicitly. The
+    `watch_end` half went with 1d-2b-i (#1055), which sets `watch_end`."""
     tree = ast.parse(inspect.getsource(dev_loop))
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             for t in node.targets:
                 if isinstance(t, ast.Attribute) and t.attr == "_reconcile_required":
                     assert not (isinstance(node.value, ast.Constant) and node.value.value is True)
-        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_WatchOutcome":
-            assert "watch_end" not in {k.arg for k in node.keywords}
 
 
 # -- T3 / T4: payload compatibility ----------------------------------------------
