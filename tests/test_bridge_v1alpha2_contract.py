@@ -535,6 +535,14 @@ def test_t12_claim_envelope():
     assert _reject(bc.check_claim_response, _text(full)) == "schema_invalid"
 
 
+def test_t12_claim_envelope_enforces_basket_rules_on_v2_writes():
+    full = _load("claim-response.v1alpha2.valid.json")
+    bc.check_claim_response(_text(full))
+    write = next(c for c in full["commands"] if c["schema_version"] == bf.V2 and c["kind"] == "place_order_fake")
+    write["payload"]["total_minor"] += 1
+    assert _reject(bc.check_claim_response, _text(full)) == "total_mismatch"
+
+
 # ---------------------------------------------------------------- T13
 
 

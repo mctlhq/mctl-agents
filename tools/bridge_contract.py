@@ -39,6 +39,7 @@ CONTRACT_DIR = ROOT / "docs" / "contracts" / "bridge" / "v1alpha2"
 V1_DIR = ROOT / "docs" / "spikes" / "1043"
 
 MAX_BODY_BYTES = 16384
+V2_SCHEMA_VERSION = "bridge.mctl.ai/v1alpha2"
 MAX_PAYLOAD_BYTES = 12288
 
 SCHEMA_FILES = {
@@ -164,6 +165,9 @@ def check_write_command(raw: bytes) -> dict[str, Any]:
 def check_claim_response(raw: bytes) -> dict[str, Any]:
     doc = _parse(raw)
     _validate_schema("claim-response", doc)
+    for command in doc.get("commands", []):
+        if command.get("schema_version") == V2_SCHEMA_VERSION and command.get("kind") == "place_order_fake":
+            _check_basket_rules(command["payload"])
     return doc
 
 
