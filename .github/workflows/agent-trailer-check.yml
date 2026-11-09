@@ -14,4 +14,4 @@ jobs:
     permissions:
       issues: write
       pull-requests: write
-    uses: mctlhq/.github/.github/workflows/agent-trailer.yml@afb232838c79279141d293e6ce311f3ec664bfbc
+    uses: mctlhq/.github/.github/workflows/agent-trailer.yml@b6e1337a3565759a7b7784db50eaf5e9f15c8748
