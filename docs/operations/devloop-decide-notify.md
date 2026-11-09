@@ -17,7 +17,10 @@ message is harmless and is never edited.
 - Not for a grant found already approved.
 - At least once, not exactly once: a worker crash between the send and its
   recording can repeat it.
-- A loop started before the worker carried the patch never sends.
+- A grant whose park already ran before the worker carried the patch is not
+  notified. A later park of the same loop (a re-ask after a transition or a
+  supersede) is: `workflow.patched()` records the marker the first time the
+  call site runs outside replay.
 
 ## Configuration
 
