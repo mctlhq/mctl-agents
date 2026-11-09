@@ -1748,6 +1748,10 @@ class MergeWatchResume:
     # attempt was decided about (MERGE_GATE_SETTLED_OUTCOMES): carried so a
     # hop does not re-ask about a head the previous run already settled.
     merge_gate_settled_head: str = ""
+    # The head a merge-gate attempt last RAN at (`_gate_ran_head`): carried so
+    # a hop does not lose the "a gate already ran at this head" fact the
+    # deadline decision reads (mctl-agents#1055).
+    gate_ran_head: str = ""
     last_lifecycle_op: str = ""
     last_lifecycle_op_landed: bool = False
     # Deliberately a DIFFERENT question from `abandoned` below -- whether
@@ -3094,14 +3098,17 @@ class DevLoopWorkflow:
         # A canonical loop's decision is a grant (#636): a bare or legacy
         # `approver` signal decides no delivery either.
         await workflow.wait_condition(
-            lambda: self._abandoned or self._is_approved() or self._gates_passed or self._exiting or self._hopping
+            lambda: self._abandoned or self._exiting or self._hopping
+            or ((self._is_approved() or self._gates_passed) and not self._watch_unrecorded)
         )
         if self._reconcile_required:
             # wait_condition suspends even when already true: a flag set in the
             # activation that resolves the wait is seen only here.
             await self._land_delivery(opened, "Failed", MERGE_WATCH_RECONCILE_REFUSAL, engine_ref)
             return
-        decided = (self._is_approved() or self._gates_passed) and not self._abandoned
+        decided = (
+            (self._is_approved() or self._gates_passed) and not self._abandoned and not self._watch_unrecorded
+        )
         if self._hopping and not decided and not self._abandoned:
             return  # still open, undecided: carried across the hop, re-bound by the next run
         await self._land_delivery(opened, "Succeeded" if decided else "Failed", "", engine_ref)
@@ -4703,6 +4710,7 @@ class DevLoopWorkflow:
         self._merge_gate_execution_id = resume.merge_gate_execution_id
         self._merge_gate_trace_id = resume.merge_gate_trace_id
         self._gate_settled_head = resume.merge_gate_settled_head
+        self._gate_ran_head = resume.gate_ran_head
         self._last_lifecycle_op = resume.last_lifecycle_op
         self._last_lifecycle_op_landed = resume.last_lifecycle_op_landed
         self._claim_abandoned = resume.claim_abandoned
@@ -6674,11 +6682,15 @@ class DevLoopWorkflow:
         record for `run`/`_resume_merge_watch` to continue_as_new with
         (mctl-agents#404 v2).
 
-        Observational, fail-open: a persistently failing read (GitHub outage
-        outlasting the activity retries) returns the last known state
-        instead of failing a loop whose implement already succeeded. That
-        state is the last observed one, not a verified final answer; later
-        slices (#1021 M2b-1d) mark such ends in `_WatchOutcome.watch_end`. Returns
+        Observational, fail-open for the read-error exit: a persistently
+        failing read (GitHub outage outlasting the activity retries) returns
+        the last known state instead of failing a loop whose implement
+        already succeeded. That state is the last observed one, not a
+        verified final answer. The DEADLINE exit of a patched watch is
+        different (mctl-agents#1055): it reads the PR once more through
+        `_decide_watch_end` and, when that state cannot be established, fails
+        closed with `MERGE_WATCH_RECONCILE_UNRECORDED`, retaining the claim.
+        Later slices (#1021 M2b-1d) mark the remaining exits. Returns
         a `last` of None when no PR link ever appeared within the grace
         polls -- UNLESS this is a resumed run carrying an abandon, in which
         case the carried `resume.last_pr` is returned instead: task 5a's
@@ -6845,6 +6857,9 @@ class DevLoopWorkflow:
         # exit -- the `finally` block's `reason=` and the final
         # `_WatchOutcome.ended` both read it.
         watch_ended = ""
+        # Set only by the deadline decision below (mctl-agents#1055).
+        watch_end = ""
+        decision_kind = ""
         try:
             # mctl-agents#420: `and not self._abandoned` lets an `abandon`
             # signal cut a 14-day merge watch short at its next poll boundary
@@ -6912,6 +6927,7 @@ class DevLoopWorkflow:
                         merge_gate_execution_id=self._merge_gate_execution_id,
                         merge_gate_trace_id=self._merge_gate_trace_id,
                         merge_gate_settled_head=self._gate_settled_head,
+                        gate_ran_head=self._gate_ran_head,
                         last_lifecycle_op=self._last_lifecycle_op,
                         last_lifecycle_op_landed=self._last_lifecycle_op_landed,
                         claim_abandoned=self._claim_abandoned,
@@ -7135,6 +7151,23 @@ class DevLoopWorkflow:
                 # guard) means what it says.
                 polls_this_run += 1
                 await workflow.sleep(cadence.poll_interval)
+            else:
+                # The loop condition went false. Only a patched (or resumed
+                # patched) watch decides; an ordinary operator abandon keeps
+                # today's path and `watch_end == ""`. `break`/`return` exits
+                # skip this arm.
+                if watch.terminal_reconcile and not self._abandoned:
+                    decision = await self._decide_watch_end("deadline", watch, service, slug)
+                    decision_kind = decision.kind
+                    if decision.last is not None:
+                        watch.last = decision.last
+                    if decision.kind == "final":
+                        return _WatchOutcome(last=decision.last, watch_end=WATCH_END_FINAL_READ)
+                    if decision.kind == "open":
+                        watch_end = WATCH_END_FINAL_READ
+                    elif decision.kind == "abandoned":
+                        watch_end = WATCH_END_ABANDONED_UNVERIFIED
+                    # "unrecorded": the flag stays True; `finally` keeps the claim.
         finally:
             await self._settle_tick(watch.tick_task, service, slug)
             # mctlhq/mctl-agents#519: same rule as the shepherd tick above --
@@ -7155,7 +7188,7 @@ class DevLoopWorkflow:
             # (an ABANDON, which releases) independent of a HOP (which does
             # not) -- the two are mutually exclusive by construction, since
             # the hop predicate refuses to fire while `self._abandoned`.
-            if not hopping and watch.track_ownership and self._owned_entity_id:
+            if not hopping and not self._watch_unrecorded and watch.track_ownership and self._owned_entity_id:
                 # The watch ended without the PR reaching a terminal state —
                 # the deadline expired, or the PR stopped resolving. RELEASE,
                 # not terminal: the work remains and somebody must be able to
@@ -7220,15 +7253,35 @@ class DevLoopWorkflow:
                 # terminal value of these fields is observable exactly when the
                 # question is asked.
                 self._finish_claim(op, done, repo, number)
+            elif not hopping and self._watch_unrecorded and watch.track_ownership:
+                # Fail closed: the deadline decision could not establish the
+                # PR state (or was unwound by an exception/cancel), so no
+                # release/terminal is written; the reconciler reaps the claim.
+                workflow.logger.warning(
+                    "%s repo=%s workflow=%s exit=deadline last=%s",
+                    MERGE_WATCH_RECONCILE_UNRECORDED,
+                    self._owned_entity_id.partition("#")[0] if self._owned_entity_id else None,
+                    workflow.info().workflow_id,
+                    (watch.last.state if watch.last is not None else None),
+                )
             # After the LAST relinquishing write of this watch, whichever path
             # made it. One metric line per abandoned entity, not per failed
             # attempt — see _report_claim_abandonment. Also skipped on a hop:
             # a hop never attempts a relinquishing write, so `_claim_abandoned`
             # cannot have changed here, and reporting it again per hop would
             # turn a once-per-entity metric into one per continuation.
+            # Deliberately NOT guarded by `_watch_unrecorded` (mctl-agents#1055
+            # R10): an unrecorded end makes no relinquishing attempt, so this
+            # still reports a claim an earlier failed write abandoned, once.
             if not hopping and watch.track_ownership:
                 self._report_claim_abandonment()
         if hopping:
             assert resume_record is not None  # noqa: S101 -- set right before every `break` above
             return _WatchOutcome(last=watch.last, resume=resume_record)
-        return _WatchOutcome(last=watch.last, ended=watch_ended)
+        if decision_kind == "unrecorded":
+            raise ApplicationError(
+                "merge watch deadline: pull-request state not established; claim retained",
+                type=MERGE_WATCH_RECONCILE_UNRECORDED,
+                non_retryable=True,
+            )
+        return _WatchOutcome(last=watch.last, ended=watch_ended, watch_end=watch_end)

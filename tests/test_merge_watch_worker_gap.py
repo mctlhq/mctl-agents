@@ -12,9 +12,10 @@ poll timer, virtual time is advanced past the deadline but before the timer
 (no timer fires, no task is pending, so time moves freely), and worker 2 then
 picks the workflow up. Its first task starts past the deadline.
 
-Scenario A (deadline start+10 min): the watch ends on the deadline with the
-pre-gap `OPEN` state and no further `get_pr_state` read; the fake already
-answers `MERGED` by then. Scenario B (deadline start+20 min, the control): the
+Scenario A (deadline start+10 min): with a patched record
+(`terminal_reconcile=True`, #1055) the watch reads the PR once more at the
+deadline and reports `MERGED`; with an unpatched record it still ends on the
+deadline with the pre-gap `OPEN` state and no further read. Scenario B (deadline start+20 min, the control): the
 same gap, but the deadline is still ahead, so worker 2 reads `MERGED`.
 
 Mapping of the `_watch_pr` statements this run executes against an ordinary
@@ -37,7 +38,8 @@ production merge watch:
 - The merge gate is suppressed by `merge_gate_settled_head` equal to the fake
   head SHA. DIFFERENCE: production would ask a human about an un-settled head.
   A real hop record can carry this state.
-- The deadline exit without a read is the same code path as production. Only
+- The deadline decision (patched record) and the legacy deadline exit
+  (unpatched record) are the same code paths as production. Only
   the gap differs: 12 virtual minutes, not 14 days. This is NOT equivalent to
   a 14-day outage.
 - One run, no continue-as-new: the same as a production watch that never hops.
@@ -111,6 +113,9 @@ async def env():
 class _Holder:
     state: PRState = OPEN_PR
     calls: list[PRState] = field(default_factory=list)
+    # The lifecycle-ownership requests the CURRENT worker's fake recorded
+    # (the factory's own list, shared by reference; worker 2 replaces it).
+    ops: list[Any] = field(default_factory=list)
 
     @property
     def merged_returns(self) -> int:
@@ -118,7 +123,8 @@ class _Holder:
 
 
 def _activities(holder: _Holder) -> list[Any]:
-    activities, *_ = _fake_activities(released=True, pr_states=[OPEN_PR])
+    activities, _calls, _investigate_ran, ownership_ops = _fake_activities(released=True, pr_states=[OPEN_PR])
+    holder.ops = ownership_ops
 
     @activity.defn(name="get_pr_state")
     async def get_pr_state(service: str, slug: str) -> PRState:
@@ -132,7 +138,7 @@ def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def _resume_record(t0: datetime, offset: timedelta) -> MergeWatchResume:
+def _resume_record(t0: datetime, offset: timedelta, *, terminal_reconcile: bool = False) -> MergeWatchResume:
     """A record shaped like one `_watch_pr` itself would hand over at a hop."""
     return MergeWatchResume(
         service=SERVICE,
@@ -147,6 +153,7 @@ def _resume_record(t0: datetime, offset: timedelta) -> MergeWatchResume:
         track_ownership=True,
         proposal_terminal_end=True,
         deferred_resume_contract=True,
+        terminal_reconcile=terminal_reconcile,
         merge_gate_settled_head=HEAD_SHA,
         owned_entity_id=OWNED_ENTITY_ID,
         owner_epoch=OWNER_EPOCH,
@@ -213,11 +220,13 @@ class _Run:
     deadline: datetime
 
 
-async def _run_with_gap(env: WorkflowEnvironment, offset: timedelta) -> _Run:
+async def _run_with_gap(
+    env: WorkflowEnvironment, offset: timedelta, *, terminal_reconcile: bool = False
+) -> _Run:
     holder = _Holder()
     t0 = await env.get_current_time()
-    record = _resume_record(t0, offset)
-    workflow_id = f"merge-watch-gap-{offset.total_seconds():.0f}"
+    record = _resume_record(t0, offset, terminal_reconcile=terminal_reconcile)
+    workflow_id = f"merge-watch-gap-{offset.total_seconds():.0f}-{int(terminal_reconcile)}"
 
     async with _worker(env, holder, WORKER_1):
         handle = await env.client.start_workflow(
@@ -301,13 +310,32 @@ async def _assert_interrupted(run: _Run, env: WorkflowEnvironment) -> None:
     assert issue.resume.deadline == run.record.deadline
 
 
-async def test_deadline_in_gap_ends_watch_without_reading_merged(env):
+async def test_deadline_in_gap_reads_the_merged_pr_once_more(env):
+    """D1 (#1055): a patched record whose deadline fell in the worker gap
+    reads the PR once more and reports it MERGED, written `terminal`."""
+    run = await _run_with_gap(env, timedelta(minutes=10), terminal_reconcile=True)
+    await _assert_interrupted(run, env)
+
+    schedules = _pr_state_schedules(run.events)
+    assert len(schedules) == 2
+    assert _ts(schedules[1]) >= run.gap_end
+    assert run.holder.merged_returns == 1
+    assert run.result.pr is not None and run.result.pr.state == "MERGED"
+    assert run.result.watch_end == "final-read"
+    ops = [o.op for o in run.holder.ops]
+    assert "terminal" in ops and "release" not in ops
+
+
+async def test_unpatched_record_keeps_the_legacy_deadline_end(env):
+    """D2: a record without `terminal_reconcile` ends on the deadline with the
+    pre-gap OPEN state and no further read, exactly as before #1055."""
     run = await _run_with_gap(env, timedelta(minutes=10))
     await _assert_interrupted(run, env)
 
     assert len(_pr_state_schedules(run.events)) == 1
     assert run.holder.merged_returns == 0
     assert run.result.pr is not None and run.result.pr.state == "OPEN"
+    assert run.result.watch_end == ""
 
     post_gap = [
         e for e in _of(run.events, EventType.EVENT_TYPE_WORKFLOW_TASK_STARTED) if _ts(e) >= run.gap_end
