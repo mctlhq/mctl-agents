@@ -1,0 +1,55 @@
+{
+  "schema_version": "bridge.mctl.ai/v1alpha2",
+  "command_id": "cmd_01HZZZZZZZZZZZZZZZZZZZZZZZ",
+  "request_id": "rdq_01HYYYYYYYYYYYYYYYYYYYYYYY",
+  "kind": "read_history",
+  "lease_token": "lt_0123456789abcdef0123",
+  "attempt": 1,
+  "worker_identity": "provider:glovo",
+  "outcome": "succeeded",
+  "provider_effect": "none",
+  "error_code": "none",
+  "completed_at": "2026-11-09T10:01:00Z",
+  "payload": {
+    "orders": [
+      {
+        "history_order_ref": "pho_00000000000000000000",
+        "placed_on": "2026-11-01",
+        "status": "delivered",
+        "total_minor": 1500,
+        "currency": "EUR",
+        "line_count": 2,
+        "lines": [
+          {
+            "item_code": "FAKE-0",
+            "quantity": 1
+          },
+          {
+            "item_code": "FAKE-1",
+            "quantity": 2
+          }
+        ]
+      },
+      {
+        "history_order_ref": "pho_00000000000000000001",
+        "placed_on": "2026-11-02",
+        "status": "cancelled",
+        "total_minor": 1501,
+        "currency": "EUR",
+        "line_count": 2,
+        "lines": [
+          {
+            "item_code": "FAKE-0",
+            "quantity": 1
+          },
+          {
+            "item_code": "FAKE-1",
+            "quantity": 2
+          }
+        ]
+      }
+    ],
+    "next_cursor": "c2VlZC1jdXJzb3I"
+  },
+  "payload_digest": "sha256:4fe00fe544e1d3ff635bf6b0cfeac135a925cd547ecbcff48416cc43c4c9e465"
+}

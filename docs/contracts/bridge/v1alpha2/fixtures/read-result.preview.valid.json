@@ -1,0 +1,52 @@
+{
+  "schema_version": "bridge.mctl.ai/v1alpha2",
+  "command_id": "cmd_01HZZZZZZZZZZZZZZZZZZZZZZZ",
+  "request_id": "rdq_01HYYYYYYYYYYYYYYYYYYYYYYY",
+  "kind": "read_preview",
+  "lease_token": "lt_0123456789abcdef0123",
+  "attempt": 1,
+  "worker_identity": "provider:glovo",
+  "outcome": "succeeded",
+  "provider_effect": "none",
+  "error_code": "none",
+  "completed_at": "2026-11-09T10:01:00Z",
+  "payload": {
+    "empty": false,
+    "display": [
+      {
+        "item_code": "FAKE-BREAD",
+        "item_name": "Fake Bread"
+      },
+      {
+        "item_code": "FAKE-MILK",
+        "item_name": "Fake Milk"
+      }
+    ],
+    "unavailable_items": [
+      "FAKE-GONE"
+    ],
+    "approval_basket": {
+      "v": "mctl-approval-basket/v1",
+      "store_ref": "pst_0123456789abcdef0123",
+      "currency": "EUR",
+      "lines": [
+        {
+          "item_code": "FAKE-BREAD",
+          "quantity": 2,
+          "unit_price_minor": 150
+        },
+        {
+          "item_code": "FAKE-MILK",
+          "quantity": 1,
+          "unit_price_minor": 120
+        }
+      ],
+      "subtotal_minor": 420,
+      "delivery_fee_minor": 199,
+      "service_fee_minor": 50,
+      "discount_minor": 0,
+      "total_minor": 669
+    }
+  },
+  "payload_digest": "sha256:76f36c65367927b1142b1ef043dc3b163fcca7e33d04faaaf8e5594b75f68ada"
+}
