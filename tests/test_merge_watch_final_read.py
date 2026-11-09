@@ -594,6 +594,12 @@ async def test_a_delivery_is_held_while_a_decision_is_undecided(api, env):  # no
             start_signal="raise_flag",
         )
         await _dispatcher(env).dispatch_once()
+        # The first bind attempt is refused while the request is still
+        # claimed; the test server skips that retry backoff only while the test
+        # sleeps. Without this the delivery has not reached the wait yet and
+        # the hold below would pass vacuously.
+        await anyio.sleep(1.0)
+        await env.sleep(timedelta(minutes=2))
         await anyio.sleep(1.5)
         assert _row(api, ref)["phase"] not in ("Succeeded", "Failed"), "the delivery was fulfilled while held"
         await env.client.get_workflow_handle(loop).signal(_UnrecordedLoop.lower_flag)
