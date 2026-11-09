@@ -161,6 +161,7 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.issue_ref import parse_issue_url, request_engine_ref, run_engine_ref
     from orchestrator.temporal.workflows.action_approval import (
         DEFAULT_MAX_WAIT_SECONDS,
+        GATED_ACTIVITY_TIMEOUT,
         OUTCOME_BLOCKED,
         OUTCOME_CONSUMED,
         OUTCOME_DENIED,
@@ -630,6 +631,12 @@ PR_LOOKUP_GRACE_POLLS = 8
 LEGACY_PR_LOOKUP_GRACE_POLLS = 4
 PR_STATE_TIMEOUT = timedelta(minutes=2)
 PR_STATE_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
+# The deadline decision's final PR read (#1052, slice 1d-2a): how many read
+# attempts one set makes, and the wait between them.
+FINAL_READ_ATTEMPTS = 3
+FINAL_READ_BACKOFF = timedelta(minutes=2)
+# Log tag / error type for the interim end 1d-2b wires in.
+MERGE_WATCH_RECONCILE_UNRECORDED = "MergeWatchReconcileUnrecorded"
 
 # The proposal statuses that mean "no machine will advance this any further"
 # (mctlhq/mctl-agents#516): `review-stuck` (run_shepherd, MAX_REVIEW_ATTEMPTS
@@ -1828,6 +1835,24 @@ class _MergeWatchRun:
 
 
 @dataclass(frozen=True)
+class _FinalRead:
+    """One final-read set of the deadline decision (#1052, 1d-2a): the first
+    found state, if any, and whether abandon cut the set short."""
+
+    fresh: PRState | None
+    abandoned: bool
+
+
+@dataclass(frozen=True)
+class _WatchDecision:
+    """The deadline decision: `kind` is `final`, `open`, `abandoned` or
+    `unrecorded`; `last` is the last observed or fresh state."""
+
+    kind: str
+    last: PRState | None
+
+
+@dataclass(frozen=True)
 class _WatchOutcome:
     """What `_watch_pr` decided when its loop ended.
 
@@ -1967,6 +1992,12 @@ class DevLoopWorkflow:
         self._gate_head = ""
         self._gate_settled_head = ""
         self._gate_off_until_poll = 0
+        # Deadline decision state (#1052, 1d-2a), instance-only, never
+        # serialized: the head a gate attempt that RAN was asked about, and
+        # the interim retention flag held from decision start until it
+        # returns final/open/abandoned.
+        self._gate_ran_head = ""
+        self._watch_unrecorded = False
         # The last relinquishing write and whether it landed, so the
         # abandonment branch in _watch_pr's finally has a reader.
         self._last_lifecycle_op = ""
@@ -5486,6 +5517,8 @@ class DevLoopWorkflow:
             # attempt on this very poll would only re-read it to answer
             # `merge_precondition_unmet`.
             self._gate_settled_head = self._gate_head
+        if result.ran:
+            self._gate_ran_head = self._gate_head
 
     def _gate_may_start(self, *, head_sha: str, poll_index: int) -> bool:
         """Whether this poll may start a new gate attempt for `head_sha`:
@@ -6536,6 +6569,102 @@ class DevLoopWorkflow:
             self._finish_claim(
                 "terminal", done, state.repo or "", state.number or 0
             )
+
+    async def _wait_unless_abandoned(self, duration: timedelta) -> bool:
+        """Wait `duration`, ending early on abandon. True when abandoned."""
+        if self._abandoned:
+            return True
+        if duration <= timedelta(0):
+            return False
+        try:
+            await workflow.wait_condition(lambda: self._abandoned, timeout=duration)
+            return True
+        except TimeoutError:
+            return False  # a workflow cancel is NOT caught here
+
+    async def _settle_watch_work(self, watch: _MergeWatchRun, service: str, slug: str) -> bool:
+        """Cancel and drain the in-flight shepherd tick and merge gate.
+        True when at least one was in flight (an own attempt unobserved)."""
+        in_flight = [t for t in (watch.tick_task, watch.gate_task) if t is not None and not t.done()]
+        for t in in_flight:
+            t.cancel()
+        if in_flight:
+            await workflow.wait(in_flight)
+        await self._settle_tick(watch.tick_task, service, slug)
+        await self._settle_gate(
+            watch.gate_task, service, slug,
+            repo=(watch.last.repo if watch.last is not None else None) or "",
+            number=(watch.last.number if watch.last is not None else None) or 0,
+            poll_index=watch.poll_index,
+        )
+        watch.tick_task = None
+        watch.gate_task = None
+        return bool(in_flight)
+
+    async def _final_pr_read(self, watch: _MergeWatchRun, service: str, slug: str) -> _FinalRead:
+        """One final-read set: up to FINAL_READ_ATTEMPTS reads of the PR."""
+        for attempt in range(FINAL_READ_ATTEMPTS):
+            if attempt and await self._wait_unless_abandoned(FINAL_READ_BACKOFF):
+                return _FinalRead(None, True)
+            try:
+                state = await workflow.execute_activity(
+                    get_pr_state,
+                    args=[service, slug],
+                    start_to_close_timeout=PR_STATE_TIMEOUT,
+                    retry_policy=PR_STATE_RETRY_POLICY,
+                )
+            except ActivityError:
+                state = None  # includes a cancelled attempt: accepted interim limit (S3)
+            if state is not None and state.found:
+                await self._apply_found_state(state, watch)
+                terminal = state.state in ("MERGED", "CLOSED")
+                return _FinalRead(state, self._abandoned and not terminal)
+            if self._abandoned:
+                return _FinalRead(None, True)
+        return _FinalRead(None, False)
+
+    def _settled(self, decision: _WatchDecision) -> _WatchDecision:
+        self._watch_unrecorded = False
+        return decision
+
+    async def _decide_watch_end(
+        self, exit_name: str, watch: _MergeWatchRun, service: str, slug: str
+    ) -> _WatchDecision:
+        """The deadline decision (#1052, 1d-2a; inert, no production caller):
+        settle, read the PR, decide. `_watch_unrecorded` is True from the
+        start and stays True on `unrecorded` and on any exception."""
+        assert exit_name == "deadline"  # noqa: S101 -- the other exits are 1d-4
+        self._watch_unrecorded = True
+        unobserved = await self._settle_watch_work(watch, service, slug)
+        settled_at = workflow.now()
+        if self._abandoned:
+            return self._settled(_WatchDecision("abandoned", watch.last))
+        read = await self._final_pr_read(watch, service, slug)
+        if read.abandoned:
+            return self._settled(_WatchDecision("abandoned", read.fresh or watch.last))
+        fresh = read.fresh
+        if (
+            fresh is not None
+            and fresh.state == "OPEN"
+            and fresh.head_sha
+            and fresh.head_sha == self._gate_ran_head
+        ):
+            unobserved = True
+        if unobserved and (fresh is None or fresh.state == "OPEN"):
+            if await self._wait_unless_abandoned(settled_at + GATED_ACTIVITY_TIMEOUT - workflow.now()):
+                return self._settled(_WatchDecision("abandoned", fresh or watch.last))
+            read = await self._final_pr_read(watch, service, slug)
+            if read.abandoned:
+                return self._settled(_WatchDecision("abandoned", read.fresh or watch.last))
+            fresh = read.fresh
+        if fresh is not None and fresh.state in ("MERGED", "CLOSED"):
+            await self._terminal_claim(fresh, watch)
+            return self._settled(_WatchDecision("final", fresh))
+        if fresh is not None and not unobserved:
+            return self._settled(_WatchDecision("open", fresh))
+        if self._abandoned:
+            return self._settled(_WatchDecision("abandoned", fresh or watch.last))
+        return _WatchDecision("unrecorded", fresh or watch.last)
 
     async def _watch_pr(
         self, service: str, slug: str, resume: MergeWatchResume | None = None
