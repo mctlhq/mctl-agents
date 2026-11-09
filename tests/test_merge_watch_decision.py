@@ -74,6 +74,8 @@ class Scenario:
     owned: bool = False  # the loop already holds the claim for PR #9
     tick: str = ""  # "" | "plain"
     gate: str = ""  # "" | "plain" | "stubborn" (waits for `release`) | "slow" (3 min)
+    # | "ran" (a cancel it swallows: waits for `release`, then returns a `ran` result)
+    gate_head: str = ""  # the head `_record_gate_result` stamps when a gate that RAN is recorded
     ran_head: str = ""
     raise_in_apply: bool = False
 
@@ -103,6 +105,7 @@ class _DecisionHarness(DevLoopWorkflow):
             self._owned_entity_id = f"{REPO}#9"
             self._owned_head_sha = HEAD
         self._gate_ran_head = sc.ran_head
+        self._gate_head = sc.gate_head
 
         async def tick() -> None:
             await workflow.wait_condition(lambda: False)
@@ -116,6 +119,9 @@ class _DecisionHarness(DevLoopWorkflow):
                     await workflow.wait_condition(lambda: self._released)
                 elif sc.gate == "slow":
                     await workflow.sleep(timedelta(minutes=3))
+                elif sc.gate == "ran":
+                    await workflow.wait_condition(lambda: self._released)
+                    return ApprovalWaitResult(outcome=OUTCOME_RAN)
                 raise
             return None
 
@@ -138,6 +144,7 @@ class _DecisionHarness(DevLoopWorkflow):
             "polls_without_pr": watch.polls_without_pr,
             "terminal_status_polls": watch.terminal_status_polls,
             "tasks_cleared": watch.tick_task is None and watch.gate_task is None,
+            "gate_ran_head": self._gate_ran_head,
         }
 
     async def _apply_found_state(self, state: PRState, watch: _MergeWatchRun) -> None:
@@ -343,6 +350,59 @@ async def test_a5_settle_runs_before_the_first_read(env):
         result = await run.handle.result()
         assert _reads(await run.events()) == 1
     assert result["kind"] == "final" and result["tasks_cleared"] is True
+
+
+# -- D / WT / WS: regression tests for the mutations the first draft left alive ----------
+
+
+@pytest.mark.parametrize("failure", ["transient", "fatal", NOT_FOUND], ids=["transient", "fatal", "not-found"])
+async def test_d_unreadable_final_read_never_falls_back_to_the_last_seen_state(env, failure):
+    # `watch.last` is OPEN, but the final read could not observe anything: that is
+    # "could not observe", never "observed OPEN". Mutation (d): `fresh = read.fresh or watch.last`.
+    fakes = Fakes(failure)
+    result, events = await _go(env, fakes, Scenario(last=OPEN, track=True, owned=True))
+    assert (result["kind"], result["flag"], result["raised"]) == ("unrecorded", True, "")
+    assert result["last"] == "OPEN"  # the last observed state is still reported, as data
+    assert _reads(events) == dev_loop.FINAL_READ_ATTEMPTS
+    assert fakes.ops == []
+
+
+async def test_wt_the_settle_waits_for_an_in_flight_gate_that_swallows_the_cancel(env):
+    # A gate that swallows the cancel and finishes with `ran` must be RECORDED by the
+    # settle: that is only so if the settle waits for the task (`workflow.wait`) and
+    # then takes the finished-task path. Mutation (wt): drop `workflow.wait(in_flight)`.
+    fakes = Fakes(OPEN)
+    scenario = Scenario(last=OPEN, gate="ran", gate_head=HEAD)
+    async with _running(env, fakes, scenario) as run:
+        for _ in range(400):
+            if (await run.snap())["in_cancel"]:
+                break
+            await anyio.sleep(0.05)
+        await anyio.sleep(0.2)  # a second cancel, were it sent, would land by now
+        snap = await run.snap()
+        assert snap["in_cancel"] and snap["flag"] is True
+        assert _reads(await run.events()) == 0 and fakes.calls == 0  # no read before the settle ends
+        await run.handle.signal(_DecisionHarness.release)
+        result = await run.handle.result()
+        events = await run.events()
+    assert result["gate_ran_head"] == HEAD  # the swallowed cancel's `ran` result was recorded
+    assert (result["kind"], result["flag"]) == ("unrecorded", True)  # ran head == open head
+    assert _reads(events) == 2 and len(_window(events)) == 1
+
+
+async def test_ws_the_window_starts_after_the_settle_and_the_first_read(env):
+    # Settle takes 3 minutes (slow gate), the first read set then spends one 2 minute
+    # backoff before it sees OPEN. The window is the REST of GATED_ACTIVITY_TIMEOUT
+    # counted from `settled_at`: T - 2 min. Mutation (ws): a full T from the wait
+    # (10 min); the other wrong start, the decision's own start, would give T - 5 min.
+    fakes = Fakes("fatal", OPEN)
+    result, events = await _go(env, fakes, Scenario(last=OPEN, gate="slow"))
+    assert (result["kind"], result["last"], result["flag"]) == ("unrecorded", "OPEN", True)
+    assert _timers(events)[:2] == [timedelta(minutes=3), dev_loop.FINAL_READ_BACKOFF]  # order of events
+    (window,) = _window(events)
+    expected = GATED_ACTIVITY_TIMEOUT - dev_loop.FINAL_READ_BACKOFF
+    assert expected - timedelta(seconds=5) <= window <= expected
+    assert _reads(events) == 3  # fatal, OPEN, then the post-window read
 
 
 # -- A6: abandon -----------------------------------------------------------------------
