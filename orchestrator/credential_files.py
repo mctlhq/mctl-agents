@@ -50,6 +50,7 @@ INVENTORY: tuple[CredentialSpec, ...] = (
     CredentialSpec("MCTL_USAGE_WRITER_TOKEN", IN_PROCESS, _LONG_LIVED),
     CredentialSpec("MCTL_EVIDENCE_WRITER_TOKEN", IN_PROCESS, _LONG_LIVED),
     CredentialSpec("SCOUT_TELEGRAM_BOT_TOKEN", IN_PROCESS, _LONG_LIVED),
+    CredentialSpec("DEVLOOP_NOTIFY_TELEGRAM_BOT_TOKEN", IN_PROCESS, _LONG_LIVED),
     CredentialSpec("GITHUB_TOKEN", SUBPROCESS_ENV, "short-lived (GitHub App token, kubelet-refreshed file)"),
     CredentialSpec("CLAUDE_CODE_OAUTH_TOKEN", CLI_ENV, _LONG_LIVED),
     CredentialSpec("CLAUDE_CODE_OAUTH_TOKEN_SECONDARY", CLI_ENV, _LONG_LIVED),

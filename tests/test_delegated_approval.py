@@ -22,7 +22,7 @@ from temporalio.testing import ActivityEnvironment
 from orchestrator import action_approvals as aa
 from orchestrator.temporal.activities import delegated_approval as da
 from orchestrator.temporal.activities.proposals import ProposalListingError
-from tests.test_action_approvals import FakeMctlApi, _Clock
+from tests.test_action_approvals import FAKE_CONTEXT_DIGEST, FakeMctlApi, _Clock
 
 pytestmark = pytest.mark.anyio
 
@@ -358,6 +358,14 @@ async def test_the_grant_binds_the_proposal_content_the_human_is_asked_about(env
     assert record["artifact_hash"] == DIGEST_A
     assert record["intent_hash"] == aa.intent_hash(da.approval_intent(WE, "mctl-telegram", "issue-7-title", DIGEST_A))
     assert result.content_digest == DIGEST_A and result.content_commit == COMMIT
+
+
+async def test_the_result_carries_mctl_apis_context_digest_for_the_decide_link(env, aar_api):
+    """mctl-api#964: the decide link names the grant by its context digest
+    too, which only mctl-api computes; the request hands it through."""
+    result = await env.run(da.request_devloop_approval, REQUEST)
+
+    assert result.context_digest == FAKE_CONTEXT_DIGEST
 
 
 async def test_changed_content_is_another_grant_not_the_approved_one(env, aar_api):

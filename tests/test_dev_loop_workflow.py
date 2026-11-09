@@ -40,6 +40,7 @@ from orchestrator.temporal.activities.canonical_execution import (
     EnsuredExecution,
     EnsureExecutionInput,
 )
+from orchestrator.temporal.activities.decide_notify import DecideNotifyInput, DecideNotifyResult
 from orchestrator.temporal.activities.delegated_approval import (
     ApprovalRequestInput,
     ApprovalRequestResult,
@@ -246,6 +247,8 @@ def _canonical_activities(
     delegated_result: DelegatedApproveResult | list[DelegatedApproveResult] | None = None,
     advance_log: list[AdvanceInput] | None = None,
     seen_queues: dict[str, list[str]] | None = None,
+    notify_log: list[DecideNotifyInput] | None = None,
+    notify_raises: bool = False,
 ) -> list:
     """Fakes for the activities a canonical DevLoop (#636) adds: its own
     WorkItem/`we_`, the grant request, the delegated approve flip, and the
@@ -319,7 +322,16 @@ def _canonical_activities(
             advance_log.append(inp)
         return "execution-existing we_test_own"
 
+    @activity.defn(name="notify_devloop_decision")
+    async def fake_notify_devloop_decision(inp: DecideNotifyInput) -> DecideNotifyResult:
+        if notify_log is not None:
+            notify_log.append(inp)
+        if notify_raises:
+            raise ApplicationError("telegram down", type="DecideNotifyUnavailable", non_retryable=True)
+        return DecideNotifyResult("sent")
+
     return [
+        fake_notify_devloop_decision,
         fake_ensure_issue_execution,
         fake_request_devloop_approval,
         fake_submit_delegated_approve,
@@ -421,6 +433,8 @@ def _fake_activities(
     # A list answers the flips in order, repeating its last entry (#702 T5/T6).
     delegated_result: DelegatedApproveResult | list[DelegatedApproveResult] | None = None,
     advance_log: list[AdvanceInput] | None = None,
+    notify_log: list[DecideNotifyInput] | None = None,
+    notify_raises: bool = False,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -835,6 +849,8 @@ def _fake_activities(
             delegated_log=delegated_log,
             delegated_result=delegated_result,
             advance_log=advance_log,
+            notify_log=notify_log,
+            notify_raises=notify_raises,
         ),
         fake_resolve_agent_release,
         fake_submit_and_wait,
@@ -8729,3 +8745,99 @@ class TestGrantFreshness:
             with anyio.fail_after(60):
                 await handle.result()
         assert [d.approval_ref for d in delegated] == [self._ref_for(requests[2])]
+
+
+class TestDecideNotify:
+    """mctlhq/mctl-api#964: a pending grant is announced once through the
+    decide-link notification, which carries exactly that grant's binding and
+    decides nothing."""
+
+    URL = "https://github.com/mctlhq/mctl-telegram/issues/43"
+    CTX = "sha256:" + "c" * 64
+    CONTENT = "sha256:" + "d" * 64
+
+    async def _wait_for(self, predicate):
+        with anyio.fail_after(20):
+            while not predicate():  # noqa: ASYNC110 - polling a test fake
+                await anyio.sleep(0.05)
+
+    async def _run(self, env, *, approve_with: list[str], before_approve=None, **kwargs):
+        activities, _calls, investigate_ran, _ops = _fake_activities(released=True, **kwargs)
+        async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run, IssueRef(issue_url=self.URL),
+                id=f"dev-loop-test-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            if before_approve is not None:
+                await before_approve(handle)
+            for ref in approve_with:
+                await handle.signal(DevLoopWorkflow.approve, {"approval_ref": ref})
+            with anyio.fail_after(30):
+                await handle.result()
+        return handle
+
+    async def test_a_pending_grant_is_announced_once_with_its_binding(self, env):
+        notes: list[DecideNotifyInput] = []
+        delegated: list[DelegatedApproveInput] = []
+        pending = ApprovalRequestResult(
+            ok=True, approval_ref="aar_test", state="pending",
+            content_digest=self.CONTENT, content_commit="c1", context_digest=self.CTX,
+        )
+
+        async def wait_notified(_handle):
+            await self._wait_for(lambda: len(notes) == 1)
+
+        handle = await self._run(
+            env, approve_with=["aar_test"], before_approve=wait_notified,
+            notify_log=notes, delegated_log=delegated, approval_result=pending,
+        )
+        assert notes == [DecideNotifyInput(
+            workflow_id=handle.id, approval_ref="aar_test", context_digest=self.CTX,
+            content_digest=self.CONTENT, target="mctl-telegram/issue-43-fake-title", issue_url=self.URL,
+        )]
+        assert [d.approval_ref for d in delegated] == ["aar_test"]
+
+    async def test_a_superseded_grant_is_announced_anew(self, env):
+        notes: list[DecideNotifyInput] = []
+        requests: list[ApprovalRequestInput] = []
+        digest = {"current": "sha256:v1"}
+
+        async def rewrite(handle):
+            await self._wait_for(lambda: len(notes) == 1)
+            digest["current"] = "sha256:v2"
+            await env.sleep(GRANT_FRESHNESS_INTERVAL + timedelta(minutes=1))
+            await self._wait_for(lambda: len(notes) == 2)
+
+        await self._run(
+            env, approve_with=["aar_test_a1"], before_approve=rewrite,
+            notify_log=notes, approval_requests=requests, digest_state=digest,
+        )
+        assert [n.approval_ref for n in notes] == ["aar_test", "aar_test_a1"]
+        assert [n.content_digest for n in notes] == ["sha256:v1", "sha256:v2"]
+
+    async def test_a_grant_found_approved_is_not_announced(self, env):
+        notes: list[DecideNotifyInput] = []
+        await self._run(
+            env, approve_with=[], notify_log=notes,
+            approval_result=ApprovalRequestResult(ok=True, approval_ref="aar_decided", state="approved"),
+        )
+        assert notes == []
+
+    async def test_a_failed_notification_decides_nothing_and_blocks_nothing(self, env):
+        notes: list[DecideNotifyInput] = []
+        delegated: list[DelegatedApproveInput] = []
+
+        async def wait_attempt(handle):
+            await self._wait_for(lambda: len(notes) == 1)
+            await env.sleep(timedelta(minutes=5))
+            assert delegated == [], "a failed notification must not approve"
+            assert (await handle.describe()).status.name == "RUNNING"
+
+        await self._run(
+            env, approve_with=["aar_test"], before_approve=wait_attempt,
+            notify_log=notes, notify_raises=True, delegated_log=delegated,
+        )
+        assert len(notes) == 1
+        assert [d.approval_ref for d in delegated] == ["aar_test"]

@@ -96,6 +96,11 @@ with workflow.unsafe.imports_passed_through():
         EnsureExecutionInput,
         ensure_issue_execution,
     )
+    from orchestrator.temporal.activities.decide_notify import (
+        DecideNotifyInput,
+        DecideNotifyResult,
+        notify_devloop_decision,
+    )
     from orchestrator.temporal.activities.delegated_approval import (
         ApprovalRequestInput,
         ApprovalRequestResult,
@@ -343,6 +348,14 @@ SUPERSEDE_REASON = "superseded: proposal rewritten"
 _MAX_SUPERSEDED_REFS = 16
 #: `request_devloop_approval`'s state for a grant a human already approved.
 APPROVAL_APPROVED = "approved"
+#: mctlhq/mctl-api#964: once per pending grant, tell the operator through a
+#: Telegram URL button to mctl-api's decide page. The notification is
+#: best-effort and decides nothing; a history without the marker replays
+#: without the activity.
+DECIDE_NOTIFY_PATCH = "decide-notify"
+#: Grants a run remembers having notified, bounded like the signalled refs.
+_MAX_NOTIFIED_REFS = 16
+DECIDE_NOTIFY_RETRY = RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=10))
 
 # A dispatched loop (mctlhq/mctl-agents#461) waits for its execution request
 # to be fulfilled before it runs anything: the dispatcher starts the loop
@@ -1895,6 +1908,8 @@ class DevLoopWorkflow:
         self._approval_digest = ""
         self._approval_commit = ""
         self._superseded_refs: list[str] = []
+        # mctl-api#964: grants this run already sent a decide notification for.
+        self._notified_refs: list[str] = []
         self._supersede_count = 0
         self._supersede_note: tuple[str, str, str, str] | None = None
         # Bumped by every surface/actor transition: the re-asked grant gets a
@@ -2382,7 +2397,38 @@ class DevLoopWorkflow:
             # The decision's signal overtook the request's answer.
             self._approval_ref = requested.approval_ref
             self._approved = True
+        elif requested.approval_ref not in self._notified_refs and workflow.patched(DECIDE_NOTIFY_PATCH):
+            await self._notify_decision(issue, target_repo, slug, requested)
         return None
+
+    async def _notify_decision(
+        self, issue: IssueRef, target_repo: str, slug: str, requested: ApprovalRequestResult
+    ) -> None:
+        """Send the decide link for a grant that is still pending (#964).
+        Recorded as notified before the send, so a replay or a later park of
+        the same grant never sends twice from this run; a superseded grant
+        has a new ref and is notified anew. A failed or refused send is only
+        logged: it is a missed notification, never a decision."""
+        self._notified_refs = [*self._notified_refs, requested.approval_ref][-_MAX_NOTIFIED_REFS:]
+        try:
+            result: DecideNotifyResult = await workflow.execute_activity(
+                notify_devloop_decision,
+                DecideNotifyInput(
+                    workflow_id=workflow.info().workflow_id,
+                    approval_ref=requested.approval_ref,
+                    context_digest=requested.context_digest,
+                    content_digest=requested.content_digest,
+                    target=f"{target_repo}/{slug}",
+                    issue_url=issue.issue_url,
+                ),
+                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                retry_policy=DECIDE_NOTIFY_RETRY,
+            )
+        except ActivityError:
+            workflow.logger.warning("DECIDE_NOTIFY for %s failed", requested.approval_ref)
+            return
+        if result.status != "sent":
+            workflow.logger.info("DECIDE_NOTIFY for %s: %s %s", requested.approval_ref, result.status, result.detail)
 
     async def _supersede_grant_if_stale(self, target_repo: str, slug: str) -> str:
         """Prove the pending grant still describes the current proposal

@@ -104,6 +104,9 @@ class ApprovalRequestResult:
     #: the bound value and hands it to the approve CWFT itself.
     content_digest: str = ""
     content_commit: str = ""
+    #: mctl-api's `decision_context.context_digest` of the grant, for the
+    #: decide link only (mctl-api#964). "" when mctl-api sent none.
+    context_digest: str = ""
 
 
 def approval_target(service: str, slug: str) -> str:
@@ -173,7 +176,8 @@ async def request_devloop_approval(input: ApprovalRequestInput) -> ApprovalReque
             reason=f"approval {answer.record.id} is not bound to this intent",
         )
     return ApprovalRequestResult(
-        ok=True, approval_ref=answer.record.id, state=answer.status, content_digest=digest, content_commit=commit
+        ok=True, approval_ref=answer.record.id, state=answer.status, content_digest=digest, content_commit=commit,
+        context_digest=answer.record.context_digest,
     )
 
 

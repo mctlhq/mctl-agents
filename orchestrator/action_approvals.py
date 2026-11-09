@@ -248,6 +248,9 @@ class ApprovalRecord:
     action_kind: str = ""
     target: str = ""
     artifact_hash: str = ""
+    #: `decision_context.context_digest` as mctl-api answered it, or "" when
+    #: the answer carried none (mctl-api#964 decide link). Never computed here.
+    context_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -294,9 +297,14 @@ def _record_of(payload: dict[str, Any]) -> ApprovalRecord | None:
         value = raw.get(name)
         return value if isinstance(value, str) else ""
 
+    ctx = payload.get("decision_context")
+    ctx_digest = ctx.get("context_digest") if isinstance(ctx, dict) else None
+    if not (isinstance(ctx_digest, str) and ctx_digest.startswith("sha256:")):
+        ctx_digest = ""
     return ApprovalRecord(
         rid, state, digest, expires, text("decided_by"),
         action_kind=text("action_kind"), target=text("target"), artifact_hash=text("artifact_hash"),
+        context_digest=ctx_digest,
     )
 
 
