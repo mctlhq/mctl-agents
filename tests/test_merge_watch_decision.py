@@ -495,7 +495,13 @@ HELPERS = {"_decide_watch_end", "_settle_watch_work", "_final_pr_read", "_wait_u
 FLAG_OWNERS = {"__init__", "_decide_watch_end", "_settled"}
 # `workflow.patched(` calls on main 55b4633, counted from the AST.
 PATCHED_CALLS = 37
-FORBIDDEN = {"is_cancelled_exception", "_retain_claim", "tick_blocked_until", "record_merge_watch_reconcile", "confirm_no_pr"}
+FORBIDDEN = {
+    "is_cancelled_exception",
+    "_retain_claim",
+    "tick_blocked_until",
+    "record_merge_watch_reconcile",
+    "confirm_no_pr",
+}
 
 
 def _mentions(node: ast.AST) -> set[str]:
