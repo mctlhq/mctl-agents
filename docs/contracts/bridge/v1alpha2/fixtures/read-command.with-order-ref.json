@@ -1,0 +1,20 @@
+{
+  "schema_version": "bridge.mctl.ai/v1alpha2",
+  "command_id": "cmd_01HZZZZZZZZZZZZZZZZZZZZZZZ",
+  "request_id": "rdq_01HYYYYYYYYYYYYYYYYYYYYYYY",
+  "kind": "read_basket",
+  "attempt": 1,
+  "tenant_ref": "tnr_0123456789abcdef0123",
+  "principal_ref": "prr_0123456789abcdef0123",
+  "connection_ref": "gcn_0123456789abcdef0123",
+  "install_revision_ref": "irv_0123456789abcdef0123",
+  "issuer": "mctl-api",
+  "audience": "provider:glovo",
+  "nonce": "AAAAAAAAAAAAAAAAAAAAAA",
+  "issued_at": "2026-11-09T10:00:00Z",
+  "expires_at": "2026-11-09T10:05:00Z",
+  "ttl_seconds": 300,
+  "lease_token": "lt_0123456789abcdef0123",
+  "params": {},
+  "order_ref": "ordr_0123456789abcdef0123"
+}

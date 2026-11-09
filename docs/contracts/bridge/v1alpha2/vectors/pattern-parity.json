@@ -1,0 +1,96 @@
+{
+  "description": "Strings that every consumer must accept or reject for an anchored schema pattern. Python and Go RE2 must agree: no trailing newline, no non-ASCII digits, ASCII only.",
+  "cases": [
+    {
+      "id": "placed_on",
+      "schema": "read-result.schema.json",
+      "pointer": "/$defs/placed_on/pattern",
+      "accept": [
+        "2026-11-09"
+      ],
+      "reject": [
+        "2026-11-09\n",
+        "2026-11-09\r",
+        "٢٠٢٦-١١-٠٩",
+        "２０２６-１１-０９",
+        "2026-11-9"
+      ]
+    },
+    {
+      "id": "issued_at",
+      "schema": "read-command.schema.json",
+      "pointer": "/properties/issued_at/pattern",
+      "accept": [
+        "2026-11-09T10:00:00Z",
+        "2026-11-09T10:00:00.123456789Z"
+      ],
+      "reject": [
+        "2026-11-09T10:00:00Z\n",
+        "2026-11-09T10:00:00Z\r",
+        "２０２６-11-09T10:00:00Z",
+        "2026-11-09 10:00:00Z",
+        "2026-11-09T10:00:00+00:00"
+      ]
+    },
+    {
+      "id": "completed_at",
+      "schema": "read-result.schema.json",
+      "pointer": "/properties/completed_at/pattern",
+      "accept": [
+        "2026-11-09T10:01:00Z"
+      ],
+      "reject": [
+        "2026-11-09T10:01:00Z\n",
+        "2026-11-09 10:01:00"
+      ]
+    },
+    {
+      "id": "item_code",
+      "schema": "approval-basket.schema.json",
+      "pointer": "/$defs/item_code/pattern",
+      "accept": [
+        "FAKE-1",
+        "FAKE-A-B-9"
+      ],
+      "reject": [
+        "FAKE-1\n",
+        "FAKE-1\r",
+        "fake-1",
+        "FAKE-a",
+        "FAKE-É",
+        "FAKE-",
+        "FAKE-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      ]
+    },
+    {
+      "id": "item_name",
+      "schema": "read-result.schema.json",
+      "pointer": "/$defs/display_name/pattern",
+      "accept": [
+        "Fake Bread (Test), 1.5"
+      ],
+      "reject": [
+        "Fake Bread\n",
+        "Fake Bread\r",
+        "Café",
+        "",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "Fake\tBread"
+      ]
+    },
+    {
+      "id": "store_ref",
+      "schema": "approval-basket.schema.json",
+      "pointer": "/properties/store_ref/pattern",
+      "accept": [
+        "pst_0123456789abcdef0123"
+      ],
+      "reject": [
+        "pst_0123456789abcdef0123\n",
+        "pst_0123456789abcdef0123\r",
+        "pst_short",
+        "pst_0123456789abcdef012É"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,85 @@
+{
+  "description": "approval basket -> JCS canonical text -> basket_fingerprint = sha256:hex(SHA-256(JCS(basket))).",
+  "vectors": [
+    {
+      "name": "minimal",
+      "input_text": "{\"v\":\"mctl-approval-basket/v1\",\"store_ref\":\"pst_0123456789abcdef0123\",\"currency\":\"EUR\",\"lines\":[{\"item_code\":\"FAKE-1\",\"quantity\":1,\"unit_price_minor\":500}],\"subtotal_minor\":500,\"delivery_fee_minor\":199,\"service_fee_minor\":50,\"discount_minor\":0,\"total_minor\":749}",
+      "canonical": "{\"currency\":\"EUR\",\"delivery_fee_minor\":199,\"discount_minor\":0,\"lines\":[{\"item_code\":\"FAKE-1\",\"quantity\":1,\"unit_price_minor\":500}],\"service_fee_minor\":50,\"store_ref\":\"pst_0123456789abcdef0123\",\"subtotal_minor\":500,\"total_minor\":749,\"v\":\"mctl-approval-basket/v1\"}",
+      "fingerprint": "sha256:662ad98455b98d60da709cb520e7b519b94ee5125e8743b47952b02553666d96"
+    },
+    {
+      "name": "thirty-lines",
+      "input_text": "{\"v\":\"mctl-approval-basket/v1\",\"store_ref\":\"pst_0123456789abcdef0123\",\"currency\":\"EUR\",\"lines\":[{\"item_code\":\"FAKE-ITEM-00\",\"quantity\":1,\"unit_price_minor\":100},{\"item_code\":\"FAKE-ITEM-01\",\"quantity\":2,\"unit_price_minor\":107},{\"item_code\":\"FAKE-ITEM-02\",\"quantity\":3,\"unit_price_minor\":114},{\"item_code\":\"FAKE-ITEM-03\",\"quantity\":1,\"unit_price_minor\":121},{\"item_code\":\"FAKE-ITEM-04\",\"quantity\":2,\"unit_price_minor\":128},{\"item_code\":\"FAKE-ITEM-05\",\"quantity\":3,\"unit_price_minor\":135},{\"item_code\":\"FAKE-ITEM-06\",\"quantity\":1,\"unit_price_minor\":142},{\"item_code\":\"FAKE-ITEM-07\",\"quantity\":2,\"unit_price_minor\":149},{\"item_code\":\"FAKE-ITEM-08\",\"quantity\":3,\"unit_price_minor\":156},{\"item_code\":\"FAKE-ITEM-09\",\"quantity\":1,\"unit_price_minor\":163},{\"item_code\":\"FAKE-ITEM-10\",\"quantity\":2,\"unit_price_minor\":170},{\"item_code\":\"FAKE-ITEM-11\",\"quantity\":3,\"unit_price_minor\":177},{\"item_code\":\"FAKE-ITEM-12\",\"quantity\":1,\"unit_price_minor\":184},{\"item_code\":\"FAKE-ITEM-13\",\"quantity\":2,\"unit_price_minor\":191},{\"item_code\":\"FAKE-ITEM-14\",\"quantity\":3,\"unit_price_minor\":198},{\"item_code\":\"FAKE-ITEM-15\",\"quantity\":1,\"unit_price_minor\":205},{\"item_code\":\"FAKE-ITEM-16\",\"quantity\":2,\"unit_price_minor\":212},{\"item_code\":\"FAKE-ITEM-17\",\"quantity\":3,\"unit_price_minor\":219},{\"item_code\":\"FAKE-ITEM-18\",\"quantity\":1,\"unit_price_minor\":226},{\"item_code\":\"FAKE-ITEM-19\",\"quantity\":2,\"unit_price_minor\":233},{\"item_code\":\"FAKE-ITEM-20\",\"quantity\":3,\"unit_price_minor\":240},{\"item_code\":\"FAKE-ITEM-21\",\"quantity\":1,\"unit_price_minor\":247},{\"item_code\":\"FAKE-ITEM-22\",\"quantity\":2,\"unit_price_minor\":254},{\"item_code\":\"FAKE-ITEM-23\",\"quantity\":3,\"unit_price_minor\":261},{\"item_code\":\"FAKE-ITEM-24\",\"quantity\":1,\"unit_price_minor\":268},{\"item_code\":\"FAKE-ITEM-25\",\"quantity\":2,\"unit_price_minor\":275},{\"item_code\":\"FAKE-ITEM-26\",\"quantity\":3,\"unit_price_minor\":282},{\"item_code\":\"FAKE-ITEM-27\",\"quantity\":1,\"unit_price_minor\":289},{\"item_code\":\"FAKE-ITEM-28\",\"quantity\":2,\"unit_price_minor\":296},{\"item_code\":\"FAKE-ITEM-29\",\"quantity\":3,\"unit_price_minor\":303}],\"subtotal_minor\":12230,\"delivery_fee_minor\":199,\"service_fee_minor\":50,\"discount_minor\":0,\"total_minor\":12479}",
+      "canonical": "{\"currency\":\"EUR\",\"delivery_fee_minor\":199,\"discount_minor\":0,\"lines\":[{\"item_code\":\"FAKE-ITEM-00\",\"quantity\":1,\"unit_price_minor\":100},{\"item_code\":\"FAKE-ITEM-01\",\"quantity\":2,\"unit_price_minor\":107},{\"item_code\":\"FAKE-ITEM-02\",\"quantity\":3,\"unit_price_minor\":114},{\"item_code\":\"FAKE-ITEM-03\",\"quantity\":1,\"unit_price_minor\":121},{\"item_code\":\"FAKE-ITEM-04\",\"quantity\":2,\"unit_price_minor\":128},{\"item_code\":\"FAKE-ITEM-05\",\"quantity\":3,\"unit_price_minor\":135},{\"item_code\":\"FAKE-ITEM-06\",\"quantity\":1,\"unit_price_minor\":142},{\"item_code\":\"FAKE-ITEM-07\",\"quantity\":2,\"unit_price_minor\":149},{\"item_code\":\"FAKE-ITEM-08\",\"quantity\":3,\"unit_price_minor\":156},{\"item_code\":\"FAKE-ITEM-09\",\"quantity\":1,\"unit_price_minor\":163},{\"item_code\":\"FAKE-ITEM-10\",\"quantity\":2,\"unit_price_minor\":170},{\"item_code\":\"FAKE-ITEM-11\",\"quantity\":3,\"unit_price_minor\":177},{\"item_code\":\"FAKE-ITEM-12\",\"quantity\":1,\"unit_price_minor\":184},{\"item_code\":\"FAKE-ITEM-13\",\"quantity\":2,\"unit_price_minor\":191},{\"item_code\":\"FAKE-ITEM-14\",\"quantity\":3,\"unit_price_minor\":198},{\"item_code\":\"FAKE-ITEM-15\",\"quantity\":1,\"unit_price_minor\":205},{\"item_code\":\"FAKE-ITEM-16\",\"quantity\":2,\"unit_price_minor\":212},{\"item_code\":\"FAKE-ITEM-17\",\"quantity\":3,\"unit_price_minor\":219},{\"item_code\":\"FAKE-ITEM-18\",\"quantity\":1,\"unit_price_minor\":226},{\"item_code\":\"FAKE-ITEM-19\",\"quantity\":2,\"unit_price_minor\":233},{\"item_code\":\"FAKE-ITEM-20\",\"quantity\":3,\"unit_price_minor\":240},{\"item_code\":\"FAKE-ITEM-21\",\"quantity\":1,\"unit_price_minor\":247},{\"item_code\":\"FAKE-ITEM-22\",\"quantity\":2,\"unit_price_minor\":254},{\"item_code\":\"FAKE-ITEM-23\",\"quantity\":3,\"unit_price_minor\":261},{\"item_code\":\"FAKE-ITEM-24\",\"quantity\":1,\"unit_price_minor\":268},{\"item_code\":\"FAKE-ITEM-25\",\"quantity\":2,\"unit_price_minor\":275},{\"item_code\":\"FAKE-ITEM-26\",\"quantity\":3,\"unit_price_minor\":282},{\"item_code\":\"FAKE-ITEM-27\",\"quantity\":1,\"unit_price_minor\":289},{\"item_code\":\"FAKE-ITEM-28\",\"quantity\":2,\"unit_price_minor\":296},{\"item_code\":\"FAKE-ITEM-29\",\"quantity\":3,\"unit_price_minor\":303}],\"service_fee_minor\":50,\"store_ref\":\"pst_0123456789abcdef0123\",\"subtotal_minor\":12230,\"total_minor\":12479,\"v\":\"mctl-approval-basket/v1\"}",
+      "fingerprint": "sha256:6b6c1dcdf7e910470c3eddefc5088e91db4eda86f51d283d6718e75a7b95db4e"
+    },
+    {
+      "name": "permuted-keys",
+      "input_text": "{\"total_minor\":749,\"discount_minor\":0,\"service_fee_minor\":50,\"delivery_fee_minor\":199,\"subtotal_minor\":500,\"lines\":[{\"unit_price_minor\":500,\"quantity\":1,\"item_code\":\"FAKE-1\"}],\"currency\":\"EUR\",\"store_ref\":\"pst_0123456789abcdef0123\",\"v\":\"mctl-approval-basket/v1\"}",
+      "canonical": "{\"currency\":\"EUR\",\"delivery_fee_minor\":199,\"discount_minor\":0,\"lines\":[{\"item_code\":\"FAKE-1\",\"quantity\":1,\"unit_price_minor\":500}],\"service_fee_minor\":50,\"store_ref\":\"pst_0123456789abcdef0123\",\"subtotal_minor\":500,\"total_minor\":749,\"v\":\"mctl-approval-basket/v1\"}",
+      "fingerprint": "sha256:662ad98455b98d60da709cb520e7b519b94ee5125e8743b47952b02553666d96",
+      "same_fingerprint_as": "minimal"
+    },
+    {
+      "name": "unit-price-plus-one",
+      "input_text": "{\"v\":\"mctl-approval-basket/v1\",\"store_ref\":\"pst_0123456789abcdef0123\",\"currency\":\"EUR\",\"lines\":[{\"item_code\":\"FAKE-1\",\"quantity\":1,\"unit_price_minor\":501}],\"subtotal_minor\":501,\"delivery_fee_minor\":199,\"service_fee_minor\":50,\"discount_minor\":0,\"total_minor\":750}",
+      "canonical": "{\"currency\":\"EUR\",\"delivery_fee_minor\":199,\"discount_minor\":0,\"lines\":[{\"item_code\":\"FAKE-1\",\"quantity\":1,\"unit_price_minor\":501}],\"service_fee_minor\":50,\"store_ref\":\"pst_0123456789abcdef0123\",\"subtotal_minor\":501,\"total_minor\":750,\"v\":\"mctl-approval-basket/v1\"}",
+      "fingerprint": "sha256:58fa0fae2371a8c113edf72f512684b63d2de8acccecf129bbc67b0ccfd513ca",
+      "different_from": "minimal"
+    },
+    {
+      "name": "delivery-fee-changed",
+      "input_text": "{\"v\":\"mctl-approval-basket/v1\",\"store_ref\":\"pst_0123456789abcdef0123\",\"currency\":\"EUR\",\"lines\":[{\"item_code\":\"FAKE-1\",\"quantity\":1,\"unit_price_minor\":500}],\"subtotal_minor\":500,\"delivery_fee_minor\":200,\"service_fee_minor\":50,\"discount_minor\":0,\"total_minor\":750}",
+      "canonical": "{\"currency\":\"EUR\",\"delivery_fee_minor\":200,\"discount_minor\":0,\"lines\":[{\"item_code\":\"FAKE-1\",\"quantity\":1,\"unit_price_minor\":500}],\"service_fee_minor\":50,\"store_ref\":\"pst_0123456789abcdef0123\",\"subtotal_minor\":500,\"total_minor\":750,\"v\":\"mctl-approval-basket/v1\"}",
+      "fingerprint": "sha256:e60430b018179f7d131dbe06237315c2188d6e4b4cc8601fb12efb892f519cd0",
+      "different_from": "minimal"
+    }
+  ],
+  "must_reject": [
+    {
+      "name": "unsorted-lines",
+      "reason": "unsorted_lines",
+      "input_text": "{\"v\":\"mctl-approval-basket/v1\",\"store_ref\":\"pst_0123456789abcdef0123\",\"currency\":\"EUR\",\"lines\":[{\"item_code\":\"FAKE-B\",\"quantity\":1,\"unit_price_minor\":100},{\"item_code\":\"FAKE-A\",\"quantity\":1,\"unit_price_minor\":100}],\"subtotal_minor\":200,\"delivery_fee_minor\":199,\"service_fee_minor\":50,\"discount_minor\":0,\"total_minor\":449}"
+    },
+    {
+      "name": "duplicate-item-code",
+      "reason": "duplicate_item",
+      "input_text": "{\"v\":\"mctl-approval-basket/v1\",\"store_ref\":\"pst_0123456789abcdef0123\",\"currency\":\"EUR\",\"lines\":[{\"item_code\":\"FAKE-MILK\",\"quantity\":1,\"unit_price_minor\":120},{\"item_code\":\"FAKE-MILK\",\"quantity\":1,\"unit_price_minor\":120}],\"subtotal_minor\":240,\"delivery_fee_minor\":199,\"service_fee_minor\":50,\"discount_minor\":0,\"total_minor\":489}"
+    },
+    {
+      "name": "wrong-subtotal",
+      "reason": "subtotal_mismatch",
+      "input_text": "{\"v\":\"mctl-approval-basket/v1\",\"store_ref\":\"pst_0123456789abcdef0123\",\"currency\":\"EUR\",\"lines\":[{\"item_code\":\"FAKE-1\",\"quantity\":1,\"unit_price_minor\":500}],\"subtotal_minor\":501,\"delivery_fee_minor\":199,\"service_fee_minor\":50,\"discount_minor\":0,\"total_minor\":750}"
+    },
+    {
+      "name": "wrong-total",
+      "reason": "total_mismatch",
+      "input_text": "{\"v\":\"mctl-approval-basket/v1\",\"store_ref\":\"pst_0123456789abcdef0123\",\"currency\":\"EUR\",\"lines\":[{\"item_code\":\"FAKE-1\",\"quantity\":1,\"unit_price_minor\":500}],\"subtotal_minor\":500,\"delivery_fee_minor\":199,\"service_fee_minor\":50,\"discount_minor\":0,\"total_minor\":748}"
+    },
+    {
+      "name": "extra-item-name",
+      "reason": "schema_invalid",
+      "input_text": "{\"v\":\"mctl-approval-basket/v1\",\"store_ref\":\"pst_0123456789abcdef0123\",\"currency\":\"EUR\",\"lines\":[{\"item_code\":\"FAKE-BREAD\",\"quantity\":2,\"unit_price_minor\":150,\"item_name\":\"Fake Bread\"},{\"item_code\":\"FAKE-MILK\",\"quantity\":1,\"unit_price_minor\":120}],\"subtotal_minor\":420,\"delivery_fee_minor\":199,\"service_fee_minor\":50,\"discount_minor\":0,\"total_minor\":669}"
+    },
+    {
+      "name": "quantity-1.0",
+      "reason": "non_integer_token",
+      "input_text": "{\"v\":\"mctl-approval-basket/v1\",\"store_ref\":\"pst_0123456789abcdef0123\",\"currency\":\"EUR\",\"lines\":[{\"item_code\":\"FAKE-1\",\"quantity\":1.0,\"unit_price_minor\":500}],\"subtotal_minor\":500,\"delivery_fee_minor\":199,\"service_fee_minor\":50,\"discount_minor\":0,\"total_minor\":749}"
+    },
+    {
+      "name": "lowercase-item-code",
+      "reason": "schema_invalid",
+      "input_text": "{\"v\":\"mctl-approval-basket/v1\",\"store_ref\":\"pst_0123456789abcdef0123\",\"currency\":\"EUR\",\"lines\":[{\"item_code\":\"fake-1\",\"quantity\":1,\"unit_price_minor\":500}],\"subtotal_minor\":500,\"delivery_fee_minor\":199,\"service_fee_minor\":50,\"discount_minor\":0,\"total_minor\":749}"
+    },
+    {
+      "name": "non-ascii-item-code",
+      "reason": "schema_invalid",
+      "input_text": "{\"v\":\"mctl-approval-basket/v1\",\"store_ref\":\"pst_0123456789abcdef0123\",\"currency\":\"EUR\",\"lines\":[{\"item_code\":\"FAKE-É\",\"quantity\":1,\"unit_price_minor\":500}],\"subtotal_minor\":500,\"delivery_fee_minor\":199,\"service_fee_minor\":50,\"discount_minor\":0,\"total_minor\":749}"
+    },
+    {
+      "name": "zero-lines",
+      "reason": "schema_invalid",
+      "input_text": "{\"v\":\"mctl-approval-basket/v1\",\"store_ref\":\"pst_0123456789abcdef0123\",\"currency\":\"EUR\",\"lines\":[],\"subtotal_minor\":0,\"delivery_fee_minor\":199,\"service_fee_minor\":50,\"discount_minor\":0,\"total_minor\":249}"
+    }
+  ]
+}

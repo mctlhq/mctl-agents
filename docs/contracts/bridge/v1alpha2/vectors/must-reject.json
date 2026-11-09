@@ -1,0 +1,208 @@
+{
+  "description": "Raw JSON text that every consumer, Go included, must reject before schema validation. `applies` names the checks that must reject it; `reason` is the reference validator's code.",
+  "entries": [
+    {
+      "name": "duplicate-key-top-level",
+      "reason": "duplicate_key",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":1,\"a\":2}"
+    },
+    {
+      "name": "duplicate-key-nested",
+      "reason": "duplicate_key",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":{\"b\":1,\"b\":2}}"
+    },
+    {
+      "name": "escaped-duplicate-key-top-level",
+      "reason": "duplicate_key",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":1,\"\\u0061\":2}"
+    },
+    {
+      "name": "escaped-duplicate-quantity-in-basket-line",
+      "reason": "duplicate_key",
+      "applies": [
+        "read-result"
+      ],
+      "raw": "{\n  \"schema_version\": \"bridge.mctl.ai/v1alpha2\",\n  \"command_id\": \"cmd_01HZZZZZZZZZZZZZZZZZZZZZZZ\",\n  \"request_id\": \"rdq_01HYYYYYYYYYYYYYYYYYYYYYYY\",\n  \"kind\": \"read_basket\",\n  \"lease_token\": \"lt_0123456789abcdef0123\",\n  \"attempt\": 1,\n  \"worker_identity\": \"provider:glovo\",\n  \"outcome\": \"succeeded\",\n  \"provider_effect\": \"none\",\n  \"error_code\": \"none\",\n  \"completed_at\": \"2026-11-09T10:01:00Z\",\n  \"payload\": {\n    \"empty\": false,\n    \"store_name\": \"Fake Store (Test)\",\n    \"display\": [\n      {\n        \"item_code\": \"FAKE-BREAD\",\n        \"item_name\": \"Fake Bread\"\n      },\n      {\n        \"item_code\": \"FAKE-MILK\",\n        \"item_name\": \"Fake Milk\"\n      }\n    ],\n    \"approval_basket\": {\n      \"v\": \"mctl-approval-basket/v1\",\n      \"store_ref\": \"pst_0123456789abcdef0123\",\n      \"currency\": \"EUR\",\n      \"lines\": [\n        {\n          \"item_code\": \"FAKE-BREAD\",\n          \"quantity\": 2, \"\\u0071uantity\": 3,\n          \"unit_price_minor\": 150\n        },\n        {\n          \"item_code\": \"FAKE-MILK\",\n          \"quantity\": 1,\n          \"unit_price_minor\": 120\n        }\n      ],\n      \"subtotal_minor\": 420,\n      \"delivery_fee_minor\": 199,\n      \"service_fee_minor\": 50,\n      \"discount_minor\": 0,\n      \"total_minor\": 669\n    }\n  },\n  \"payload_digest\": \"sha256:42ab30f46f56a9dcd257514cc6b7d558679c9a15bfe6e012267ef53fe2902002\"\n}"
+    },
+    {
+      "name": "escape-in-object-key",
+      "reason": "escaped_key",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"\\u0061\":1}"
+    },
+    {
+      "name": "lone-high-surrogate",
+      "reason": "lone_surrogate",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":\"\\ud800\"}"
+    },
+    {
+      "name": "lone-low-surrogate",
+      "reason": "lone_surrogate",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":\"\\udc00\"}"
+    },
+    {
+      "name": "high-surrogate-then-non-surrogate",
+      "reason": "lone_surrogate",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":\"\\ud800\\u0041\"}"
+    },
+    {
+      "name": "nan",
+      "reason": "non_finite",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":NaN}"
+    },
+    {
+      "name": "infinity",
+      "reason": "non_finite",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":Infinity}"
+    },
+    {
+      "name": "negative-infinity",
+      "reason": "non_finite",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":-Infinity}"
+    },
+    {
+      "name": "exponent-overflow-1e400",
+      "reason": "number_range",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":1e400}"
+    },
+    {
+      "name": "integer-2-pow-53-plus-1",
+      "reason": "number_range",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":9007199254740993}"
+    },
+    {
+      "name": "integer-minus-2-pow-53-minus-1",
+      "reason": "number_range",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":-9007199254740993}"
+    },
+    {
+      "name": "quantity-1.0",
+      "reason": "non_integer_token",
+      "applies": [
+        "read-result"
+      ],
+      "raw": "{\n  \"schema_version\": \"bridge.mctl.ai/v1alpha2\",\n  \"command_id\": \"cmd_01HZZZZZZZZZZZZZZZZZZZZZZZ\",\n  \"request_id\": \"rdq_01HYYYYYYYYYYYYYYYYYYYYYYY\",\n  \"kind\": \"read_basket\",\n  \"lease_token\": \"lt_0123456789abcdef0123\",\n  \"attempt\": 1,\n  \"worker_identity\": \"provider:glovo\",\n  \"outcome\": \"succeeded\",\n  \"provider_effect\": \"none\",\n  \"error_code\": \"none\",\n  \"completed_at\": \"2026-11-09T10:01:00Z\",\n  \"payload\": {\n    \"empty\": false,\n    \"store_name\": \"Fake Store (Test)\",\n    \"display\": [\n      {\n        \"item_code\": \"FAKE-BREAD\",\n        \"item_name\": \"Fake Bread\"\n      },\n      {\n        \"item_code\": \"FAKE-MILK\",\n        \"item_name\": \"Fake Milk\"\n      }\n    ],\n    \"approval_basket\": {\n      \"v\": \"mctl-approval-basket/v1\",\n      \"store_ref\": \"pst_0123456789abcdef0123\",\n      \"currency\": \"EUR\",\n      \"lines\": [\n        {\n          \"item_code\": \"FAKE-BREAD\",\n          \"quantity\": 1.0,\n          \"unit_price_minor\": 150\n        },\n        {\n          \"item_code\": \"FAKE-MILK\",\n          \"quantity\": 1,\n          \"unit_price_minor\": 120\n        }\n      ],\n      \"subtotal_minor\": 420,\n      \"delivery_fee_minor\": 199,\n      \"service_fee_minor\": 50,\n      \"discount_minor\": 0,\n      \"total_minor\": 669\n    }\n  },\n  \"payload_digest\": \"sha256:42ab30f46f56a9dcd257514cc6b7d558679c9a15bfe6e012267ef53fe2902002\"\n}"
+    },
+    {
+      "name": "quantity-1e2",
+      "reason": "non_integer_token",
+      "applies": [
+        "read-result"
+      ],
+      "raw": "{\n  \"schema_version\": \"bridge.mctl.ai/v1alpha2\",\n  \"command_id\": \"cmd_01HZZZZZZZZZZZZZZZZZZZZZZZ\",\n  \"request_id\": \"rdq_01HYYYYYYYYYYYYYYYYYYYYYYY\",\n  \"kind\": \"read_basket\",\n  \"lease_token\": \"lt_0123456789abcdef0123\",\n  \"attempt\": 1,\n  \"worker_identity\": \"provider:glovo\",\n  \"outcome\": \"succeeded\",\n  \"provider_effect\": \"none\",\n  \"error_code\": \"none\",\n  \"completed_at\": \"2026-11-09T10:01:00Z\",\n  \"payload\": {\n    \"empty\": false,\n    \"store_name\": \"Fake Store (Test)\",\n    \"display\": [\n      {\n        \"item_code\": \"FAKE-BREAD\",\n        \"item_name\": \"Fake Bread\"\n      },\n      {\n        \"item_code\": \"FAKE-MILK\",\n        \"item_name\": \"Fake Milk\"\n      }\n    ],\n    \"approval_basket\": {\n      \"v\": \"mctl-approval-basket/v1\",\n      \"store_ref\": \"pst_0123456789abcdef0123\",\n      \"currency\": \"EUR\",\n      \"lines\": [\n        {\n          \"item_code\": \"FAKE-BREAD\",\n          \"quantity\": 1e2,\n          \"unit_price_minor\": 150\n        },\n        {\n          \"item_code\": \"FAKE-MILK\",\n          \"quantity\": 1,\n          \"unit_price_minor\": 120\n        }\n      ],\n      \"subtotal_minor\": 420,\n      \"delivery_fee_minor\": 199,\n      \"service_fee_minor\": 50,\n      \"discount_minor\": 0,\n      \"total_minor\": 669\n    }\n  },\n  \"payload_digest\": \"sha256:42ab30f46f56a9dcd257514cc6b7d558679c9a15bfe6e012267ef53fe2902002\"\n}"
+    },
+    {
+      "name": "quantity-true",
+      "reason": "schema_invalid",
+      "applies": [
+        "read-result"
+      ],
+      "raw": "{\n  \"schema_version\": \"bridge.mctl.ai/v1alpha2\",\n  \"command_id\": \"cmd_01HZZZZZZZZZZZZZZZZZZZZZZZ\",\n  \"request_id\": \"rdq_01HYYYYYYYYYYYYYYYYYYYYYYY\",\n  \"kind\": \"read_basket\",\n  \"lease_token\": \"lt_0123456789abcdef0123\",\n  \"attempt\": 1,\n  \"worker_identity\": \"provider:glovo\",\n  \"outcome\": \"succeeded\",\n  \"provider_effect\": \"none\",\n  \"error_code\": \"none\",\n  \"completed_at\": \"2026-11-09T10:01:00Z\",\n  \"payload\": {\n    \"empty\": false,\n    \"store_name\": \"Fake Store (Test)\",\n    \"display\": [\n      {\n        \"item_code\": \"FAKE-BREAD\",\n        \"item_name\": \"Fake Bread\"\n      },\n      {\n        \"item_code\": \"FAKE-MILK\",\n        \"item_name\": \"Fake Milk\"\n      }\n    ],\n    \"approval_basket\": {\n      \"v\": \"mctl-approval-basket/v1\",\n      \"store_ref\": \"pst_0123456789abcdef0123\",\n      \"currency\": \"EUR\",\n      \"lines\": [\n        {\n          \"item_code\": \"FAKE-BREAD\",\n          \"quantity\": true,\n          \"unit_price_minor\": 150\n        },\n        {\n          \"item_code\": \"FAKE-MILK\",\n          \"quantity\": 1,\n          \"unit_price_minor\": 120\n        }\n      ],\n      \"subtotal_minor\": 420,\n      \"delivery_fee_minor\": 199,\n      \"service_fee_minor\": 50,\n      \"discount_minor\": 0,\n      \"total_minor\": 669\n    }\n  },\n  \"payload_digest\": \"sha256:42ab30f46f56a9dcd257514cc6b7d558679c9a15bfe6e012267ef53fe2902002\"\n}"
+    },
+    {
+      "name": "utf8-bom",
+      "reason": "bom",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "\ufeff{}"
+    },
+    {
+      "name": "trailing-bytes",
+      "reason": "trailing_bytes",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{} x"
+    },
+    {
+      "name": "two-root-objects",
+      "reason": "trailing_bytes",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{}{}"
+    },
+    {
+      "name": "array-root",
+      "reason": "not_object",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "[]"
+    },
+    {
+      "name": "raw-control-char-in-string",
+      "reason": "control_char",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":\"x\ty\"}"
+    },
+    {
+      "name": "nesting-too-deep",
+      "reason": "too_deep",
+      "applies": [
+        "read-result",
+        "read-command"
+      ],
+      "raw": "{\"a\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "schema_version": "bridge.mctl.ai/v1alpha2",
+  "command_id": "cmd_01HZZZZZZZZZZZZZZZZZZZZZZZ",
+  "request_id": "rdq_01HYYYYYYYYYYYYYYYYYYYYYYY",
+  "kind": "read_basket",
+  "lease_token": "lt_0123456789abcdef0123",
+  "attempt": 1,
+  "worker_identity": "provider:glovo",
+  "outcome": "succeeded",
+  "provider_effect": "none",
+  "error_code": "none",
+  "completed_at": "2026-11-09T10:01:00Z",
+  "payload": {
+    "empty": true,
+    "display": []
+  },
+  "payload_digest": "sha256:b1bc10e3ffd52e0d95bde4fd5698fc7302aa20cf1f74dfd83e264e89de95c900"
+}

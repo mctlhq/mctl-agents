@@ -1,0 +1,173 @@
+{
+  "description": "RFC 8785 vectors. `canonical` is written by hand from the RFC and the ECMAScript number rules, and `digest` is sha256 of its UTF-8 bytes. Every consumer reproduces them byte for byte.",
+  "vectors": [
+    {
+      "name": "literals",
+      "category": "literals",
+      "input_text": "[true,false,null]",
+      "canonical": "[true,false,null]",
+      "digest": "sha256:4d0f18de2133118249c26acc481838d4f6bb6bc1de882d99abbd19ae9397e8df"
+    },
+    {
+      "name": "bool-in-object",
+      "category": "literals",
+      "input_text": "{\"a\":true}",
+      "canonical": "{\"a\":true}",
+      "digest": "sha256:5daa0644c4a1c43ea018f7f1ef2944b90e0165ef1f2d5669ca89e5d4f69ac597"
+    },
+    {
+      "name": "empty-object",
+      "category": "empty",
+      "input_text": "{}",
+      "canonical": "{}",
+      "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    {
+      "name": "empty-array",
+      "category": "empty",
+      "input_text": "[]",
+      "canonical": "[]",
+      "digest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "name": "nested",
+      "category": "nested",
+      "input_text": "{\"z\":[{\"b\":2,\"a\":1},[3,2,1]],\"y\":{\"d\":{},\"c\":[]}}",
+      "canonical": "{\"y\":{\"c\":[],\"d\":{}},\"z\":[{\"a\":1,\"b\":2},[3,2,1]]}",
+      "digest": "sha256:801991657e055749e92b18938546010ca1349bc29db879d1a78c82d98757bb33"
+    },
+    {
+      "name": "key-order-bmp",
+      "category": "utf16-key-order",
+      "input_text": "{\"b\":1,\"a\":2,\"B\":3,\"\\u00e9\":4,\"\\ufb33\":5}",
+      "canonical": "{\"B\":3,\"a\":2,\"b\":1,\"é\":4,\"דּ\":5}",
+      "digest": "sha256:73fcb110196d9a789367380fa418e72d10217f3401300a5d7c1c7a7fd4aa2849"
+    },
+    {
+      "name": "key-order-supplementary",
+      "category": "utf16-key-order",
+      "input_text": "{\"\\ufb33\":1,\"\\ud83d\\ude00\":2}",
+      "canonical": "{\"😀\":2,\"דּ\":1}",
+      "digest": "sha256:ec4e7d8c2963caa38dccc3d42693719ac9c6ecd783891b583d333565620ac2be"
+    },
+    {
+      "name": "key-order-numeric-strings",
+      "category": "utf16-key-order",
+      "input_text": "{\"10\":1,\"9\":2,\"1\":3}",
+      "canonical": "{\"1\":3,\"10\":1,\"9\":2}",
+      "digest": "sha256:38a3fdd6f89c34bb41bdb86e885678938b4aaaa0b743d49f3f509d65bbefa88e"
+    },
+    {
+      "name": "control-escapes",
+      "category": "control-escapes",
+      "input_text": "{\"s\":\"\\u0000\\u0001\\u001f\\b\\t\\n\\f\\r\"}",
+      "canonical": "{\"s\":\"\\u0000\\u0001\\u001f\\b\\t\\n\\f\\r\"}",
+      "digest": "sha256:e15f83b45a02c8e19ed48f0e01b0568eb3565bf13e6a0b31fba4608601aa2b2a"
+    },
+    {
+      "name": "del-unescaped",
+      "category": "del",
+      "input_text": "{\"s\":\"\\u007f\"}",
+      "canonical": "{\"s\":\"\"}",
+      "digest": "sha256:487ec760fe5ebe05d21893f0f63b6271963dc1ba0a133585a0fb03b663f7cfe1"
+    },
+    {
+      "name": "quote-backslash",
+      "category": "string-escapes",
+      "input_text": "{\"s\":\"\\\"\\\\\"}",
+      "canonical": "{\"s\":\"\\\"\\\\\"}",
+      "digest": "sha256:8e094918f52f9adc6a011876bcfd9ff71d867ba58357c980fce5a0d2a977be0c"
+    },
+    {
+      "name": "solidus-unescaped",
+      "category": "string-escapes",
+      "input_text": "{\"s\":\"\\/\"}",
+      "canonical": "{\"s\":\"/\"}",
+      "digest": "sha256:3a21357b943ab7956f071b0904981aac17577986281af33468108795e079946d"
+    },
+    {
+      "name": "raw-non-ascii",
+      "category": "string-escapes",
+      "input_text": "{\"s\":\"\\u00e9\\u20ac\\ud83d\\ude00\"}",
+      "canonical": "{\"s\":\"é€😀\"}",
+      "digest": "sha256:fa8f72071fcda45ae6bf588b8f622ed60158a7c0b76fef5965c915e0cace1a5e"
+    },
+    {
+      "name": "number-1e21",
+      "category": "es-numbers",
+      "input_text": "[1e21]",
+      "canonical": "[1e+21]",
+      "digest": "sha256:5f5f297c3b2ec0b2793ea5cfe3f242ad4bd3aa438734268b6c9b7251a643d86c"
+    },
+    {
+      "name": "number-1e20",
+      "category": "es-numbers",
+      "input_text": "[1e20]",
+      "canonical": "[100000000000000000000]",
+      "digest": "sha256:e7172a9602cb82291195c39a042201a2d0765d41138e05bed1ff800b6f83ecba"
+    },
+    {
+      "name": "number-1e-7",
+      "category": "es-numbers",
+      "input_text": "[1e-7]",
+      "canonical": "[1e-7]",
+      "digest": "sha256:bc7a06269156cbffa6333144da8da95e93d9c6cf0ad4895595a8e886fb780433"
+    },
+    {
+      "name": "number-1e-6",
+      "category": "es-numbers",
+      "input_text": "[0.000001]",
+      "canonical": "[0.000001]",
+      "digest": "sha256:1051d381ca47ccc627251714cc2a92838b92b0e9cf0130318b25b82ef7e18d9e"
+    },
+    {
+      "name": "number-4.50",
+      "category": "es-numbers",
+      "input_text": "[4.50]",
+      "canonical": "[4.5]",
+      "digest": "sha256:ae8e886586d3023e5df97848de2a4cdff1e53eb611fb52c19bab99a6859deac0"
+    },
+    {
+      "name": "number-large-float",
+      "category": "es-numbers",
+      "input_text": "[1.2345678901234568e20]",
+      "canonical": "[123456789012345680000]",
+      "digest": "sha256:fb913b7a1b91e90d388eadadc271b19a4f3ff832b871523a588bf7acc0de728b"
+    },
+    {
+      "name": "negative-zero-int",
+      "category": "negative-zero",
+      "input_text": "[-0]",
+      "canonical": "[0]",
+      "digest": "sha256:d0bca111f8628137adc4c16f123496dcdd1d590d06cb5d9acd68b39fe656fb97"
+    },
+    {
+      "name": "negative-zero-float",
+      "category": "negative-zero",
+      "input_text": "[-0.0]",
+      "canonical": "[0]",
+      "digest": "sha256:d0bca111f8628137adc4c16f123496dcdd1d590d06cb5d9acd68b39fe656fb97"
+    },
+    {
+      "name": "integers",
+      "category": "integers",
+      "input_text": "[0,-1,9007199254740991,-9007199254740991]",
+      "canonical": "[0,-1,9007199254740991,-9007199254740991]",
+      "digest": "sha256:d1f4b91349edc7ebd49ff1de73304f618c38a7456b5e36df82573d372466fff6"
+    },
+    {
+      "name": "rfc8785-3.2.2-sample",
+      "category": "rfc8785-3.2.2",
+      "input_text": "{\"numbers\":[333333333.33333329,1E30,4.50,2e-3,0.000000000000000000000000001],\"string\":\"\\u20ac$\\u000F\\u000aA'\\u0042\\u0022\\u005c\\\\\\\"\\/\",\"literals\":[null,true,false]}",
+      "canonical": "{\"literals\":[null,true,false],\"numbers\":[333333333.3333333,1e+30,4.5,0.002,1e-27],\"string\":\"€$\\u000f\\nA'B\\\"\\\\\\\\\\\"/\"}",
+      "digest": "sha256:2d5e01a318d0f0879ab568c4be289c8b1f64ef8921a53c6277d5e069978baacb"
+    },
+    {
+      "name": "rfc8785-3.2.3-sorting",
+      "category": "rfc8785-3.2.3",
+      "input_text": "{\"\\u20ac\":\"Euro Sign\",\"\\r\":\"Carriage Return\",\"\\ufb33\":\"Hebrew Letter Dalet With Dagesh\",\"1\":\"One\",\"\\ud83d\\ude00\":\"Emoji: Grinning Face\",\"\\u0080\":\"Control\",\"\\u00f6\":\"Latin Small Letter O With Diaeresis\"}",
+      "canonical": "{\"\\r\":\"Carriage Return\",\"1\":\"One\",\"\":\"Control\",\"ö\":\"Latin Small Letter O With Diaeresis\",\"€\":\"Euro Sign\",\"😀\":\"Emoji: Grinning Face\",\"דּ\":\"Hebrew Letter Dalet With Dagesh\"}",
+      "digest": "sha256:5e321556d22018a9656991a9e94f77ec175fa193e52a2429d312f8419ec8b08c"
+    }
+  ]
+}

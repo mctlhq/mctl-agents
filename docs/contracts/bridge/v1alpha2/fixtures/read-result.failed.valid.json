@@ -1,0 +1,14 @@
+{
+  "schema_version": "bridge.mctl.ai/v1alpha2",
+  "command_id": "cmd_01HZZZZZZZZZZZZZZZZZZZZZZZ",
+  "request_id": "rdq_01HYYYYYYYYYYYYYYYYYYYYYYY",
+  "kind": "read_preview",
+  "lease_token": "lt_0123456789abcdef0123",
+  "attempt": 1,
+  "worker_identity": "provider:glovo",
+  "outcome": "failed_terminal",
+  "provider_effect": "none",
+  "error_code": "provider_rejected",
+  "completed_at": "2026-11-09T10:01:00Z",
+  "error_detail": "unknown history_order_ref"
+}
