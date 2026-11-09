@@ -70,6 +70,9 @@ class _Resp(io.BytesIO):
         self.close()
 
 
+FAKE_CONTEXT_DIGEST = "sha256:" + "e" * 64
+
+
 class FakeMctlApi:
     def __init__(self, clock: _Clock) -> None:
         self.clock = clock
@@ -111,7 +114,12 @@ class FakeMctlApi:
         return _Resp(payload, status)
 
     def _ok(self, status: int, rec: dict[str, Any]) -> Any:
-        return self._answer(status, {"schema_version": "actionapproval/v1", "approval": self.view(rec)})
+        # Like mctl-api's writeApproval, every answer carries the decision
+        # context; only its digest is read on this side (mctl-api#964).
+        return self._answer(status, {
+            "schema_version": "actionapproval/v1", "approval": self.view(rec),
+            "decision_context": {"context_digest": FAKE_CONTEXT_DIGEST},
+        })
 
     @staticmethod
     def _err(status: int, code: str) -> Any:

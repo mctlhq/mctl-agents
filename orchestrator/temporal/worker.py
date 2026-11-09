@@ -47,6 +47,7 @@ from orchestrator.github_token import refresh_github_token
 from orchestrator.temporal.activities.action_approval import read_action_approval
 from orchestrator.temporal.activities.argo import submit_and_wait
 from orchestrator.temporal.activities.canonical_execution import ensure_issue_execution
+from orchestrator.temporal.activities.decide_notify import notify_devloop_decision
 from orchestrator.temporal.activities.delegated_approval import (
     check_grant_freshness,
     request_devloop_approval,
@@ -726,6 +727,9 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         # mctl-api round trips, the same shape as the two above.
         ensure_issue_execution,
         request_devloop_approval,
+        # One Telegram sendMessage with the decide link of a pending grant
+        # (mctl-api#964): a bounded external call like the comment below.
+        notify_devloop_decision,
         # Read-only digest check and best-effort audit comment of a superseded
         # grant (#701).
         check_grant_freshness,

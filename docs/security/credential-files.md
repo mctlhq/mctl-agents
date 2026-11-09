@@ -20,6 +20,7 @@ are recorded here, never a value.
 | `MCTL_USAGE_WRITER_TOKEN` | `MCTL_USAGE_WRITER_TOKEN_FILE` | `usage_ledger`, `run_usage_collector` | per delivery | in-process | long-lived, operator-rotated (exact lifetime: not observed) |
 | `MCTL_EVIDENCE_WRITER_TOKEN` | `MCTL_EVIDENCE_WRITER_TOKEN_FILE` | `evidence_producer`, `decision_records` | per call | in-process | long-lived, operator-rotated (exact lifetime: not observed) |
 | `SCOUT_TELEGRAM_BOT_TOKEN` | `SCOUT_TELEGRAM_BOT_TOKEN_FILE` | `run_scout` | per run | in-process | long-lived, operator-rotated (exact lifetime: not observed) |
+| `DEVLOOP_NOTIFY_TELEGRAM_BOT_TOKEN` | `DEVLOOP_NOTIFY_TELEGRAM_BOT_TOKEN_FILE` | `temporal/activities/decide_notify` | per notification | in-process | long-lived, operator-rotated (exact lifetime: not observed) |
 | `GITHUB_TOKEN` | `GITHUB_TOKEN_FILE` | `gh`/`git` children | per subprocess, via `refresh_github_token()` and once at each entrypoint start | subprocess-env | short-lived (GitHub App token, kubelet-refreshed file) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | `CLAUDE_CODE_OAUTH_TOKEN_FILE` | `auth.session_auth_env` | per SDK session | cli-env | long-lived, operator-rotated (exact lifetime: not observed) |
 | `CLAUDE_CODE_OAUTH_TOKEN_SECONDARY` | `CLAUDE_CODE_OAUTH_TOKEN_SECONDARY_FILE` | `auth.rotate_to_secondary_auth` | per SDK session, after a 429 | cli-env | long-lived, operator-rotated (exact lifetime: not observed) |
