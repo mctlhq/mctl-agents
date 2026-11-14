@@ -1019,3 +1019,44 @@ def test_a_partly_understood_constraint_does_not_resolve(constraint):
         resolver._version_satisfies(
             "1.0.0", constraint, path=Path("x"), field_path="compatibility"
         )
+
+
+# Optional list fields fail closed on a wrong type with ResolverError, never
+# a raw TypeError or a silently exploded string.
+@pytest.mark.parametrize("sources", [None, "inline", {"inline": "x"}])
+def test_load_definition_refuses_non_list_prompt_sources(tmp_path, monkeypatch, sources):
+    definitions_dir = tmp_path / "manifests"
+    monkeypatch.setattr(resolver, "DEFINITIONS_DIR", definitions_dir)
+    doc = _base_definition_doc("sha256:" + "0" * 64)
+    doc["spec"]["prompt"]["sources"] = sources
+    _write(definitions_dir / _AGENT / "agent.yaml", doc)
+    expected = r"sources must not be empty" if sources is None else r"spec\.prompt\.sources must be a list"
+    with pytest.raises(resolver.ResolverError, match=expected):
+        resolver.load_definition(_AGENT)
+
+
+@pytest.mark.parametrize("field", ["skills", "tools"])
+@pytest.mark.parametrize("value", ["Read", 5, ["Read", 5]], ids=["string", "int", "non-str-item"])
+def test_load_profile_refuses_non_string_list_skills_and_tools(tmp_path, monkeypatch, field, value):
+    monkeypatch.setattr(resolver, "CATALOG_PROFILES_DIR", tmp_path / "profiles")
+    doc = _base_profile_doc()
+    doc["spec"][field] = value
+    _write(tmp_path / "profiles" / _PROFILE / "profile.yaml", doc)
+    with pytest.raises(resolver.ResolverError, match=rf"spec\.{field}"):
+        resolver.load_profile(_PROFILE)
+
+
+def test_load_profile_reads_null_skills_and_tools_as_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(resolver, "CATALOG_PROFILES_DIR", tmp_path / "profiles")
+    doc = _base_profile_doc()
+    doc["spec"]["skills"] = None
+    doc["spec"]["tools"] = None
+    _write(tmp_path / "profiles" / _PROFILE / "profile.yaml", doc)
+    profile = resolver.load_profile(_PROFILE)
+    assert profile.skills == () and profile.tools == ()
+
+
+def test_parse_version_refuses_unicode_digits_with_resolver_error():
+    # '²'.isdigit() is True but int('²') raises ValueError.
+    with pytest.raises(resolver.ResolverError, match="non-numeric component"):
+        resolver._parse_version("1.²", path=Path("p"), field_path="version")

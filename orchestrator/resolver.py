@@ -424,6 +424,25 @@ def _require_mapping(value: Any, *, path: Path, field_path: str) -> dict[str, An
     return value
 
 
+def _require_list(value: Any, *, path: Path, field_path: str) -> list[Any]:
+    """An optional list field: absent or null reads as empty, anything else
+    must be a list. Iterating whatever was there turned `sources: null` into
+    a raw `TypeError` and `skills: "abc"` into `('a', 'b', 'c')`."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ResolverError(f"{path}: {field_path} must be a list, got {type(value).__name__}")
+    return value
+
+
+def _require_str_list(value: Any, *, path: Path, field_path: str) -> tuple[str, ...]:
+    items = _require_list(value, path=path, field_path=field_path)
+    for index, item in enumerate(items):
+        if not isinstance(item, str):
+            raise ResolverError(f"{path}: {field_path}[{index}] must be a string, got {type(item).__name__}")
+    return tuple(items)
+
+
 def _parse_version(version: str, *, path: Path, field_path: str) -> tuple[int, ...]:
     """Parse a dotted numeric version into a comparable tuple.
 
@@ -435,7 +454,8 @@ def _parse_version(version: str, *, path: Path, field_path: str) -> tuple[int, .
     parts = version.split(".")
     out: list[int] = []
     for part in parts:
-        if not part.isdigit():
+        # isascii: str.isdigit() also admits superscripts, which int() refuses.
+        if not (part.isascii() and part.isdigit()):
             raise ResolverError(
                 f"{path}: {field_path} {version!r} has non-numeric component {part!r}"
             )
@@ -659,7 +679,8 @@ def parse_definition(raw: bytes, *, path: Path) -> AgentDefinition:
         )
 
     prompt = _require_mapping(spec.get("prompt") or {}, path=path, field_path="spec.prompt")
-    prompt_sources = tuple(_parse_prompt_source(s, path) for s in prompt.get("sources", []))
+    raw_sources = _require_list(prompt.get("sources"), path=path, field_path="spec.prompt.sources")
+    prompt_sources = tuple(_parse_prompt_source(s, path) for s in raw_sources)
     if not prompt_sources:
         raise ResolverError(f"{path}: spec.prompt.sources must not be empty")
 
@@ -787,8 +808,8 @@ def load_profile(name: str) -> ExecutionProfile:
         version=profile_version,
         model_policy_task=model_policy_task,
         model_policy_legacy_env_override=model_policy_ref.get("legacyEnvOverride"),
-        skills=tuple(spec.get("skills") or []),
-        tools=tuple(spec.get("tools") or []),
+        skills=_require_str_list(spec.get("skills"), path=path, field_path="spec.skills"),
+        tools=_require_str_list(spec.get("tools"), path=path, field_path="spec.tools"),
         policy_ref=policy_ref,
         permissions=permissions,
         budget_usd=float(budget),
