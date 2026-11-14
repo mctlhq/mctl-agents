@@ -255,19 +255,37 @@ class AssuranceReplayVerifier:
 # -- scanner rerun ----------------------------------------------------------
 
 
-def _bound_observations(ctx: Context) -> list[contract.Observation]:
+def _binding(o: contract.Observation, a: contract.Attempt) -> str:
+    """How `o` binds to `a`, by mctl-api's rule (`attemptRow.bound` in
+    internal/securityfindings/remediation.go): EVERY landed field the attempt
+    has set must match exactly; fields it has not set are ignored, and an
+    attempt with none binds nothing. Returns "bound", "partial" (it matches
+    some set field but not all, so the server would refuse anything built on
+    it) or "unbound"."""
+    fields = [(a.landed_revision, o.observed_revision), (a.landed_artifact_digest, o.observed_artifact_digest)]
+    set_fields = [(want, got) for want, got in fields if want]
+    if not set_fields:
+        return "unbound"
+    matched = [want == got for want, got in set_fields]
+    if all(matched):
+        return "bound"
+    return "partial" if any(matched) else "unbound"
+
+
+def _candidate_observations(ctx: Context) -> list[tuple[contract.Observation, str]]:
+    """Authenticated, post-landing, deduplicated observations with their
+    binding; observations that bind not at all are dropped."""
     a = ctx.attempt
     landed_at = parse_time(a.landed_at) if a.landed_at else None
     seen: set[str] = set()
-    found: list[contract.Observation] = []
+    found: list[tuple[contract.Observation, str]] = []
     for o in ctx.occurrence.observations:
         if not o.provider_ref or o.provider_ref.startswith("admin:"):
             continue
         if o.claimed_action not in ("absent", "present"):
             continue
-        rev_ok = bool(a.landed_revision) and o.observed_revision == a.landed_revision
-        dig_ok = bool(a.landed_artifact_digest) and o.observed_artifact_digest == a.landed_artifact_digest
-        if not (rev_ok or dig_ok):
+        binding = _binding(o, a)
+        if binding == "unbound":
             continue
         at = parse_time(o.observed_at) if o.observed_at else None
         if landed_at is not None and (at is None or at < landed_at):
@@ -277,8 +295,19 @@ def _bound_observations(ctx: Context) -> list[contract.Observation]:
         if key in seen:
             continue
         seen.add(key)
-        found.append(o)
+        found.append((o, binding))
     return found
+
+
+def _bound_observations(ctx: Context) -> list[contract.Observation]:
+    return [o for o, binding in _candidate_observations(ctx) if binding == "bound"]
+
+
+def _partial_reason(ctx: Context, partial: list[contract.Observation]) -> str:
+    a = ctx.attempt
+    if any(o.observed_revision == a.landed_revision for o in partial):
+        return "observation binds the revision only, not the landed artifact digest"
+    return "observation binds the artifact digest only, not the landed revision"
 
 
 @dataclass
@@ -290,20 +319,21 @@ class ScannerRerunVerifier:
     mechanism: str = "scanner_rerun_exact_revision"
 
     def verify(self, ctx: Context) -> Outcome | NotApplicable | Pending:
-        bound = _bound_observations(ctx)
+        candidates = _candidate_observations(ctx)
+        bound = [o for o, binding in candidates if binding == "bound"]
         if not bound:
+            partial = [o for o, binding in candidates if binding == "partial"]
+            if partial:
+                # Not "nothing observed": an observation exists but cannot be
+                # recorded against this attempt. Say so instead of dropping it.
+                return Pending(self.mechanism, _partial_reason(ctx, partial))
             return Pending(self.mechanism, "no authenticated observation bound to the landed revision yet")
         latest = max(bound, key=lambda o: parse_time(o.observed_at) or datetime.min.replace(tzinfo=UTC))
         if latest.claimed_action == "absent":
             return NotApplicable(self.mechanism, "bound absent: recorded server-side by mctl-api")
+        # `latest` is fully bound, so it carries exactly the attempt's fields.
         a = ctx.attempt
-        return Outcome(
-            self.mechanism, "failed",
-            revision=a.landed_revision if latest.observed_revision == a.landed_revision else "",
-            artifact_digest=(
-                a.landed_artifact_digest if latest.observed_artifact_digest == a.landed_artifact_digest else ""
-            ),
-        )
+        return Outcome(self.mechanism, "failed", revision=a.landed_revision, artifact_digest=a.landed_artifact_digest)
 
 
 # -- planning ---------------------------------------------------------------
