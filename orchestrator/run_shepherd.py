@@ -115,9 +115,8 @@ from typing import Any, Literal
 import anyio
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
-from orchestrator import evidence_producer, policy_checkpoint, tracing, usage_ledger
+from orchestrator import evidence_producer, policy_checkpoint, run_token, tracing, usage_ledger
 from orchestrator.ci_checks import CheckBlocker, CIStatus, fetch_failure_logs, read_required_checks
-from orchestrator.credential_files import read_credential
 from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
 from orchestrator.github_token import refresh_github_token
 from orchestrator.lifecycle import rollout, shadow
@@ -227,6 +226,9 @@ def _dev_loop_owns(service: str, slug: str) -> bool:
     return _owns(_dev_loop_owns_answer(service, slug))
 
 
+RUN_TOKEN_SCOPE = "shepherd"  # noqa: S105 — a scope name, not a credential
+
+
 def _dev_loop_owns_answer(service: str, slug: str) -> str:
     """The same probe, three-valued: LEGACY_OWNED / LEGACY_FREE / LEGACY_UNKNOWN.
 
@@ -249,7 +251,9 @@ def _dev_loop_owns_answer(service: str, slug: str) -> str:
         # (incident-*, anything pre-Temporal) never had a DevLoop, so the old
         # mechanism genuinely answers "nobody drives this".
         return LEGACY_FREE
-    token = read_credential("MCTL_TOKEN")
+    # The run token in enforce mode, never the static one: enforce with no run
+    # token answers "", which stays "never asked" and not "not owned".
+    token = run_token.mctl_api_bearer()
     if not token:
         # Never asked.
         return LEGACY_UNKNOWN
@@ -331,6 +335,30 @@ def _dev_loop_owns_answer(service: str, slug: str) -> str:
     if payload.get("shepherd_in_loop_known") is False:
         return LEGACY_UNKNOWN
     return LEGACY_FREE
+
+
+def _setup_run_token() -> None:
+    """Acquire the sweep's run token per MCTL_RUN_TOKEN_MODE (mctlhq/mctl-gitops#1980).
+
+    Sweep only: a targeted --slug tick, including the DevLoop's own, makes no
+    liveness read and must not depend on the exchange.
+
+    A failure enforce must not survive exits 2. Going on would answer
+    LEGACY_UNKNOWN for every proposal, and the sweep drives what it cannot
+    place, so a refused exchange would mean driving every live DevLoop's PR
+    too (#213). A failed tick is visible, and the next one retries."""
+    try:
+        run_token.setup(shadow_scope=RUN_TOKEN_SCOPE)
+    except run_token.RunTokenError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
+def _implementer_child_env() -> dict[str, str]:
+    """The environment of the run_implementer subprocess. The run token mode
+    belongs to the shepherd's own process: the implementer would read it as its
+    own, and under enforce refuse to start for lack of an execution_id."""
+    return {k: v for k, v in os.environ.items() if k != run_token.MODE_ENV}
 
 
 def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
@@ -3358,7 +3386,9 @@ def apply_followup(
         if state_dir is not None and Path(state_dir) != run_implementer.DEFAULT_STATE_DIR:
             cmd.extend(["--state-dir", str(state_dir)])
         print(f"$ {' '.join(cmd)}")
-        proc = subprocess.run(cmd, check=False, text=True)  # noqa: S603 — cmd is list[str], built above
+        proc = subprocess.run(  # noqa: S603 — cmd is list[str], built above
+            cmd, check=False, text=True, env=_implementer_child_env()
+        )
         # Gated on the codes `run_implementer` actually writes `--refusal-out`
         # for, NOT read unconditionally. `mkstemp` leaves the file empty, so
         # reading it on every tick parsed zero bytes and warned on 100% of
@@ -5270,6 +5300,7 @@ def main() -> None:
     # reconcile stays unfiltered too (read-only idempotent projection,
     # and terminal states must be projected even for owned slugs).
     if not args.slug and not args.reconcile:
+        _setup_run_token()
         refs = _filter_dev_loop_owned(refs)
 
     # PR adoption (mctlhq/mctl-agents#334): sweep mode only, same as the
