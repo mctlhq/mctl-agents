@@ -325,7 +325,14 @@ def _heredoc_body_spans(command: str) -> list[tuple[int, int, bool]]:
                     line_end = command.find("\n", cursor)
                     line_end = length if line_end == -1 else line_end
                     line = command[cursor:line_end]
-                    if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                    # bash keeps a trailing `\r` in both the delimiter word
+                    # and the line, so a CRLF heredoc does terminate; compare
+                    # without it on both sides. A mismatch either way only
+                    # ends the body EARLIER than bash, the safe direction.
+                    candidate = line.rstrip("\r")
+                    if strip_tabs:
+                        candidate = candidate.lstrip("\t")
+                    if candidate == delimiter:
                         spans.append((body_start, line_end, literal))
                         cursor = min(line_end + 1, length)
                         terminated = True
@@ -746,8 +753,12 @@ def detachment_match(command: str, _depth: int = 0) -> tuple[str, str] | None:
 
     if _depth >= MAX_PAYLOAD_DEPTH:
         return None
+    # Substitutions in an UNQUOTED heredoc body still run, so that scan keeps
+    # them; a `bash -c` line in any body is text (only `$(...)` and backticks
+    # execute there), so the `-c` scan reads the fully blanked view.
     executable = blank_heredoc_bodies(normalized, literal_only=True)
-    for payload in _command_substitutions(executable) + _shell_c_payloads(normalized):
+    payloads = _command_substitutions(executable) + _shell_c_payloads(blank_heredoc_bodies(normalized))
+    for payload in payloads:
         if not payload:
             continue
         nested = detachment_match(payload, _depth + 1)

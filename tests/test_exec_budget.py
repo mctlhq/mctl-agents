@@ -686,6 +686,10 @@ def test_text_that_only_looks_like_process_substitution(command):
         ),
         pytest.param("cat <<-EOF\n\tR&D\n\tEOF\necho ok", id="dash-strips-tabs"),
         pytest.param("cat <<EOF # write it\nR&D\nEOF", id="comment-after-the-operator"),
+        pytest.param("cat <<'EOF' > s.sh\nbash -c \"echo hi &\"\nEOF", id="bash-c-in-a-literal-body-is-text"),
+        pytest.param("cat <<EOF > s.sh\nbash -c \"echo hi &\"\nEOF", id="bash-c-in-an-unquoted-body-is-text"),
+        pytest.param("cat <<'EOF' > f\r\nR&D\r\nEOF\r\necho ok", id="crlf-heredoc-terminates"),
+        pytest.param("cat <<-EOF > f\r\n\tR&D\r\n\tEOF\r\necho ok", id="crlf-dash-heredoc-terminates"),
         pytest.param("echo $# x#y <<EOF\nR&D\nEOF", id="hash-inside-a-word-is-no-comment"),
         pytest.param("cat <<'EOF'\n$(sleep 100 &)\nEOF", id="literal-body-substitution-is-text"),
     ],
@@ -701,6 +705,10 @@ def test_an_ampersand_in_a_heredoc_body_is_not_a_detachment(command: str) -> Non
         pytest.param("cat <<EOF &\nhi\nEOF", id="on-the-operator-line"),
         pytest.param("cat <<EOF\nsleep 100 &", id="unterminated-stays-visible"),
         pytest.param("cat <<EOF\n$(sleep 100 &)\nEOF", id="unquoted-body-substitution-runs"),
+        pytest.param(
+            "cat <<EOF\nbash -c \"$(sleep 100 &)\"\nEOF", id="unquoted-body-substitution-in-a-bash-c-line-runs"
+        ),
+        pytest.param("cat <<'EOF' > f\r\nhi\r\nEOF\r\nsleep 100 &", id="crlf-after-the-terminator"),
         pytest.param("cat <<EOF\nhi\nEOF \nsleep 100 &", id="near-miss-terminator-stays-visible"),
         pytest.param("echo $((1<<2)) &", id="arithmetic-shift-is-not-a-heredoc"),
         pytest.param(
