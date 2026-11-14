@@ -97,11 +97,12 @@ manifest_api_versions:
   scout: agents.mctl.ai/v1alpha1
   service-agent: agents.mctl.ai/v1alpha1
   shepherd: agents.mctl.ai/v1alpha1
-mcp_tool_count: 105
+mcp_tool_count: 112
 mcp_tools:
 - mctl_abandon_dev_loop
 - mctl_acknowledge_incident
 - mctl_add_custom_domain
+- mctl_append_work_item_intent
 - mctl_approve_dev_loop
 - mctl_ask_support
 - mctl_bind_agent_release
@@ -109,10 +110,12 @@ mcp_tools:
 - mctl_create_agent
 - mctl_create_preview
 - mctl_create_tenant
+- mctl_create_work_item
 - mctl_decide_signup_request
 - mctl_delete_preview
 - mctl_delete_tenant
 - mctl_deploy_analyze
+- mctl_deploy_plan
 - mctl_deploy_service
 - mctl_deprecate_platform_skill
 - mctl_disable_tenant_skill
@@ -125,6 +128,7 @@ mcp_tools:
 - mctl_get_agent_preflight
 - mctl_get_commerce_budget
 - mctl_get_commerce_receipt
+- mctl_get_deploy_plan
 - mctl_get_dev_loop
 - mctl_get_epic_status
 - mctl_get_incident
@@ -133,6 +137,7 @@ mcp_tools:
 - mctl_get_ready_work_items
 - mctl_get_repo_binding
 - mctl_get_resource_usage
+- mctl_get_review_gate
 - mctl_get_service_config
 - mctl_get_service_logs
 - mctl_get_service_pods
@@ -166,6 +171,7 @@ mcp_tools:
 - mctl_list_tenants
 - mctl_list_work_item_execution_requests
 - mctl_list_work_item_executions
+- mctl_list_work_item_intents
 - mctl_list_work_item_snapshots
 - mctl_list_workflows
 - mctl_plan_epic_wave
@@ -191,6 +197,7 @@ mcp_tools:
 - mctl_set_agent_version_lifecycle
 - mctl_signup_capacity
 - mctl_start_epic_wave
+- mctl_submit_review_assertion
 - mctl_sync_repos
 - mctl_trigger_agents_run
 - mctl_trigger_approve
@@ -247,13 +254,13 @@ registry_environments:
 - production
 - shadow
 releases_seen:
-  mctlhq/mctl-academy: 0.1.57
+  mctlhq/mctl-academy: 0.1.68
   mctlhq/mctl-agent: 2.9.0
-  mctlhq/mctl-agents: 1.112.0
-  mctlhq/mctl-api: 4.140.0
-  mctlhq/mctl-docs: 0.1.59
+  mctlhq/mctl-agents: 1.115.0
+  mctlhq/mctl-api: 4.150.2
+  mctlhq/mctl-docs: 0.1.61
   mctlhq/mctl-portal: 4.31.0
-  mctlhq/mctl-telegram: 0.107.0
+  mctlhq/mctl-telegram: 0.121.1
 schedules:
   ImplementSweepWorkflow: 15 min
   IncidentLoopWorkflow: 1 h
