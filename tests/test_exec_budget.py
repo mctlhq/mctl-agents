@@ -382,7 +382,10 @@ def test_wrap_bounded_rounds_the_kill_grace_up_not_down():
         "sh -c 'nohup ./run.sh'",
         "/bin/bash -c 'setsid ./run.sh'",
         'echo "$(cmd &)"',
-        "X=`slow &` echo hi",
+        # Quoted, so the operator scan cannot see it and only the payload
+        # recursion can. Unquoted, the `&` is caught at the top level (see
+        # test_ampersand_followed_by_a_word_still_backgrounds).
+        'X="`slow &`" echo hi',
         'bash -c "bash -c \'x &\'"',
     ],
 )
@@ -599,3 +602,72 @@ def test_an_exec_wrapper_does_not_hide_the_payload(command):
 )
 def test_seeing_through_a_wrapper_does_not_manufacture_a_payload(command):
     assert exec_budget.detachment_match(command) is None
+
+
+# ---------------------------------------------------------------------------
+# Bug roadmap W1, agents ch. 5, 4a, 4c: false denials and cheap bypasses.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `|&` pipes stderr too and runs in the foreground (ch. 5).
+        "go test ./... |& tee /tmp/test.log",
+        "make check 2>&1 |& tee log",
+        # The words only detach as command words, not inside paths (ch. 5).
+        "tail -n 50 /tmp/setsid.log",
+        "cat docs/nohup-notes.md",
+        "ls ./disown/",
+        "grep -c error build-setsid.out",
+        "cp nohup.out nohup.out.bak",
+        "cat my-nohup",
+        "rm -f old_setsid",
+        "ls x.disown",
+        # `&>` and `&>>` are redirections, not the async operator.
+        "go test ./... &>/tmp/test.log",
+        "go test ./... &>>/tmp/test.log",
+        # Process substitution itself is not a detachment.
+        "diff <(sort a.txt) <(sort b.txt)",
+    ],
+)
+def test_no_false_detachment_denials(command):
+    assert exec_budget.is_detached(command) is None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Whitespace after `&` is not what makes it the async operator (ch. 4a).
+        "go test ./... &echo started",
+        "sleep 100 &true",
+        "X=`slow &` echo hi",
+        # Still denied as command words, including after an operator.
+        "true; nohup ./run.sh",
+        "(setsid ./run.sh)",
+        "./run.sh &\ndisown",
+        "/usr/bin/nohup ./run.sh",
+        "sudo setsid ./run.sh",
+        # A background `&` inside a process substitution (ch. 4c).
+        "cat <(sleep 100 &)",
+        "tee >(slow & ) < in",
+    ],
+)
+def test_detachment_bypasses_are_closed(command):
+    assert exec_budget.is_detached(command) is not None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["cd <(sleep 100)", "pushd >(sleep 100)", "export F=<(sleep 100)"],
+)
+def test_process_substitution_is_not_shell_state_only(command):
+    """`cd <(sleep 100)` starts an unbounded child; it must be wrapped (ch. 4c)."""
+    assert exec_budget.is_shell_state_only(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    ['cd "<(not a substitution)"', "export N=$(( a<(b+1) ))"],
+)
+def test_text_that_only_looks_like_process_substitution(command):
+    """Inside double quotes `<(` is text; inside arithmetic it is a comparison."""
+    assert exec_budget._command_substitutions(command) == []

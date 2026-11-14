@@ -157,10 +157,28 @@ def command_budget(
 # `)` closes a subshell, so `( worker & )` backgrounds exactly as a trailing
 # `&` does -- and after arithmetic stopped being blanked wholesale, that is
 # the spelling `$((worker &) )` reaches the scanner with.
-_TRAILING_BACKGROUND_RE = re.compile(r"(?<![&<>])&(?!&)(?=[\s)]|$)")
-_NOHUP_RE = re.compile(r"\bnohup\b", re.IGNORECASE)
-_SETSID_RE = re.compile(r"\bsetsid\b", re.IGNORECASE)
-_DISOWN_RE = re.compile(r"\bdisown\b", re.IGNORECASE)
+#
+# What FOLLOWS the `&` does not matter: `cmd &echo hi` backgrounds `cmd` just
+# as `cmd & echo hi` does, and requiring whitespace after it let that spelling
+# through (bug roadmap W1, agents ch. 4a). Only the two spellings where `&`
+# is not the async operator are excluded:
+#   - `&&` (logical AND) and `&>`/`&>>` (redirect both streams);
+#   - `|&` (pipe stderr too: `a |& tee log` runs in the foreground), `>&`/`<&`
+#     (fd duplication, `2>&1`) and `;&`/`;;&` (case fall-through).
+_TRAILING_BACKGROUND_RE = re.compile(r"(?<![&<>|;])&(?![&>])")
+# `nohup`, `setsid` and `disown` only detach as COMMAND WORDS, so each must
+# stand as a whole shell word: bounded by whitespace, a control operator or a
+# subshell paren on both sides. `\b` also fired inside paths and file names
+# -- `tail /tmp/setsid.log`, `cat docs/nohup-notes.md` -- and every such
+# false denial cost the agent a turn (bug roadmap W1, agents ch. 5). A `/`
+# may precede the word, so `/usr/bin/nohup ./run.sh` still reads as the
+# command; the price is that a path ending in such a word (`ls /srv/nohup`)
+# is still denied, which is the conservative side.
+_WORD_START = r"(?<![^\s;&|()`/])"
+_WORD_END = r"(?![^\s;&|()`])"
+_NOHUP_RE = re.compile(_WORD_START + r"nohup" + _WORD_END)
+_SETSID_RE = re.compile(_WORD_START + r"setsid" + _WORD_END)
+_DISOWN_RE = re.compile(_WORD_START + r"disown" + _WORD_END)
 
 # Ordered (label, pattern) pairs -- `is_detached` returns the first label that
 # matches, so the order only affects which name is reported, not whether a
@@ -279,7 +297,11 @@ SHELL_COMMAND_WORDS = frozenset({"ash", "bash", "busybox", "dash", "ksh", "sh", 
 # costing unbounded work.
 MAX_PAYLOAD_DEPTH = 3
 
-_SUBSTITUTION_OPEN_RE = re.compile(r"\$\(")
+# `$(...)` command substitution, and `<(...)`/`>(...)` process
+# substitution. The latter runs its command ASYNCHRONOUSLY and bash does not
+# wait for it, so `cd <(sleep 100)` is a long-running child spelled as a
+# shell-state builtin (bug roadmap W1, agents ch. 4c).
+_SUBSTITUTION_OPEN_RE = re.compile(r"\$\(|[<>]\(")
 _ARITHMETIC_OPEN_RE = re.compile(r"\$\(\(")
 # A shell's `-c` need not be a lone token: `bash -lc`, `sh -ec`, `bash -cl`
 # all take the next word as the command to run. Only applied once the
@@ -363,13 +385,18 @@ def _blank_arithmetic(visible: str) -> str:
 
 
 def _command_substitutions(command: str) -> list[str]:
-    """Contents of every `$(...)` and backtick pair that the shell would run.
+    """Contents of every `$(...)`, `<(...)`, `>(...)` and backtick pair that
+    the shell would run.
 
     Single-quoted regions are masked (no substitution happens there); DOUBLE
-    quotes are left transparent, because `"$(cmd &)"` does substitute.
+    quotes are left transparent, because `"$(cmd &)"` does substitute. A
+    `<(`/`>(` inside double quotes is literal text in bash, so process
+    substitution is only recognised outside every quote.
     """
     visible = _mask(command, mask_double=False)
-    arithmetic_starts = {start for start, _ in _arithmetic_spans(visible)}
+    fully_masked = mask_quoted(command)
+    arithmetic = _arithmetic_spans(visible)
+    arithmetic_starts = {start for start, _ in arithmetic}
     found: list[str] = []
 
     position = 0
@@ -380,6 +407,14 @@ def _command_substitutions(command: str) -> list[str]:
         if opened.start() in arithmetic_starts:
             # Not a command substitution. Advance INTO it rather than past
             # it, so a `$(cmd)` nested in the arithmetic is still found.
+            position = opened.end()
+            continue
+        if visible[opened.start()] in "<>" and (
+            fully_masked[opened.start()] != visible[opened.start()]
+            or any(lo <= opened.start() < hi for lo, hi in arithmetic)
+        ):
+            # A `<(` inside double quotes is text; inside arithmetic it is a
+            # comparison followed by a parenthesised operand, `$(( a<(b) ))`.
             position = opened.end()
             continue
         depth = 1
@@ -574,9 +609,10 @@ def is_shell_state_only(command: str) -> bool:
     shape, the agent wrote as a prefix to THIS command anyway). Callers use
     this to decide whether `wrap_bounded` may rewrite the command at all.
 
-    A command carrying a command substitution is never exempt, however it is
-    spelled: `export FOO=$(slow)` is a builtin by command word and an
-    unbounded subprocess in fact (claude P3 on `624a433`).
+    A command carrying a command or process substitution is never exempt,
+    however it is spelled: `export FOO=$(slow)` and `cd <(slow)` are builtins
+    by command word and unbounded subprocesses in fact (claude P3 on
+    `624a433`; bug roadmap W1, agents ch. 4c).
 
     A command this cannot parse (unbalanced quotes) returns False -- the
     conservative direction, since False only means "bound it as usual".
@@ -608,6 +644,15 @@ def is_shell_state_only(command: str) -> bool:
 
 def is_detached(command: str) -> str | None:
     """Return the matched detachment form, or ``None``.
+
+    A hygiene guard, not a security boundary. It keeps an implementer from
+    detaching work by ACCIDENT, the mctl-telegram#652 shape; it does not
+    claim to stop an agent set on hiding a background job. Exec wrappers
+    whose payload is not a `-c` program -- `time`, `timeout N`, `exec`,
+    `command`, `env -S "bash -c '... &'"` -- are a known, accepted gap (bug
+    roadmap W1, agents ch. 4b): a denylist of wrappers never ends, and the
+    process-group kill in `wrap_bounded` still reaches anything they start
+    that stays in the group.
 
     ``command`` is normalized first (see `normalize_shell_command`) so a
     line-continued `&`/`nohup`/`setsid`/`disown` cannot hide past a pattern
