@@ -6802,3 +6802,184 @@ def test_process_one_merge_state_unknown_counter_resets(tmp_path) -> None:
     status = read_status(ref)
     assert "merge_unknown_ticks" not in status
     assert "merge_unknown_head" not in status
+
+
+# ---------------------------------------------------------------------------
+# A failed review read is not "no findings" (bug roadmap W0, mctl-agents#622)
+# ---------------------------------------------------------------------------
+_CLEAN_NOW = datetime(2026, 4, 29, 12, 0, 0, tzinfo=UTC)
+_LISTING_LABELS = {
+    "/pulls/42/reviews": "reviews",
+    "/pulls/42/comments": "pull comments",
+    "/issues/42/comments": "issue comments",
+    "/reactions": "trigger reactions",
+}
+
+
+def _review_listings(fail: str | None = None, error: BaseException | None = None):
+    """GitHub as the shepherd reads it: a CHANGES_REQUESTED review carrying a
+    P1 on the current head, plus an issue-comment approval and a +1 on an
+    `@claude review` trigger, both newer than the push. Read in full, the
+    review blocks. Read without the reviews listing, it looks approved.
+    """
+    listings = {
+        "/pulls/42/reviews": [{
+            "id": 1,
+            "user": {"login": run_shepherd.REVIEW_BOT},
+            "commit_id": HEAD_SHA,
+            "state": "CHANGES_REQUESTED",
+            "submitted_at": "2026-04-29T11:30:00Z",
+            "body": "**P1**: the migration drops a column that is still read",
+        }],
+        "/pulls/42/comments": [],
+        "/issues/42/comments": [
+            {
+                "id": 7,
+                "user": {"login": "mashkovd"},
+                "created_at": "2026-04-29T10:30:00Z",
+                "body": "@claude review",
+            },
+            {
+                "id": 8,
+                "user": {"login": run_shepherd.REVIEW_BOT},
+                "created_at": "2026-04-29T11:00:00Z",
+                "body": "No P1/P2 findings.",
+            },
+        ],
+        "/reactions": [{
+            "user": {"login": run_shepherd.REVIEW_BOT},
+            "content": "+1",
+            "created_at": "2026-04-29T11:00:00Z",
+        }],
+    }
+
+    def fake(args):
+        path = args[0]
+        key = next(k for k in listings if path.endswith(k))
+        if key == fail:
+            raise error
+        return listings[key]
+
+    return fake
+
+
+def test_fully_read_review_blocks_the_merge() -> None:
+    """Baseline: with every listing read, the P1 in the review body blocks."""
+    with patch.object(run_shepherd, "_gh_api_json", side_effect=_review_listings()):
+        review = run_shepherd.read_codex_review(make_pr())
+    assert review.known
+    decision, _ = decide(make_pr(), review, now=_CLEAN_NOW)
+    assert decision == "address-review"
+
+
+@pytest.mark.parametrize("error", [
+    run_shepherd.subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 502"),
+    json.JSONDecodeError("Extra data", "[][]", 2),
+    OSError("gh not found"),
+], ids=["gh-failed", "malformed-body", "os-error"])
+def test_unread_reviews_listing_never_merges(error) -> None:
+    """The reviews read fails while the approval in issue comments is read.
+    Before the fix this was `reviews = []`: the CHANGES_REQUESTED verdict and
+    its P1 vanished, the approval stood, and decide() returned `merge`.
+    """
+    pr = make_pr()
+    fake = _review_listings(fail="/pulls/42/reviews", error=error)
+    with patch.object(run_shepherd, "_gh_api_json", side_effect=fake):
+        review = run_shepherd.read_codex_review(pr)
+    assert not review.known
+    assert review.unread == ("reviews",)
+    assert decide(pr, review, now=_CLEAN_NOW) == ("review-unknown", ["reviews"])
+    assert decide(pr, review, now=_CLEAN_NOW, fix_only=True)[0] == "review-unknown"
+
+
+@pytest.mark.parametrize("fail", list(_LISTING_LABELS))
+def test_every_unread_listing_is_recorded(fail) -> None:
+    """Sweep of the class: each of the four listings fails closed, not empty."""
+    fake = _review_listings(
+        fail=fail, error=run_shepherd.subprocess.CalledProcessError(1, ["gh"], stderr="boom"),
+    )
+    with patch.object(run_shepherd, "_gh_api_json", side_effect=fake):
+        review = run_shepherd.read_codex_review(make_pr())
+    assert review.unread == (_LISTING_LABELS[fail],)
+    assert decide(make_pr(), review, now=_CLEAN_NOW)[0] == "review-unknown"
+
+
+def test_non_list_listing_body_is_unread() -> None:
+    """A body that is not a list of objects is a malformed read, not a listing."""
+    def fake(args):
+        if args[0].endswith("/pulls/42/reviews"):
+            return {"message": "Server Error"}
+        return _review_listings()(args)
+
+    with patch.object(run_shepherd, "_gh_api_json", side_effect=fake):
+        review = run_shepherd.read_codex_review(make_pr())
+    assert review.unread == ("reviews",)
+
+
+def test_empty_listing_body_is_observed_empty() -> None:
+    """Empty output is GitHub's absence signal and stays a known empty listing."""
+    with patch.object(run_shepherd, "_gh_api_json", return_value=None):
+        review = run_shepherd.read_codex_review(make_pr())
+    assert review.known
+    assert decide(make_pr(), review, now=_CLEAN_NOW) == ("wait", None)
+
+
+def test_review_unknown_does_not_mask_a_merged_or_closed_pr() -> None:
+    """Terminal PR states do not depend on the review; they still flip."""
+    review = CodexReview(has_responded=False, findings=[], unread=("reviews",))
+    merged = make_pr(merged=True, merge_commit="deadbeef")
+    assert decide(merged, review) == ("flip-to-merged", "deadbeef")
+    assert decide(make_pr(closed_unmerged=True), review)[0] == "flip-to-rejected"
+
+
+def test_process_one_review_unknown_waits_and_charges_nothing(tmp_path) -> None:
+    """process_one: an unread listing never merges and never spends a review
+    attempt; the proposal is left exactly as it was, to be read next tick."""
+    ref = make_ref(tmp_path, review_attempts=1)
+    pr = make_pr()
+    review = CodexReview(
+        has_responded=True, findings=[], head_verdict="APPROVED", unread=("reviews",),
+    )
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "merge_pr") as mocked_merge, \
+         patch.object(run_shepherd, "apply_followup") as mocked_followup:
+        result = process_one(ref, skip_subprocess=True)
+    assert result.decision == "wait"
+    assert "reviews" in (result.notes or "")
+    mocked_merge.assert_not_called()
+    mocked_followup.assert_not_called()
+    status = read_status(ref)
+    assert status["status"] == "implemented"
+    assert status.get("review_attempts") == 1
+
+
+def test_reconcile_unstick_clears_the_outage_counters(tmp_path) -> None:
+    """Clearing review-stuck must clear every counter that can re-stick it,
+    including the three outage counters (bug roadmap, agents ch. 7)."""
+    ref = make_ref(tmp_path, service="mctl-agents", slug="stuck", status="review-stuck")
+    status = read_status(ref)
+    status["github"] = {"state": "open", "head_sha": HEAD_SHA, "observed_at": "2026-04-29T12:00:00Z"}
+    status["failure"] = {"code": "review-attempts-exhausted"}
+    status.update(
+        ci_infra_retries=4,
+        ci_infra_head=HEAD_SHA,
+        ci_probe_failures=run_shepherd.SHEPHERD_CI_PROBE_FAILURES_MAX,
+        merge_unknown_ticks=run_shepherd.SHEPHERD_MERGE_UNKNOWN_MAX,
+        merge_unknown_head=HEAD_SHA,
+    )
+    ref.status_path.write_text(yaml.safe_dump(status, sort_keys=False), encoding="utf-8")
+
+    approved = make_pr(review_decision="APPROVED")
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=approved):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "repair-open-pr"
+    final = read_status(ref)
+    assert final["status"] == "implemented"
+    for key in (
+        "ci_infra_retries", "ci_infra_head", "ci_probe_failures",
+        "merge_unknown_ticks", "merge_unknown_head",
+    ):
+        assert key not in final, key
