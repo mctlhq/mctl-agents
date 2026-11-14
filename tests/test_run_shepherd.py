@@ -16,6 +16,7 @@ fixture so the YAML serialisation is exercised.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import urllib.request
 from datetime import UTC, datetime
@@ -37,6 +38,25 @@ from orchestrator.run_shepherd import (
     decide,
     process_one,
 )
+
+
+@contextlib.contextmanager
+def _patch_gh_api(**mock_kwargs):
+    """Patch `_gh_api_json` like `patch.object(run_shepherd, "_gh_api_json", ...)`
+    and route `_gh_api_list(path)` (how `read_codex_review` reads its listings)
+    through the same mock as `[path, "--paginate"]`, so one fake answers both.
+    A non-list answer is a malformed read, as in the real `_gh_api_list`."""
+    with patch.object(run_shepherd, "_gh_api_json", **mock_kwargs) as json_mock:
+        def listing(path: str) -> list[dict]:
+            items = json_mock([path, "--paginate"])
+            if items is None:
+                return []
+            if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
+                raise ValueError("listing is not a list of objects")
+            return items
+
+        with patch.object(run_shepherd, "_gh_api_list", side_effect=listing):
+            yield json_mock
 
 # ---------------------------------------------------------------------------
 # Fixture helpers
@@ -2118,7 +2138,7 @@ def test_has_responded_set_on_issue_comment_findings() -> None:
             return []
         return []
 
-    with patch.object(run_shepherd, "_gh_api_json", side_effect=fake_gh_api_json):
+    with _patch_gh_api(side_effect=fake_gh_api_json):
         review = run_shepherd.read_codex_review(pr)
 
     assert review.has_responded is True
@@ -2176,9 +2196,7 @@ def test_connector_inline_finding_gates_merge() -> None:
         "body": "![P2 Badge] Fix premise: the retry loop never re-reads state.",
         "created_at": "2026-04-29T11:02:00Z",
     }]
-    with patch.object(
-        run_shepherd, "_gh_api_json",
-        side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
+    with _patch_gh_api(side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -2212,9 +2230,7 @@ def test_connector_stale_commit_finding_does_not_gate() -> None:
         "body": "![P2 Badge] Already fixed in the follow-up.",
         "created_at": "2026-04-29T09:00:00Z",
     }]
-    with patch.object(
-        run_shepherd, "_gh_api_json",
-        side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
+    with _patch_gh_api(side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -2233,9 +2249,7 @@ def test_connector_alone_never_flips_has_responded() -> None:
         "body": "Didn't find any major issues. Swish!",
         "submitted_at": "2026-04-29T11:00:00Z",
     }]
-    with patch.object(
-        run_shepherd, "_gh_api_json",
-        side_effect=_route_gh(pr, reviews=reviews),
+    with _patch_gh_api(side_effect=_route_gh(pr, reviews=reviews),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -2272,9 +2286,7 @@ def test_connector_issue_comment_finding_time_anchored() -> None:
             "created_at": "2026-04-29T11:30:00Z",
         },
     ]
-    with patch.object(
-        run_shepherd, "_gh_api_json",
-        side_effect=_route_gh(pr, reviews=reviews, issue_comments=issue_comments),
+    with _patch_gh_api(side_effect=_route_gh(pr, reviews=reviews, issue_comments=issue_comments),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -2308,9 +2320,7 @@ def test_claude_closed_bold_inline_finding_gates_merge() -> None:
         "body": "**P2**: size check runs after the decode",
         "created_at": "2026-04-29T11:01:00Z",
     }]
-    with patch.object(
-        run_shepherd, "_gh_api_json",
-        side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
+    with _patch_gh_api(side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -5547,8 +5557,7 @@ def test_a_dismissed_approval_does_not_gate() -> None:
         "body": "LGTM",
         "submitted_at": "2026-04-29T11:00:00Z",
     }]
-    with patch.object(
-        run_shepherd, "_gh_api_json", side_effect=_route_gh(pr, reviews=reviews),
+    with _patch_gh_api(side_effect=_route_gh(pr, reviews=reviews),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -5573,8 +5582,7 @@ def test_the_newest_verdict_at_the_head_wins() -> None:
             "state": "APPROVED", "body": "", "submitted_at": "2026-04-29T12:00:00Z",
         },
     ]
-    with patch.object(
-        run_shepherd, "_gh_api_json", side_effect=_route_gh(pr, reviews=reviews),
+    with _patch_gh_api(side_effect=_route_gh(pr, reviews=reviews),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -5605,9 +5613,7 @@ def test_a_verdict_on_an_earlier_head_does_not_carry_over() -> None:
         "body": "nit, not a finding",
         "created_at": "2026-04-29T11:05:00Z",
     }]
-    with patch.object(
-        run_shepherd, "_gh_api_json",
-        side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
+    with _patch_gh_api(side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -5640,9 +5646,7 @@ def test_a_no_findings_issue_comment_is_a_verdict_too() -> None:
         "body": "No P1/P2 findings. Good to merge.",
         "created_at": "2026-04-29T11:00:00Z",   # after HEAD_PUSHED_AT
     }]
-    with patch.object(
-        run_shepherd, "_gh_api_json",
-        side_effect=_route_gh(pr, issue_comments=issue_comments),
+    with _patch_gh_api(side_effect=_route_gh(pr, issue_comments=issue_comments),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -5671,7 +5675,7 @@ def test_a_thumbs_up_on_the_trigger_is_a_verdict_too() -> None:
             }]
         return []
 
-    with patch.object(run_shepherd, "_gh_api_json", side_effect=fake):
+    with _patch_gh_api(side_effect=fake):
         review = run_shepherd.read_codex_review(pr)
 
     assert review.has_responded is True
@@ -5695,9 +5699,7 @@ def test_a_later_changes_requested_beats_an_earlier_no_findings_comment() -> Non
         "body": "No P1/P2 findings",
         "created_at": "2026-04-29T11:00:00Z",
     }]
-    with patch.object(
-        run_shepherd, "_gh_api_json",
-        side_effect=_route_gh(pr, reviews=reviews, issue_comments=issue_comments),
+    with _patch_gh_api(side_effect=_route_gh(pr, reviews=reviews, issue_comments=issue_comments),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -5745,9 +5747,7 @@ def test_a_force_push_of_the_same_sha_resets_the_verdict_too() -> None:
         "body": "![P1 Badge] Command injection here.",
         "created_at": "2026-04-29T11:30:00Z",
     }]
-    with patch.object(
-        run_shepherd, "_gh_api_json",
-        side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
+    with _patch_gh_api(side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -5769,8 +5769,7 @@ def test_an_unknown_push_time_does_not_wedge_the_verdict() -> None:
         "body": "",
         "submitted_at": "2026-04-29T11:00:00Z",
     }]
-    with patch.object(
-        run_shepherd, "_gh_api_json", side_effect=_route_gh(pr, reviews=reviews),
+    with _patch_gh_api(side_effect=_route_gh(pr, reviews=reviews),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -5801,9 +5800,7 @@ def test_an_undatable_push_keeps_findings_but_still_drops_approvals() -> None:
             "created_at": "2026-04-29T09:30:00Z",
         },
     ]
-    with patch.object(
-        run_shepherd, "_gh_api_json",
-        side_effect=_route_gh(pr, issue_comments=issue_comments),
+    with _patch_gh_api(side_effect=_route_gh(pr, issue_comments=issue_comments),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -5828,9 +5825,7 @@ def test_a_finding_without_a_timestamp_survives_a_known_push_time() -> None:
         "body": "![P2 Badge] Undated, but real.",
         "created_at": None,
     }]
-    with patch.object(
-        run_shepherd, "_gh_api_json",
-        side_effect=_route_gh(pr, issue_comments=issue_comments),
+    with _patch_gh_api(side_effect=_route_gh(pr, issue_comments=issue_comments),
     ):
         review = run_shepherd.read_codex_review(pr)
 
@@ -6865,12 +6860,64 @@ def _review_listings(fail: str | None = None, error: BaseException | None = None
 
 def test_fully_read_review_blocks_the_merge() -> None:
     """Baseline: with every listing read, the P1 in the review body blocks."""
-    with patch.object(run_shepherd, "_gh_api_json", side_effect=_review_listings()):
+    with _patch_gh_api(side_effect=_review_listings()):
         review = run_shepherd.read_codex_review(make_pr())
     assert review.known
     decision, _ = decide(make_pr(), review, now=_CLEAN_NOW)
     assert decision == "address-review"
 
+
+def test_a_listing_that_spans_pages_is_read_not_unread() -> None:
+    """A long-lived PR: 31+ reviews span two pages. A `gh api --paginate`
+    that prints one JSON array per page, back to back, must not make the
+    listing unread (which would park the PR in review-unknown on every
+    tick); the per-object `--jq '.[]'` stream reads both pages."""
+    page1 = [
+        {"id": i, "user": {"login": "someone"}, "commit_id": HEAD_SHA, "state": "COMMENTED",
+         "submitted_at": "2026-04-29T11:00:00Z", "body": "note"}
+        for i in range(30)
+    ]
+    page2 = [{
+        "id": 99, "user": {"login": run_shepherd.REVIEW_BOT}, "commit_id": HEAD_SHA,
+        "state": "CHANGES_REQUESTED", "submitted_at": "2026-04-29T11:30:00Z",
+        "body": "**P1**: the migration drops a column that is still read",
+    }]
+    pages = {"/pulls/42/reviews": [page1, page2]}
+
+    def fake_gh(cmd, cwd=None, check=True):
+        path = cmd[-1]
+        listing = next((v for k, v in pages.items() if path.endswith(k)), [[]])
+        if "--jq" in cmd:
+            out = "".join(json.dumps(item) + "\n" for page in listing for item in page)
+        else:
+            out = "".join(json.dumps(page) for page in listing)
+        return run_shepherd.subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    with patch.object(run_shepherd, "_run", side_effect=fake_gh):
+        review = run_shepherd.read_codex_review(make_pr())
+    assert review.known, review.unread
+    assert review.has_responded
+    assert decide(make_pr(), review, now=_CLEAN_NOW)[0] == "address-review"
+
+
+
+def test_copilot_read_spans_pages_and_never_crashes_the_tick() -> None:
+    """The observe-only Copilot read had the same `--paginate` body and only
+    caught CalledProcessError, so a multi-page body raised out of the tick."""
+    copilot = {"user": {"login": run_shepherd.COPILOT_BOT}, "body": "nit"}
+    other = {"user": {"login": "someone"}, "body": "note"}
+
+    def fake_gh(cmd, cwd=None, check=True):
+        pages = [[other] * 30, [copilot, copilot]] if cmd[-1].endswith("/comments") else [[other] * 30, [other]]
+        if "--jq" in cmd:
+            out = "".join(json.dumps(item) + "\n" for page in pages for item in page)
+        else:
+            out = "".join(json.dumps(page) for page in pages)
+        return run_shepherd.subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    with patch.object(run_shepherd, "_run", side_effect=fake_gh):
+        seen = run_shepherd.read_copilot_review(make_pr())
+    assert (seen.has_responded, seen.findings_count) == (True, 2)
 
 @pytest.mark.parametrize("error", [
     run_shepherd.subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 502"),
@@ -6884,7 +6931,7 @@ def test_unread_reviews_listing_never_merges(error) -> None:
     """
     pr = make_pr()
     fake = _review_listings(fail="/pulls/42/reviews", error=error)
-    with patch.object(run_shepherd, "_gh_api_json", side_effect=fake):
+    with _patch_gh_api(side_effect=fake):
         review = run_shepherd.read_codex_review(pr)
     assert not review.known
     assert review.unread == ("reviews",)
@@ -6898,7 +6945,7 @@ def test_every_unread_listing_is_recorded(fail) -> None:
     fake = _review_listings(
         fail=fail, error=run_shepherd.subprocess.CalledProcessError(1, ["gh"], stderr="boom"),
     )
-    with patch.object(run_shepherd, "_gh_api_json", side_effect=fake):
+    with _patch_gh_api(side_effect=fake):
         review = run_shepherd.read_codex_review(make_pr())
     assert review.unread == (_LISTING_LABELS[fail],)
     assert decide(make_pr(), review, now=_CLEAN_NOW)[0] == "review-unknown"
@@ -6911,14 +6958,14 @@ def test_non_list_listing_body_is_unread() -> None:
             return {"message": "Server Error"}
         return _review_listings()(args)
 
-    with patch.object(run_shepherd, "_gh_api_json", side_effect=fake):
+    with _patch_gh_api(side_effect=fake):
         review = run_shepherd.read_codex_review(make_pr())
     assert review.unread == ("reviews",)
 
 
 def test_empty_listing_body_is_observed_empty() -> None:
     """Empty output is GitHub's absence signal and stays a known empty listing."""
-    with patch.object(run_shepherd, "_gh_api_json", return_value=None):
+    with _patch_gh_api(return_value=None):
         review = run_shepherd.read_codex_review(make_pr())
     assert review.known
     assert decide(make_pr(), review, now=_CLEAN_NOW) == ("wait", None)
@@ -6936,6 +6983,12 @@ def test_process_one_review_unknown_waits_and_charges_nothing(tmp_path) -> None:
     """process_one: an unread listing never merges and never spends a review
     attempt; the proposal is left exactly as it was, to be read next tick."""
     ref = make_ref(tmp_path, review_attempts=1)
+    # A merge-state outage already in progress on this head: an unread review
+    # listing is a different unknown and must neither advance nor clear it.
+    seeded = read_status(ref)
+    seeded.update(merge_unknown_ticks=2, merge_unknown_head=HEAD_SHA)
+    ref.status_path.write_text(yaml.safe_dump(seeded, sort_keys=False), encoding="utf-8")
+    ref.merge_unknown_ticks, ref.merge_unknown_head = 2, HEAD_SHA
     pr = make_pr()
     review = CodexReview(
         has_responded=True, findings=[], head_verdict="APPROVED", unread=("reviews",),
@@ -6954,6 +7007,7 @@ def test_process_one_review_unknown_waits_and_charges_nothing(tmp_path) -> None:
     status = read_status(ref)
     assert status["status"] == "implemented"
     assert status.get("review_attempts") == 1
+    assert (status.get("merge_unknown_ticks"), status.get("merge_unknown_head")) == (2, HEAD_SHA)
 
 
 def test_reconcile_unstick_clears_the_outage_counters(tmp_path) -> None:

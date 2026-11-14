@@ -1608,9 +1608,10 @@ def _gh_api_list(path: str) -> list[dict]:
     """Every item of a paginated GitHub REST listing, or an exception.
 
     `_gh_api_json([path, "--paginate"])` is NOT safe for a listing that can
-    span pages: `gh api --paginate` then prints several JSON arrays back to
-    back, which `json.loads` rejects, so the read fails on exactly the
-    long-lived PRs with 31+ comments. `--jq '.[]'` streams one compact object
+    span pages: depending on the gh release, `gh api --paginate` prints
+    several JSON arrays back to back (which `json.loads` rejects, so the
+    read fails on exactly the long-lived PRs with 31+ comments) or merges
+    them into one (gh 2.97.0 does). Do not depend on either. `--jq '.[]'` streams one compact object
     per line instead (bodies keep their newlines escaped, so one line is one
     item) -- the pattern run_issue_directive_poller already uses.
 
@@ -2255,19 +2256,18 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
 
     def _listing(label: str, path: str) -> list[dict]:
         # "Could not observe" is never "observed absent" (AGENTS.md). A failed
-        # gh call, a malformed body or a non-list body is recorded as unread
+        # gh call, a malformed body or a non-object item is recorded as unread
         # and decide() then refuses to act on this review; it never becomes
-        # an empty listing. Only an empty body is GitHub's absence signal.
+        # an empty listing. Only an empty listing is GitHub's absence signal.
+        # `_gh_api_list`, not `_gh_api_json([path, "--paginate"])`: a listing
+        # of 31+ items spans pages, and a gh that prints one array per page
+        # would make the latter unparseable, so every long-lived PR would be
+        # unread on every tick.
         try:
-            items = _gh_api_json([path, "--paginate"])
-            if items is None:
-                return []
-            if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
-                raise ValueError(f"{label} listing is not a list of objects")
-            return items
+            return _gh_api_list(path)
         except subprocess.CalledProcessError as e:
             detail = (e.stderr or "").strip() or str(e)
-        except (OSError, ValueError) as e:
+        except (subprocess.SubprocessError, OSError, ValueError) as e:
             detail = f"{type(e).__name__}: {e}"
         print(f"warn: {label} fetch failed for {pr.repo}#{pr.number}: {detail}")
         unread.append(label)
@@ -2455,24 +2455,21 @@ def read_copilot_review(pr: PRSnapshot) -> CopilotReview:
     """
     has_responded = False
     count = 0
+    # Observe-only, so an unread listing may count as no signal here; it must
+    # still never crash the tick (a multi-page body or a timeout used to).
     try:
-        reviews = _gh_api_json([
-            f"repos/{pr.repo}/pulls/{pr.number}/reviews",
-            "--paginate",
-        ]) or []
-    except subprocess.CalledProcessError as e:
-        print(f"warn: copilot reviews fetch failed: {e.stderr.strip()}")
+        reviews = _gh_api_list(f"repos/{pr.repo}/pulls/{pr.number}/reviews")
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        print(f"warn: copilot reviews fetch failed: {type(e).__name__}: {e}")
         reviews = []
     for r in reviews:
         if (r.get("user") or {}).get("login") != COPILOT_BOT:
             continue
         has_responded = True
     try:
-        comments = _gh_api_json([
-            f"repos/{pr.repo}/pulls/{pr.number}/comments",
-            "--paginate",
-        ]) or []
-    except subprocess.CalledProcessError:
+        comments = _gh_api_list(f"repos/{pr.repo}/pulls/{pr.number}/comments")
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        print(f"warn: copilot comments fetch failed: {type(e).__name__}: {e}")
         comments = []
     for c in comments:
         if (c.get("user") or {}).get("login") == COPILOT_BOT:

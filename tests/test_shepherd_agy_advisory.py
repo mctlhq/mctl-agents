@@ -237,9 +237,10 @@ def test_agy_never_reaches_the_gating_review() -> None:
             return [_agy(1, AGY_SEVERITY_LINES)]
         return []
 
-    with patch.object(run_shepherd, "_gh_api_json", side_effect=fake):
+    with patch.object(run_shepherd, "_gh_api_list", side_effect=lambda path: fake([path])):
         review = run_shepherd.read_codex_review(pr)
 
+    assert review.known
     assert review.findings == []
     assert review.has_responded is False
     assert review.head_verdict is None
