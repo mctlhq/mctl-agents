@@ -1,5 +1,93 @@
 # Changelog
 
+## [1.118.0](https://github.com/mctlhq/mctl-agents/compare/1.117.0...1.118.0) (2026-11-14)
+
+
+### Features
+
+* **agents:** issue-1006-devloop-part-m-m2a-extend-m1-state-and-p ([96b1f54](https://github.com/mctlhq/mctl-agents/commit/96b1f542b3a2e7b872e066c627742b0c1c3e7426))
+* **agents:** issue-1006-devloop-part-m-m2a-extend-m1-state-and-p ([70ef75c](https://github.com/mctlhq/mctl-agents/commit/70ef75c6a69b05b5787d4cafcc98d41fbce4c928))
+* **agents:** issue-1029-devloop-part-m-m2b-1a-resume-based-worke ([bd3f51a](https://github.com/mctlhq/mctl-agents/commit/bd3f51a81ee355678096a690b8ca2358f8d572a7))
+* **agents:** issue-1029-devloop-part-m-m2b-1a-resume-based-worke ([e9d0366](https://github.com/mctlhq/mctl-agents/commit/e9d0366b19b3ef948e82352b50ba9fa4b44ffb91))
+* **agents:** issue-1037-devloop-part-m-m2b-1b-retry-reconcile-pa ([883b3a1](https://github.com/mctlhq/mctl-agents/commit/883b3a1bf20221d607f0082018830e1807a85dbe))
+* **agents:** issue-1037-devloop-part-m-m2b-1b-retry-reconcile-pa ([86b5aa0](https://github.com/mctlhq/mctl-agents/commit/86b5aa0bc6c901ddb7d0bba6bf0774cfe3c4e815))
+* **agents:** issue-1041-devloop-part-m-m2b-1c-record-merge-watch ([e6b70a3](https://github.com/mctlhq/mctl-agents/commit/e6b70a307600ece378e3a1fbef79f49612aa532f))
+* **agents:** issue-1041-devloop-part-m-m2b-1c-record-merge-watch ([20233a6](https://github.com/mctlhq/mctl-agents/commit/20233a635ed1522638fa5671bb8b3889d17d0879))
+* **agents:** issue-1043-spike-assistants-verify-cross-namespace ([14645f9](https://github.com/mctlhq/mctl-agents/commit/14645f93fd4eb425a3ac5adeae497209431b8342))
+* **agents:** issue-1043-spike-assistants-verify-cross-namespace ([da6b163](https://github.com/mctlhq/mctl-agents/commit/da6b16330d20b27805b4b05d6b8b556d3b45ecd9)), closes [#1043](https://github.com/mctlhq/mctl-agents/issues/1043)
+* **agents:** issue-1046-devloop-part-m-m2b-1d-1-typed-result-cli ([55b4633](https://github.com/mctlhq/mctl-agents/commit/55b4633583f2858069816b3b253f7d656b1fc32f))
+* **agents:** issue-1046-devloop-part-m-m2b-1d-1-typed-result-cli ([c3f292a](https://github.com/mctlhq/mctl-agents/commit/c3f292ac90d120d57d29029bd79ffa7ebef04cb2))
+* **agents:** issue-1052-devloop-part-m-m2b-1d-2-deadline-exit-of ([0536caf](https://github.com/mctlhq/mctl-agents/commit/0536cafcc0a796334f85871bed5473ed6b200a99))
+* **agents:** issue-1052-devloop-part-m-m2b-1d-2-deadline-exit-of ([2217428](https://github.com/mctlhq/mctl-agents/commit/22174288a8cce2bfd991d32c12b90e5d51207d6f))
+* **agents:** issue-1055-devloop-part-m-m2b-1d-2b-wire-the-merge ([0ef0e04](https://github.com/mctlhq/mctl-agents/commit/0ef0e04f544979251083ca1d8bfa12f7fbf98970))
+* **agents:** issue-1055-devloop-part-m-m2b-1d-2b-wire-the-merge ([6c72861](https://github.com/mctlhq/mctl-agents/commit/6c72861a0bdf5c86cf490cc0197a930362ae6e0a))
+* **agents:** issue-1059-feat-bridge-v1alpha2-contract-for-typed ([46ccddc](https://github.com/mctlhq/mctl-agents/commit/46ccddcec15077a188e5a80089b57d030d056e16))
+* **agents:** issue-1059-feat-bridge-v1alpha2-contract-for-typed ([d594582](https://github.com/mctlhq/mctl-agents/commit/d59458208e3a3039c6e7da1512980ac687bc1ee4))
+* **agents:** issue-996-feat-devloop-m1-deferred-resume-identity ([e346093](https://github.com/mctlhq/mctl-agents/commit/e346093d614933a4dfab1114ae45dd0782e148be))
+* **agents:** issue-996-feat-devloop-m1-deferred-resume-identity ([6f1d971](https://github.com/mctlhq/mctl-agents/commit/6f1d9715dcf44c9dad48729b1573450fec70b9b9))
+* **devloop:** send the decide link when a grant parks ([1f9fb6e](https://github.com/mctlhq/mctl-agents/commit/1f9fb6e84e99ac62c8d8842e8661536f4fe963ea))
+* **devloop:** send the decide link when a grant parks ([ef345de](https://github.com/mctlhq/mctl-agents/commit/ef345de8a601b556e430493ea35a4f2e00c0d1ff))
+* **tools:** add --patch-id to the temporal marker scanner ([7d503a3](https://github.com/mctlhq/mctl-agents/commit/7d503a3e6526b4040ffda5df8d11c0be49fad80a))
+* **tools:** add --patch-id to the temporal marker scanner ([85a5e5e](https://github.com/mctlhq/mctl-agents/commit/85a5e5e6480bc9cf6d7f58406f738461f068ee1b))
+* **tools:** add read-only Temporal patch-marker scanner (B4 P-6) ([0c81de9](https://github.com/mctlhq/mctl-agents/commit/0c81de98e9196915147d2c262615586ae51cb825))
+* **tools:** add read-only Temporal patch-marker scanner (B4 P-6) ([c5caadc](https://github.com/mctlhq/mctl-agents/commit/c5caadc223dbeedca0021d0d6f5ba6cdbf193bc1))
+* **tools:** detect Temporal non-determinism task failures ([cfa034c](https://github.com/mctlhq/mctl-agents/commit/cfa034c703622922170cfae7d5128e8eca6db246))
+* **tools:** prove M1 replays pre-M1 histories (B4 P-5) ([6c99d35](https://github.com/mctlhq/mctl-agents/commit/6c99d359747d9fca9e049dce976789a71320031a))
+* **tools:** prove M1 replays pre-M1 histories (B4 P-5) ([a3d483d](https://github.com/mctlhq/mctl-agents/commit/a3d483d41d2661397be415c073b50f9c6df65ca0))
+
+
+### Bug Fixes
+
+* **agents:** bound issue/PR number length in evidence recorders ([2ec1070](https://github.com/mctlhq/mctl-agents/commit/2ec1070fd44bad9288543e50f508ec9a5af41619))
+* **agents:** bound issue/PR number length in evidence recorders ([40e42d5](https://github.com/mctlhq/mctl-agents/commit/40e42d5b0403a9fe80c6e3a6fb23d2f063699acf))
+* **agents:** canonical work_merged and no_actionable_intent refusal reasons ([990250a](https://github.com/mctlhq/mctl-agents/commit/990250acbb6d3b5bb6699540a37bc644354e7efb))
+* **agents:** check basket rules on v1alpha2 writes inside the claim envelope ([68d6ed8](https://github.com/mctlhq/mctl-agents/commit/68d6ed87db365717801741e0e84cef489eb8d29d))
+* **agents:** close five small fail-open and off-by-one gaps ([2a5e20a](https://github.com/mctlhq/mctl-agents/commit/2a5e20a2690267a6e4459f68298369ede8712910))
+* **agents:** close five small fail-open and off-by-one gaps ([8697950](https://github.com/mctlhq/mctl-agents/commit/8697950a77ae9f09035c9bf66f610acae44d61bc))
+* **auditor:** distinguish agent-labelled pods from unrestricted namespaces ([95feb20](https://github.com/mctlhq/mctl-agents/commit/95feb208debacfa2ddc5dcc90ef714634090b678))
+* **auditor:** empty namespaceSelector is not the argo-workflows namespace ([4a71f32](https://github.com/mctlhq/mctl-agents/commit/4a71f32f22a7bc5dae94a323139b0b6e90960a36))
+* **capability:** freeze CapabilityDescriptor annotations deeply ([77d4c0a](https://github.com/mctlhq/mctl-agents/commit/77d4c0acee2d0bb52f066e49c003a5c17ebad669))
+* **ci:** fix failing required checks on issue-1006-devloop-part-m-m2a-extend-m1-state-and-p ([5c4ba9d](https://github.com/mctlhq/mctl-agents/commit/5c4ba9d66596e9286714d24d574275a3c0d057fc))
+* **ci:** fix failing required checks on issue-1052-devloop-part-m-m2b-1d-2-deadline-exit-of ([46b5f4b](https://github.com/mctlhq/mctl-agents/commit/46b5f4b708a5ce15eb399312ce59585b5082ae1e))
+* **context:** order evidence by instant and refuse unreadable seals ([315ed01](https://github.com/mctlhq/mctl-agents/commit/315ed019fc78a095e732173aedbd1c9ca964b4ea))
+* **context:** order evidence by instant and refuse unreadable seals ([453e250](https://github.com/mctlhq/mctl-agents/commit/453e250dcad2b2f0c729883e580437e291117d74))
+* **devloop:** announce only a grant whose state is pending ([c762aa6](https://github.com/mctlhq/mctl-agents/commit/c762aa6c3d55e39b4692db5e6c57a0398e164864))
+* **devloop:** carry an open canonical execution across a merge-watch hop ([2bae4f5](https://github.com/mctlhq/mctl-agents/commit/2bae4f5b04a0700a0b69a7ba01bad7dd89c459ad))
+* **devloop:** carry an open canonical execution across a merge-watch hop ([17e4c41](https://github.com/mctlhq/mctl-agents/commit/17e4c411c8ab721b436a3c3cd8742926008201c5))
+* **dispatcher:** defer on the SDK update RPC timeout with the fixed reason ([5060a5f](https://github.com/mctlhq/mctl-agents/commit/5060a5f1c32842fd82bfa9fe6fcd501182c9b756))
+* **dispatcher:** defer on the SDK's update RPC timeout with the fixed reason ([d27a994](https://github.com/mctlhq/mctl-agents/commit/d27a9940d7d6a0e4d90b02a3dc97a74dd3db60a0))
+* **exec-budget:** open no heredoc where bash does not ([968d71b](https://github.com/mctlhq/mctl-agents/commit/968d71b740948d9bb930483d7464bd4623a906ac))
+* **exec-budget:** skip heredoc bodies in the -c scan, accept CRLF ([d524c9a](https://github.com/mctlhq/mctl-agents/commit/d524c9a7d634c68f3a0d3153a3e838532e56a4ce))
+* **exec-budget:** stop false detachment denials, close two bypasses ([1bdc325](https://github.com/mctlhq/mctl-agents/commit/1bdc325a59959daf30b449336156a7a472399d34))
+* **exec-budget:** stop false detachment denials, close two bypasses ([8073d9e](https://github.com/mctlhq/mctl-agents/commit/8073d9e43bb98ca2af740abf629a8de10f469a1e))
+* **exec-budget:** treat heredoc bodies as data ([0e7ffc5](https://github.com/mctlhq/mctl-agents/commit/0e7ffc59e1d8f00df5b44f44743d252003b87d1e))
+* **implementer:** exact, fail-loud origin branch lookup ([689c227](https://github.com/mctlhq/mctl-agents/commit/689c22753e8d062c5d2a7360eede60e91e838868))
+* **implementer:** exact, fail-loud origin branch lookup ([09b7820](https://github.com/mctlhq/mctl-agents/commit/09b7820102d4a018fcf4fdd9f6077e99b8fd0c9e))
+* **lock:** restore uv lock revision 5 for bridge dev schema dependency ([e1b5005](https://github.com/mctlhq/mctl-agents/commit/e1b5005c7c1971f0da529a954b7ff255773fde93))
+* **review:** address advisory reviewer items ([a943442](https://github.com/mctlhq/mctl-agents/commit/a9434429d27d5a9f20c5b852712de708eb0302a2))
+* **review:** address advisory reviewer items ([6ab2547](https://github.com/mctlhq/mctl-agents/commit/6ab2547edfe715ee824a73a8683c1c0247cc0b7c))
+* scanner-rerun binding and deep-frozen capability annotations ([4d7efd3](https://github.com/mctlhq/mctl-agents/commit/4d7efd3555eafbb4af969687e029c5b5b9863b14))
+* **security_findings:** bind scanner-rerun observations like mctl-api ([897593d](https://github.com/mctlhq/mctl-agents/commit/897593dd9a7caf88ec35128939d12eb4d171bee5))
+* **shepherd:** honour a merge reserved with merge:owner-go ([80d79da](https://github.com/mctlhq/mctl-agents/commit/80d79da274da174e781797907076476ae3d73d71))
+* **shepherd:** honour a merge reserved with merge:owner-go ([842183c](https://github.com/mctlhq/mctl-agents/commit/842183cadadc0098b596dc7a70f3e832e8b642eb))
+* **shepherd:** match merge:owner-go in any case and say where it was ([2c19702](https://github.com/mctlhq/mctl-agents/commit/2c1970209c7ea5c2ec1668583a8d656b2a16f4bb))
+* **shepherd:** read review listings through the per-object stream ([c76c6fc](https://github.com/mctlhq/mctl-agents/commit/c76c6fc58987d8ae7ac2ef83fe6fee9a28afe054))
+* **shepherd:** treat an unread review listing as unknown, not clean ([f06e389](https://github.com/mctlhq/mctl-agents/commit/f06e3890899497a2c77cffd7643658bc9b1f7c2f))
+* **shepherd:** treat an unread review listing as unknown, not clean ([4ef99f8](https://github.com/mctlhq/mctl-agents/commit/4ef99f84cb1ca041e00c737c35f31627be42ee63))
+* sweep anchored validators to fullmatch ([81abdb4](https://github.com/mctlhq/mctl-agents/commit/81abdb44f62879665979f2210040bfb885ca35f9))
+* sweep anchored validators to fullmatch ([ad44ad7](https://github.com/mctlhq/mctl-agents/commit/ad44ad7b0d7584619147583db2fb1de4a5d19b52))
+* **tests:** use datetime.UTC in the worker-gap harness ([c8fb487](https://github.com/mctlhq/mctl-agents/commit/c8fb48719a5134ab6aaa3d6c6bbba274e3ed7389))
+* **tools:** apply Kubernetes defaults in the agent isolation audit ([11f649c](https://github.com/mctlhq/mctl-agents/commit/11f649cc00835e01ea43cd7ec6f03870d4bada0b))
+* **tools:** apply Kubernetes defaults in the agent isolation audit ([a03f66b](https://github.com/mctlhq/mctl-agents/commit/a03f66b28401f04e442daff78fddd0d312dcd3ae))
+* **tools:** drop unused type-ignore flagged by mypy in the P-5 recorder ([23c2c39](https://github.com/mctlhq/mctl-agents/commit/23c2c39a422109f73789222572b400551bbbce2a))
+* **tools:** make the marker scanner usable on a real namespace ([fae9c8a](https://github.com/mctlhq/mctl-agents/commit/fae9c8a69ceb3d6687e89eac554e34eae04e59be))
+* **tools:** make the marker scanner usable on a real namespace ([1723e65](https://github.com/mctlhq/mctl-agents/commit/1723e655c07dc7ee589518b88b0f7e213261acc7))
+
+
+### Reverts
+
+* restore fail-closed null-author handling in comment reads ([c035dd1](https://github.com/mctlhq/mctl-agents/commit/c035dd157ab8b2e5dba54a176ddc6c96648a967f))
+
 ## [1.117.0](https://github.com/mctlhq/mctl-agents/compare/1.116.0...1.117.0) (2026-11-03)
 
 
