@@ -1110,7 +1110,7 @@ class CapabilityGateway:
             return {"reason_code": "not-eligible", "error": f"{capability_id!r} is not eligible for this execution"}
 
         if idempotency_key is not None and not (
-            isinstance(idempotency_key, str) and _CLIENT_IDEMPOTENCY_KEY.match(idempotency_key)
+            isinstance(idempotency_key, str) and _CLIENT_IDEMPOTENCY_KEY.fullmatch(idempotency_key)
         ):
             record = self._record(capability_id, "refused", "invalid-arguments", start, arguments,
                                   policy_checkpoint="absent")

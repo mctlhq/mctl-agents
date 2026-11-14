@@ -265,7 +265,7 @@ async def confirm_no_pr(service: str, slug: str) -> NoPrProof:
         )
     if not (
         isinstance(service, str) and isinstance(slug, str)
-        and _NAME_RE.match(service) and _NAME_RE.match(slug)
+        and _NAME_RE.fullmatch(service) and _NAME_RE.fullmatch(slug)
     ):
         raise ProposalListingError("service and slug must be plain [A-Za-z0-9._-]+ names")
 

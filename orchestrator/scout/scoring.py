@@ -164,7 +164,7 @@ def validate_row(row: dict[str, Any], sent: set[str], repos: list[str]) -> dict[
     repo = row.get("repo")
     if repo not in repos:
         repo = FALLBACK_REPO
-    related = [r for r in (row.get("related") or []) if isinstance(r, str) and _RELATED_RE.match(r)][:3]
+    related = [r for r in (row.get("related") or []) if isinstance(r, str) and _RELATED_RE.fullmatch(r)][:3]
     return {"id": row["id"], **nums, **texts, "repo": repo, "related": related}
 
 

@@ -222,7 +222,7 @@ def _trace_attributes(input: SubmitAndWaitInput) -> dict[str, Any]:
     work_item_id = param("work_item_id")
     if work_item_id:
         attributes[tracing.WORK_ITEM_ID] = work_item_id
-    match = _ISSUE_URL_RE.match(param("issue_url"))
+    match = _ISSUE_URL_RE.fullmatch(param("issue_url"))
     if match:
         attributes[tracing.REPOSITORY_NAME] = match.group(1)
         attributes[tracing.ISSUE_NUMBER] = int(match.group(2))

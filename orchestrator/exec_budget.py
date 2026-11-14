@@ -518,7 +518,7 @@ def _shell_c_payloads(command: str) -> list[str]:
                 # `bash -c'cmd &'` lexes as the single token `-ccmd &`.
                 found.append(attached)
                 break
-            if _SHELL_C_FLAG_RE.match(word) and position + 1 < len(words):
+            if _SHELL_C_FLAG_RE.fullmatch(word) and position + 1 < len(words):
                 found.append(words[position + 1])
                 break
             position += 1

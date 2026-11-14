@@ -56,7 +56,7 @@ def _parse_issue_binding(value: Any) -> tuple[str, int]:
         raise ValueError("spec.github.issue is not a {repository, number} mapping")
     repository = value["repository"]
     number = value["number"]
-    if not isinstance(repository, str) or not _REPOSITORY_RE.match(repository):
+    if not isinstance(repository, str) or not _REPOSITORY_RE.fullmatch(repository):
         raise ValueError("spec.github.issue.repository is not owner/repo")
     if isinstance(number, bool) or not isinstance(number, int) or number < 1:
         raise ValueError("spec.github.issue.number is not an integer >= 1")

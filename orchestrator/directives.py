@@ -174,7 +174,7 @@ def parse_comment(comment: RawComment) -> Directive | None:
     (with `verb=None`) — that distinction is the whole point of #417: an
     unrecognised instruction gets a reply, not silence.
     """
-    if not _LOGIN_RE.match(comment.author or ""):
+    if not _LOGIN_RE.fullmatch(comment.author or ""):
         return None
     if (comment.author or "").lower() in {b.lower() for b in BOT_LOGINS}:
         return None

@@ -103,7 +103,7 @@ def _validate_provider(profile_name: str, profile: Mapping[str, Any]) -> Provide
             raise fail(f"must define {key}")
     name, api = block["name"], block["api"]
     base_url, credential_env = block["base_url"], block["credential_env"]
-    if not _PROVIDER_NAME_RE.match(name):
+    if not _PROVIDER_NAME_RE.fullmatch(name):
         raise fail("name must match [a-z0-9-]+")
     if api != "anthropic-messages":
         raise fail("api must be 'anthropic-messages'")
@@ -123,7 +123,7 @@ def _validate_provider(profile_name: str, profile: Mapping[str, Any]) -> Provide
             "base_url must be an absolute https URL with a host and no "
             "credentials, query or fragment"
         )
-    if not _ENV_NAME_RE.match(credential_env):
+    if not _ENV_NAME_RE.fullmatch(credential_env):
         raise fail("credential_env must be an upper-case env var name")
     if _is_anthropic_credential_name(credential_env):
         raise fail("credential_env must not name an Anthropic credential")
