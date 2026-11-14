@@ -147,7 +147,9 @@ _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _RUNTIME_ID_RE = re.compile(r"ex-[0-9a-f]{16}")
 _TRACE_ID_RE = re.compile(r"[0-9a-f]{32}")
 _REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
-_ASCII_DIGITS_RE = re.compile(r"[0-9]+")
+# Bounded: past 4300 digits int() raises ValueError (the str-to-int
+# conversion limit), which the never-raising recorders cannot afford.
+_ASCII_DIGITS_RE = re.compile(r"[0-9]{1,18}")
 
 
 def _positive_number(number: Any) -> int | None:

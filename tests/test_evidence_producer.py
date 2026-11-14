@@ -960,7 +960,7 @@ def test_the_evidence_head_read_is_bounded_at_ten_seconds(monkeypatch, tmp_path)
 
 # The note_* recorders must never raise: a Unicode digit like '²' passes
 # str.isdigit() but int() refuses it.
-@pytest.mark.parametrize("number", ["²", "١٢", True, 0, -3, "7a", None])
+@pytest.mark.parametrize("number", ["²", "١٢", True, 0, -3, "7a", None, "9" * 5000])
 def test_note_subject_ignores_a_bad_number_without_raising(number):
     evidence = ep.RunEvidence(ep.STAGE_IMPLEMENTER)
     evidence.note_subject_issue("mctlhq/mctl-agents", number)
