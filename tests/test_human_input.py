@@ -386,3 +386,69 @@ def test_module_import_is_stdlib_only():
         if any(name == prefix or name.startswith(prefix + ".") for prefix in third_party_prefixes)
     )
     assert not leaked, f"orchestrator.human_input pulled in third-party modules: {leaked}"
+
+
+# A sealed request must always read back: `seal_request` refuses whatever
+# `from_dict` would refuse (bug: an empty work_item_id sealed fine, then the
+# document could not be read).
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"work_item_id": ""},
+        {"work_item_id": 7},
+        {"request_version": True},
+        {"request_version": "1"},
+        {"round": True},
+    ],
+    ids=["empty-work-item-id", "non-str-work-item-id", "bool-request-version", "str-request-version", "bool-round"],
+)
+def test_seal_refuses_what_from_dict_refuses(overrides):
+    with pytest.raises(hi.HumanInputError):
+        _seal(**overrides)
+
+
+def test_seal_round_trip_guard_catches_a_from_dict_only_rule(monkeypatch):
+    # Pins the round-trip guard itself, independent of the explicit field
+    # checks: a rule only `from_dict` knows must still stop the seal.
+    real = hi.HumanInputRequest.from_dict
+
+    def stricter(data):
+        if data.get("reason") == "from-dict-only":
+            raise hi.HumanInputError("rule only from_dict applies")
+        return real(data)
+
+    monkeypatch.setattr(hi.HumanInputRequest, "from_dict", staticmethod(stricter))
+    with pytest.raises(hi.HumanInputError, match="only from_dict"):
+        _seal(reason="from-dict-only")
+
+
+# `validate()` carries the field rules itself, so a request built in code
+# (not only one that went through `seal_request`) is refused the same way.
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"work_item_id": ""},
+        {"question": 3},
+        {"reason": None},
+        {"request_version": True},
+        {"round": "1"},
+        {"context_refs": ("ok", 5)},
+    ],
+    ids=[
+        "empty-work-item-id",
+        "non-str-question",
+        "none-reason",
+        "bool-request-version",
+        "str-round",
+        "bad-context-ref",
+    ],
+)
+def test_validate_applies_the_from_dict_field_rules(overrides):
+    import dataclasses
+
+    (field,) = overrides
+    request = dataclasses.replace(_seal(), **overrides)
+    # Matched on the field name: the refusal must come from the field rule,
+    # not from a later check that happens to trip on the same value.
+    with pytest.raises(hi.HumanInputError, match=rf"^{field} must be"):
+        request.validate()

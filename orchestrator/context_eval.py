@@ -902,6 +902,24 @@ def _parse_observed_at(value: str) -> datetime | None:
     return parsed
 
 
+def newest_first(records: Sequence[EvalRecord]) -> list[EvalRecord] | None:
+    """`records` ordered newest `observed_at` first, compared as instants.
+
+    `observed_at` strings must not be ordered as text: the same instant can
+    be written with different UTC offsets (`...T01:00:00+01:00` is earlier
+    than `...T00:30:00Z`), so a string sort can pick the wrong record as the
+    newest. Returns `None` when any timestamp does not parse to a
+    timezone-aware instant: the order is then unknown, never guessed."""
+    keyed: list[tuple[datetime, EvalRecord]] = []
+    for record in records:
+        parsed = _parse_observed_at(record.observed_at)
+        if parsed is None:
+            return None
+        keyed.append((parsed, record))
+    keyed.sort(key=lambda pair: pair[0], reverse=True)
+    return [record for _, record in keyed]
+
+
 def _declared_identity_matches(record: EvalRecord, expected: EvidenceIdentity) -> bool:
     identity = record.identity
     return (
@@ -961,13 +979,23 @@ def assess_evidence(
     by construction. `now` is an argument: this function reads no clock."""
     usable = [r for r in records if r.verdict == VERDICT_EVALUATED]
     if not usable:
-        fallback_kind = max(records, key=lambda r: r.observed_at).evidence_kind if records else "none"
+        by_time = newest_first(records)
+        fallback_kind = by_time[0].evidence_kind if by_time else "none"
         return EvidenceAssessment(
             status="missing", reason_code="no-evidence", evidence_kind=fallback_kind, observations=0,
             newest_age_seconds=None,
         )
 
-    ordered = sorted(usable, key=lambda r: r.observed_at, reverse=True)
+    ordered_or_unknown = newest_first(usable)
+    if ordered_or_unknown is None:
+        # Which record is newest cannot be known when any `observed_at` does
+        # not parse, so neither identity nor freshness can be judged: fail
+        # closed, as for an unparseable anchor (mctlhq/mctl-agents#526).
+        return EvidenceAssessment(
+            status="stale", reason_code="observed-at-unparseable", evidence_kind="none",
+            observations=0, newest_age_seconds=None,
+        )
+    ordered = ordered_or_unknown
     newest = ordered[0]
     observations = len({key for r in ordered if (key := _observation_key(r)) is not None})
 

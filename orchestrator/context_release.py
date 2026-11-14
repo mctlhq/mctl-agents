@@ -842,7 +842,11 @@ def assess_production_evidence(
     # so its observation key is always its own `execution_ref` (never a
     # `store_ref`, which `evaluate()` refuses for this evidence kind).
     usable = [r for r in production_records if r.verdict == context_eval.VERDICT_EVALUATED]
-    ordered = sorted(usable, key=lambda r: r.observed_at, reverse=True)
+    ordered = context_eval.newest_first(usable)
+    if ordered is None:  # pragma: no cover — a "fresh" assessment implies every observed_at parsed
+        raise ContextReleaseError(
+            VERDICT_UNKNOWN, "production evidence carries an observed_at that does not parse; order unknown"
+        )
     anchor = next((r for r in ordered if r.execution_ref is not None and r.execution_ref.execution_id), None)
     newest_observed_at = anchor.observed_at if anchor is not None else ""
 
