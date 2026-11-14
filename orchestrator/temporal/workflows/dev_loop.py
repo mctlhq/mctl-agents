@@ -489,6 +489,18 @@ _OVERWRITABLE_PROPOSAL_STATUSES = {"proposed"}
 #: out to assert it; if those templates are ever changed to drop or rename
 #: the parameters, this silently reverts to sending unread values.
 LAUNCH_CORRELATION_PATCH = "launch-correlation"
+#: Guards passing the loop's canonical `we_` to the `mctl-agents-implement`
+#: submit as `execution_id` (mctlhq/mctl-agents#991, #717 S5), so the run-token
+#: exchange binds to an execution. mctl-api only mints run tokens for a
+#: NON-TERMINAL execution, so under this marker the canonical `we_` is held
+#: open past the approve flip and ended after the implement run returns.
+#: Evaluated once at the flip site; histories recorded before it replay with
+#: the old sequence (end at the flip, no `execution_id`): migration by
+#: attrition.
+IMPLEMENT_EXECUTION_PATCH = "implement-execution-id"
+#: Non-retryable failure type when the marker is recorded but no canonical
+#: execution id is available to bind the implement run to.
+IMPLEMENT_EXECUTION_MISSING_ERROR_TYPE = "ImplementExecutionMissing"
 #: Guards ending the merge watch on the proposal's own terminal `status:`
 #: (mctlhq/mctl-agents#516) rather than only on the PR's state. Evaluated
 #: once in `_watch_pr`'s `resume is None` arm and carried across a hop in
@@ -1922,6 +1934,9 @@ class DevLoopWorkflow:
         self._canonical = False
         self._canonical_open = False
         self._canonical_end_phase = ""
+        # True when the canonical `we_` is held open past the approve flip
+        # for the implement run (IMPLEMENT_EXECUTION_PATCH).
+        self._hold_canonical_for_implement = False
         self._approve_refusal_code = ""
         # The phase an end of the own `we_` still has to reach when its
         # advance did not land; `run`'s exit retries it with this phase.
@@ -2646,7 +2661,8 @@ class DevLoopWorkflow:
     def _canonical_execution_id(self) -> str:
         """This canonical loop's own `we_`, pinned when it was opened or
         bound. A resume or a delivery records other executions after it; the
-        grant, the run token and the flip must all name this one."""
+        grant, the run token and the flip must all name this one. Under
+        IMPLEMENT_EXECUTION_PATCH the implement run's token names it too."""
         return self._canonical_execution
 
     def _is_approved(self, *, needs_grant: bool = True) -> bool:
@@ -3786,7 +3802,9 @@ class DevLoopWorkflow:
         recorded `CANONICAL_APPROVAL_PATCH`). Held non-terminal from the start
         through the approval because mctl-api only binds an `aar_` to, mints a
         run token for, and resolves an approve to a NON-TERMINAL execution; it
-        ends right after the approve flip, or on whichever exit comes first."""
+        ends right after the approve flip (before IMPLEMENT_EXECUTION_PATCH) or,
+        under that marker, once the implement run returns, or on whichever
+        exit comes first."""
         if not self._canonical_open:
             return
         # Stay open when the store gave no answer, so the exit path in `run`
@@ -4448,8 +4466,11 @@ class DevLoopWorkflow:
                     )
         if self._canonical:
             # The grant is spent and the proposal is accepted: this loop's
-            # `we_` ends here with the phase the investigator's run had.
-            await self._end_canonical_execution(self._canonical_end_phase or "Failed")
+            # `we_` ends here with the phase the investigator's run had,
+            # unless it is held open for the implement run's run token.
+            self._hold_canonical_for_implement = workflow.patched(IMPLEMENT_EXECUTION_PATCH)
+            if not self._hold_canonical_for_implement:
+                await self._end_canonical_execution(self._canonical_end_phase or "Failed")
         if atomic_approve:
             # Resolve the implementer only AFTER the approval flip is
             # durable: _resolve can fail permanently (registry outage
@@ -4495,6 +4516,16 @@ class DevLoopWorkflow:
         # `_launch_correlation` for the patch gate and why `work_item_id` is
         # omitted rather than sent empty.
         implement_params.update(self._launch_correlation())
+        if self._hold_canonical_for_implement:
+            # #717 S5: the run-token exchange binds to the loop's own `we_`.
+            canonical_execution_id = self._canonical_execution_id()
+            if not canonical_execution_id:
+                raise ApplicationError(
+                    "implement run has no canonical execution to bind its run token to",
+                    type=IMPLEMENT_EXECUTION_MISSING_ERROR_TYPE,
+                    non_retryable=True,
+                )
+            implement_params["execution_id"] = canonical_execution_id
 
         # Re-check approval immediately before implementing (mctlhq/mctl-
         # agents#267, ADR 011) — the twin of the gate before the approve
@@ -4512,7 +4543,10 @@ class DevLoopWorkflow:
                 # releases the implementer: a human decides a fresh grant.
                 ended = await self._await_canonical_reapproval(
                     issue, target_repo, investigate_result,
-                    approve=approve_result, human_input=human_input_outcome, after_flip=True,
+                    approve=approve_result, human_input=human_input_outcome,
+                    # Held open under the marker: a resume cannot attach a new
+                    # execution, so bind the grant to the still-open `we_`.
+                    after_flip=not self._hold_canonical_for_implement,
                 )
             else:
                 ended = await self._await_reapproval(
@@ -4526,6 +4560,9 @@ class DevLoopWorkflow:
         self._deferred_resume_contract = workflow.patched(DEFERRED_RESUME_PATCH)
         self._gates_passed = True
         implement_result = await self._implement(implementer_release, implement_params, target_repo)
+        if self._hold_canonical_for_implement:
+            self._canonical_end_phase = "Succeeded" if implement_result.succeeded else "Failed"
+            await self._end_canonical_execution(self._canonical_end_phase)
 
         # mctl-agents#420: an abandon signal arriving while _implement was running
         # ends the loop immediately without entering the merge watch or deploy stages.
