@@ -157,10 +157,34 @@ def command_budget(
 # `)` closes a subshell, so `( worker & )` backgrounds exactly as a trailing
 # `&` does -- and after arithmetic stopped being blanked wholesale, that is
 # the spelling `$((worker &) )` reaches the scanner with.
-_TRAILING_BACKGROUND_RE = re.compile(r"(?<![&<>])&(?!&)(?=[\s)]|$)")
-_NOHUP_RE = re.compile(r"\bnohup\b", re.IGNORECASE)
-_SETSID_RE = re.compile(r"\bsetsid\b", re.IGNORECASE)
-_DISOWN_RE = re.compile(r"\bdisown\b", re.IGNORECASE)
+#
+# What FOLLOWS the `&` does not matter: `cmd &echo hi` backgrounds `cmd` just
+# as `cmd & echo hi` does, and requiring whitespace after it let that spelling
+# through (bug roadmap W1, agents ch. 4a). Only the two spellings where `&`
+# is not the async operator are excluded:
+#   - `&&` (logical AND) and `&>`/`&>>` (redirect both streams);
+#   - `|&` (pipe stderr too: `a |& tee log` runs in the foreground), `>&`/`<&`
+#     (fd duplication, `2>&1`) and `;&`/`;;&` (case fall-through).
+_TRAILING_BACKGROUND_RE = re.compile(r"(?<![&<>|;])&(?![&>])")
+# `nohup`, `setsid` and `disown` only detach as COMMAND WORDS, so each must
+# stand as a whole shell word: bounded by whitespace, a control operator or a
+# subshell paren on both sides. `\b` also fired inside paths and file names
+# -- `tail /tmp/setsid.log`, `cat docs/nohup-notes.md` -- and every such
+# false denial cost the agent a turn (bug roadmap W1, agents ch. 5). A `/`
+# may precede the word, so `/usr/bin/nohup ./run.sh` still reads as the
+# command; the price is that a path ending in such a word (`ls /srv/nohup`)
+# is still denied, which is the conservative side.
+#
+# The word may END at a quote or a redirection too: `nohup"" sleep` and
+# `nohup>out.log sleep` still run `nohup` (the quote pair is removed, the
+# redirection is not part of the word). Case-insensitive as before: the
+# patterns are a deny list, and a false `NOHUP` denial costs one turn where
+# a missed spelling costs an unbounded child.
+_WORD_START = r"(?<![^\s;&|()`/])"
+_WORD_END = r"(?![^\s;&|()`'\"<>])"
+_NOHUP_RE = re.compile(_WORD_START + r"nohup" + _WORD_END, re.IGNORECASE)
+_SETSID_RE = re.compile(_WORD_START + r"setsid" + _WORD_END, re.IGNORECASE)
+_DISOWN_RE = re.compile(_WORD_START + r"disown" + _WORD_END, re.IGNORECASE)
 
 # Ordered (label, pattern) pairs -- `is_detached` returns the first label that
 # matches, so the order only affects which name is reported, not whether a
@@ -188,6 +212,163 @@ def normalize_shell_command(command: str) -> str:
     """
     command = re.sub(r"(?<=\S)\\[ \t]*\r?\n(?=\S)", "", command)
     return re.sub(r"\\[ \t]*\r?\n[ \t]*", " ", command)
+
+
+_HEREDOC_DELIMITER_RE = re.compile(r"""(?:[^\s;&|<>()'"\\]|'[^']*'|"[^"]*"|\\.)+""")
+
+
+_COMMENT_START_AFTER = frozenset(" \t\n;&|()")
+_BARE_ARITHMETIC_OPEN_RE = re.compile(r"(?<!\$)\(\(")
+_NON_REDIRECT_BRACKET_OPEN_RE = re.compile(r"\$\{|\$\[")
+
+
+def _bare_arithmetic_spans(visible: str) -> list[tuple[int, int]]:
+    """``(start, end)`` of every `((...))` NOT preceded by `$`.
+
+    Only the heredoc scanner needs this: the arithmetic COMMAND `((x=1<<EOF))`
+    shifts, it opens no here-document. Read conservatively, because the
+    caller only uses it to decide where NOT to blank: a `((` whose closing
+    `))` is not found (bash may then reparse it as nested subshells) spans to
+    the end of the string -- the scan simply runs out -- so nothing after it
+    is blanked.
+
+    `${...}` and `$[...]` are included too: their `<<` is an operator or
+    pattern text, never a redirection.
+    """
+    spans: list[tuple[int, int]] = []
+    for opened in _BARE_ARITHMETIC_OPEN_RE.finditer(visible):
+        depth = 2
+        index = opened.end()
+        while index < len(visible) and depth:
+            if visible[index] == "(":
+                depth += 1
+            elif visible[index] == ")":
+                depth -= 1
+            index += 1
+        spans.append((opened.start(), index))
+    for opened in _NON_REDIRECT_BRACKET_OPEN_RE.finditer(visible):
+        close = "}" if opened.group() == "${" else "]"
+        end = visible.find(close, opened.end())
+        spans.append((opened.start(), len(visible) if end == -1 else end + 1))
+    return spans
+
+
+def _heredoc_body_spans(command: str) -> list[tuple[int, int, bool]]:
+    """``(start, end, literal)`` of every TERMINATED here-document body.
+
+    `start`..`end` covers the body lines and the terminator line. `literal` is
+    True when the delimiter was quoted (`<<'EOF'`, `<<"EOF"`, `<<\\EOF`):
+    bash then performs no expansion in the body, so it is pure data. With an
+    unquoted delimiter the body is still not shell SYNTAX -- its `&` and `;`
+    are text -- but `$(...)` and backticks in it do run.
+
+    Only a body whose terminator line is actually found is reported. Blanking
+    text can only turn a denial into an allow, so an unterminated or
+    misparsed heredoc (`$((a<<b))` read as one, say) stays visible: the
+    conservative direction for a deny list.
+    """
+    visible = _mask(command, mask_double=False)
+    arithmetic = _arithmetic_spans(visible) + _bare_arithmetic_spans(visible)
+    spans: list[tuple[int, int, bool]] = []
+    pending: list[tuple[str, bool, bool]] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    length = len(command)
+    while index < length:
+        ch = command[index]
+        if escaped:
+            escaped = False
+        elif quote is not None:
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"':
+                escaped = True
+        elif ch == "\\":
+            escaped = True
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "#" and (index == 0 or command[index - 1] in _COMMENT_START_AFTER):
+            # A comment runs to end of line, and a `<<` in it opens nothing:
+            # `echo hi # <<EOF` then `sleep 100 &` backgrounds the sleep.
+            line_end = command.find("\n", index)
+            if line_end == -1:
+                break
+            index = line_end
+            continue
+        elif (
+            command.startswith("<<", index)
+            and not command.startswith("<<<", index)
+            and (index == 0 or command[index - 1] != "<")
+            and not any(lo <= index < hi for lo, hi in arithmetic)
+        ):
+            cursor = index + 2
+            strip_tabs = cursor < length and command[cursor] == "-"
+            if strip_tabs:
+                cursor += 1
+            while cursor < length and command[cursor] in " \t":
+                cursor += 1
+            word = _HEREDOC_DELIMITER_RE.match(command, cursor)
+            if word is not None and not word.group().isdigit():
+                raw = word.group()
+                literal = any(q in raw for q in "'\"\\")
+                delimiter = re.sub(r"""\\(.)|['"]""", lambda m: m.group(1) or "", raw)
+                pending.append((delimiter, strip_tabs, literal))
+                index = word.end()
+                continue
+        elif ch == "\n" and pending:
+            cursor = index + 1
+            for delimiter, strip_tabs, literal in pending:
+                body_start = cursor
+                terminated = False
+                while cursor < length:
+                    line_end = command.find("\n", cursor)
+                    line_end = length if line_end == -1 else line_end
+                    line = command[cursor:line_end]
+                    # bash keeps a trailing `\r` in both the delimiter word
+                    # and the line, so a CRLF heredoc does terminate; compare
+                    # without it on both sides. A mismatch either way only
+                    # ends the body EARLIER than bash, the safe direction.
+                    candidate = line.rstrip("\r")
+                    if strip_tabs:
+                        candidate = candidate.lstrip("\t")
+                    if candidate == delimiter:
+                        spans.append((body_start, line_end, literal))
+                        cursor = min(line_end + 1, length)
+                        terminated = True
+                        break
+                    cursor = line_end + 1
+                if not terminated:
+                    return spans
+            pending = []
+            index = cursor
+            continue
+        index += 1
+    return spans
+
+
+def blank_heredoc_bodies(command: str, *, literal_only: bool = False) -> str:
+    """`command` with here-document bodies replaced by ``x``, length and
+    newlines preserved, so offsets still map onto the input.
+
+    A heredoc body is data to the shell's parser: `p := &Config{}` in a Go
+    file written with `cat <<'EOF'`, or `R&D` in a commit message, is not an
+    async list. Without this every such `&` read as a detachment (bug roadmap
+    W1, agents ch. 5, lead P2 on #1071). With `literal_only` only quoted-
+    delimiter bodies are blanked -- the view `_command_substitutions` reads,
+    since an unquoted body's `$(...)` still executes.
+    """
+    spans = _heredoc_body_spans(command)
+    if not spans:
+        return command
+    chars = list(command)
+    for start, end, literal in spans:
+        if literal_only and not literal:
+            continue
+        for position in range(start, end):
+            if chars[position] != "\n":
+                chars[position] = "x"
+    return "".join(chars)
 
 
 def _mask(command: str, *, mask_double: bool) -> str:
@@ -279,7 +460,11 @@ SHELL_COMMAND_WORDS = frozenset({"ash", "bash", "busybox", "dash", "ksh", "sh", 
 # costing unbounded work.
 MAX_PAYLOAD_DEPTH = 3
 
-_SUBSTITUTION_OPEN_RE = re.compile(r"\$\(")
+# `$(...)` command substitution, and `<(...)`/`>(...)` process
+# substitution. The latter runs its command ASYNCHRONOUSLY and bash does not
+# wait for it, so `cd <(sleep 100)` is a long-running child spelled as a
+# shell-state builtin (bug roadmap W1, agents ch. 4c).
+_SUBSTITUTION_OPEN_RE = re.compile(r"\$\(|[<>]\(")
 _ARITHMETIC_OPEN_RE = re.compile(r"\$\(\(")
 # A shell's `-c` need not be a lone token: `bash -lc`, `sh -ec`, `bash -cl`
 # all take the next word as the command to run. Only applied once the
@@ -363,13 +548,18 @@ def _blank_arithmetic(visible: str) -> str:
 
 
 def _command_substitutions(command: str) -> list[str]:
-    """Contents of every `$(...)` and backtick pair that the shell would run.
+    """Contents of every `$(...)`, `<(...)`, `>(...)` and backtick pair that
+    the shell would run.
 
     Single-quoted regions are masked (no substitution happens there); DOUBLE
-    quotes are left transparent, because `"$(cmd &)"` does substitute.
+    quotes are left transparent, because `"$(cmd &)"` does substitute. A
+    `<(`/`>(` inside double quotes is literal text in bash, so process
+    substitution is only recognised outside every quote.
     """
     visible = _mask(command, mask_double=False)
-    arithmetic_starts = {start for start, _ in _arithmetic_spans(visible)}
+    fully_masked = mask_quoted(command)
+    arithmetic = _arithmetic_spans(visible)
+    arithmetic_starts = {start for start, _ in arithmetic}
     found: list[str] = []
 
     position = 0
@@ -380,6 +570,14 @@ def _command_substitutions(command: str) -> list[str]:
         if opened.start() in arithmetic_starts:
             # Not a command substitution. Advance INTO it rather than past
             # it, so a `$(cmd)` nested in the arithmetic is still found.
+            position = opened.end()
+            continue
+        if visible[opened.start()] in "<>" and (
+            fully_masked[opened.start()] != visible[opened.start()]
+            or any(lo <= opened.start() < hi for lo, hi in arithmetic)
+        ):
+            # A `<(` inside double quotes is text; inside arithmetic it is a
+            # comparison followed by a parenthesised operand, `$(( a<(b) ))`.
             position = opened.end()
             continue
         depth = 1
@@ -539,7 +737,7 @@ def detachment_match(command: str, _depth: int = 0) -> tuple[str, str] | None:
     very masking that fixed the false positives (claude P2 on `624a433`).
     """
     normalized = normalize_shell_command(command)
-    masked = _blank_arithmetic(mask_quoted(normalized))
+    masked = _blank_arithmetic(mask_quoted(blank_heredoc_bodies(normalized)))
     for label, pattern in DETACH_PATTERNS:
         found = pattern.search(masked)
         if found is None:
@@ -555,7 +753,12 @@ def detachment_match(command: str, _depth: int = 0) -> tuple[str, str] | None:
 
     if _depth >= MAX_PAYLOAD_DEPTH:
         return None
-    for payload in _command_substitutions(normalized) + _shell_c_payloads(normalized):
+    # Substitutions in an UNQUOTED heredoc body still run, so that scan keeps
+    # them; a `bash -c` line in any body is text (only `$(...)` and backticks
+    # execute there), so the `-c` scan reads the fully blanked view.
+    executable = blank_heredoc_bodies(normalized, literal_only=True)
+    payloads = _command_substitutions(executable) + _shell_c_payloads(blank_heredoc_bodies(normalized))
+    for payload in payloads:
         if not payload:
             continue
         nested = detachment_match(payload, _depth + 1)
@@ -574,9 +777,10 @@ def is_shell_state_only(command: str) -> bool:
     shape, the agent wrote as a prefix to THIS command anyway). Callers use
     this to decide whether `wrap_bounded` may rewrite the command at all.
 
-    A command carrying a command substitution is never exempt, however it is
-    spelled: `export FOO=$(slow)` is a builtin by command word and an
-    unbounded subprocess in fact (claude P3 on `624a433`).
+    A command carrying a command or process substitution is never exempt,
+    however it is spelled: `export FOO=$(slow)` and `cd <(slow)` are builtins
+    by command word and unbounded subprocesses in fact (claude P3 on
+    `624a433`; bug roadmap W1, agents ch. 4c).
 
     A command this cannot parse (unbalanced quotes) returns False -- the
     conservative direction, since False only means "bound it as usual".
@@ -608,6 +812,15 @@ def is_shell_state_only(command: str) -> bool:
 
 def is_detached(command: str) -> str | None:
     """Return the matched detachment form, or ``None``.
+
+    A hygiene guard, not a security boundary. It keeps an implementer from
+    detaching work by ACCIDENT, the mctl-telegram#652 shape; it does not
+    claim to stop an agent set on hiding a background job. Exec wrappers
+    whose payload is not a `-c` program -- `time`, `timeout N`, `exec`,
+    `command`, `env -S "bash -c '... &'"` -- are a known, accepted gap (bug
+    roadmap W1, agents ch. 4b): a denylist of wrappers never ends, and the
+    process-group kill in `wrap_bounded` still reaches anything they start
+    that stays in the group.
 
     ``command`` is normalized first (see `normalize_shell_command`) so a
     line-continued `&`/`nohup`/`setsid`/`disown` cannot hide past a pattern
