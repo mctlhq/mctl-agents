@@ -12,7 +12,7 @@ follow-up gitops PR; this module is the orchestrator only):
        never observed and the proposal sits in `implemented` forever).
     3. Run decide(pr, codex_review). One of: wait, address-review,
        merge, flip-to-merged, flip-to-rejected, defer-merge,
-       ci-infra, ci-unknown, merge-state-unknown. `decide()`
+       ci-infra, ci-unknown, merge-state-unknown, review-unknown. `decide()`
        is a pure function. The `MAX_REVIEW_ATTEMPTS` cap on follow-up
        loops lives in the OUTER state machine (this module), not in
        decide().
@@ -1302,6 +1302,18 @@ class CodexReview:
     # head yet. This -- not a count of inline comments -- is what gates the
     # merge; see decide() and mctl-agents#359.
     head_verdict: str | None = None
+    # Listings that could not be read this tick ("reviews", "pull comments",
+    # ...). Empty means every listing was observed. A failed read is NOT an
+    # empty listing: an unread reviews page hides a CHANGES_REQUESTED verdict
+    # and every finding in a review body, while an approval read from another
+    # listing still stands, so treating it as `[]` can merge past a block.
+    # decide() refuses to act on a review it could not fully observe.
+    unread: tuple[str, ...] = ()
+
+    @property
+    def known(self) -> bool:
+        """Whether every listing the review is built from was read."""
+        return not self.unread
 
     def findings_p1_p2(self, at: str) -> list[CodexFinding]:
         """Return findings that belong to the given head SHA.
@@ -1596,9 +1608,10 @@ def _gh_api_list(path: str) -> list[dict]:
     """Every item of a paginated GitHub REST listing, or an exception.
 
     `_gh_api_json([path, "--paginate"])` is NOT safe for a listing that can
-    span pages: `gh api --paginate` then prints several JSON arrays back to
-    back, which `json.loads` rejects, so the read fails on exactly the
-    long-lived PRs with 31+ comments. `--jq '.[]'` streams one compact object
+    span pages: depending on the gh release, `gh api --paginate` prints
+    several JSON arrays back to back (which `json.loads` rejects, so the
+    read fails on exactly the long-lived PRs with 31+ comments) or merges
+    them into one (gh 2.97.0 does). Do not depend on either. `--jq '.[]'` streams one compact object
     per line instead (bodies keep their newlines escaped, so one line is one
     item) -- the pattern run_issue_directive_poller already uses.
 
@@ -2239,16 +2252,29 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
     # (submitted_at, state) of the newest verdict review at the current head.
     head_verdict: str | None = None
     head_verdict_at: str = ""
+    unread: list[str] = []
+
+    def _listing(label: str, path: str) -> list[dict]:
+        # "Could not observe" is never "observed absent" (AGENTS.md). A failed
+        # gh call, a malformed body or a non-object item is recorded as unread
+        # and decide() then refuses to act on this review; it never becomes
+        # an empty listing. Only an empty listing is GitHub's absence signal.
+        # `_gh_api_list`, not `_gh_api_json([path, "--paginate"])`: a listing
+        # of 31+ items spans pages, and a gh that prints one array per page
+        # would make the latter unparseable, so every long-lived PR would be
+        # unread on every tick.
+        try:
+            return _gh_api_list(path)
+        except subprocess.CalledProcessError as e:
+            detail = (e.stderr or "").strip() or str(e)
+        except (subprocess.SubprocessError, OSError, ValueError) as e:
+            detail = f"{type(e).__name__}: {e}"
+        print(f"warn: {label} fetch failed for {pr.repo}#{pr.number}: {detail}")
+        unread.append(label)
+        return []
 
     # 1. Reviews — `gh api repos/<owner>/<repo>/pulls/<n>/reviews`.
-    try:
-        reviews = _gh_api_json([
-            f"repos/{pr.repo}/pulls/{pr.number}/reviews",
-            "--paginate",
-        ]) or []
-    except subprocess.CalledProcessError as e:
-        print(f"warn: code reviews fetch failed for {pr.repo}#{pr.number}: {e.stderr.strip()}")
-        reviews = []
+    reviews = _listing("reviews", f"repos/{pr.repo}/pulls/{pr.number}/reviews")
     for r in reviews:
         login = (r.get("user") or {}).get("login")
         if login not in GATING_BOTS:
@@ -2300,14 +2326,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
             ))
 
     # 2. Line-anchored review comments — `gh api repos/.../pulls/<n>/comments`.
-    try:
-        review_comments = _gh_api_json([
-            f"repos/{pr.repo}/pulls/{pr.number}/comments",
-            "--paginate",
-        ]) or []
-    except subprocess.CalledProcessError as e:
-        print(f"warn: codex pull comments fetch failed: {e.stderr.strip()}")
-        review_comments = []
+    review_comments = _listing("pull comments", f"repos/{pr.repo}/pulls/{pr.number}/comments")
     for c in review_comments:
         login = (c.get("user") or {}).get("login")
         if login not in GATING_BOTS:
@@ -2334,14 +2353,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
     # 3. Issue comments — top-level `No P1/P2 findings` newer
     #    than head_pushed_at — and (4) +1 reactions on a `@claude review`
     #    trigger newer than head_pushed_at. `gh api repos/.../issues/<n>/comments`.
-    try:
-        issue_comments = _gh_api_json([
-            f"repos/{pr.repo}/issues/{pr.number}/comments",
-            "--paginate",
-        ]) or []
-    except subprocess.CalledProcessError as e:
-        print(f"warn: codex issue comments fetch failed: {e.stderr.strip()}")
-        issue_comments = []
+    issue_comments = _listing("issue comments", f"repos/{pr.repo}/issues/{pr.number}/comments")
 
     # Walk newest-first to find the most recent `@claude review` trigger.
     latest_trigger: dict | None = None
@@ -2408,14 +2420,12 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
     # +1 reaction by claude review bot on the latest @claude review trigger.
     if latest_trigger and _iso_gt(latest_trigger.get("created_at"), pr.head_pushed_at):
         comment_id = latest_trigger.get("id")
-        try:
-            reactions = _gh_api_json([
-                f"repos/{pr.repo}/issues/comments/{comment_id}/reactions",
-                "--paginate",
-            ]) or []
-        except subprocess.CalledProcessError as e:
-            print(f"warn: codex reactions fetch failed: {e.stderr.strip()}")
-            reactions = []
+        # An unread reactions listing can only hide an approval, never a
+        # block, but it is still not "no reaction": recorded as unread like
+        # the others so the review is either fully observed or not acted on.
+        reactions = _listing(
+            "trigger reactions", f"repos/{pr.repo}/issues/comments/{comment_id}/reactions",
+        )
         for r in reactions:
             if (r.get("user") or {}).get("login") == REVIEW_BOT and r.get("content") == "+1":
                 has_responded = True
@@ -2432,6 +2442,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
         has_responded=has_responded,
         findings=findings,
         head_verdict=head_verdict,
+        unread=tuple(unread),
     )
 
 
@@ -2444,24 +2455,21 @@ def read_copilot_review(pr: PRSnapshot) -> CopilotReview:
     """
     has_responded = False
     count = 0
+    # Observe-only, so an unread listing may count as no signal here; it must
+    # still never crash the tick (a multi-page body or a timeout used to).
     try:
-        reviews = _gh_api_json([
-            f"repos/{pr.repo}/pulls/{pr.number}/reviews",
-            "--paginate",
-        ]) or []
-    except subprocess.CalledProcessError as e:
-        print(f"warn: copilot reviews fetch failed: {e.stderr.strip()}")
+        reviews = _gh_api_list(f"repos/{pr.repo}/pulls/{pr.number}/reviews")
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        print(f"warn: copilot reviews fetch failed: {type(e).__name__}: {e}")
         reviews = []
     for r in reviews:
         if (r.get("user") or {}).get("login") != COPILOT_BOT:
             continue
         has_responded = True
     try:
-        comments = _gh_api_json([
-            f"repos/{pr.repo}/pulls/{pr.number}/comments",
-            "--paginate",
-        ]) or []
-    except subprocess.CalledProcessError:
+        comments = _gh_api_list(f"repos/{pr.repo}/pulls/{pr.number}/comments")
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        print(f"warn: copilot comments fetch failed: {type(e).__name__}: {e}")
         comments = []
     for c in comments:
         if (c.get("user") or {}).get("login") == COPILOT_BOT:
@@ -2800,6 +2808,14 @@ def decide(
         return ("flip-to-rejected", pr.close_comment_or_default)
     if pr.is_draft:
         return ("wait", None)
+    if not codex_review.known:
+        # A review listing could not be read this tick. What was read is a
+        # partial picture: it can carry an approval while the unread listing
+        # carries the CHANGES_REQUESTED or the P1 that should block it. Act on
+        # nothing -- no merge, no defer-merge, no address-review charged to the
+        # proposal -- and read again next tick. Ahead of `has_responded` so a
+        # partial read is reported as what it is, not as "not reviewed yet".
+        return ("review-unknown", list(codex_review.unread))
     if not codex_review.has_responded:
         # Codex still parsing the PR head.
         return ("wait", None)
@@ -3991,13 +4007,32 @@ def process_one(
             ci_blockers=(current_ci_names or None),
         )
 
-    if decision != "merge-state-unknown" and (ref.merge_unknown_ticks or ref.merge_unknown_head):
+    if (
+        decision not in ("merge-state-unknown", "review-unknown")
+        and (ref.merge_unknown_ticks or ref.merge_unknown_head)
+    ):
         # The bound counts CONSECUTIVE unknown ticks: any tick that decided
         # anything else clears it. Change-only, so a healthy run writes nothing.
+        # A review-unknown tick observed nothing about the merge state either
+        # way, so it neither advances nor clears the bound.
         _update_status_if_changed(ref, ref.status, merge_unknown_ticks=None, merge_unknown_head=None)
 
     if decision == "wait":
         return ShepherdResult(ref=ref, decision="wait")
+
+    if decision == "review-unknown":
+        # Fail closed (decide() acted on nothing). The proposal is blameless
+        # and nothing is charged; the next tick reads every listing again.
+        unread_labels = ", ".join(payload or []) or "(unspecified)"
+        print(
+            f"warn: {ref.service}/{ref.slug}: review state unknown on head "
+            f"{pr.head_sha[:7]} (unread: {unread_labels}); not acting this tick"
+        )
+        return ShepherdResult(
+            ref=ref,
+            decision="wait",
+            notes=f"review listings unread: {unread_labels}; will retry next tick",
+        )
 
     if decision == "merge-state-unknown":
         # Ready to merge except that GitHub will not say whether it can be
@@ -5051,6 +5086,15 @@ def reconcile_one(
             repair_fields["harness_failures"] = None
             repair_fields["refusals"] = None
             repair_fields["refusals_head"] = None
+            # The three outage counters flip to review-stuck too (ci-infra,
+            # ci-unknown, merge-state-unknown), and `ci_probe_failures` is not
+            # head-pinned at all: left at its cap, one more probe blip
+            # re-sticks the proposal on the very next tick.
+            repair_fields["ci_infra_retries"] = None
+            repair_fields["ci_infra_head"] = None
+            repair_fields["ci_probe_failures"] = None
+            repair_fields["merge_unknown_ticks"] = None
+            repair_fields["merge_unknown_head"] = None
     changed = _update_status_if_changed(
         ref,
         target_status,
