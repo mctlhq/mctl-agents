@@ -382,7 +382,10 @@ def test_wrap_bounded_rounds_the_kill_grace_up_not_down():
         "sh -c 'nohup ./run.sh'",
         "/bin/bash -c 'setsid ./run.sh'",
         'echo "$(cmd &)"',
-        "X=`slow &` echo hi",
+        # Quoted, so the operator scan cannot see it and only the payload
+        # recursion can. Unquoted, the `&` is caught at the top level (see
+        # test_ampersand_followed_by_a_word_still_backgrounds).
+        'X="`slow &`" echo hi',
         'bash -c "bash -c \'x &\'"',
     ],
 )
@@ -599,3 +602,141 @@ def test_an_exec_wrapper_does_not_hide_the_payload(command):
 )
 def test_seeing_through_a_wrapper_does_not_manufacture_a_payload(command):
     assert exec_budget.detachment_match(command) is None
+
+
+# ---------------------------------------------------------------------------
+# Bug roadmap W1, agents ch. 5, 4a, 4c: false denials and cheap bypasses.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `|&` pipes stderr too and runs in the foreground (ch. 5).
+        "go test ./... |& tee /tmp/test.log",
+        "make check 2>&1 |& tee log",
+        # The words only detach as command words, not inside paths (ch. 5).
+        "tail -n 50 /tmp/setsid.log",
+        "cat docs/nohup-notes.md",
+        "ls ./disown/",
+        "grep -c error build-setsid.out",
+        "cp nohup.out nohup.out.bak",
+        "cat my-nohup",
+        "rm -f old_setsid",
+        "ls x.disown",
+        # `&>` and `&>>` are redirections, not the async operator.
+        "go test ./... &>/tmp/test.log",
+        "go test ./... &>>/tmp/test.log",
+        # Process substitution itself is not a detachment.
+        "diff <(sort a.txt) <(sort b.txt)",
+    ],
+)
+def test_no_false_detachment_denials(command):
+    assert exec_budget.is_detached(command) is None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Whitespace after `&` is not what makes it the async operator (ch. 4a).
+        "go test ./... &echo started",
+        "sleep 100 &true",
+        "X=`slow &` echo hi",
+        # Still denied as command words, including after an operator.
+        "true; nohup ./run.sh",
+        "(setsid ./run.sh)",
+        "./run.sh &\ndisown",
+        "/usr/bin/nohup ./run.sh",
+        "sudo setsid ./run.sh",
+        # A background `&` inside a process substitution (ch. 4c).
+        "cat <(sleep 100 &)",
+        "tee >(slow & ) < in",
+    ],
+)
+def test_detachment_bypasses_are_closed(command):
+    assert exec_budget.is_detached(command) is not None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["cd <(sleep 100)", "pushd >(sleep 100)", "export F=<(sleep 100)"],
+)
+def test_process_substitution_is_not_shell_state_only(command):
+    """`cd <(sleep 100)` starts an unbounded child; it must be wrapped (ch. 4c)."""
+    assert exec_budget.is_shell_state_only(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    ['cd "<(not a substitution)"', "export N=$(( a<(b+1) ))"],
+)
+def test_text_that_only_looks_like_process_substitution(command):
+    """Inside double quotes `<(` is text; inside arithmetic it is a comparison."""
+    assert exec_budget._command_substitutions(command) == []
+
+
+# -- heredoc bodies are data (lead P2 on #1071) -------------------------------
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("cat > main.go <<'EOF'\npackage main\np := &Config{}\nEOF", id="go-address-of"),
+        pytest.param("cat > lib.rs <<EOF\nfn f(s: &str) -> &str { s }\nEOF\ncargo build", id="rust-ref"),
+        pytest.param("git commit -m \"$(cat <<'EOF'\nfix: R&D page\nEOF\n)\"", id="commit-heredoc"),
+        pytest.param(
+            "gh pr create --title t --body-file - <<'EOF'\nA&nbsp;B, don't\nEOF", id="pr-body-nbsp"
+        ),
+        pytest.param("cat <<-EOF\n\tR&D\n\tEOF\necho ok", id="dash-strips-tabs"),
+        pytest.param("cat <<EOF # write it\nR&D\nEOF", id="comment-after-the-operator"),
+        pytest.param("cat <<'EOF' > s.sh\nbash -c \"echo hi &\"\nEOF", id="bash-c-in-a-literal-body-is-text"),
+        pytest.param("cat <<EOF > s.sh\nbash -c \"echo hi &\"\nEOF", id="bash-c-in-an-unquoted-body-is-text"),
+        pytest.param("cat <<'EOF' > f\r\nR&D\r\nEOF\r\necho ok", id="crlf-heredoc-terminates"),
+        pytest.param("cat <<-EOF > f\r\n\tR&D\r\n\tEOF\r\necho ok", id="crlf-dash-heredoc-terminates"),
+        pytest.param("echo $# x#y <<EOF\nR&D\nEOF", id="hash-inside-a-word-is-no-comment"),
+        pytest.param("cat <<'EOF'\n$(sleep 100 &)\nEOF", id="literal-body-substitution-is-text"),
+    ],
+)
+def test_an_ampersand_in_a_heredoc_body_is_not_a_detachment(command: str) -> None:
+    assert exec_budget.is_detached(command) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("cat <<'EOF' > f\nit's\nEOF\nsleep 100 &", id="after-the-terminator"),
+        pytest.param("cat <<EOF &\nhi\nEOF", id="on-the-operator-line"),
+        pytest.param("cat <<EOF\nsleep 100 &", id="unterminated-stays-visible"),
+        pytest.param("cat <<EOF\n$(sleep 100 &)\nEOF", id="unquoted-body-substitution-runs"),
+        pytest.param(
+            "cat <<EOF\nbash -c \"$(sleep 100 &)\"\nEOF", id="unquoted-body-substitution-in-a-bash-c-line-runs"
+        ),
+        pytest.param("cat <<'EOF' > f\r\nhi\r\nEOF\r\nsleep 100 &", id="crlf-after-the-terminator"),
+        pytest.param("cat <<EOF\nhi\nEOF \nsleep 100 &", id="near-miss-terminator-stays-visible"),
+        pytest.param("echo $((1<<2)) &", id="arithmetic-shift-is-not-a-heredoc"),
+        pytest.param(
+            "x=$((a<<EOF))\nsleep 100 &\nEOF", id="arithmetic-shift-by-a-name-opens-no-body"
+        ),
+        pytest.param("echo hi # <<EOF\nsleep 100 &\nEOF", id="heredoc-in-a-comment-opens-no-body"),
+        pytest.param("#<<EOF\nsleep 100 &\nEOF", id="comment-at-start-opens-no-body"),
+        pytest.param("((x=1<<EOF))\nsleep 100 &\nEOF", id="bare-arithmetic-command-opens-no-body"),
+        pytest.param("((x=1<<EOF\nsleep 100 &\nEOF", id="unclosed-double-paren-blanks-nothing"),
+        pytest.param("echo ${x//<<EOF/y}\nsleep 100 &\nEOF/y}", id="parameter-expansion-opens-no-body"),
+        pytest.param("echo $[1<<EOF]\nsleep 100 &\nEOF]", id="legacy-arithmetic-opens-no-body"),
+    ],
+)
+def test_a_real_detachment_around_a_heredoc_is_still_denied(command: str) -> None:
+    assert exec_budget.is_detached(command) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    ['nohup"" sleep 1', "nohup>out.log sleep 1", "NOHUP sleep 1", "setsid'' x", "DISOWN"],
+)
+def test_detach_words_ending_at_a_quote_or_redirect_or_in_caps_are_denied(command: str) -> None:
+    assert exec_budget.is_detached(command) is not None
+
+
+def test_blanking_preserves_length_and_newlines() -> None:
+    command = "cat <<'EOF'\nR&D\nEOF\necho ok"
+    blanked = exec_budget.blank_heredoc_bodies(command)
+    assert len(blanked) == len(command)
+    assert blanked.count("\n") == command.count("\n")
+    assert blanked.endswith("\necho ok")
