@@ -488,7 +488,7 @@ def valid_traceparent(value: str | None) -> bool:
     """A W3C version-00 traceparent with non-zero trace and span ids."""
     if not value:
         return False
-    match = _TRACEPARENT_RE.match(value.strip())
+    match = _TRACEPARENT_RE.fullmatch(value.strip())
     if not match:
         return False
     trace_id, span_id, _flags = match.groups()
@@ -499,7 +499,7 @@ def sampled_traceparent(value: str | None) -> bool:
     """A valid traceparent whose sampled flag is set."""
     if not valid_traceparent(value):
         return False
-    match = _TRACEPARENT_RE.match((value or "").strip())
+    match = _TRACEPARENT_RE.fullmatch((value or "").strip())
     return match is not None and bool(int(match.group(3), 16) & 0x01)
 
 
@@ -535,7 +535,7 @@ def trace_ids(traceparent: str | None) -> tuple[str, str] | None:
     """The (trace_id, span_id) hex pair of a W3C traceparent, or None."""
     if not valid_traceparent(traceparent):
         return None
-    match = _TRACEPARENT_RE.match((traceparent or "").strip())
+    match = _TRACEPARENT_RE.fullmatch((traceparent or "").strip())
     return (match.group(1), match.group(2)) if match else None
 
 
@@ -881,9 +881,9 @@ def classify_command(cmd: list[str] | tuple[str, ...]) -> tuple[str, dict[str, A
     attributes["mctl.github.operation"] = operation
     attributes["mctl.github.mutation"] = mutation
     for i, arg in enumerate(args):
-        if arg in ("--repo", "-R") and i + 1 < len(args) and _REPO_RE.match(args[i + 1]):
+        if arg in ("--repo", "-R") and i + 1 < len(args) and _REPO_RE.fullmatch(args[i + 1]):
             attributes.setdefault(REPOSITORY_NAME, args[i + 1])
-        match = _GITHUB_URL_RE.match(arg)
+        match = _GITHUB_URL_RE.fullmatch(arg)
         if match:
             attributes.setdefault(REPOSITORY_NAME, match.group(1))
             if match.group(2) == "issues":

@@ -270,7 +270,7 @@ def render_report(drift: list[tuple[str, Any, Any]], releases: list[dict[str, An
             prev = r.get("previous_tag") or "?"
             lines.append(f"### {r['repo']} {prev} -> {r['tag']} ({r['published_at'][:10]})")
             lines.append("")
-            paths = [p for p in r.get("changed_paths", []) if _SAFE_PATH_RE.match(str(p))]
+            paths = [p for p in r.get("changed_paths", []) if _SAFE_PATH_RE.fullmatch(str(p))]
             lines += [f"- `{p}`" for p in paths[:200]] or ["- (changed paths unavailable)"]
             lines.append("")
     if not drift and not releases:

@@ -152,7 +152,7 @@ def _require_str_tuple(value: Any, *, where: str) -> tuple[str, ...]:
 
 def _require_trace_id(value: Any, *, where: str) -> str:
     text = _require_str(value, where=where, allow_empty=False)
-    if not _TRACE_ID_RE.match(text):
+    if not _TRACE_ID_RE.fullmatch(text):
         raise ExecutionIdentityError(f"{where} must be 32 lowercase hex characters, got {text!r}")
     return text
 

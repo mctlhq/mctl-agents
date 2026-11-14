@@ -20,7 +20,7 @@ class IssueRefParts:
 
 
 def parse_issue_url(issue_url: str) -> IssueRefParts:
-    match = _ISSUE_URL_RE.match(issue_url)
+    match = _ISSUE_URL_RE.fullmatch(issue_url)
     if not match:
         raise ValueError(f"{issue_url!r} does not look like a mctlhq GitHub issue URL")
     repo, number = match.groups()

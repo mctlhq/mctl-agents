@@ -1358,7 +1358,7 @@ class ExecutionEvidence:
 
 
 def _check_created_at(created_at: str) -> None:
-    if len(created_at) > MAX_CREATED_AT_LENGTH or not _CREATED_AT_PATTERN.match(created_at):
+    if len(created_at) > MAX_CREATED_AT_LENGTH or not _CREATED_AT_PATTERN.fullmatch(created_at):
         raise ExecutionEvidenceError(
             "created_at must be an ISO8601 UTC timestamp of the form "
             f"YYYY-MM-DDTHH:MM:SS[.ffffff]Z, got {created_at!r}"
@@ -1397,7 +1397,7 @@ def _check_outcome(outcome: Outcome) -> None:
     if outcome.code and outcome.code not in OUTCOME_CODES:
         raise ExecutionEvidenceError(f"outcome.code {outcome.code!r} is not one of {sorted(OUTCOME_CODES)!r}")
     if outcome.reason_code and (
-        len(outcome.reason_code) > MAX_SLUG_LENGTH or not _SLUG_PATTERN.match(outcome.reason_code)
+        len(outcome.reason_code) > MAX_SLUG_LENGTH or not _SLUG_PATTERN.fullmatch(outcome.reason_code)
     ):
         raise ExecutionEvidenceError(
             f"outcome.reason_code must be a 1..{MAX_SLUG_LENGTH} character code of [a-z0-9._-]"
@@ -1467,7 +1467,7 @@ def _check_artifact(ref: ArtifactRef) -> None:
 def _check_artifact_name(name: str) -> None:
     if (
         len(name) > MAX_ARTIFACT_NAME_LENGTH
-        or not _ARTIFACT_NAME_PATTERN.match(name)
+        or not _ARTIFACT_NAME_PATTERN.fullmatch(name)
         or "/" in name
         or "\\" in name
         or ".." in name
@@ -1596,7 +1596,7 @@ def _check_provenance(provenance: Provenance, *, own_evidence_id: str) -> None:
             f"provenance.authority {provenance.authority!r} is not one of {list(AUTHORITIES)!r}"
         )
     if provenance.observed_at and (
-        len(provenance.observed_at) > MAX_CREATED_AT_LENGTH or not _CREATED_AT_PATTERN.match(provenance.observed_at)
+        len(provenance.observed_at) > MAX_CREATED_AT_LENGTH or not _CREATED_AT_PATTERN.fullmatch(provenance.observed_at)
     ):
         raise ExecutionEvidenceError(
             "provenance.observed_at must be an ISO8601 UTC timestamp of the form "

@@ -226,7 +226,7 @@ def provenance_for_env(
 ) -> ModelProvenance:
     """The single validation gate for provenance; see the module docstring."""
     if declared is not None:
-        if not _PROVIDER_ID_RE.match(declared.provider or ""):
+        if not _PROVIDER_ID_RE.fullmatch(declared.provider or ""):
             raise ValueError(f"provider id {declared.provider!r} must match [a-z0-9-]+")
         if declared.price_source not in PRICE_SOURCES:
             raise ValueError(f"price_source {declared.price_source!r} is not one of {sorted(PRICE_SOURCES)}")
@@ -365,7 +365,7 @@ def _checked_correlation(correlation: Mapping[str, Any]) -> dict[str, Any]:
         logger.warning("usage ledger: not sending %s=%r (%s)", key, fields.pop(key), why)
 
     repo = fields.get("target_repo")
-    if repo is not None and not (isinstance(repo, str) and TARGET_REPO_RE.match(repo)):
+    if repo is not None and not (isinstance(repo, str) and TARGET_REPO_RE.fullmatch(repo)):
         drop("target_repo", "not owner/name")
     for key in ("issue_number", "pr_number"):
         if key not in fields:
@@ -378,7 +378,7 @@ def _checked_correlation(correlation: Mapping[str, Any]) -> dict[str, Any]:
         else:
             fields[key] = number
     execution_id = fields.get("execution_id")
-    if execution_id is not None and not (isinstance(execution_id, str) and _EXECUTION_ID_RE.match(execution_id)):
+    if execution_id is not None and not (isinstance(execution_id, str) and _EXECUTION_ID_RE.fullmatch(execution_id)):
         drop("execution_id", "not an execution id")
     stage = fields.get("devloop_stage")
     if stage is not None and stage not in DEVLOOP_STAGES:

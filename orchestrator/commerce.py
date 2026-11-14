@@ -121,7 +121,7 @@ def hashed_time(value: datetime | str) -> str:
     `isoformat()`, which writes `+00:00` (ADR 020 sec. 5). A string is
     accepted only when it is already in exactly this form."""
     if isinstance(value, str):
-        if not _HASHED_TIME_PATTERN.match(value):
+        if not _HASHED_TIME_PATTERN.fullmatch(value):
             raise CommerceError(f"{value!r} is not a YYYY-MM-DDTHH:MM:SSZ time")
         return value
     if value.tzinfo is None:

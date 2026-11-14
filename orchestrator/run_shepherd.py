@@ -2544,7 +2544,7 @@ def _agy_headings(body: str) -> list[tuple[int, int]]:
     fence: str | None = None
     offset = 0
     for line in body.split("\n"):
-        f = _AGY_FENCE_RE.match(line)
+        f = _AGY_FENCE_RE.fullmatch(line)
         h = _AGY_HEADING_LINE_RE.match(line)
         if fence is not None:
             # CommonMark: a closing fence is the same character, at least as
