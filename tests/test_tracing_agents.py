@@ -614,3 +614,43 @@ def test_classifier_interruptions_reach_the_root_span_without_the_notice_text(ex
     root = _spans(exported)["invoke_agent issue-investigator"]
     assert root.attributes[tracing.CLASSIFIER_INTERRUPTIONS] == 1
     _assert_no_payload(exported, "safety classifier")
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["gh", "workflow", "run", "ci.yml", "-R", "o/r"],
+        ["gh", "workflow", "enable", "ci.yml"],
+        ["gh", "release", "upload", "1.0.0", "a.tgz"],
+        ["gh", "release", "delete-asset", "1.0.0", "a.tgz"],
+        ["gh", "repo", "archive", "o/r", "--yes"],
+        ["gh", "repo", "rename", "x"],
+        ["gh", "label", "clone", "o/src"],
+        ["gh", "run", "delete", "123"],
+        # A subcommand outside the vocabulary cannot be vouched for as a read.
+        ["gh", "issue", "some-future-verb"],
+    ],
+)
+def test_github_writes_are_classified_as_mutations(cmd):
+    _, attributes = tracing.classify_command(cmd)
+    assert attributes["mctl.github.mutation"] is True, attributes
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["gh", "repo", "clone", "o/r"],
+        ["gh", "repo", "view", "o/r"],
+        ["gh", "pr", "checks", "1"],
+        ["gh", "pr", "checkout", "1"],
+        ["gh", "run", "watch", "123"],
+        ["gh", "run", "download", "123"],
+        ["gh", "release", "download", "1.0.0"],
+        ["gh", "workflow", "list"],
+        ["gh", "search", "issues", "x"],
+        ["gh", "label", "list"],
+    ],
+)
+def test_github_reads_are_not_mutations(cmd):
+    _, attributes = tracing.classify_command(cmd)
+    assert attributes["mctl.github.mutation"] is False, attributes

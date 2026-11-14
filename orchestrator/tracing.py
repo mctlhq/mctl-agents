@@ -805,11 +805,25 @@ _GH_SUBCOMMANDS = frozenset({
     "view", "list", "status", "comment", "create", "edit", "close", "reopen", "merge", "review", "ready",
     "checks", "diff", "delete", "develop", "lock", "unlock", "transfer", "pin", "unpin", "clone", "fork",
     "issues", "prs", "code", "repos", "commits", "rerun", "cancel", "watch", "download",
+    "run", "enable", "disable", "upload", "delete-asset", "archive", "unarchive", "rename", "sync",
+    "checkout", "set-default",
 })
-_GH_MUTATING = frozenset({
-    "comment", "create", "edit", "close", "reopen", "merge", "review", "ready", "delete", "develop", "lock",
-    "unlock", "transfer", "pin", "unpin", "fork", "rerun", "cancel",
-})
+# What does NOT write to GitHub, per group. Everything else is a mutation,
+# including a subcommand outside the vocabulary ("other"): an operation this
+# classifier cannot name is one it cannot vouch for, and reporting it as a
+# read would hide a write. A single group-agnostic set of mutating verbs
+# missed `workflow run`, `release upload` and `repo archive`, and could not
+# tell `repo clone` (a read) from `label clone` (copies labels into a repo).
+_GH_READ_ONLY: dict[str, frozenset[str]] = {
+    "issue": frozenset({"view", "list", "status"}),
+    "pr": frozenset({"view", "list", "status", "checks", "diff", "checkout"}),
+    "repo": frozenset({"view", "list", "clone", "set-default"}),
+    "label": frozenset({"list"}),
+    "release": frozenset({"view", "list", "download"}),
+    "search": frozenset({"issues", "prs", "code", "repos", "commits"}),
+    "run": frozenset({"view", "list", "watch", "download"}),
+    "workflow": frozenset({"view", "list"}),
+}
 _GH_API_BODY_FLAGS = frozenset({"-f", "-F", "--field", "--raw-field", "--input"})
 _GIT_REMOTE = frozenset({"push", "clone", "fetch", "pull", "ls-remote"})
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -864,7 +878,7 @@ def classify_command(cmd: list[str] | tuple[str, ...]) -> tuple[str, dict[str, A
             operation = "api.write" if mutation else "api.read"
         else:
             sub = args[1] if len(args) > 1 and args[1] in _GH_SUBCOMMANDS else "other"
-            mutation = sub in _GH_MUTATING
+            mutation = sub not in _GH_READ_ONLY[group]
             operation = f"{group}.{sub}"
         name = f"github.{operation}"
     elif exe == "git":

@@ -41,10 +41,13 @@ def _rotate_old_digests(digest_dir: Path, keep_weeks: int = 8) -> None:
     """Move digest files older than the last `keep_weeks` ISO-weeks to archive/.
 
     Called before the SDK writes the new digest. Files matching `YYYY-WNN.md`
-    older than (latest_week - keep_weeks) are renamed into `digest_dir/archive/`.
+    older than (latest_week - (keep_weeks - 1)) are renamed into `digest_dir/archive/`,
+    so exactly the `keep_weeks` most recent ISO weeks stay.
     Non-matching files (README.md, archive/, etc.) are left untouched.
     The function is idempotent — silent when there is nothing to rotate.
     """
+    if keep_weeks < 1:
+        raise ValueError(f"keep_weeks must be >= 1, got {keep_weeks}")
     if not digest_dir.is_dir():
         return
 
@@ -71,8 +74,11 @@ def _rotate_old_digests(digest_dir: Path, keep_weeks: int = 8) -> None:
         return
 
     latest_year, latest_week = max(key for key, _ in candidates)
+    # The window is `keep_weeks` weeks INCLUDING the latest one, so its
+    # oldest week is `keep_weeks - 1` before the latest. Subtracting the full
+    # `keep_weeks` kept one digest too many.
     threshold_year, threshold_week = _subtract_iso_weeks(
-        latest_year, latest_week, keep_weeks
+        latest_year, latest_week, keep_weeks - 1
     )
     threshold = (threshold_year, threshold_week)
 

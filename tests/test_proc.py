@@ -187,3 +187,17 @@ def test_bounded_path_drains_stderr_concurrently_so_a_full_pipe_does_not_deadloc
     assert proc.returncode == 0
     assert len(proc.stdout) == 300000
     assert len(proc.stderr) == 300000
+
+
+def test_stderr_cap_hit_after_stdout_eof_is_still_a_truncation_not_a_failure():
+    """A child that closes stdout first and only then overruns the stderr cap
+    is killed by the stderr drainer after the stdout loop already finished.
+    That SIGKILL must read as the cap, like a stdout overrun does, not as a
+    failed command."""
+    child = (
+        "import os, sys, time; os.close(1); time.sleep(0.3); "
+        "sys.stderr.write('x' * 500000); sys.stderr.flush()"
+    )
+    proc = run_capturing(["python", "-c", child], timeout=20, max_output_bytes=1000)
+    assert proc.returncode == 0
+    assert len(proc.stderr) == 1000

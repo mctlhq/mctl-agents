@@ -207,6 +207,11 @@ def _run_capturing_bounded(
         # end is at EOF or will be shortly — this join does not reintroduce
         # the wait the draining thread exists to avoid.
         stderr_thread.join()
+        # Re-read after the join: a child that closes stdout first and only
+        # then overruns the stderr cap is killed by the draining thread
+        # AFTER `capped` was computed above, and its SIGKILL returncode
+        # turned a merely truncated run into a failure.
+        capped = capped or stderr_capped.is_set()
         stderr_bytes = b"".join(stderr_chunks)
     finally:
         if timer is not None:

@@ -147,6 +147,20 @@ _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _RUNTIME_ID_RE = re.compile(r"ex-[0-9a-f]{16}")
 _TRACE_ID_RE = re.compile(r"[0-9a-f]{32}")
 _REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
+_ASCII_DIGITS_RE = re.compile(r"[0-9]+")
+
+
+def _positive_number(number: Any) -> int | None:
+    """An issue/PR number as a positive int, else None. ASCII digits only:
+    `str.isdigit()` also accepts superscripts and other Unicode digits
+    (`'²'`) that `int()` then refuses, which made the `note_*` recorders
+    raise instead of ignoring a bad number (they must never raise)."""
+    # str(True) is "True", so a bool falls out at the regex too.
+    text = str(number)
+    if not _ASCII_DIGITS_RE.fullmatch(text):
+        return None
+    value = int(text)
+    return value if value > 0 else None
 _PR_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100})/pull/([1-9][0-9]{0,9})")
 _TOOL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 _SLUG_INVALID = re.compile(r"[^a-z0-9._-]+")
@@ -465,9 +479,10 @@ class RunEvidence:
     def note_subject_issue(self, repository: str, number: Any) -> None:
         if not (isinstance(repository, str) and _REPO_RE.fullmatch(repository)):
             return
-        if not str(number).isdigit() or int(number) <= 0:
+        n = _positive_number(number)
+        if n is None:
             return
-        self.subject = ee.SubjectRef(kind="issue", repository=repository, ref=str(int(number)), revision="")
+        self.subject = ee.SubjectRef(kind="issue", repository=repository, ref=str(n), revision="")
         self.subject_observed_at = _utc_now_iso()
         self.pending_pr = None
 
@@ -489,12 +504,13 @@ class RunEvidence:
         never read at seal time."""
         if not (isinstance(repository, str) and _REPO_RE.fullmatch(repository)):
             return
-        if not str(number).isdigit() or int(number) <= 0:
+        n = _positive_number(number)
+        if n is None:
             return
         head_sha = head_sha or self.pushed_head_sha or None
         if isinstance(head_sha, str) and _GIT_SHA_RE.fullmatch(head_sha):
             self.subject = ee.SubjectRef(
-                kind="pull_request", repository=repository, ref=str(int(number)), revision=head_sha
+                kind="pull_request", repository=repository, ref=str(n), revision=head_sha
             )
             self.subject_observed_at = _utc_now_iso()
             self.pending_pr = None
@@ -504,11 +520,11 @@ class RunEvidence:
             current is not None
             and current.kind == "pull_request"
             and current.repository == repository
-            and current.ref == str(int(number))
+            and current.ref == str(n)
         ):
             return  # already bound to an observed head: keep it
         self.subject = None
-        self.pending_pr = (repository, int(number))
+        self.pending_pr = (repository, n)
 
     def note_subject_pr_url(self, url: str | None, head_sha: str | None = None) -> None:
         match = _PR_URL_RE.fullmatch((url or "").strip())

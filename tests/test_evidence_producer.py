@@ -956,3 +956,22 @@ def test_the_evidence_head_read_is_bounded_at_ten_seconds(monkeypatch, tmp_path)
         ri._note_pushed_head(tmp_path)
     assert seen == {"timeout": 10}
     assert evidence.pushed_head_sha == SHA
+
+
+# The note_* recorders must never raise: a Unicode digit like '²' passes
+# str.isdigit() but int() refuses it.
+@pytest.mark.parametrize("number", ["²", "١٢", True, 0, -3, "7a", None])
+def test_note_subject_ignores_a_bad_number_without_raising(number):
+    evidence = ep.RunEvidence(ep.STAGE_IMPLEMENTER)
+    evidence.note_subject_issue("mctlhq/mctl-agents", number)
+    evidence.note_subject_pr("mctlhq/mctl-agents", number, "a" * 40)
+    assert evidence.subject is None
+    assert evidence.pending_pr is None
+
+
+def test_note_subject_accepts_a_numeric_string():
+    evidence = ep.RunEvidence(ep.STAGE_IMPLEMENTER)
+    evidence.note_subject_pr("mctlhq/mctl-agents", "42")
+    assert evidence.pending_pr == ("mctlhq/mctl-agents", 42)
+    evidence.note_subject_issue("mctlhq/mctl-agents", "0042")
+    assert evidence.subject.ref == "42"
