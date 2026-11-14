@@ -376,7 +376,7 @@ def load_version(name: str, version: str, *, versions_dir: Path = VERSIONS_DIR) 
             f"{path}: metadata.name {declared_name!r} is not a strategy orchestrator/context_assembly.py "
             f"implements (one of {sorted(STRATEGIES)!r})",
         )
-    if not isinstance(declared_version, str) or not _SEMVER_RE.match(declared_version):
+    if not isinstance(declared_version, str) or not _SEMVER_RE.fullmatch(declared_version):
         raise ContextReleaseError(
             VERDICT_UNKNOWN, f"{path}: metadata.version {declared_version!r} must be semver X.Y.Z"
         )
@@ -1096,7 +1096,7 @@ def build_version_document(
             VERDICT_UNKNOWN, f"{name!r} is not a strategy orchestrator/context_assembly.py implements "
             f"(one of {sorted(STRATEGIES)!r})"
         )
-    if not _SEMVER_RE.match(version):
+    if not _SEMVER_RE.fullmatch(version):
         raise ContextReleaseError(VERDICT_UNKNOWN, f"version must be semver X.Y.Z, got {version!r}")
 
     existing_path = versions_dir / name / f"{version}.yaml"

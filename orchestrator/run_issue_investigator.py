@@ -2652,7 +2652,7 @@ def _validate_outcome(outcome_code: str, outcome_reason: str) -> None:
         raise ValueError(f"outcome_code {outcome_code!r} is not one of {sorted(OUTCOME_CODES)!r}")
     if not outcome_reason:
         return
-    if len(outcome_reason) > MAX_SLUG_LENGTH or not _SLUG_PATTERN.match(outcome_reason):
+    if len(outcome_reason) > MAX_SLUG_LENGTH or not _SLUG_PATTERN.fullmatch(outcome_reason):
         raise ValueError(
             f"outcome_reason must be a 1..{MAX_SLUG_LENGTH} character code of "
             f"[a-z0-9][a-z0-9._-]*, got {outcome_reason!r}"

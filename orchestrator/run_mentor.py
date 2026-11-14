@@ -52,7 +52,7 @@ def _rotate_old_digests(digest_dir: Path, keep_weeks: int = 8) -> None:
     for entry in digest_dir.iterdir():
         if not entry.is_file():
             continue
-        match = _DIGEST_RE.match(entry.name)
+        match = _DIGEST_RE.fullmatch(entry.name)
         if not match:
             continue
         iso_year = int(match.group(1))

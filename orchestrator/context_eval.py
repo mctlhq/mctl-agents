@@ -177,7 +177,7 @@ def _safe_or_kind(source_id: str, by_id: Mapping[str, ContextSource]) -> str:
     otherwise the literal `"unknown"` — an id this unsafe naming a source
     this module has never seen at all (mctlhq/mctl-agents#526, ADR 015
     sec. 3)."""
-    if SAFE_SOURCE_ID.match(source_id):
+    if SAFE_SOURCE_ID.fullmatch(source_id):
         return source_id
     source = by_id.get(source_id)
     return source.kind if source is not None else "unknown"

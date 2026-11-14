@@ -1434,7 +1434,7 @@ def _review_execution_id() -> str:
 
 def _parse_pr_url(url: str) -> tuple[str, int] | None:
     """Split a GitHub PR URL into (repo, number), or None if it does not match."""
-    m = _PR_URL_RE.match(url.strip())
+    m = _PR_URL_RE.fullmatch(url.strip())
     if not m:
         return None
     return m.group(1), int(m.group(2))
