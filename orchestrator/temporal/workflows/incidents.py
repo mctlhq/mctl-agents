@@ -89,7 +89,18 @@ class IncidentLoopWorkflow:
         params = {"mode": INCIDENTS_MODE}
         release: ResolvedRelease | None = None
 
-        if workflow.patched("incident-registry-and-record"):
+        if workflow.patched("incident-image-from-gitops"):
+            # The responder is the one mctl-agents-run template that holds
+            # MCTL_TOKEN, so its image is what decides whether that session
+            # has a shell: every release before the session was built without
+            # Bash still has one. A caller-chosen image, a registry promotion
+            # or a rollback could bring it back next to the token, so the
+            # image now comes only from a literal in gitops, changed by a
+            # reviewed PR (mctlhq/mctl-gitops#1980). No pin is sent and the
+            # registry is not asked. The execution record therefore carries
+            # no version; the image is in the Argo workflow's pod spec.
+            pass
+        elif workflow.patched("incident-registry-and-record"):
             # Pin the released responder image, exactly as the dev loop
             # pins investigate/implement/shepherd. Without this the run
             # took whatever image `cwft-mctl-agents-run` had baked in, so
