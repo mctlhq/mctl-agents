@@ -1797,6 +1797,19 @@ class MergeWatchResume:
     # waiting for their fulfilment; the next run binds them.
     accepted_request_ids: tuple[str, ...] = ()
     open_deliveries: tuple[OpenDelivery, ...] = ()
+    # This loop's own canonical `we_` (#636) when it is still open at the
+    # hop: the end at the approve flip did not land, so `run`'s exit was
+    # going to retry it. A continue-as-new is not an exit (`ContinueAsNewError`
+    # is a BaseException), so without these the next run would start with
+    # `_canonical_open` False and no engine ref, and the `we_` would stay
+    # non-terminal, blocking its work item, after the loop ended. A record
+    # without them (every hop before this field existed) decodes closed,
+    # which is exactly what that run would have done.
+    canonical_open: bool = False
+    canonical_execution: str = ""
+    canonical_pending_phase: str = ""
+    canonical_end_phase: str = ""
+    own_engine_ref: str = ""
 
     # --- Prior stage results. A continued run never re-runs investigate,
     # approve or implement, so the final DevLoopResult can only report
@@ -3684,9 +3697,10 @@ class DevLoopWorkflow:
         own (`<loop id>#<xr id>`)."""
         own_ref = self._own_engine_ref
         if engine_ref is None and not own_ref:
-            # Only a run that bound its own execution has one to advance; its
-            # ref is never re-derived here (a continued run starts without
-            # it, and the bare workflow id is no longer any execution's ref).
+            # Only a loop that bound its own execution has one to advance; its
+            # ref is never re-derived here (the bare workflow id is no longer
+            # any execution's ref). A continued run has it only when the hop
+            # carried it (`MergeWatchResume.own_engine_ref`).
             workflow.logger.error("no dispatched execution of this run to advance to %s", phase)
             # Not "landed": a caller holding a pending advance keeps it.
             return False
@@ -4582,6 +4596,11 @@ class DevLoopWorkflow:
             deferred_resume_contract=self._deferred_resume_contract,
             feedback_done=tuple(sorted(self._feedback_done)),
             pending_feedback=self._pending_feedback,
+            canonical_open=self._canonical_open,
+            canonical_execution=self._canonical_execution,
+            canonical_pending_phase=self._canonical_pending_phase,
+            canonical_end_phase=self._canonical_end_phase,
+            own_engine_ref=self._own_engine_ref,
         )
 
     def _rehydrate_work_context(self, resume: MergeWatchResume) -> None:
@@ -4619,6 +4638,13 @@ class DevLoopWorkflow:
         # is shown by `contract_state`, not silently dropped.
         self._feedback_done = set(resume.feedback_done)
         self._pending_feedback = tuple(resume.pending_feedback)
+        # The own `we_` (#636), as the previous run left it. Plain
+        # assignments: no signal or delivery in the gap touches these.
+        self._canonical_open = resume.canonical_open
+        self._canonical_execution = resume.canonical_execution
+        self._canonical_pending_phase = resume.canonical_pending_phase
+        self._canonical_end_phase = resume.canonical_end_phase
+        self._own_engine_ref = resume.own_engine_ref
         # A gap `resume` ran against an EMPTY binding, so the
         # work-item-mismatch guard was vacuous for it: a resume naming a
         # foreign work item was accepted there. Re-applying it here would
@@ -4742,6 +4768,16 @@ class DevLoopWorkflow:
         self._initialized = True
         for rid in sorted(self._open_deliveries):
             self._start_delivery(self._open_deliveries[rid])
+        # The own `we_` is still open only when the previous run's end of it
+        # did not land: try again now rather than when the watch ends, which
+        # can be days away, since it blocks the work item until it ends. A
+        # record from before these fields existed carries it closed, so this
+        # schedules nothing on such a history. Still pending after this,
+        # `run`'s exit (or the next hop) keeps it.
+        if self._canonical_open:
+            await self._end_canonical_execution(
+                self._canonical_pending_phase or self._canonical_end_phase or "Failed"
+            )
 
         outcome = await self._watch_pr(resume.service, resume.slug, resume=resume)
         if outcome.resume is not None:
