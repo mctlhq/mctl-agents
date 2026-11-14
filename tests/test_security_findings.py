@@ -514,6 +514,83 @@ def test_redelivery_counts_once(store: FakeStore) -> None:
     assert len(verification._bound_observations(verification.Context(dup, dup.active_attempt, lambda: "", NOW))) == 1
 
 
+# -- scanner rerun binding: mctl-api's rule, every set landed field ------------------------
+
+DIGEST_A, DIGEST_B = "sha256:" + "d" * 64, "sha256:" + "e" * 64
+
+
+def _scanner_ctx(*, revision: str, digest: str, observations: list[dict[str, Any]]) -> verification.Context:
+    raw = load("example-occurrence-awaiting.json")
+    attempt = {**raw["remediation_attempts"][0], "landed_revision": revision, "landed_artifact_digest": digest}
+    occ = contract.parse_occurrence({**raw, "remediation_attempts": [attempt], "observations": observations})
+    assert occ is not None and occ.active_attempt is not None
+    return verification.Context(occ, occ.active_attempt, lambda: "", NOW)
+
+
+def _present(oid: str, *, revision: str = "", digest: str = "") -> dict[str, Any]:
+    return {"id": oid, "provider_ref": "scan", "observation_hash": f"h-{oid}", "claimed_action": "present",
+            "observed_revision": revision, "observed_artifact_digest": digest,
+            "observed_at": "2026-10-03T00:00:00Z"}
+
+
+@pytest.mark.parametrize(("obs", "reason"), [
+    (_present("sob_1", revision=SHA_A, digest=DIGEST_B), "binds the revision only"),
+    (_present("sob_1", revision=SHA_A), "binds the revision only"),
+    (_present("sob_1", revision=SHA_B, digest=DIGEST_A), "binds the artifact digest only"),
+    (_present("sob_1", digest=DIGEST_A), "binds the artifact digest only"),
+])
+def test_scanner_partial_binding_is_pending_with_reason_not_a_dropped_failure(
+    obs: dict[str, Any], reason: str,
+) -> None:
+    ctx = _scanner_ctx(revision=SHA_A, digest=DIGEST_A, observations=[obs])
+    assert verification._bound_observations(ctx) == []
+    got = verification.ScannerRerunVerifier().verify(ctx)
+    assert isinstance(got, verification.Pending) and reason in got.reason, got
+    decision = verification.plan(ctx, [verification.ScannerRerunVerifier()])
+    assert decision.reason == "pending" and decision.write is None
+
+
+def test_scanner_fully_bound_present_on_dual_attempt_is_recorded_failed() -> None:
+    ctx = _scanner_ctx(revision=SHA_A, digest=DIGEST_A, observations=[
+        _present("sob_1", revision=SHA_A, digest=DIGEST_B),  # partial: does not hide the bound one
+        _present("sob_2", revision=SHA_A, digest=DIGEST_A),
+    ])
+    got = verification.ScannerRerunVerifier().verify(ctx)
+    assert got == verification.Outcome("scanner_rerun_exact_revision", "failed", revision=SHA_A,
+                                        artifact_digest=DIGEST_A)
+    assert verification.locally_bound(got, ctx.attempt)
+    decision = verification.plan(ctx, [verification.ScannerRerunVerifier()])
+    assert decision.reason == "definite" and decision.write == got
+
+
+@pytest.mark.parametrize(("revision", "digest", "obs", "want"), [
+    (SHA_A, "", _present("sob_1", revision=SHA_A, digest=DIGEST_B), ("failed", SHA_A, "")),
+    ("", DIGEST_A, _present("sob_1", revision=SHA_B, digest=DIGEST_A), ("failed", "", DIGEST_A)),
+])
+def test_scanner_single_field_attempts_still_bind(
+    revision: str, digest: str, obs: dict[str, Any], want: tuple[str, str, str],
+) -> None:
+    ctx = _scanner_ctx(revision=revision, digest=digest, observations=[obs])
+    got = verification.ScannerRerunVerifier().verify(ctx)
+    assert isinstance(got, verification.Outcome) and (got.result, got.revision, got.artifact_digest) == want
+    assert verification.locally_bound(got, ctx.attempt)
+    assert verification.plan(ctx, [verification.ScannerRerunVerifier()]).reason == "definite"
+
+
+def test_scanner_attempt_with_no_landed_field_binds_nothing() -> None:
+    ctx = _scanner_ctx(revision="", digest="", observations=[_present("sob_1", revision="", digest="")])
+    assert verification._bound_observations(ctx) == []
+    got = verification.ScannerRerunVerifier().verify(ctx)
+    assert isinstance(got, verification.Pending) and "only" not in got.reason
+
+
+def test_scanner_mismatching_observation_is_plain_pending() -> None:
+    ctx = _scanner_ctx(revision=SHA_A, digest=DIGEST_A, observations=[_present("sob_1", revision=SHA_B,
+                                                                               digest=DIGEST_B)])
+    got = verification.ScannerRerunVerifier().verify(ctx)
+    assert isinstance(got, verification.Pending) and "only" not in got.reason
+
+
 # -- assurance -------------------------------------------------------------------------------
 
 
