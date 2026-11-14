@@ -671,3 +671,56 @@ def test_process_substitution_is_not_shell_state_only(command):
 def test_text_that_only_looks_like_process_substitution(command):
     """Inside double quotes `<(` is text; inside arithmetic it is a comparison."""
     assert exec_budget._command_substitutions(command) == []
+
+
+# -- heredoc bodies are data (lead P2 on #1071) -------------------------------
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("cat > main.go <<'EOF'\npackage main\np := &Config{}\nEOF", id="go-address-of"),
+        pytest.param("cat > lib.rs <<EOF\nfn f(s: &str) -> &str { s }\nEOF\ncargo build", id="rust-ref"),
+        pytest.param("git commit -m \"$(cat <<'EOF'\nfix: R&D page\nEOF\n)\"", id="commit-heredoc"),
+        pytest.param(
+            "gh pr create --title t --body-file - <<'EOF'\nA&nbsp;B, don't\nEOF", id="pr-body-nbsp"
+        ),
+        pytest.param("cat <<-EOF\n\tR&D\n\tEOF\necho ok", id="dash-strips-tabs"),
+        pytest.param("cat <<'EOF'\n$(sleep 100 &)\nEOF", id="literal-body-substitution-is-text"),
+    ],
+)
+def test_an_ampersand_in_a_heredoc_body_is_not_a_detachment(command: str) -> None:
+    assert exec_budget.is_detached(command) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("cat <<'EOF' > f\nit's\nEOF\nsleep 100 &", id="after-the-terminator"),
+        pytest.param("cat <<EOF &\nhi\nEOF", id="on-the-operator-line"),
+        pytest.param("cat <<EOF\nsleep 100 &", id="unterminated-stays-visible"),
+        pytest.param("cat <<EOF\n$(sleep 100 &)\nEOF", id="unquoted-body-substitution-runs"),
+        pytest.param("cat <<EOF\nhi\nEOF \nsleep 100 &", id="near-miss-terminator-stays-visible"),
+        pytest.param("echo $((1<<2)) &", id="arithmetic-shift-is-not-a-heredoc"),
+        pytest.param(
+            "x=$((a<<EOF))\nsleep 100 &\nEOF", id="arithmetic-shift-by-a-name-opens-no-body"
+        ),
+    ],
+)
+def test_a_real_detachment_around_a_heredoc_is_still_denied(command: str) -> None:
+    assert exec_budget.is_detached(command) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    ['nohup"" sleep 1', "nohup>out.log sleep 1", "NOHUP sleep 1", "setsid'' x", "DISOWN"],
+)
+def test_detach_words_ending_at_a_quote_or_redirect_or_in_caps_are_denied(command: str) -> None:
+    assert exec_budget.is_detached(command) is not None
+
+
+def test_blanking_preserves_length_and_newlines() -> None:
+    command = "cat <<'EOF'\nR&D\nEOF\necho ok"
+    blanked = exec_budget.blank_heredoc_bodies(command)
+    assert len(blanked) == len(command)
+    assert blanked.count("\n") == command.count("\n")
+    assert blanked.endswith("\necho ok")

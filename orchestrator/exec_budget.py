@@ -174,11 +174,17 @@ _TRAILING_BACKGROUND_RE = re.compile(r"(?<![&<>|;])&(?![&>])")
 # may precede the word, so `/usr/bin/nohup ./run.sh` still reads as the
 # command; the price is that a path ending in such a word (`ls /srv/nohup`)
 # is still denied, which is the conservative side.
+#
+# The word may END at a quote or a redirection too: `nohup"" sleep` and
+# `nohup>out.log sleep` still run `nohup` (the quote pair is removed, the
+# redirection is not part of the word). Case-insensitive as before: the
+# patterns are a deny list, and a false `NOHUP` denial costs one turn where
+# a missed spelling costs an unbounded child.
 _WORD_START = r"(?<![^\s;&|()`/])"
-_WORD_END = r"(?![^\s;&|()`])"
-_NOHUP_RE = re.compile(_WORD_START + r"nohup" + _WORD_END)
-_SETSID_RE = re.compile(_WORD_START + r"setsid" + _WORD_END)
-_DISOWN_RE = re.compile(_WORD_START + r"disown" + _WORD_END)
+_WORD_END = r"(?![^\s;&|()`'\"<>])"
+_NOHUP_RE = re.compile(_WORD_START + r"nohup" + _WORD_END, re.IGNORECASE)
+_SETSID_RE = re.compile(_WORD_START + r"setsid" + _WORD_END, re.IGNORECASE)
+_DISOWN_RE = re.compile(_WORD_START + r"disown" + _WORD_END, re.IGNORECASE)
 
 # Ordered (label, pattern) pairs -- `is_detached` returns the first label that
 # matches, so the order only affects which name is reported, not whether a
@@ -206,6 +212,111 @@ def normalize_shell_command(command: str) -> str:
     """
     command = re.sub(r"(?<=\S)\\[ \t]*\r?\n(?=\S)", "", command)
     return re.sub(r"\\[ \t]*\r?\n[ \t]*", " ", command)
+
+
+_HEREDOC_DELIMITER_RE = re.compile(r"""(?:[^\s;&|<>()'"\\]|'[^']*'|"[^"]*"|\\.)+""")
+
+
+def _heredoc_body_spans(command: str) -> list[tuple[int, int, bool]]:
+    """``(start, end, literal)`` of every TERMINATED here-document body.
+
+    `start`..`end` covers the body lines and the terminator line. `literal` is
+    True when the delimiter was quoted (`<<'EOF'`, `<<"EOF"`, `<<\\EOF`):
+    bash then performs no expansion in the body, so it is pure data. With an
+    unquoted delimiter the body is still not shell SYNTAX -- its `&` and `;`
+    are text -- but `$(...)` and backticks in it do run.
+
+    Only a body whose terminator line is actually found is reported. Blanking
+    text can only turn a denial into an allow, so an unterminated or
+    misparsed heredoc (`$((a<<b))` read as one, say) stays visible: the
+    conservative direction for a deny list.
+    """
+    arithmetic = _arithmetic_spans(_mask(command, mask_double=False))
+    spans: list[tuple[int, int, bool]] = []
+    pending: list[tuple[str, bool, bool]] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    length = len(command)
+    while index < length:
+        ch = command[index]
+        if escaped:
+            escaped = False
+        elif quote is not None:
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"':
+                escaped = True
+        elif ch == "\\":
+            escaped = True
+        elif ch in ("'", '"'):
+            quote = ch
+        elif (
+            command.startswith("<<", index)
+            and not command.startswith("<<<", index)
+            and (index == 0 or command[index - 1] != "<")
+            and not any(lo <= index < hi for lo, hi in arithmetic)
+        ):
+            cursor = index + 2
+            strip_tabs = cursor < length and command[cursor] == "-"
+            if strip_tabs:
+                cursor += 1
+            while cursor < length and command[cursor] in " \t":
+                cursor += 1
+            word = _HEREDOC_DELIMITER_RE.match(command, cursor)
+            if word is not None and not word.group().isdigit():
+                raw = word.group()
+                literal = any(q in raw for q in "'\"\\")
+                delimiter = re.sub(r"""\\(.)|['"]""", lambda m: m.group(1) or "", raw)
+                pending.append((delimiter, strip_tabs, literal))
+                index = word.end()
+                continue
+        elif ch == "\n" and pending:
+            cursor = index + 1
+            for delimiter, strip_tabs, literal in pending:
+                body_start = cursor
+                terminated = False
+                while cursor < length:
+                    line_end = command.find("\n", cursor)
+                    line_end = length if line_end == -1 else line_end
+                    line = command[cursor:line_end]
+                    if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                        spans.append((body_start, line_end, literal))
+                        cursor = min(line_end + 1, length)
+                        terminated = True
+                        break
+                    cursor = line_end + 1
+                if not terminated:
+                    return spans
+            pending = []
+            index = cursor
+            continue
+        index += 1
+    return spans
+
+
+def blank_heredoc_bodies(command: str, *, literal_only: bool = False) -> str:
+    """`command` with here-document bodies replaced by ``x``, length and
+    newlines preserved, so offsets still map onto the input.
+
+    A heredoc body is data to the shell's parser: `p := &Config{}` in a Go
+    file written with `cat <<'EOF'`, or `R&D` in a commit message, is not an
+    async list. Without this every such `&` read as a detachment (bug roadmap
+    W1, agents ch. 5, lead P2 on #1071). With `literal_only` only quoted-
+    delimiter bodies are blanked -- the view `_command_substitutions` reads,
+    since an unquoted body's `$(...)` still executes.
+    """
+    spans = _heredoc_body_spans(command)
+    if not spans:
+        return command
+    chars = list(command)
+    for start, end, literal in spans:
+        if literal_only and not literal:
+            continue
+        for position in range(start, end):
+            if chars[position] != "\n":
+                chars[position] = "x"
+    return "".join(chars)
 
 
 def _mask(command: str, *, mask_double: bool) -> str:
@@ -574,7 +685,7 @@ def detachment_match(command: str, _depth: int = 0) -> tuple[str, str] | None:
     very masking that fixed the false positives (claude P2 on `624a433`).
     """
     normalized = normalize_shell_command(command)
-    masked = _blank_arithmetic(mask_quoted(normalized))
+    masked = _blank_arithmetic(mask_quoted(blank_heredoc_bodies(normalized)))
     for label, pattern in DETACH_PATTERNS:
         found = pattern.search(masked)
         if found is None:
@@ -590,7 +701,8 @@ def detachment_match(command: str, _depth: int = 0) -> tuple[str, str] | None:
 
     if _depth >= MAX_PAYLOAD_DEPTH:
         return None
-    for payload in _command_substitutions(normalized) + _shell_c_payloads(normalized):
+    executable = blank_heredoc_bodies(normalized, literal_only=True)
+    for payload in _command_substitutions(executable) + _shell_c_payloads(normalized):
         if not payload:
             continue
         nested = detachment_match(payload, _depth + 1)
