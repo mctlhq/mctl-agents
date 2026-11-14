@@ -7599,6 +7599,202 @@ class TestMergeWatchTerminalReconcileCarry:
         assert MergeWatchResume(service="s", slug="x", deadline="2099-01-01T00:00:00Z").terminal_reconcile is False
 
 
+class TestCanonicalExecutionAcrossAHop:
+    """agents ch. 9: a canonical loop's own `we_` that is still open at a
+    merge-watch hop (its end at the approve flip did not land) is carried to
+    the next run and ended there. Before, the hop dropped `canonical_open`,
+    the pending phase and the engine ref, `run`'s exit never sees a
+    continue-as-new, and the `we_` stayed non-terminal for good."""
+
+    pytestmark = pytest.mark.anyio
+
+    async def _run_hopping_loop_whose_flip_end_did_not_land(
+        self, env, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[list[AdvanceInput], list[AdvanceInput], list[Any]]:
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_HISTORY_FLOOR", 1)
+        attempts: list[AdvanceInput] = []
+        landed: list[AdvanceInput] = []
+
+        @activity.defn(name="advance_dispatched_execution")
+        async def flaky_advance(inp: AdvanceInput) -> str:
+            attempts.append(inp)
+            if len(attempts) <= 10:  # the flip end's whole retry policy
+                raise ApplicationError("mctl-api down")
+            landed.append(inp)
+            return "execution-existing we_test_own"
+
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo, number=MERGED_PR.number,
+            state="OPEN", head_sha="deadbeef",
+        )
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[open_pr, open_pr, MERGED_PR]
+        )
+        activities = [
+            a for a in activities if getattr(a, "__temporal_activity_definition").name != "advance_dispatched_execution"
+        ]
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=[*activities, flaky_advance],
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1069"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve, {"approval_ref": "aar_test"})
+            with anyio.fail_after(60):
+                await handle.result()
+            histories = []
+            run_id: str | None = handle.first_execution_run_id
+            while run_id:
+                run = env.client.get_workflow_handle(handle.id, run_id=run_id)
+                history = await run.fetch_history()
+                histories.append(history)
+                run_id = None
+                for event in history.events:
+                    if event.HasField("workflow_execution_continued_as_new_event_attributes"):
+                        run_id = event.workflow_execution_continued_as_new_event_attributes.new_execution_run_id
+        return attempts, landed, histories
+
+    async def test_the_open_we_is_carried_and_ended_by_the_next_run(
+        self, env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        attempts, landed, histories = await self._run_hopping_loop_whose_flip_end_did_not_land(env, monkeypatch)
+
+        assert len(histories) >= 2, "the forced floor must have produced a hop"
+        carried = _continued_resume_inputs(histories[0])
+        own_ref = attempts[0].engine_ref
+        assert own_ref.endswith(f"#run_{histories[0].run_id}")
+        assert carried[0]["canonical_open"] is True
+        assert carried[0]["canonical_pending_phase"] == "Succeeded"
+        assert carried[0]["own_engine_ref"] == own_ref
+        assert carried[0]["canonical_execution"]
+        # Ended exactly once, by the continued run, with the investigator's
+        # phase and under the FIRST run's engine ref (never re-derived).
+        assert [(a.phase, a.engine_ref) for a in landed] == [("Succeeded", own_ref)]
+        assert {a.phase for a in attempts} == {"Succeeded"}
+        # Nothing left open to carry on the next hop.
+        for later in carried[1:]:
+            assert later["canonical_open"] is False
+
+    async def test_the_hop_chain_replays_under_the_same_code(
+        self, env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from temporalio.worker import Replayer
+
+        _attempts, _landed, histories = await self._run_hopping_loop_whose_flip_end_did_not_land(env, monkeypatch)
+        assert len(histories) >= 2
+        replayer = Replayer(workflows=[DevLoopWorkflow], workflow_runner=UnsandboxedWorkflowRunner())
+        for history in histories:
+            await replayer.replay_workflow(history)
+
+    async def test_a_carried_open_we_is_ended_before_the_watch_runs(self, env) -> None:
+        """Ended at the start of the continued run, not when its watch ends
+        (days later): the `we_` blocks its work item until it ends."""
+        advances: list[AdvanceInput] = []
+        advanced = anyio.Event()
+
+        @activity.defn(name="advance_dispatched_execution")
+        async def recording_advance(inp: AdvanceInput) -> str:
+            advances.append(inp)
+            advanced.set()
+            return "execution-existing we_carried"
+
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo, number=MERGED_PR.number,
+            state="OPEN", head_sha="deadbeef",
+        )
+        activities, _calls, _investigate_ran, _ownership_ops = _fake_activities(released=True, pr_states=[open_pr])
+        activities = [
+            a for a in activities if getattr(a, "__temporal_activity_definition").name != "advance_dispatched_execution"
+        ]
+        resume = MergeWatchResume(
+            service="mctl-telegram",
+            slug="issue-1-x",
+            deadline="2099-01-01T00:00:00Z",
+            work_item_id="wi_carried",
+            canonical_open=True,
+            canonical_execution="we_carried",
+            canonical_pending_phase="Succeeded",
+            canonical_end_phase="Succeeded",
+            own_engine_ref="dev-loop-earlier#run_earlier",
+            investigate=WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase="Succeeded"),
+            implement=WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded"),
+            approve=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Succeeded"),
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=[*activities, recording_advance],
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1069", resume=resume),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(15):
+                await advanced.wait()
+            # The watch is still running: the end did not wait for it.
+            assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING
+            context = await handle.query(DevLoopWorkflow.work_context)
+            await handle.signal(DevLoopWorkflow.abandon, "test done")
+            with anyio.fail_after(30):
+                await handle.result()
+
+        assert [(a.phase, a.engine_ref, a.work_item_id) for a in advances] == [
+            ("Succeeded", "dev-loop-earlier#run_earlier", "wi_carried")
+        ]
+        assert context.canonical_open is False
+        assert context.canonical_execution_id == "we_carried"
+
+    async def test_a_record_without_the_fields_schedules_no_advance(self, env) -> None:
+        """Every hop recorded before these fields existed: decodes closed,
+        and the continued run advances nothing, as it did then."""
+        from temporalio.converter import DataConverter
+
+        converter = DataConverter.default.payload_converter
+        legacy = converter.to_payload(
+            {"service": "mctl-telegram", "slug": "issue-1-x", "deadline": "2099-01-01T00:00:00Z"}
+        )
+        decoded = converter.from_payload(legacy, MergeWatchResume)
+        assert (decoded.canonical_open, decoded.own_engine_ref, decoded.canonical_pending_phase) == (False, "", "")
+
+        advances: list[AdvanceInput] = []
+        activities, _calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[MERGED_PR], advance_log=advances
+        )
+        resume = dataclasses.replace(
+            decoded,
+            investigate=WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase="Succeeded"),
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1069", resume=resume),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                await handle.result()
+        assert advances == []
+
+
 class TestMergeWatchFoundHelpers:
     """#1021 M2b-1b T3/T4: the extracted found-branch helpers and the
     per-run record."""
