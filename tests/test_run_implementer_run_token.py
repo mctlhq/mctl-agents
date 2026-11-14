@@ -148,9 +148,24 @@ def _run_main(monkeypatch, tmp_path, *extra):
 
 def test_main_sets_up_the_run_token_with_scope_implement(monkeypatch, tmp_path):
     seen = []
+    monkeypatch.setenv(run_implementer.EXECUTION_ID_ENV, "we_1")
     monkeypatch.setattr(run_token, "setup", lambda **kw: seen.append(kw))
     _run_main(monkeypatch, tmp_path)
     assert seen == [{"shadow_scope": "implement"}]
+
+
+def test_main_shadows_the_grant_scope_without_an_execution(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(run_token, "setup", lambda **kw: seen.append(kw))
+    _run_main(monkeypatch, tmp_path)
+    assert seen == [{"shadow_scope": "implement-grant"}]
+
+
+def test_main_hands_its_filters_to_the_run_token_setup(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(run_implementer, "_setup_run_token", lambda *a: seen.append(a))
+    _run_main(monkeypatch, tmp_path, "--service", "mctl-api", "--slug", "issue-1-x")
+    assert seen == [("mctl-api", "issue-1-x")]
 
 
 def test_main_sets_up_before_find_accepted_proposals(monkeypatch, tmp_path):
@@ -185,6 +200,7 @@ def test_enforce_without_an_execution_id_fails_by_name(monkeypatch, tmp_path, ca
     assert exc.value.code == 2
     err = capsys.readouterr().err
     assert "needs an execution_id" in err and run_implementer.EXECUTION_ID_ENV in err
+    assert "--service and --slug" in err
     assert run_token.mctl_api_bearer() == ""  # and no fallback to MCTL_TOKEN
 
 
@@ -221,4 +237,92 @@ def test_observe_exchange_failure_is_not_fatal(monkeypatch, tmp_path):
     monkeypatch.setenv(run_token.MODE_ENV, "observe")
     monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(503, json={}))
     _run_main(monkeypatch, tmp_path)  # no execution_id: observe only logs
+    assert run_token.mcp_auth(STATIC) == (STATIC, {run_token.SHADOW_HEADER: "implement-grant"})
+
+
+def test_observe_exchange_failure_shadows_implement_on_an_execution(monkeypatch, tmp_path):
+    monkeypatch.setenv(run_token.MODE_ENV, "observe")
+    monkeypatch.setenv(run_implementer.EXECUTION_ID_ENV, "we_1")
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(503, json={}))
+    _run_main(monkeypatch, tmp_path)
     assert run_token.mcp_auth(STATIC) == (STATIC, {run_token.SHADOW_HEADER: "implement"})
+
+
+@pytest.mark.parametrize(("service", "slug"), [("mctl-api", ""), ("", "issue-1-x"), ("", "")])
+def test_enforce_without_an_execution_needs_both_filters(monkeypatch, service, slug, capsys):
+    monkeypatch.setenv(run_token.MODE_ENV, "enforce")
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: pytest.fail("no exchange without one proposal"))
+    with pytest.raises(SystemExit) as exc:
+        run_implementer._setup_run_token(service, slug)
+    assert exc.value.code == 2
+    assert run_token.mctl_api_bearer() == ""
+    assert "--service and --slug" in capsys.readouterr().err
+
+
+class _PinnedApi(_Api):
+    def __call__(self, url, bearer):
+        if url.endswith(run_token.EXCHANGE_PATH):
+            self.calls.append((url, bearer))
+            return httpx.Response(201, json={
+                "token": RUN, "token_id": "art_1", "scope": "implement-grant", "execution_id": "",
+                "expires_at": "2099-01-01T00:00:00Z", "grant_id": "aar_pinned",
+            })
+        return super().__call__(url, bearer)
+
+
+def _pinned_run(monkeypatch):
+    monkeypatch.setenv(run_token.MODE_ENV, "enforce")
+    api = _PinnedApi()
+    monkeypatch.setattr(httpx, "post", lambda url, headers, timeout: api(url, headers["Authorization"][7:]))
+    monkeypatch.setattr(httpx, "get", lambda url, headers, timeout: api(url, headers["Authorization"][7:]))
+    run_implementer._setup_run_token("mctl-api", "issue-1-x")
+    return api
+
+
+def test_enforce_with_one_proposal_exchanges_for_a_pinned_token(monkeypatch):
+    api = _pinned_run(monkeypatch)
+    assert api.calls[0][0].endswith(run_token.EXCHANGE_PATH)
+    assert run_token.mctl_api_bearer() == RUN
+    assert run_token.pinned_grant_id() == "aar_pinned"
+
+
+def test_a_pinned_run_does_not_read_another_grant_as_absent(monkeypatch):
+    _pinned_run(monkeypatch)
+    asked: list[str] = []
+
+    class _Client:
+        def get(self, grant_id):
+            asked.append(grant_id)
+            return aa.ApprovalAnswer(aa.NOT_FOUND)
+
+    monkeypatch.setattr(run_implementer.action_approvals, "ActionApprovalClient", _Client)
+
+    # The record names an older grant than the token's: never asked, and not
+    # the durable refusal a 404 would become.
+    verdict = run_implementer.ae.verify_execution_grant(
+        {"approval": {"approval_ref": "aar_older"}},
+        service="mctl-api", slug="issue-1-x", current_digest="sha256:abc",
+        lookup=run_implementer._lookup_grant,
+    )
+    assert asked == []
+    assert verdict.transient and not verdict.ok and not verdict.code
+    assert "aar_pinned" in verdict.detail
+
+    # Its own grant is asked for, and the store's 404 for it does mean absent.
+    verdict = run_implementer.ae.verify_execution_grant(
+        {"approval": {"approval_ref": "aar_pinned"}},
+        service="mctl-api", slug="issue-1-x", current_digest="sha256:abc",
+        lookup=run_implementer._lookup_grant,
+    )
+    assert asked == ["aar_pinned"]
+    assert verdict.code == run_implementer.ae.GRANT_NOT_FOUND
+
+
+def test_an_execution_bound_run_has_no_pin(monkeypatch):
+    monkeypatch.setenv(run_token.MODE_ENV, "enforce")
+    monkeypatch.setenv(run_implementer.EXECUTION_ID_ENV, "we_1")
+    api = _Api()
+    monkeypatch.setattr(httpx, "post", lambda url, headers, timeout: api(url, headers["Authorization"][7:]))
+    monkeypatch.setattr(httpx, "get", lambda url, headers, timeout: api(url, headers["Authorization"][7:]))
+    run_implementer._setup_run_token()
+    assert run_token.pinned_grant_id() == ""

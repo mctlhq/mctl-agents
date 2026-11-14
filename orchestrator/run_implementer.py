@@ -3751,6 +3751,16 @@ def _result_branch_is_missing(detail: str) -> bool:
 
 
 def _lookup_grant(grant_id: str) -> action_approvals.ApprovalAnswer:
+    pinned = run_token.pinned_grant_id()
+    if pinned and pinned != grant_id:
+        # The token sees one grant, so the store's 404 for this id would not
+        # mean it is absent. Not asking keeps that from becoming a durable
+        # refusal: the next run exchanges again, once the record and the
+        # newest decision agree.
+        return action_approvals.ApprovalAnswer(
+            action_approvals.UNKNOWN,
+            reason=f"this run's token is pinned to {pinned}, so {grant_id} cannot be read",
+        )
     return action_approvals.ActionApprovalClient().get(grant_id)
 
 
@@ -6031,26 +6041,31 @@ def _max_proposals_error(max_proposals: int, dry_run: bool) -> str | None:
 
 
 RUN_TOKEN_SCOPE = "implement"  # noqa: S105 -- a scope name (what mctl-api registers for `implementer`)
+RUN_TOKEN_GRANT_SCOPE = "implement-grant"  # noqa: S105 -- the scope of a run with no execution
 EXECUTION_ID_ENV = "WORKFLOW_EXECUTION_ID"  # cwft-mctl-agents-implement: parameter execution_id
 
 
-def _setup_run_token() -> None:
+def _setup_run_token(service: str = "", slug: str = "") -> None:
     """Acquire the implementer's run token per MCTL_RUN_TOKEN_MODE
     (mctlhq/mctl-agents#717), before the first mctl-api call.
 
     off: a no-op. observe: setup logs a failed exchange and goes on. enforce:
-    the exchange is bound to the run's execution, so a pod without an
-    execution_id (a manual or sweep trigger leaves the CWFT parameter empty)
-    is refused here, by name, instead of surfacing as an opaque exchange
-    refusal -- and never degrades to MCTL_TOKEN. Exits 2 on any failure that
-    enforce must not survive, the same as an unusable argument."""
+    the token is bound to the run's execution or, without one (the sweep, a
+    manual trigger; mctlhq/mctl-gitops#1980), pinned to the decided grant of
+    the one proposal the run names. A pod with neither is refused here, by
+    name, instead of surfacing as an opaque exchange refusal -- and never
+    degrades to MCTL_TOKEN. mctl-api decides from the Workflow's own
+    parameters; service and slug only make this message earlier and clearer.
+    Exits 2 on any failure that enforce must not survive, the same as an
+    unusable argument."""
+    bound = bool(os.environ.get(EXECUTION_ID_ENV, "").strip())
     try:
-        if run_token.mode() == run_token.MODE_ENFORCE and not os.environ.get(EXECUTION_ID_ENV, "").strip():
+        if run_token.mode() == run_token.MODE_ENFORCE and not bound and not (service and slug):
             raise run_token.RunTokenError(
-                f"{run_token.MODE_ENV}=enforce needs an execution_id ({EXECUTION_ID_ENV} is empty): "
-                "the implement run token is bound to an execution; this run has none"
+                f"{run_token.MODE_ENV}=enforce needs an execution_id ({EXECUTION_ID_ENV} is empty) "
+                "or both --service and --slug: this run names neither an execution nor one proposal"
             )
-        run_token.setup(shadow_scope=RUN_TOKEN_SCOPE)
+        run_token.setup(shadow_scope=RUN_TOKEN_SCOPE if bound else RUN_TOKEN_GRANT_SCOPE)
     except run_token.RunTokenError as exc:
         print(f"run token: {exc}", file=sys.stderr)
         sys.exit(2)
@@ -6149,7 +6164,7 @@ def main() -> None:
     # and the action-approval client take their credential from here. Not in
     # dry-run, which discovers proposals and calls nothing.
     if not args.dry_run:
-        _setup_run_token()
+        _setup_run_token(args.service, args.slug)
 
     # Review-feedback mode: drive the existing PR's branch with codex findings.
     if args.review_feedback:
