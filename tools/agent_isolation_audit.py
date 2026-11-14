@@ -21,12 +21,19 @@ ingress peers are evaluated as the intersection of `namespaceSelector` and
 
 Exit code: 0 on a completed audit whatever it finds, 2 on unreadable input
 (a missing root, an unreadable or non-UTF-8 core file, invalid YAML in a core file).
+A file or directory outside the core set that cannot be read is not a reason
+to exit 2: it yields a `not-observed` row, because it may hold a policy.
+
+Kubernetes defaults are applied where the audit reads them: a container-level
+`securityContext` field overrides the pod-level one, and a NetworkPolicy with
+no `policyTypes` affects egress when it has a non-empty `egress` section.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import asdict, dataclass, field
@@ -75,6 +82,7 @@ class Inputs:
     profiles: dict[str, list[dict[str, Any]]]
     other_netpols: dict[str, list[dict[str, Any]]]
     unparsed_netpols: dict[str, bool] = field(default_factory=dict)  # path -> names argo-workflows ns
+    unreadable_paths: dict[str, str] = field(default_factory=dict)  # path -> read error
 
 
 class UnreadableInput(Exception):
@@ -104,22 +112,46 @@ def _load_opt(path: Path) -> list[dict[str, Any]] | None:
     return _load(path) if path.is_file() else None
 
 
-def _scan_netpols(root: Path) -> tuple[dict[str, list[dict[str, Any]]], dict[str, bool]]:
+def _yaml_files(root: Path, unreadable: dict[str, str]) -> list[Path]:
+    """Every YAML file under root. A directory that cannot be listed is recorded, never skipped."""
+    def onerror(exc: OSError) -> None:
+        where = Path(exc.filename) if exc.filename else root
+        try:
+            rel = str(where.relative_to(root)) or "."
+        except ValueError:
+            rel = str(where)
+        unreadable[rel] = f"directory not listable: {exc.strerror or exc}"
+
+    out: list[Path] = []
+    for dirpath, _dirs, files in os.walk(root, onerror=onerror):
+        out += [Path(dirpath) / f for f in files if Path(f).suffix in YAML_SUFFIXES]
+    return sorted(out)
+
+
+def _scan_netpols(
+    root: Path,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, bool], dict[str, str]]:
     """Every file outside NETPOL with a top-level `kind: NetworkPolicy`.
 
-    Returns parsed NetworkPolicy docs per path, and the paths that could not be
+    Returns parsed NetworkPolicy docs per path; the paths that could not be
     parsed (templated YAML), each flagged with whether its raw text names the
-    agent namespace.
+    agent namespace; and the paths that could not be read at all. An
+    unreadable path may hold an agent policy, so it is reported, never dropped.
     """
     parsed: dict[str, list[dict[str, Any]]] = {}
     unparsed: dict[str, bool] = {}
-    for p in sorted(root.rglob("*")):
-        if p.suffix not in YAML_SUFFIXES or not p.is_file():
+    unreadable: dict[str, str] = {}
+    for p in _yaml_files(root, unreadable):
+        if not p.is_file():
             continue
         rel = str(p.relative_to(root))
         if rel == NETPOL:
             continue
-        raw = _read(p)
+        try:
+            raw = _read(p)
+        except UnreadableInput as exc:
+            unreadable[rel] = str(exc.__cause__ or exc)
+            continue
         if not NETPOL_KIND_RE.search(raw):
             continue
         try:
@@ -129,7 +161,7 @@ def _scan_netpols(root: Path) -> tuple[dict[str, list[dict[str, Any]]], dict[str
             continue
         if docs:
             parsed[rel] = docs
-    return parsed, unparsed
+    return parsed, unparsed, unreadable
 
 
 def load_inputs(root: Path) -> Inputs:
@@ -137,10 +169,10 @@ def load_inputs(root: Path) -> Inputs:
         raise UnreadableInput(f"{root}: --gitops-root is not a directory")
     cwfts = {str(p.relative_to(root)): _load(p) for p in sorted(root.glob(CWFT_GLOB))}
     profiles = {str(p.relative_to(root)): _load(p) for p in sorted(root.glob(PROFILE_GLOB))}
-    others, unparsed = _scan_netpols(root)
+    others, unparsed, unreadable = _scan_netpols(root)
     return Inputs(
         root, cwfts, _load_opt(root / SA_RBAC), _load_opt(root / NETPOL),
-        _load_opt(root / QUOTA), profiles, others, unparsed,
+        _load_opt(root / QUOTA), profiles, others, unparsed, unreadable,
     )
 
 
@@ -211,6 +243,11 @@ def check_identity(src: str, cwft: str, tpl: dict[str, Any], spec: dict[str, Any
     return rows
 
 
+def _container_wins(psc: dict[str, Any], csc: dict[str, Any], key: str) -> Any:
+    """Kubernetes precedence: a field set in the container securityContext overrides the pod one."""
+    return csc[key] if key in csc else psc.get(key)
+
+
 def check_pod_security(src: str, cwft: str, tpl: dict[str, Any],
                        spec: dict[str, Any] | None = None) -> list[Row]:
     scope = _scope(cwft, tpl)
@@ -218,11 +255,11 @@ def check_pod_security(src: str, cwft: str, tpl: dict[str, Any],
     psc = {**((spec or {}).get("securityContext") or {}), **(tpl.get("securityContext") or {})}
     csc = _ctr(tpl).get("securityContext") or {}
     drop = [str(x).upper() for x in (csc.get("capabilities") or {}).get("drop") or []]
+    seccomp = _container_wins(psc, csc, "seccompProfile") or {}
     checks = [
-        ("securityContext.runAsNonRoot",
-         psc.get("runAsNonRoot") is True or csc.get("runAsNonRoot") is True, "high"),
+        ("securityContext.runAsNonRoot", _container_wins(psc, csc, "runAsNonRoot") is True, "high"),
         ("securityContext.seccompProfile.type",
-         (psc.get("seccompProfile") or {}).get("type") == "RuntimeDefault", "medium"),
+         isinstance(seccomp, dict) and seccomp.get("type") == "RuntimeDefault", "medium"),
         ("container.securityContext.allowPrivilegeEscalation", csc.get("allowPrivilegeEscalation") is False, "high"),
         ("container.securityContext.capabilities.drop", "ALL" in drop, "high"),
     ]
@@ -292,8 +329,21 @@ def _selects_agents(pol: dict[str, Any]) -> bool:
     return all((k, v) == AGENT_LABEL for k, v in labels.items())
 
 
+def _policy_types(pol: dict[str, Any]) -> list[str]:
+    """policyTypes as the API server defaults it.
+
+    When the field is omitted or empty, Kubernetes sets Ingress and adds Egress
+    only if the policy has a non-empty `egress` section.
+    """
+    spec = pol.get("spec") or {}
+    types = spec.get("policyTypes") or []
+    if types:
+        return [str(t) for t in types]
+    return ["Ingress"] + (["Egress"] if spec.get("egress") else [])
+
+
 def _has_egress(pol: dict[str, Any]) -> bool:
-    return "Egress" in ((pol.get("spec") or {}).get("policyTypes") or [])
+    return "Egress" in _policy_types(pol)
 
 
 def _in_agent_ns(pol: dict[str, Any], default_ns: str | None) -> bool:
@@ -323,18 +373,24 @@ def _agent_egress_policies(netpol: list[dict[str, Any]],
 
 def check_egress(netpol: list[dict[str, Any]] | None,
                  others: dict[str, list[dict[str, Any]]] | None = None,
-                 unparsed: dict[str, bool] | None = None) -> Row:
+                 unparsed: dict[str, bool] | None = None,
+                 unreadable: dict[str, str] | None = None) -> Row:
     if netpol is None:
         return Row("NetworkPolicy/egress", NS, "not-observed", "high", NETPOL, "spec.policyTypes",
                    "networkpolicy.yaml not readable", "Provide the file.")
     pols = _agent_egress_policies(netpol, others or {})
     hidden = sorted(p for p, names_ns in (unparsed or {}).items() if names_ns)
+    # An unreadable path may hold an agent egress policy: it was not observed, so it is not absent.
+    unread = sorted(unreadable or {})
     rec = "Default-deny egress for agent pods with an FQDN or proxy allowlist."
     field_ = "spec.policyTypes+podSelector+metadata.namespace"
-    if not pols and hidden:
-        return Row("NetworkPolicy/egress", NS, "not-observed", "high", NETPOL, field_,
-                   "templated files name the agent namespace and could not be parsed: " + ", ".join(hidden),
-                   rec)
+    if not pols and (hidden or unread):
+        parts = []
+        if hidden:
+            parts.append("templated files name the agent namespace and could not be parsed: " + ", ".join(hidden))
+        if unread:
+            parts.append("paths could not be read: " + ", ".join(unread))
+        return Row("NetworkPolicy/egress", NS, "not-observed", "high", NETPOL, field_, "; ".join(parts), rec)
     if not pols:
         return Row("NetworkPolicy/egress", NS, "absent", "high", NETPOL, field_,
                    f"no Egress policy in {NS} selects {AGENT_LABEL[0]}={AGENT_LABEL[1]}", rec)
@@ -401,7 +457,8 @@ def _policy_admission(pol: dict[str, Any], policy_ns: str | None) -> str:
 
 
 def check_east_west(netpol: list[dict[str, Any]] | None, others: dict[str, list[dict[str, Any]]],
-                    unparsed: dict[str, bool] | None = None) -> list[Row]:
+                    unparsed: dict[str, bool] | None = None,
+                    unreadable: dict[str, str] | None = None) -> list[Row]:
     unparsed = unparsed or {}
     if netpol is None:
         return [Row("NetworkPolicy/east-west", NS, "not-observed", "medium", NETPOL, "spec.podSelector",
@@ -418,6 +475,10 @@ def check_east_west(netpol: list[dict[str, Any]] | None, others: dict[str, list[
                         "templated YAML, not statically parseable"
                         + ("; text names argo-workflows" if names_ns else ""),
                         "Audit the rendered manifest."))
+    for path, err in sorted((unreadable or {}).items()):
+        rows.append(Row("NetworkPolicy/cross-namespace", path, "not-observed", "medium", path,
+                        "kind: NetworkPolicy", f"could not be read: {err}",
+                        "Make the path readable and re-run the audit."))
     for path, docs in sorted(others.items()):
         for d in docs:
             adm = _policy_admission(d, (d.get("metadata") or {}).get("namespace"))
@@ -463,8 +524,9 @@ def check_quota(quota: list[dict[str, Any]] | None) -> Row:
 def check_profile_network(netpol: list[dict[str, Any]] | None,
                           profiles: dict[str, list[dict[str, Any]]],
                           others: dict[str, list[dict[str, Any]]] | None = None,
-                          unparsed: dict[str, bool] | None = None) -> list[Row]:
-    egress = check_egress(netpol, others, unparsed)
+                          unparsed: dict[str, bool] | None = None,
+                          unreadable: dict[str, str] | None = None) -> list[Row]:
+    egress = check_egress(netpol, others, unparsed, unreadable)
     rows: list[Row] = []
     for path, docs in sorted(profiles.items()):
         for d in docs:
@@ -508,10 +570,11 @@ def audit(inp: Inputs) -> list[Row]:
         rows.append(Row("PodSecurity", "mctl-agents CWFTs", "not-observed", "high", CWFT_GLOB, "templates",
                         f"{len(inp.cwfts)} CWFT file(s) read but no template runs image {AGENT_IMAGE}",
                         "Check the agent image parameter name."))
-    rows.append(check_egress(inp.netpol, inp.other_netpols, inp.unparsed_netpols))
-    rows += check_east_west(inp.netpol, inp.other_netpols, inp.unparsed_netpols)
+    rows.append(check_egress(inp.netpol, inp.other_netpols, inp.unparsed_netpols, inp.unreadable_paths))
+    rows += check_east_west(inp.netpol, inp.other_netpols, inp.unparsed_netpols, inp.unreadable_paths)
     rows.append(check_quota(inp.quota))
-    rows += check_profile_network(inp.netpol, inp.profiles, inp.other_netpols, inp.unparsed_netpols)
+    rows += check_profile_network(inp.netpol, inp.profiles, inp.other_netpols, inp.unparsed_netpols,
+                                  inp.unreadable_paths)
     return rows
 
 

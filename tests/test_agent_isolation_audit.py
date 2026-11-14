@@ -445,3 +445,131 @@ def test_json_schema_version(tmp_path: Path) -> None:
     inp = aud.load_inputs(_tree(tmp_path, _cwft(), [INGRESS_ONLY]))
     out = json.loads(aud.render(aud.audit(inp), inp, "json"))
     assert out["schema_version"] == 2
+
+
+# --- container securityContext overrides the pod one (Kubernetes precedence) ---
+
+def _pod_security(tmp_path: Path, csc_patch: dict[str, Any], psc_patch: dict[str, Any] | None = None
+                  ) -> dict[str, str]:
+    cwft = _cwft()
+    tpl = cwft["spec"]["templates"][0]
+    tpl["container"]["securityContext"].update(csc_patch)
+    if psc_patch is not None:
+        tpl["securityContext"] = psc_patch
+    rows = _find(_rows(_tree(tmp_path, cwft, [INGRESS_ONLY])), "PodSecurity")
+    return {r.field: r.status for r in rows}
+
+
+def test_container_run_as_non_root_false_overrides_pod_true(tmp_path: Path) -> None:
+    got = _pod_security(tmp_path, {"runAsNonRoot": False})
+    assert got["securityContext.runAsNonRoot"] == "partial"
+
+
+def test_container_run_as_non_root_true_with_pod_unset_is_enforced(tmp_path: Path) -> None:
+    got = _pod_security(tmp_path, {"runAsNonRoot": True}, {"seccompProfile": {"type": "RuntimeDefault"}})
+    assert got["securityContext.runAsNonRoot"] == "enforced"
+
+
+def test_pod_run_as_non_root_applies_when_container_omits_it(tmp_path: Path) -> None:
+    cwft = _cwft()
+    del cwft["spec"]["templates"][0]["container"]["securityContext"]["runAsNonRoot"]
+    rows = _find(_rows(_tree(tmp_path, cwft, [INGRESS_ONLY])), "PodSecurity", "runAsNonRoot")
+    assert [r.status for r in rows] == ["enforced"]
+
+
+def test_container_seccomp_unconfined_overrides_pod_runtime_default(tmp_path: Path) -> None:
+    got = _pod_security(tmp_path, {"seccompProfile": {"type": "Unconfined"}})
+    assert got["securityContext.seccompProfile.type"] == "partial"
+
+
+def test_container_seccomp_runtime_default_with_pod_unset_is_enforced(tmp_path: Path) -> None:
+    got = _pod_security(tmp_path, {"seccompProfile": {"type": "RuntimeDefault"}}, {"runAsNonRoot": True})
+    assert got["securityContext.seccompProfile.type"] == "enforced"
+
+
+# --- policyTypes defaulting: an egress section without policyTypes is an egress policy ---
+
+def test_egress_section_without_policy_types_counts_as_egress_policy(tmp_path: Path) -> None:
+    pol = {"kind": "NetworkPolicy", "metadata": {"name": "e-defaulted"},
+           "spec": {"podSelector": {}, "egress": [{"to": [{"podSelector": {"matchLabels": {"app": "dns"}}}]}]}}
+    rows = _rows(_tree(tmp_path, _cwft(), [INGRESS_ONLY, pol]))
+    assert _find(rows, "NetworkPolicy/egress")[0].status == "enforced"
+    assert [r.status for r in _find(rows, "NetworkPolicy/profile")] == ["enforced"]
+
+
+def test_open_egress_section_without_policy_types_is_partial(tmp_path: Path) -> None:
+    pol = {"kind": "NetworkPolicy", "metadata": {"name": "e-open"},
+           "spec": {"podSelector": {}, "egress": [{}]}}
+    rows = _rows(_tree(tmp_path, _cwft(), [INGRESS_ONLY, pol]))
+    assert _find(rows, "NetworkPolicy/egress")[0].status == "partial"
+
+
+def test_empty_egress_section_without_policy_types_is_ingress_only(tmp_path: Path) -> None:
+    # The API server adds Egress only for a non-empty egress section.
+    pol = {"kind": "NetworkPolicy", "metadata": {"name": "e-empty"}, "spec": {"podSelector": {}, "egress": []}}
+    rows = _rows(_tree(tmp_path, _cwft(), [INGRESS_ONLY, pol]))
+    assert _find(rows, "NetworkPolicy/egress")[0].status == "absent"
+
+
+def test_explicit_policy_types_are_not_overridden_by_egress_section(tmp_path: Path) -> None:
+    pol = {"kind": "NetworkPolicy", "metadata": {"name": "i-only"},
+           "spec": {"podSelector": {}, "policyTypes": ["Ingress"], "egress": [{"to": [{"podSelector": {}}]}]}}
+    rows = _rows(_tree(tmp_path, _cwft(), [INGRESS_ONLY, pol]))
+    assert _find(rows, "NetworkPolicy/egress")[0].status == "absent"
+
+
+# --- an unreadable non-core path is not-observed, never exit 2 and never absent ---
+
+def _unreadable(p: Path) -> None:
+    p.chmod(0)
+    try:
+        p.read_bytes() if p.is_file() else list(p.iterdir())
+    except OSError:
+        return
+    pytest.skip("running as a user that can read mode-0 files")
+
+
+def test_unreadable_non_core_yaml_is_not_observed_not_exit_2(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    root = _tree(tmp_path, _cwft(), [INGRESS_ONLY])
+    other = root / "elsewhere/np.yaml"
+    other.parent.mkdir()
+    other.write_text(yaml.safe_dump(EGRESS))
+    _unreadable(other)
+    try:
+        assert aud.main(["--gitops-root", str(root)]) == 0
+        rows = json.loads(capsys.readouterr().out)["rows"]
+    finally:
+        other.chmod(0o644)
+    egress = [r for r in rows if r["primitive"] == "NetworkPolicy/egress"]
+    assert [r["status"] for r in egress] == ["not-observed"]
+    assert "elsewhere/np.yaml" in egress[0]["detail"]
+    cross = [r for r in rows if r["primitive"] == "NetworkPolicy/cross-namespace"
+             and r["source"] == "elsewhere/np.yaml"]
+    assert [r["status"] for r in cross] == ["not-observed"]
+    assert [r["status"] for r in rows if r["primitive"] == "NetworkPolicy/profile"] == ["not-observed"]
+
+
+def test_unlistable_directory_is_not_observed(tmp_path: Path) -> None:
+    root = _tree(tmp_path, _cwft(), [INGRESS_ONLY])
+    hidden = root / "locked"
+    hidden.mkdir()
+    (hidden / "np.yaml").write_text(yaml.safe_dump(EGRESS))
+    _unreadable(hidden)
+    try:
+        rows = _rows(root)
+    finally:
+        hidden.chmod(0o755)
+    egress = _find(rows, "NetworkPolicy/egress")[0]
+    assert egress.status == "not-observed"
+    assert "locked" in egress.detail
+
+
+def test_unreadable_core_file_still_exits_2(tmp_path: Path) -> None:
+    root = _tree(tmp_path, _cwft(), [INGRESS_ONLY])
+    core = root / "argo-workflows/cluster-templates/cwft-mctl-agents-x.yaml"
+    _unreadable(core)
+    try:
+        assert aud.main(["--gitops-root", str(root)]) == 2
+    finally:
+        core.chmod(0o644)
