@@ -202,7 +202,7 @@ from orchestrator.options import (
     build_implementer_agent_options,
     implementer_envelope,
 )
-from orchestrator.proc import describe_output, run_capturing
+from orchestrator.proc import CommandFailed, describe_output, run_capturing
 from orchestrator.proposal_state import (
     APPROVAL_DIGEST_MATCH,
     BLOCKED_APPROVAL_DIGEST_MISMATCH,
@@ -2543,17 +2543,38 @@ def _render_full_findings_section(findings: list) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _branch_exists_on_origin(repo_dir: Path, branch: str) -> bool:
-    """True iff `git ls-remote --heads origin <branch>` returns a ref line."""
-    proc = _run(["git", "ls-remote", "--heads", "origin", branch], cwd=repo_dir, check=False)
-    return bool(proc.stdout.strip())
-
-
 def _remote_head_sha(repo_dir: Path, branch: str) -> str | None:
-    """The current head SHA of ``branch`` on origin, or None if it has none."""
-    proc = _run(["git", "ls-remote", "--heads", "origin", branch], cwd=repo_dir, check=False)
-    line = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
-    return line.split()[0] if line else None
+    """The head SHA of exactly ``refs/heads/<branch>`` on origin.
+
+    None means origin answered and has no such branch -- the only absence
+    signal there is: `ls-remote` exiting 0 with no matching line. Anything
+    else is not "absent" and raises:
+
+    - A non-zero exit (network, auth, a missing remote) raises
+      `CommandFailed`. Reading it as "no branch" cost a review-feedback run
+      one of its five attempts on a transient blip and sent `_push_and_open_pr`
+      down the plain `push -u` arm against a branch that exists.
+    - The pattern is the full ref, and the answer is matched exactly. A bare
+      ``<branch>`` pattern matches by path suffix, so `feat/agents-x` also
+      matched `refs/heads/bob/feat/agents-x` and returned that branch's SHA.
+    """
+    full_ref = f"refs/heads/{branch}"
+    proc = _run(["git", "ls-remote", "--heads", "origin", full_ref], cwd=repo_dir, check=False)
+    if proc.returncode != 0:
+        raise CommandFailed(proc.returncode, proc.args, proc.stdout, proc.stderr)
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == full_ref:
+            return parts[0]
+    return None
+
+
+def _branch_exists_on_origin(repo_dir: Path, branch: str) -> bool:
+    """Whether exactly ``refs/heads/<branch>`` exists on origin.
+
+    Raises on a failed read; see `_remote_head_sha`.
+    """
+    return _remote_head_sha(repo_dir, branch) is not None
 
 
 def _require_push_policy(repo: str, branch: str, *, lease: str | None) -> None:
@@ -3028,7 +3049,8 @@ def _review_feedback_attempt(
         # 2. The branch must exist on origin — the shepherd only triggers
         # follow-ups for PRs whose head ref already exists. If it does
         # not, fail loudly so the operator can investigate (a missing
-        # branch implies the PR was closed/deleted between ticks).
+        # branch implies the PR was closed/deleted between ticks). A failed
+        # `ls-remote` raises out of here instead of reading as "missing".
         if not _branch_exists_on_origin(target, branch):
             return ImplementResult(
                 ref=ref,
@@ -4393,10 +4415,9 @@ def _push_and_open_pr(
 ) -> str:
     branch = f"feat/agents-{ref.slug}"
     # One `git ls-remote`, not two: `_remote_head_sha` already answers None for
-    # a branch origin does not have, and guarding it with
-    # `_branch_exists_on_origin` only added a second remote call whose
-    # transient failure would read as "no branch" and send us down the `push
-    # -u` arm against a branch that exists (agy P3 on `f4d0dec`).
+    # a branch origin does not have (agy P3 on `f4d0dec`). A failed read
+    # raises rather than answering None, so a transient blip can no longer
+    # send us down the `push -u` arm against a branch that exists.
     expected_sha = _remote_head_sha(repo_dir, branch)
     if expected_sha:
         # A previous attempt already pushed and died before opening the PR —
@@ -4414,8 +4435,8 @@ def _push_and_open_pr(
         # third writer moves the branch in the gap between the read above and
         # the push below. A missing head is NOT expressible as a lease —
         # `--force-with-lease=<branch>:` means "must not already exist", the
-        # negation of the precondition that selected this path — so an
-        # unreadable head falls through to the plain `-u` push instead.
+        # negation of the precondition that selected this path. An
+        # unreadable head never reaches here: `_remote_head_sha` raises.
         if claim_context is not None:
             # Deliberately NOT `entity_version=expected_sha`. This claim is on
             # the PROPOSAL (`EntityRef.for_proposal`, acquired with
