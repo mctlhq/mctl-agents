@@ -685,6 +685,8 @@ def test_text_that_only_looks_like_process_substitution(command):
             "gh pr create --title t --body-file - <<'EOF'\nA&nbsp;B, don't\nEOF", id="pr-body-nbsp"
         ),
         pytest.param("cat <<-EOF\n\tR&D\n\tEOF\necho ok", id="dash-strips-tabs"),
+        pytest.param("cat <<EOF # write it\nR&D\nEOF", id="comment-after-the-operator"),
+        pytest.param("echo $# x#y <<EOF\nR&D\nEOF", id="hash-inside-a-word-is-no-comment"),
         pytest.param("cat <<'EOF'\n$(sleep 100 &)\nEOF", id="literal-body-substitution-is-text"),
     ],
 )
@@ -704,6 +706,12 @@ def test_an_ampersand_in_a_heredoc_body_is_not_a_detachment(command: str) -> Non
         pytest.param(
             "x=$((a<<EOF))\nsleep 100 &\nEOF", id="arithmetic-shift-by-a-name-opens-no-body"
         ),
+        pytest.param("echo hi # <<EOF\nsleep 100 &\nEOF", id="heredoc-in-a-comment-opens-no-body"),
+        pytest.param("#<<EOF\nsleep 100 &\nEOF", id="comment-at-start-opens-no-body"),
+        pytest.param("((x=1<<EOF))\nsleep 100 &\nEOF", id="bare-arithmetic-command-opens-no-body"),
+        pytest.param("((x=1<<EOF\nsleep 100 &\nEOF", id="unclosed-double-paren-blanks-nothing"),
+        pytest.param("echo ${x//<<EOF/y}\nsleep 100 &\nEOF/y}", id="parameter-expansion-opens-no-body"),
+        pytest.param("echo $[1<<EOF]\nsleep 100 &\nEOF]", id="legacy-arithmetic-opens-no-body"),
     ],
 )
 def test_a_real_detachment_around_a_heredoc_is_still_denied(command: str) -> None:

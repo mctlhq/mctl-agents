@@ -217,6 +217,42 @@ def normalize_shell_command(command: str) -> str:
 _HEREDOC_DELIMITER_RE = re.compile(r"""(?:[^\s;&|<>()'"\\]|'[^']*'|"[^"]*"|\\.)+""")
 
 
+_COMMENT_START_AFTER = frozenset(" \t\n;&|()")
+_BARE_ARITHMETIC_OPEN_RE = re.compile(r"(?<!\$)\(\(")
+_NON_REDIRECT_BRACKET_OPEN_RE = re.compile(r"\$\{|\$\[")
+
+
+def _bare_arithmetic_spans(visible: str) -> list[tuple[int, int]]:
+    """``(start, end)`` of every `((...))` NOT preceded by `$`.
+
+    Only the heredoc scanner needs this: the arithmetic COMMAND `((x=1<<EOF))`
+    shifts, it opens no here-document. Read conservatively, because the
+    caller only uses it to decide where NOT to blank: a `((` whose closing
+    `))` is not found (bash may then reparse it as nested subshells) spans to
+    the end of the string -- the scan simply runs out -- so nothing after it
+    is blanked.
+
+    `${...}` and `$[...]` are included too: their `<<` is an operator or
+    pattern text, never a redirection.
+    """
+    spans: list[tuple[int, int]] = []
+    for opened in _BARE_ARITHMETIC_OPEN_RE.finditer(visible):
+        depth = 2
+        index = opened.end()
+        while index < len(visible) and depth:
+            if visible[index] == "(":
+                depth += 1
+            elif visible[index] == ")":
+                depth -= 1
+            index += 1
+        spans.append((opened.start(), index))
+    for opened in _NON_REDIRECT_BRACKET_OPEN_RE.finditer(visible):
+        close = "}" if opened.group() == "${" else "]"
+        end = visible.find(close, opened.end())
+        spans.append((opened.start(), len(visible) if end == -1 else end + 1))
+    return spans
+
+
 def _heredoc_body_spans(command: str) -> list[tuple[int, int, bool]]:
     """``(start, end, literal)`` of every TERMINATED here-document body.
 
@@ -231,7 +267,8 @@ def _heredoc_body_spans(command: str) -> list[tuple[int, int, bool]]:
     misparsed heredoc (`$((a<<b))` read as one, say) stays visible: the
     conservative direction for a deny list.
     """
-    arithmetic = _arithmetic_spans(_mask(command, mask_double=False))
+    visible = _mask(command, mask_double=False)
+    arithmetic = _arithmetic_spans(visible) + _bare_arithmetic_spans(visible)
     spans: list[tuple[int, int, bool]] = []
     pending: list[tuple[str, bool, bool]] = []
     quote: str | None = None
@@ -251,6 +288,14 @@ def _heredoc_body_spans(command: str) -> list[tuple[int, int, bool]]:
             escaped = True
         elif ch in ("'", '"'):
             quote = ch
+        elif ch == "#" and (index == 0 or command[index - 1] in _COMMENT_START_AFTER):
+            # A comment runs to end of line, and a `<<` in it opens nothing:
+            # `echo hi # <<EOF` then `sleep 100 &` backgrounds the sleep.
+            line_end = command.find("\n", index)
+            if line_end == -1:
+                break
+            index = line_end
+            continue
         elif (
             command.startswith("<<", index)
             and not command.startswith("<<<", index)
