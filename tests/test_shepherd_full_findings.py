@@ -154,9 +154,10 @@ def test_read_codex_review_records_where_each_finding_lives() -> None:
                      "created_at": "2026-04-29T11:00:00Z", "body": "**P2: issue finding**"}]
         return []
 
-    with patch.object(run_shepherd, "_gh_api_json", side_effect=fake_gh_api_json):
+    with patch.object(run_shepherd, "_gh_api_list", side_effect=lambda path: fake_gh_api_json([path])):
         review = run_shepherd.read_codex_review(pr)
 
+    assert review.known
     got = {(f.comment_kind, f.comment_id, f.thread_id) for f in review.findings}
     assert got == {
         ("review_body", 501, None),

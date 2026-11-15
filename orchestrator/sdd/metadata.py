@@ -88,7 +88,7 @@ def validate_mapping(data: Mapping[str, Any], *, strict: bool = False, change_di
     if not isinstance(data.get("schema"), str) or not data["schema"]:
         raise MetadataError("'schema' is required and must be a non-empty string")
     created = data.get("created")
-    if created is not None and not (isinstance(created, str) and _DATE.match(created)):
+    if created is not None and not (isinstance(created, str) and _DATE.fullmatch(created)):
         raise MetadataError("'created' must be a YYYY-MM-DD string")
     if "goal" in data and not isinstance(data["goal"], str):
         raise MetadataError("'goal' must be a string")
@@ -111,7 +111,7 @@ def validate_mapping(data: Mapping[str, Any], *, strict: bool = False, change_di
                 raise MetadataError(f"'x-' key {k!r} is not allowed inside 'initiative'")
             if k not in ("store", "id"):
                 raise MetadataError(f"unknown key {k!r} inside 'initiative'")
-            if not isinstance(v, str) or not _KEBAB.match(v):
+            if not isinstance(v, str) or not _KEBAB.fullmatch(v):
                 raise MetadataError(f"initiative.{k} must be kebab-case")
     if data.get("skip_specs") is True and _has_spec_files(change_dir):
         raise MetadataError("skip_specs is true but specs/ contains files")

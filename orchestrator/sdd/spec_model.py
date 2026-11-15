@@ -82,7 +82,7 @@ def fence_mask(lines: list[str]) -> list[bool]:
                 mask[i] = True
             continue
         mask[i] = True
-        m = _FENCE_CLOSE.match(line)
+        m = _FENCE_CLOSE.fullmatch(line)
         if m and m.group(1)[0] == active[0] and len(m.group(1)) >= active[1]:
             active = None
     return mask
@@ -172,7 +172,7 @@ def _blocks(lines: list[str], mask: list[bool]) -> tuple[list[str], list[Require
     """(preamble lines, requirement blocks); a block ends at the next requirement or '## '."""
 
     def is_req(i: int) -> bool:
-        return not mask[i] and _REQUIREMENT_HEADER.match(lines[i]) is not None
+        return not mask[i] and _REQUIREMENT_HEADER.fullmatch(lines[i]) is not None
 
     i = 0
     preamble: list[str] = []
@@ -184,7 +184,7 @@ def _blocks(lines: list[str], mask: list[bool]) -> tuple[list[str], list[Require
         if not is_req(i):
             i += 1
             continue
-        m = _REQUIREMENT_HEADER.match(lines[i])
+        m = _REQUIREMENT_HEADER.fullmatch(lines[i])
         if m is None:  # pragma: no cover - is_req matched this line
             raise GrammarError("malformed requirement block")
         buf = [lines[i]]
@@ -210,7 +210,7 @@ class Spec:
 def parse_spec(text: str) -> Spec:
     lines = normalize_text(text).split("\n")
     mask = fence_mask(lines)
-    start = next((i for i, ln in enumerate(lines) if not mask[i] and _REQUIREMENTS_SECTION.match(ln)), -1)
+    start = next((i for i, ln in enumerate(lines) if not mask[i] and _REQUIREMENTS_SECTION.fullmatch(ln)), -1)
     if start == -1:
         before = "\n".join(lines).rstrip()
         return Spec(before + "\n\n" if before else "", "## Requirements", "", [], "\n")
@@ -233,7 +233,7 @@ def parse_spec(text: str) -> Spec:
 def has_requirements_section(text: str) -> bool:
     lines = normalize_text(text).split("\n")
     mask = fence_mask(lines)
-    return any(not mask[i] and _REQUIREMENTS_SECTION.match(ln) for i, ln in enumerate(lines))
+    return any(not mask[i] and _REQUIREMENTS_SECTION.fullmatch(ln) for i, ln in enumerate(lines))
 
 
 def _collapse_blank_runs(text: str) -> str:
@@ -267,7 +267,7 @@ def structure_issues(text: str) -> list[str]:
     lines = normalize_text(text).split("\n")
     mask = fence_mask(lines)
     lines = ["" if mask[i] else ln for i, ln in enumerate(lines)]
-    start = next((i for i, ln in enumerate(lines) if _REQUIREMENTS_SECTION.match(ln)), -1)
+    start = next((i for i, ln in enumerate(lines) if _REQUIREMENTS_SECTION.fullmatch(ln)), -1)
     end = len(lines)
     if start != -1:
         end = next((i for i in range(start + 1, len(lines)) if _TOP_LEVEL.match(lines[i])), len(lines))
@@ -276,10 +276,10 @@ def structure_issues(text: str) -> list[str]:
     for i, line in enumerate(lines):
         if not line.strip():
             continue
-        if _SS_DELTA.match(line):
+        if _SS_DELTA.fullmatch(line):
             issues.append(f"line {i + 1}: main spec contains delta header {line.strip()!r}")
             continue
-        m = _SS_REQUIREMENT.match(line)
+        m = _SS_REQUIREMENT.fullmatch(line)
         if not m:
             continue
         if not (start != -1 and start < i < end):
@@ -308,7 +308,7 @@ def purpose(text: str) -> str | None:
     lines = normalized.split("\n")
     masked = _mask_html_comments(normalized).split("\n")
     mask = fence_mask(masked)
-    start = next((i for i, ln in enumerate(masked) if not mask[i] and _PURPOSE.match(ln)), -1)
+    start = next((i for i, ln in enumerate(masked) if not mask[i] and _PURPOSE.fullmatch(ln)), -1)
     if start == -1:
         return None
     end = next(
@@ -340,7 +340,7 @@ def parse_delta(text: str) -> Delta:
     """Read a delta spec (RB:parseDeltaSpec). Repeated sections merge; other '## ' sections are ignored."""
     lines = normalize_text(text).split("\n")
     mask = fence_mask(lines)
-    heads = [(i, m.group(2).strip()) for i, ln in enumerate(lines) if not mask[i] and (m := _SECTION.match(ln))]
+    heads = [(i, m.group(2).strip()) for i, ln in enumerate(lines) if not mask[i] and (m := _SECTION.fullmatch(ln))]
     d = Delta(purpose=purpose(text))
     for n, (i, title) in enumerate(heads):
         end = heads[n + 1][0] if n + 1 < len(heads) else len(lines)
@@ -359,7 +359,7 @@ def parse_delta(text: str) -> Delta:
             for j, line in enumerate(body):
                 if body_mask[j]:
                     continue
-                m = _REQUIREMENT_HEADER.match(line) or _REMOVED_BULLET.match(line)
+                m = _REQUIREMENT_HEADER.fullmatch(line) or _REMOVED_BULLET.fullmatch(line)
                 if m:
                     d.removed.append(normalize_requirement_name(m.group(1)))
         else:
@@ -376,7 +376,7 @@ def _renamed_pairs(body: list[str], mask: list[bool], first_line: int) -> list[t
     for j, line in enumerate(body):
         if mask[j]:
             continue
-        mf, mt = _FROM.match(line), _TO.match(line)
+        mf, mt = _FROM.fullmatch(line), _TO.fullmatch(line)
         if mf:
             if pending is not None:
                 raise GrammarError(f"RENAMED FROM on line {pending[1]} has no matching TO")

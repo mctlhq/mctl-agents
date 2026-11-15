@@ -984,3 +984,59 @@ def test_replay_cli_catalog_identity_is_populated_and_empty_on_a_bad_catalog(tmp
         real_module.load_version = original  # type: ignore[assignment]
     assert payload2["identity"]["strategy_content_hash"] == ""
     assert payload2["identity"]["strategy_implementation_hash"] == ""
+
+
+def test_assess_evidence_orders_observed_at_as_instants_not_strings():
+    """`observed_at` with different UTC offsets: as text `...T01:00:00+01:00`
+    sorts after `...T00:30:00Z`, but it is 30 minutes EARLIER. The newest
+    record (a differing version) must win, so the result is `mismatched`,
+    not judged on the older matching record."""
+    expected = _identity()
+    policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=1)
+    now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
+    older_matching = replace(_record(expected, observed_at="2026-09-26T01:00:00+01:00"), store_ref=_store_ref("we_1"))
+    newer_differing = replace(
+        _record(_identity(strategy_version="9.9.9"), observed_at="2026-09-26T00:30:00Z"), store_ref=_store_ref("we_2")
+    )
+    result = ce.assess_evidence([older_matching, newer_differing], expected=expected, now=now, policy=policy)
+    assert result.status == "mismatched"
+    assert result.reason_code == "declared-identity-mismatch"
+
+
+def test_assess_evidence_fractional_seconds_do_not_reorder():
+    # "...00.5Z" < "...00Z" as text, but it is the later instant.
+    expected = _identity()
+    policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=1)
+    now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
+    older_matching = replace(_record(expected, observed_at="2026-09-26T00:00:00Z"), store_ref=_store_ref("we_1"))
+    newer_differing = replace(
+        _record(_identity(strategy_version="9.9.9"), observed_at="2026-09-26T00:00:00.500000Z"),
+        store_ref=_store_ref("we_2"),
+    )
+    result = ce.assess_evidence([older_matching, newer_differing], expected=expected, now=now, policy=policy)
+    assert result.status == "mismatched"
+
+
+def test_assess_evidence_unparseable_non_anchor_record_fails_closed():
+    """With one unparseable `observed_at` the order is unknown, so no record
+    can be called the newest: stale, never fresh."""
+    expected = _identity()
+    policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=1)
+    now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
+    good = replace(_record(expected, observed_at="2026-09-26T00:00:00Z"), store_ref=_store_ref("we_1"))
+    bad = replace(_record(_identity(strategy_version="9.9.9"), observed_at="yesterday"), store_ref=_store_ref("we_2"))
+    result = ce.assess_evidence([good, bad], expected=expected, now=now, policy=policy)
+    assert (result.status, result.reason_code) == ("stale", "observed-at-unparseable")
+
+
+def test_assess_evidence_missing_fallback_kind_uses_the_newest_instant():
+    expected = _identity()
+    policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=1)
+    now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
+    older = replace(
+        _record(expected, observed_at="2026-09-26T01:00:00+01:00", verdict=ce.VERDICT_HASH_MISMATCH),
+        evidence_kind="live",
+    )
+    newer = _record(expected, observed_at="2026-09-26T00:30:00Z", verdict=ce.VERDICT_HASH_MISMATCH)
+    result = ce.assess_evidence([older, newer], expected=expected, now=now, policy=policy)
+    assert (result.status, result.evidence_kind) == ("missing", "stored-replay")

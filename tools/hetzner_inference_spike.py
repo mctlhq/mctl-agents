@@ -214,7 +214,7 @@ class HetznerClient:
         if error is not None and contains_credential(error):
             error = "[redacted]"
         return {"status": resp.status_code, "json": parsed, "error": error, "latency_ms": _ms(started),
-                "headers": {k.lower(): v for k, v in resp.headers.items() if _RATE_HEADERS.match(k)},
+                "headers": {k.lower(): v for k, v in resp.headers.items() if _RATE_HEADERS.fullmatch(k)},
                 "retries": self.retries}
 
     def stream(self, path: str, body: Mapping[str, Any]) -> dict[str, Any]:

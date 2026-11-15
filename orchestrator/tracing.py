@@ -488,7 +488,7 @@ def valid_traceparent(value: str | None) -> bool:
     """A W3C version-00 traceparent with non-zero trace and span ids."""
     if not value:
         return False
-    match = _TRACEPARENT_RE.match(value.strip())
+    match = _TRACEPARENT_RE.fullmatch(value.strip())
     if not match:
         return False
     trace_id, span_id, _flags = match.groups()
@@ -499,7 +499,7 @@ def sampled_traceparent(value: str | None) -> bool:
     """A valid traceparent whose sampled flag is set."""
     if not valid_traceparent(value):
         return False
-    match = _TRACEPARENT_RE.match((value or "").strip())
+    match = _TRACEPARENT_RE.fullmatch((value or "").strip())
     return match is not None and bool(int(match.group(3), 16) & 0x01)
 
 
@@ -535,7 +535,7 @@ def trace_ids(traceparent: str | None) -> tuple[str, str] | None:
     """The (trace_id, span_id) hex pair of a W3C traceparent, or None."""
     if not valid_traceparent(traceparent):
         return None
-    match = _TRACEPARENT_RE.match((traceparent or "").strip())
+    match = _TRACEPARENT_RE.fullmatch((traceparent or "").strip())
     return (match.group(1), match.group(2)) if match else None
 
 
@@ -805,11 +805,25 @@ _GH_SUBCOMMANDS = frozenset({
     "view", "list", "status", "comment", "create", "edit", "close", "reopen", "merge", "review", "ready",
     "checks", "diff", "delete", "develop", "lock", "unlock", "transfer", "pin", "unpin", "clone", "fork",
     "issues", "prs", "code", "repos", "commits", "rerun", "cancel", "watch", "download",
+    "run", "enable", "disable", "upload", "delete-asset", "archive", "unarchive", "rename", "sync",
+    "checkout", "set-default",
 })
-_GH_MUTATING = frozenset({
-    "comment", "create", "edit", "close", "reopen", "merge", "review", "ready", "delete", "develop", "lock",
-    "unlock", "transfer", "pin", "unpin", "fork", "rerun", "cancel",
-})
+# What does NOT write to GitHub, per group. Everything else is a mutation,
+# including a subcommand outside the vocabulary ("other"): an operation this
+# classifier cannot name is one it cannot vouch for, and reporting it as a
+# read would hide a write. A single group-agnostic set of mutating verbs
+# missed `workflow run`, `release upload` and `repo archive`, and could not
+# tell `repo clone` (a read) from `label clone` (copies labels into a repo).
+_GH_READ_ONLY: dict[str, frozenset[str]] = {
+    "issue": frozenset({"view", "list", "status"}),
+    "pr": frozenset({"view", "list", "status", "checks", "diff", "checkout"}),
+    "repo": frozenset({"view", "list", "clone", "set-default"}),
+    "label": frozenset({"list"}),
+    "release": frozenset({"view", "list", "download"}),
+    "search": frozenset({"issues", "prs", "code", "repos", "commits"}),
+    "run": frozenset({"view", "list", "watch", "download"}),
+    "workflow": frozenset({"view", "list"}),
+}
 _GH_API_BODY_FLAGS = frozenset({"-f", "-F", "--field", "--raw-field", "--input"})
 _GIT_REMOTE = frozenset({"push", "clone", "fetch", "pull", "ls-remote"})
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -864,7 +878,7 @@ def classify_command(cmd: list[str] | tuple[str, ...]) -> tuple[str, dict[str, A
             operation = "api.write" if mutation else "api.read"
         else:
             sub = args[1] if len(args) > 1 and args[1] in _GH_SUBCOMMANDS else "other"
-            mutation = sub in _GH_MUTATING
+            mutation = sub not in _GH_READ_ONLY[group]
             operation = f"{group}.{sub}"
         name = f"github.{operation}"
     elif exe == "git":
@@ -881,9 +895,9 @@ def classify_command(cmd: list[str] | tuple[str, ...]) -> tuple[str, dict[str, A
     attributes["mctl.github.operation"] = operation
     attributes["mctl.github.mutation"] = mutation
     for i, arg in enumerate(args):
-        if arg in ("--repo", "-R") and i + 1 < len(args) and _REPO_RE.match(args[i + 1]):
+        if arg in ("--repo", "-R") and i + 1 < len(args) and _REPO_RE.fullmatch(args[i + 1]):
             attributes.setdefault(REPOSITORY_NAME, args[i + 1])
-        match = _GITHUB_URL_RE.match(arg)
+        match = _GITHUB_URL_RE.fullmatch(arg)
         if match:
             attributes.setdefault(REPOSITORY_NAME, match.group(1))
             if match.group(2) == "issues":

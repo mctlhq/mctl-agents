@@ -181,7 +181,7 @@ def _safe_target(repo: str, team: str, app: str) -> DeployTarget | None:
     the only way to keep a crafted value out of it.
     """
     for label, value in (("team", team), ("app", app)):
-        if not _SAFE_SEGMENT_RE.match(value):
+        if not _SAFE_SEGMENT_RE.fullmatch(value):
             activity.logger.warning(
                 "refusing deploy target from %s: %s=%r is not a single safe path segment",
                 repo,

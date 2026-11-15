@@ -309,6 +309,14 @@ class HumanInputRequest:
             raise HumanInputError(f"kind must be {REQUEST_KIND!r}, got {self.kind!r}")
         if not self.request_hash.startswith("sha256:"):
             raise HumanInputError(f"request_hash must carry the 'sha256:' prefix, got {self.request_hash!r}")
+        # The same field rules `from_dict` applies, so `seal_request` cannot
+        # seal a document that reading it back would refuse.
+        _require_str(self.work_item_id, where="work_item_id")
+        _require_str(self.question, where="question")
+        _require_str(self.reason, where="reason")
+        _require_int(self.request_version, where="request_version")
+        _require_int(self.round, where="round")
+        _require_str_tuple(self.context_refs, where="context_refs")
         if self.round < 1:
             raise HumanInputError(f"round must be >= 1, got {self.round}")
         self.response.validate()
@@ -562,6 +570,10 @@ def seal_request(
         round=round,
     )
     request.validate()
+    # A sealed document must read back. Anything `from_dict` refuses that the
+    # checks above let through is refused here, at seal time, instead of
+    # surfacing later as an unreadable request in gitops.
+    HumanInputRequest.from_dict(request.to_dict())
     return request
 
 

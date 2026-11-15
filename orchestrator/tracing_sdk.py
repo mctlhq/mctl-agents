@@ -97,13 +97,13 @@ def key_allowed(key: str, *, error_detail: bool = False) -> bool:
         return False
     if key in _USAGE_TOKEN_KEYS:
         return True
-    if error_detail and _ERROR_DETAIL_KEY.match(key):
+    if error_detail and _ERROR_DETAIL_KEY.fullmatch(key):
         # Checked before the denylist, which would refuse `.message`; the
         # VALUE still goes through the credential and length checks.
         return True
     if TOKEN_KEY.search(key) or _DENIED_KEY.search(key):
         return False
-    return bool(_ALLOWED_KEY.match(key))
+    return bool(_ALLOWED_KEY.fullmatch(key))
 
 
 def redact_attributes(attributes: Mapping[str, Any] | None, *, error_detail: bool = False) -> dict[str, Any]:
@@ -145,7 +145,7 @@ def redacted_name(name: str) -> str:
     """Span names are not attributes, so the key allowlist cannot see them.
     Ours are fixed vocabulary plus a tool or model name; anything else —
     too long, odd characters, a credential shape — is replaced whole."""
-    if isinstance(name, str) and _SPAN_NAME.match(name) and not _CREDENTIAL_VALUE.search(name):
+    if isinstance(name, str) and _SPAN_NAME.fullmatch(name) and not _CREDENTIAL_VALUE.search(name):
         return name
     return "redacted"
 

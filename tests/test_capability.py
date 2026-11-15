@@ -1088,3 +1088,52 @@ def test_commerce_summary_carries_no_authorization_vocabulary():
     banned = ("allow", "deny", "permit", "grant", "authoriz")
     keys = set(_summary().to_dict()) | set(_summary().to_dict()["price"])
     assert not [k for k in keys if any(b in k.lower() for b in banned)]
+
+
+# ---------------------------------------------------------------------------
+# Deep freeze of `annotations`: a shallow `MappingProxyType(dict(...))` left
+# nested dicts and lists shared with the caller, so mutating them after
+# seal() changed to_dict() while content_hash stayed as computed.
+# ---------------------------------------------------------------------------
+def _nested_annotations() -> dict:
+    return {"readOnlyHint": True, "meta": {"tags": ["a", "b"], "inner": {"k": 1}}}
+
+
+def test_nested_annotations_mutation_after_seal_changes_neither_to_dict_nor_hash():
+    passed = _nested_annotations()
+    provider = _provider()
+    sealed = _sealed_set(providers=[provider], capabilities=[_descriptor(provider, annotations=passed)])
+    before = json.dumps(sealed.to_dict(), sort_keys=True)
+    passed["meta"]["tags"].append("c")
+    passed["meta"]["inner"]["k"] = 2
+    passed["meta"]["new"] = "x"
+    assert json.dumps(sealed.to_dict(), sort_keys=True) == before
+    assert cap.recompute_content_hash(sealed) == sealed.content_hash
+
+
+def test_writing_through_nested_annotations_raises():
+    d = _descriptor(_provider(), annotations=_nested_annotations())
+    with pytest.raises(TypeError):
+        d.annotations["meta"]["inner"]["k"] = 2  # type: ignore[index]
+    with pytest.raises(TypeError):
+        d.annotations["meta"]["new"] = "x"  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        d.annotations["meta"]["tags"].append("c")
+
+
+def test_nested_annotations_to_dict_is_plain_json_and_round_trips():
+    d = _descriptor(_provider(), annotations=_nested_annotations())
+    out = d.to_dict()["annotations"]
+    assert out == _nested_annotations()
+    assert type(out) is dict and type(out["meta"]) is dict and type(out["meta"]["tags"]) is list
+    again = cap.CapabilityDescriptor.from_dict(d.to_dict())
+    assert again == d and hash(again) == hash(d)
+    assert json.dumps(again.to_dict(), sort_keys=True) == json.dumps(d.to_dict(), sort_keys=True)
+
+
+def test_fixture_from_dict_to_dict_round_trip_is_byte_identical():
+    raw = FIXTURE_PATH.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    loaded = cap.CapabilitySet.from_dict(data)
+    assert json.dumps(loaded.to_dict(), sort_keys=True) == json.dumps(data, sort_keys=True)
+    assert cap.recompute_content_hash(loaded) == loaded.content_hash

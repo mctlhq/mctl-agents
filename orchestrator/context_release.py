@@ -376,7 +376,7 @@ def load_version(name: str, version: str, *, versions_dir: Path = VERSIONS_DIR) 
             f"{path}: metadata.name {declared_name!r} is not a strategy orchestrator/context_assembly.py "
             f"implements (one of {sorted(STRATEGIES)!r})",
         )
-    if not isinstance(declared_version, str) or not _SEMVER_RE.match(declared_version):
+    if not isinstance(declared_version, str) or not _SEMVER_RE.fullmatch(declared_version):
         raise ContextReleaseError(
             VERDICT_UNKNOWN, f"{path}: metadata.version {declared_version!r} must be semver X.Y.Z"
         )
@@ -842,7 +842,11 @@ def assess_production_evidence(
     # so its observation key is always its own `execution_ref` (never a
     # `store_ref`, which `evaluate()` refuses for this evidence kind).
     usable = [r for r in production_records if r.verdict == context_eval.VERDICT_EVALUATED]
-    ordered = sorted(usable, key=lambda r: r.observed_at, reverse=True)
+    ordered = context_eval.newest_first(usable)
+    if ordered is None:  # pragma: no cover — a "fresh" assessment implies every observed_at parsed
+        raise ContextReleaseError(
+            VERDICT_UNKNOWN, "production evidence carries an observed_at that does not parse; order unknown"
+        )
     anchor = next((r for r in ordered if r.execution_ref is not None and r.execution_ref.execution_id), None)
     newest_observed_at = anchor.observed_at if anchor is not None else ""
 
@@ -1096,7 +1100,7 @@ def build_version_document(
             VERDICT_UNKNOWN, f"{name!r} is not a strategy orchestrator/context_assembly.py implements "
             f"(one of {sorted(STRATEGIES)!r})"
         )
-    if not _SEMVER_RE.match(version):
+    if not _SEMVER_RE.fullmatch(version):
         raise ContextReleaseError(VERDICT_UNKNOWN, f"version must be semver X.Y.Z, got {version!r}")
 
     existing_path = versions_dir / name / f"{version}.yaml"

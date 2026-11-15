@@ -65,7 +65,7 @@ def _requirement_block(n: int, group: str | None, lines: list[str]) -> str:
     if group:
         out.append(f"_Group: {group}_")
     out += lines
-    m = _EARS.match(" ".join(x.strip() for x in lines))
+    m = _EARS.fullmatch(" ".join(x.strip() for x in lines))
     scen = [f"#### Scenario: AC-{n:02d}"]
     if m:
         scen += [f"- **WHEN** {m.group(2)}", f"- **THEN** {m.group(3)}"]
@@ -146,7 +146,7 @@ def change_to_triplet(pkg: ChangePackage) -> tuple[dict[str, str], dict[str, Any
     for r in parse_delta(spec).added if spec else []:
         body = r.text.split("\n\n#### Scenario:")[0].splitlines()[1:]
         group = None
-        if body and (m := _GROUP.match(body[0])):
+        if body and (m := _GROUP.fullmatch(body[0])):
             group, body = m.group(1), body[1:]
         if group and group != prev_group:
             if out_lines:

@@ -49,7 +49,7 @@ def _catalog_name(value: str) -> str:
     is not a single safe path segment, so `BINDINGS_DIR / environment /
     f"{agent}.yaml"` can never escape the catalog directory via `..`, an
     absolute path, an embedded `/`, or a null byte."""
-    if not _SAFE_NAME_RE.match(value):
+    if not _SAFE_NAME_RE.fullmatch(value):
         raise argparse.ArgumentTypeError(
             f"must be a single path segment matching {_SAFE_NAME_RE.pattern!r}, got {value!r}"
         )

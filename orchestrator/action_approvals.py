@@ -211,7 +211,7 @@ def context_for(request: pc.ActionRequest, *, rule_id: str) -> DecisionContext:
     risk, side_effect = _CONTEXT_BY_KIND.get(request.action_kind, _DEFAULT_CONTEXT)
     reasons = ["policy.require-approval"]
     rule_reason = f"policy.rule:{rule_id}"
-    if _REASON_RE.match(rule_reason):
+    if _REASON_RE.fullmatch(rule_reason):
         reasons.append(rule_reason)
     if dict(request.metadata).get("commerce") == "paid":
         reasons.append("commerce.paid")

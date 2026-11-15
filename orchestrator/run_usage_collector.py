@@ -422,7 +422,7 @@ def sanitise(raw: dict[str, Any]) -> dict[str, Any] | None:
         sanitised["price_source"] = "unknown"
 
     repo = sanitised.get("target_repo")
-    if repo is not None and not TARGET_REPO_RE.match(repo):
+    if repo is not None and not TARGET_REPO_RE.fullmatch(repo):
         print(
             f"WARN: dropping field 'target_repo'={repo!r} of record "
             f"{session_id!r}/{model_key!r} — not owner/name"

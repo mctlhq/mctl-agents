@@ -1351,3 +1351,20 @@ def test_cli_help_exits_zero():
     assert "promote" in result.stdout
     assert "rollback" in result.stdout
     assert "resolve" in result.stdout
+
+
+def test_assess_production_evidence_newest_observed_at_compares_instants(tmp_path):
+    """`newest_observed_at` names the newest INSTANT. As text
+    `2026-09-26T01:00:00+01:00` sorts after `2026-09-26T00:30:00Z`, but it is
+    30 minutes earlier."""
+    version = _loaded_version(tmp_path)
+    records = [
+        _observe_candidate_record(version, observed_at="2026-09-26T01:00:00+01:00", execution_id="we_a"),
+        _observe_candidate_record(version, observed_at="2026-09-26T00:30:00Z", execution_id="we_b"),
+        _observe_candidate_record(version, observed_at="2026-09-25T00:00:00Z", execution_id="we_c"),
+    ]
+    verdict = cr.assess_production_evidence(
+        version=version, records=records, evidence_evaluator_version=ce.EVALUATOR_VERSION, now=NOW,
+    )
+    assert verdict.code == cr.VERDICT_OK
+    assert verdict.newest_observed_at == "2026-09-26T00:30:00Z"

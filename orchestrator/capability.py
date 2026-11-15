@@ -194,6 +194,28 @@ def _canonical_json(payload: Any) -> bytes:
         raise CapabilityError(f"payload is not JSON-serializable: {exc}") from exc
 
 
+def _freeze_json(value: Any) -> Any:
+    """A deep, read-only copy of a JSON-shaped value: every mapping becomes a
+    `MappingProxyType` over a fresh dict and every list or tuple a tuple, so
+    neither the caller's nested objects nor writes through the copy can change
+    it. Leaves are kept as they are (canonical JSON still validates them)."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({k: _freeze_json(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(v) for v in value)
+    return value
+
+
+def _thaw_json(value: Any) -> Any:
+    """The plain dict/list form of a `_freeze_json` value, for `to_dict` and
+    canonical JSON."""
+    if isinstance(value, Mapping):
+        return {k: _thaw_json(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(v) for v in value]
+    return value
+
+
 def _reject_unknown_keys(data: Mapping[str, Any], allowed: frozenset[str], *, where: str) -> None:
     unknown = set(data) - allowed
     if unknown:
@@ -474,11 +496,12 @@ class CapabilityDescriptor:
             raise CapabilityError(
                 f"capability.annotations must be a mapping, got {type(self.annotations).__name__}"
             )
-        # Defensive copy + read-only wrap, mirroring ContextSource.selector
-        # in context_snapshot.py: a caller mutating the dict it passed in
-        # must never change this descriptor's effective content after
-        # construction.
-        object.__setattr__(self, "annotations", MappingProxyType(dict(self.annotations)))
+        # Deep defensive copy + read-only wrap: a caller mutating the dict it
+        # passed in, or any dict or list nested in it, must never change this
+        # descriptor's effective content after construction, and writing
+        # through a nested value must fail loudly. A shallow
+        # `MappingProxyType(dict(...))` left nested values shared.
+        object.__setattr__(self, "annotations", _freeze_json(self.annotations))
         # Mirrors what CapabilityDescriptor.from_dict enforces via
         # _require_str (allow_empty defaults to False) for capability_id/
         # tool_name/title/matched_tool_pattern — checked here too so
@@ -511,7 +534,7 @@ class CapabilityDescriptor:
                 raise CapabilityError(
                     f"capability {self.capability_id!r}: a keyword exceeds {MAX_KEYWORD_LENGTH} characters"
                 )
-        annotations_len = len(_canonical_json(dict(self.annotations)))
+        annotations_len = len(_canonical_json(_thaw_json(self.annotations)))
         if annotations_len > MAX_ANNOTATIONS_JSON_LENGTH:
             raise CapabilityError(
                 f"capability {self.capability_id!r}: annotations JSON exceeds {MAX_ANNOTATIONS_JSON_LENGTH} bytes"
@@ -534,7 +557,7 @@ class CapabilityDescriptor:
             and self.input_schema_bytes == other.input_schema_bytes
             and self.consequence == other.consequence
             and self.matched_tool_pattern == other.matched_tool_pattern
-            and _canonical_json(dict(self.annotations)) == _canonical_json(dict(other.annotations))
+            and _canonical_json(_thaw_json(self.annotations)) == _canonical_json(_thaw_json(other.annotations))
             and self.commerce == other.commerce
         )
 
@@ -550,7 +573,7 @@ class CapabilityDescriptor:
             self.input_schema_bytes,
             self.consequence,
             self.matched_tool_pattern,
-            _canonical_json(dict(self.annotations)),
+            _canonical_json(_thaw_json(self.annotations)),
             self.commerce,
         ))
 
@@ -566,7 +589,7 @@ class CapabilityDescriptor:
             "input_schema_bytes": self.input_schema_bytes,
             "consequence": self.consequence,
             "matched_tool_pattern": self.matched_tool_pattern,
-            "annotations": dict(self.annotations),
+            "annotations": _thaw_json(self.annotations),
         }
         if self.commerce is not None:
             # Omitted, never null, when absent (ADR 020 sec. 12).
