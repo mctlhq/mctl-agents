@@ -15,7 +15,9 @@ this document has been measured.
 
 | label | meaning |
 |---|---|
-| `[S]` | source-verified: the text of the file at the base commit was read. It was **not executed**. |
+| `[S]` | source-read: the text of the cited lines was read at the base commit. It was **not executed**. Applies only to the files/lines that section 1 lists as read; `[G]` and `[A]` below are weaker. |
+| `[G]` | grep or outline observation only: a pattern search or symbol list, surrounding code not read. Existence/absence within the searched paths only. |
+| `[A]` | ADR-only: taken from ADR text, not re-derived from code. |
 | `[P]` | proposal: a suggestion, not shipped, not decided. |
 | `[I]` | inferred from `[S]` facts; reasoning shown, not observed. |
 | `[U]` | unknown. Also written `NOT_OBSERVED` when a source was out of reach. |
@@ -36,9 +38,11 @@ Base: `origin/main` `4d7efd3` (Merge PR #1079). Branch `docs/context-memory-budg
 | `orchestrator/context_assembly.py` | read `[S]`: constants, `apply_budget`, `run_pipeline`, collectors, `assemble`, `assemble_investigator_context`, `_to_context_source` |
 | `orchestrator/context_snapshot.py` | read `[S]` for `_content_payload` only |
 | `orchestrator/run_issue_investigator.py` | read `[S]` for `_context_mode`, `_assemble_context`, `_render_assembled_context_section`, the issue block of `_build_prompt` |
-| `orchestrator/options.py:532-543`, `orchestrator/usage_ledger.py` | outline and grep only |
-| `orchestrator/context_eval.py`, `context_release.py`, `context_rollout.py`, `exec_budget.py`, `work_context/*` | grep or outline only. Behaviour is taken from the ADRs, not re-derived. |
-| `tests/fixtures/context_eval/cases/02-…`, `04-…` | read `[S]`. The other five cases, `baseline.json` and every test file were **not** read. |
+| `orchestrator/options.py:532-543`, `orchestrator/usage_ledger.py` | outline and grep only `[G]` |
+| `orchestrator/context_eval.py` | grep/outline in the first pass `[G]`; lines 385-429 (used_bytes, `context_tokens_estimate`, `coverage_by_kind`, `EvalMetrics`) and `context_assembly.py` `apply_budget` (`:481-525`) read in the correction pass `[S]` |
+| `context_release.py`, `context_rollout.py`, `exec_budget.py`, `work_context/*` | grep or outline only `[G]`. Behaviour is taken from the ADRs `[A]`, not re-derived. |
+| `orchestrator/redaction.py` | symbol list only `[G]` (`contains_credential`, `value_allowed`, `safe_scalar`, ...). Whether it covers snapshot/completeness redaction is `[U]`. |
+| `tests/fixtures/context_eval/cases/02-…`, `04-…` | read `[S]`. The other five cases, `baseline.json` and every test file were **not** read. No test was executed; nothing here says what any test does or does not guarantee. |
 | `.github` workflow code, mctl-gitops, mctl-api, production logs, Temporal histories | `NOT_OBSERVED` (cross-repo and no production reads) |
 | Issues #597, #747, #885, #848, #1014, #1059, #1073, `.github#309` | `NOT_OBSERVED` as text. Statuses below are the orchestrator's snapshot, quoted as data, not verified. |
 
@@ -48,9 +52,9 @@ clone only. It is not exhaustive.
 
 Related-issue boundaries (orchestrator snapshot, unverified here):
 
-- #747 is PARKED / DO NOT START. This document does not reopen, activate or depend on it. Dependency note only: if
-  a later memory proposal turns out to overlap #747, it must wait for the owner to unpark it. The overlap itself is
-  `[U]`.
+- #747 is PARKED / DO NOT START (parked Git coordination / immutable execution state per the orchestrator; it is not
+  confirmed here to own persistent agent memory). This document does not reopen, activate or depend on it, and does
+  not unpark it. Whether any later memory proposal overlaps #747 is `[U]`; if it does, the owner decides.
 - `.github#309` is ACTIVE RESEARCH RUNNING. Not duplicated.
 - #848 needs actual owner timing. `[U]`.
 - #1059 (closed, typed read contract) is related and grants no permission to change context handling.
@@ -74,13 +78,15 @@ Consequence for the question: "expiry" in the article's sense maps onto the fres
 classes the repo already has. "Token budgeting" is a different layer from the assembly budget, and today those
 layers are not connected (gap G5).
 
-## 3. Inventory of shipped primitives (all `[S]`, none executed)
+## 3. Inventory of shipped primitives (labelled per item; nothing executed)
 
 1. **Snapshot contract.** `ContextSnapshot` with per-source `freshness{observed_at, staleness, max_age_seconds}`,
    `trust{tier}`, `selection{rank, score, reason_code, included}`, `redaction`, and a `ContextBudget` in
    sources/bytes only. `unknown` is the fail-safe freshness default (ADR 009 sec. 6).
-2. **Assembly.** `assemble_investigator_context` is the feature-gated entry. The only module that calls it is
-   `run_issue_investigator.py` (grep over `orchestrator/` and `tools/`). No other agent produces a snapshot.
+2. **Assembly.** `assemble_investigator_context` is the feature-gated entry. In a grep over `orchestrator/` and
+   `tools/` `[G]` the only caller found is `run_issue_investigator.py`, and `context_snapshot.seal` is called only at
+   `context_assembly.py:1666` and `:1720` (same grep; other `seal()` hits belong to other modules' own `seal`
+   functions). That bounds the claim to the inspected paths; it does not prove no other producer exists elsewhere.
    `ISSUE_INVESTIGATOR_CONTEXT_MODE` defaults to `off` (`run_issue_investigator.py:163`). `shadow` seals and logs
    but leaves the prompt untouched; `on` appends rendered sources.
 3. **Two strategies.** `deterministic-fixed-order` 1.0.0 (default: rank = collector order, drops `stale`) and
@@ -112,27 +118,29 @@ layers are not connected (gap G5).
 
 | term from the issue | already in repo? | where | note |
 |---|---|---|---|
-| tiered memory | partly, as *retention classes* and *trust tiers*, not as hot/warm/cold storage | ADR 009 `RetentionPolicy.class`, `Trust.tier`; WorkItem + snapshot store | ADR 009 forbids a payload store ("no payload, ever, anywhere") and a generic search/context service (non-goal). A memory tier that stores content would reopen both. |
-| expiry | yes, for selection | `Freshness.max_age_seconds`, `classify_freshness` (fresh <= max/2, aging <= max, stale beyond), `stale` drop / `stale-demoted`; snapshot `expires_after_days` = 180 | but see G1: live collectors cannot produce `stale` |
+| tiered memory | partly, as *retention classes* and *trust tiers*, not as hot/warm/cold storage | ADR 009 `RetentionPolicy.class`, `Trust.tier`; WorkItem + snapshot store | ADR 009 "no payload, ever, anywhere" limits the *snapshot schema, its store and telemetry*; it is not a ban on every platform payload store. ADR 009 also lists a generic search/context service as a non-goal `[A]`. A memory tier that put content into the snapshot or its telemetry would reopen that; a separate store would need its own owner and contract `[U]`. |
+| expiry | yes, for selection | `Freshness.max_age_seconds`, `classify_freshness` (fresh <= max/2, aging <= max, stale beyond), `stale` drop / `stale-demoted`; snapshot `expires_after_days` = 180 | ADR 009 Amendment 1 defines GitHub freshness as time since retrieval (see G1): an intended contract, not a defect |
 | token budgeting | no (deliberately) | ADR 009 sec. 6 defers `max_tokens`: tokenizer dependency absent and model policy can change under a sealed snapshot | an optional `max_tokens`/`used_tokens` pair is allowed later without an `apiVersion` bump |
 
 ## 5. Source-backed gaps and counterexamples
 
 Each gap is `[S]` at the cited line unless marked. None was run. "Reachable" claims are inferences `[I]`.
 
-**G1. Freshness measures retrieval age, so live sources cannot be stale.**
+**G1. Freshness is defined as retrieval age (intended contract); content age is a separate, proposed axis.**
+ADR 009 Amendment 1 states "GitHub-fetched sources keep time since retrieval" `[A]`. The collectors follow that:
 `collect_github_issue`, `collect_issue_comments` and `collect_target_repo` set `observed_at=_iso(assembly_input.now)`
 (`context_assembly.py:757`, `:792`, `:816`), and `classify_freshness` is called with the same `now`
-(`run_pipeline`, `:1347`). Age is 0, so these classify `fresh` (or `unknown` for a missing window, which the
-collectors do not leave missing). `collect_prior_proposal` also uses the retrieval time under the default
-strategy (`:893`); only the ranked strategy substitutes the proposal's `.status.yaml` `updated_at` (`:896-902`).
-`[I]` Under the default strategy the `stale` drop (`:1349-1353`) is unreachable from any live collector, and for
-live issue comments `stale_rate` is 0 by construction. Counterexample: fixture `02-stale-source.json` hand-sets
-`observed_at: 2026-01-01T00:00:00Z` for a comment. A real collector never emits that value; it would emit
-`observed_at = now` with `content_time = created_at`. So the committed baseline exercises a code path production
-input cannot reach. The comment's own age (`content_time`) is used only for recency ordering (`_recency`, `:542`),
-never for freshness. Note the fixture also labels that stale comment **useful**: age and relevance are different
-axes, so an age-based expiry that drops sources would lose it.
+(`run_pipeline`, `:1347`). For freshly collected input the retrieval age is 0, so these classify `fresh`. This is the
+documented guard working as designed, not a broken freshness check. `collect_prior_proposal` uses retrieval time
+under the default strategy (`:893`); the ranked strategy uses the proposal's `.status.yaml` `updated_at`
+(`:896-902`), as Amendment 1 also states.
+`[I]` Consequence: retrieval-time freshness cannot say that a *content* is old. Whether content age should matter
+is a **proposed research question**, not a proven defect. The comment's own age (`content_time`) is used only for
+recency ordering (`_recency`, `:542`). Fixture `02-stale-source.json` hand-sets `observed_at: 2026-01-01T00:00:00Z`
+for a comment; that validly exercises the generic pipeline's `stale` path, but it does not model freshly collected
+input (a real collector would emit `observed_at = now`). It is not evidence that the baseline is invalid. The
+fixture also labels that stale comment **useful**: an old actionable comment must not be discarded merely for age, so
+any content-age idea would have to flag or demote, never drop on age alone `[P]`.
 
 **G2. Default-strategy budget order puts untrusted comments ahead of the prior proposal.**
 Default rank is collector order (`assign_ranks`, `:1343`). `_COLLECTOR_ORDER` is template, issue, comments,
@@ -167,39 +175,50 @@ saying a source is *required*, other than the `pinned` flag used only for the re
 In `on` mode only sources with `render_text` reach the prompt: comments, prior-proposal documents, WorkItem
 intents (`_render_assembled_context_section`, `run_issue_investigator.py:1493-1532`). The issue body is outside the
 budget (G4), the target repo is explored by the agent with Glob/Grep/Read (ADR 009 sec. 8, "agent-directed"),
-tool results, human answers and capability blocks are separate prompt parts. `context_bytes` and
-`context_tokens_estimate` therefore describe only the assembled section. The usage ledger carries tokens and
-`execution_id`, but its field list has no snapshot id (grep over `usage_ledger.py`). A join is possible through
-the store execution id when one exists `[I]`; no code that performs the join was found, and none was searched for
-outside the files listed in section 1 `[U]`. Consequence: the repo cannot currently attribute token cost to context
-selection choices. A "token saving" claim has no instrument in this codebase.
+tool results, human answers and capability blocks are separate prompt parts. What the metrics measure
+(`context_eval.py:394-399`, `apply_budget` `:481-525`, both `[S]`): `context_bytes` is `assembly.used_bytes` (or
+`snapshot.budget.used_bytes`), the sum of `byte_count` of the *selected raw candidates*. For comments and proposal
+documents `byte_count` is the canonical-JSON envelope length (G4), and the selected set includes the issue and
+template envelopes. So it is neither exactly the rendered appended section nor the complete prompt, and it
+excludes tool results, human answers, capability blocks and agent-directed repo reads. `context_tokens_estimate` is
+`ceil(used_bytes / 4)` of that same quantity, an estimate and never billed tokens `[S]`. The usage ledger carries
+tokens and `execution_id`, but in the grep `[G]` its field list showed no snapshot id. A join through the store
+execution id looks possible `[I]`; no code performing it was found in the paths inspected, and unassessed joins
+elsewhere (mctl-api, gitops, other modules) are `[U]`. Consequence: in the inspected paths nothing attributes token
+cost to context selection choices, so a "token saving" claim has no instrument there.
 
 **G6. Everything above is off by default and unobserved.** `ISSUE_INVESTIGATOR_CONTEXT_MODE` defaults to `off`,
 context eval and release rollout default to `off`. Which environments set them is in mctl-gitops: `[U]`. So there
-is no production-shaped distribution of stale or truncated sources to size any of G1-G4 against.
+is no production-shaped distribution of stale or truncated sources to size any of G1-G4 against `[U]` (none was searched for beyond this repo).
 
-**G7. Snapshot identity is per-assembly-moment, not per-input.** ADR 009 sec. 2 says re-assembling identical inputs
-at a different wall-clock time yields an identical identity because only `created_at` is excluded. But
-`_to_context_source` puts `retrieved_at` and `freshness.observed_at` into each source (`:387-392`), and
-`_content_payload` hashes `sources` (`context_snapshot.py:1231-1263`). With live collectors both equal `now`, so
-`snapshot_id` changes with the assembly clock. ADR 011-resume sec. 6 already accounts for this for retries ("a retry
-at a later second restamps them"). Counterexamples: (a) two assemblies of identical content never share a
-`snapshot_id`, so `snapshot_id` cannot serve as a cache key or as "same context" evidence; (b) a retry is
-distinguished only by a field-by-field "retry-equivalent" compare. Reuse of a prior snapshot's identity as proof of
-freshness would be wrong in both directions. Guarded today: reuse of one identity for different content is refused
-(store answers 409, divergence blocks from `enforce`).
+**G7. Snapshot identity distinguishes timestamps; three cases must not be conflated.** ADR 009 sec. 2 says only
+`created_at` is excluded from the hash `[A]`. `_to_context_source` puts `retrieved_at` and `freshness.observed_at`
+into each source (`:387-392`) and `_content_payload` hashes `sources` (`context_snapshot.py:1231-1263`) `[S]`. With
+live collectors both equal `now`. Therefore:
+(a) **identical full inputs, including identical observation timestamps**: same identity (the ADR's intent);
+(b) **identical text with changed observation timestamps**: different `snapshot_id`, by construction;
+(c) **changed timestamps landing at a later second** (a retry): ADR 011-resume sec. 6 already says a retry at a later
+second restamps them, and a field-by-field "retry-equivalent" compare handles it `[A]`. This is not the same
+statement as "never the same id": identical *full* inputs do share one.
+Reuse of one identity for different content is refused (store answers 409, divergence blocks from `enforce`) `[A]`.
+A content-only digest (hash over source `content_hash` + ids, excluding timestamps) would be a different quantity.
+It is **not** freshness, authorization, cache validity or proof of context equivalence: locators, selection, trust,
+strategy and budget can differ while content hashes match. Any content-only grouping is a **non-authoritative
+proposal, pending the owner's decision**. Ambiguity in ADR wording is not permission to change a contract.
 
 **G8. Pins can drift from the thing later acted on.** `target-repo` is `fresh` by being content-addressed at the
-clone's SHA (`_CONTENT_ADDRESSED_KINDS`, `:122`). Nothing in the assembler re-checks that SHA against the branch
-head at a later phase, and no other agent assembles a snapshot (section 3, item 2), so the implement and review-fix
-phases have no context snapshot to drift or to compare `[S]`. Approval binding to a proposal digest is a separate
-mechanism (spike 670 describes `freshness(artifact, current_digest, current_sha)`), not read here. Branch/head
-drift for implement-phase context is therefore not measurable with current primitives.
+clone's SHA (`_CONTENT_ADDRESSED_KINDS`, `:122`). In the assembler code read `[S]`, nothing re-checks that SHA against the branch head at a later phase. A grep of
+`orchestrator/` and `tools/` `[G]` found `context_snapshot.seal` called only inside `context_assembly.py`
+(`:1666`, `:1720`) and `assemble_investigator_context` called only from `run_issue_investigator.py`, so in those
+inspected entrypoints the implement and review-fix phases do not build a context snapshot. Other producers outside
+the inspected paths, or other drift evidence for implement-phase work (approval binding to a proposal digest is a
+separate mechanism; spike 670 describes `freshness(artifact, current_digest, current_sha)`, not read here),
+are `[U]`. This does not show implement-phase drift is unmeasurable in general.
 
-Not found as gaps (checked, so the owner need not re-check): missing provenance for selected sources (each carries
-locator, selector, hash, trust, selection reason); silent drops (every exclusion has a `reason_code` and a
-counter); authority creep (no allow/deny field; import-direction tests per ADR 009 sec. 5 and ADR 019 safety
-invariant).
+Not found as gaps in the lines read `[S]`: missing provenance for selected sources (each carries locator, selector,
+hash, trust, selection reason); silent drops (each exclusion has a `reason_code` and a counter); authority creep
+(no allow/deny field in the shape). ADR 009 sec. 5 and ADR 019 describe import-direction tests `[A]`; no test was
+read or run here, so nothing is asserted about them and the owner should not read this paragraph as a guarantee.
 
 ## 6. Duplicate map (who owns what)
 
@@ -222,15 +241,15 @@ invariant).
 | option | what it is | fits shipped contracts? | evidence it is needed | cost and risk |
 |---|---|---|---|---|
 | **A. Reuse current primitives** | Use `trust-freshness-ranked`, the existing size knobs, `observe` + ADR 015 evaluation, and the usage ledger as they are. Add no code. | yes, entirely | G2 is already answered by the ranked strategy `[S]` | needs someone to turn `shadow` and `observe` on and read the logs: a gitops decision, outside this repo and outside this task |
-| **B. Narrow deterministic policy extension** | A *new strategy version* (ADR 019) that (1) classifies freshness for comments and prior proposals from `content_time` where present, flagging rather than dropping; (2) lets a source be marked *required* so budget cuts and truncation cannot silently remove it, with a recorded reason; (3) adds a content-only digest (hash over source `content_hash` + selection, excluding timestamps) to fix G7's "same context?" question. Each item is an optional field or a new strategy version per ADR 009 sec. 6 growth rule. | yes, if it goes through ADR 019 and keeps "relevance is never authorization" | G1, G3, G4, G7 are source-visible. Their *frequency* is `[U]`. | new code under review, new fixture baseline, ADR amendment for the field(s), an implementation-hash republish. Benefit is unmeasured. |
-| **C. Tiered-memory subsystem** | A store of summarised or cached context with hot/warm/cold tiers and expiry. | no as stated: needs a payload store (ADR 009 sec. 7 and Alternative 2 reject it), a retrieval service (non-goal), and overlaps #747 | none found | highest cost, largest authority and privacy surface; the repo has no redactor (ADR 009 sec. 7, follow-up (c)) |
+| **B. Narrow deterministic policy extension** | A *new strategy version* (ADR 019) that (1) *researches* a content-age signal from `content_time` where present, flagging or demoting, never dropping on age alone; (2) lets a source be marked *required* so budget cuts and truncation cannot silently remove it, with a recorded reason; (3) optionally, a **non-authoritative** content-only grouping of sources (G7), only if the owner wants it. Item (3) is not freshness, authorization or cache validity. | **not established.** Optional fields are not shown compatible with the closed schemas and their consumers; ADR 009 sec. 6 growth rule is cited as precedent `[A]` only. Any B needs revised consumer, schema and owner contracts, decided by the owner, before it is implementable. | G2, G3, G4 are source-visible. G1 and G7 are intended contract versus a research question, not defects. Frequency is `[U]`. | new code under review, new fixture baseline, ADR amendment(s), an implementation-hash republish. Benefit is unmeasured. |
+| **C. Tiered-memory subsystem** | A store of summarised or cached context with hot/warm/cold tiers and expiry. | not as stated: storing content in the snapshot or its telemetry is rejected by ADR 009 sec. 7 / Alternative 2 `[A]`, and a generic retrieval service is a non-goal. A separate store would need its own owner and contract; overlap with #747 is `[U]` and #747 stays parked | none found | highest cost, largest authority and privacy surface. `orchestrator/redaction.py` exists `[G]`; whether it is span-safe or complete enough for snapshots or stored summaries is unassessed `[U]` |
 | **D. Defer** | Record G1-G8, take no action until A produces production-shaped numbers. | yes | G6: no production distribution exists | the question stays unanswered; zero implementation risk |
 
 Proposed (not decided): **A now, D for B and C.** Rationale: the cheapest honest step is to obtain real counters from
 primitives that already exist. B is plausible, but its value rests on frequencies this research could not observe.
 C contradicts two accepted ADR decisions and has no supporting evidence. If the owner prefers to learn more before
 asking gitops to enable anything, the synthetic test below is the smallest offline step, and it only tests whether
-the *mechanism* exists (G1-G4), not how often it bites.
+the *mechanism* exists (G2-G4, plus the G1 content-age question), not how often it bites.
 
 An A-only outcome does not satisfy the issue's "reduce token cost" half. No evidence in the repo says assembly
 choices move token cost materially (G5), and none is claimed.
@@ -247,11 +266,12 @@ Design `[P]`:
   existing baseline is untouched. Candidate lists use **live-shaped** timestamps: `observed_at = now` and
   `content_time` = the real age. This is the property the existing fixtures lack (G1).
 - **Cases** (one failure mechanism each, five in total): C1 an old actionable comment under a one-hour window
-  (G1); C2 template + issue + target-repo + 9 comments + prior proposal at `max_sources=12` (G2); C3 a large
+  (content-age research question, G1; expected: kept, possibly flagged, never dropped on age); C2 template + issue + target-repo + 9 comments + prior proposal at `max_sources=12` (G2); C3 a large
   middle source ahead of small required ones (G3); C4 a required fact located at the tail of a source over the
-  per-source limit (G4); C5 the same content assembled at two `now` values (G7).
+  per-source limit (G4); C5 the same content assembled at two `now` values, recording which of G7's cases (a)/(b)/(c) apply; no equivalence
+  is asserted.
 - **Frozen oracle.** Per case, a committed list of `required_source_ids`, `expected_excluded` with expected
-  `reason_code`s, and for C5 the expectation "same content digest". Labels are written by hand before any
+  `reason_code`s, and for C5 whether text-identical sources differ only in timestamps (descriptive, non-authoritative). Labels are written by hand before any
   candidate output is seen, and stored with their rationale.
 - **Baseline.** `deterministic-fixed-order` 1.0.0 and `trust-freshness-ranked` 1.0.0 as shipped, outputs committed as
   a frozen file. Candidate: the option B strategy, only when it exists; until then the test is a design.
@@ -275,7 +295,7 @@ Design `[P]`:
 | cost (tokens, USD) | `[U]` | `[U]` | `NOT_RUN`, no snapshot-to-ledger join found (G5). `unknown` is not zero. |
 | latency | `[U]` | `[U]` | `NOT_RUN`. ADR 019 sizes the `observe` pass as one extra in-memory pass `[S]`; no timing measured. |
 | reliability | `[U]` | `[U]` | `NOT_RUN` |
-| stale-context failure rate | `[U]` | `[U]` | `NOT_RUN`. G1 shows it is 0 by construction for live GitHub sources under the default strategy, so "0" would be an artefact, not evidence of health. |
+| stale-context failure rate | `[U]` | `[U]` | `NOT_RUN`. Not measured by anything inspected. ADR 015's `stale_rate` is the share of *selected sources classified `stale`* (selection staleness by retrieval-time freshness); it is not a stale-context failure rate, and no zero or non-zero value is claimed for either. |
 
 ## 10. Invariants this document keeps
 
@@ -290,8 +310,9 @@ Design `[P]`:
 1. Decide A / B / C / D (section 7). Proposed: A now, D for B and C.
 2. If A: ask the gitops owner whether `ISSUE_INVESTIGATOR_CONTEXT_MODE`, `ISSUE_INVESTIGATOR_CONTEXT_EVAL` and
    `CONTEXT_RELEASE_ROLLOUT_MODE` are set anywhere, and read their existing log lines. `[U]` from this repo.
-3. Reconcile ADR 009 sec. 2 and sec. 7 wording with G4 and G7 (a documentation fix, no code): the hash covers the
-   raw envelope, and identity includes source timestamps.
+3. Owner to decide whether ADR 009 sec. 2 and sec. 7 wording needs clarification against G4 (hash covers the raw
+   envelope) and G7 (identity includes source timestamps). Wording ambiguity alone does not authorise any contract
+   change; this is a question, not a fix.
 4. If B: write the synthetic cases of section 8 first, then decide. Open one issue per proven gap, not one epic.
 5. Whether a snapshot-to-usage join exists or is wanted (G5) is a question for the ADR 012 owner.
 
