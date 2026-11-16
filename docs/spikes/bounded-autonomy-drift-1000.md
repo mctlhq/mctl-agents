@@ -73,15 +73,15 @@ strong the evidence is. The "gap" column says what is not covered.
 
 | Concept | Existing owner and mechanism | Evidence | Gap |
 | --- | --- | --- | --- |
-| Intention | The proposal triplet plus `proposed-content.md`, hashed by `proposal_state.content_digest_of` over `PROPOSAL_DIGEST_FILES` (`proposal_state.py:165-202`) | SRC | Prose. No machine-readable scope inside it |
+| Intention | The proposal triplet plus `proposed-content.md`, hashed by `proposal_state.content_digest_of` over `PROPOSAL_DIGEST_FILES` (`proposal_state.py:165-202`) | SRC | Prose. No machine-readable scope seen in the bounded reads |
 | Human authorization of that intention | `aar_` grant: `request_devloop_approval` binds `artifact_hash = content_digest` (`delegated_approval.py:116-148`); the implementer reads it back and requires equal digest, human decider, matching target, state `consumed`/`executed` (`approval_evidence.verify_execution_grant`, `approval_evidence.py:117-167`) | SRC | None for freshness of approval against content |
 | Stale approval or stale content | Mismatch refuses (`GRANT_CONTENT_MISMATCH`); a digest that cannot be computed refuses; an unreadable store is `transient`, never authorization (`approval_evidence.py:132-137,155-160`). Local blocker codes in `proposal_state.py:173-174` | SRC | None found for the file digest. Stale target repo head vs approval is UNK (not read) |
-| Allowed files / scope | Prompt text only: "Stay strictly within the proposal's scope", "do not refactor outside the touched files" (`run_implementer.py:2154,2201,2014`) | SRC (prompt strings) | No machine-readable allowed-file list found. Textual instruction to the agent, not a check (GREP-level absence: no `allowed_paths`/`allowed_files` symbol anywhere in `orchestrator/`) |
+| Allowed files / scope | Prompt text only: "Stay strictly within the proposal's scope", "do not refactor outside the touched files" (`run_implementer.py:2154,2201,2014`) | SRC (prompt strings) | No machine-readable allowed-file list seen. Textual instruction to the agent, not a check (GREP only: no `allowed_paths`/`allowed_files` symbol matched in `orchestrator/`; not an exhaustive absence proof) |
 | Path-level guard after the fact | (a) chart MAJOR bump detector run before push, blocks unless a `crd-migration*` file exists (`run_implementer.py:5129-5158`, `_detect_chart_major_bumps` at `:3468`); (b) shepherd merge gate on changed paths under `agents/`, `platform-gitops/agent-platform/`, fail-closed when the list is truncated or unreadable (`run_shepherd.py:710-765`, `merge_operation_for` at `:815`) | SRC | Both are single-purpose rules for named risks. Neither compares the diff to the proposal |
-| Budget | Wall-clock envelope and nested per-command bounds (ADR 011; `exec_budget.py`); `budget_exhausted` outcomes in the completion record | DOC + SRC (completion mapping read at `run_implementer.py:5540-5568`; `exec_budget.py` not read in full) | Time only. No file-count, line-count or paths budget found |
-| Expected results | `tasks.md` in the digest set; ADR 021 names follow-up F1 `task_coverage` that "compares the pushed head with the approved `tasks.md`" and says it does not exist | DOC; absence GREP (`task_coverage` appears only in docs and a module docstring, `implementation_completion.py:17`) | The expected-vs-observed comparison is the named, unbuilt F1 |
+| Budget | Several budgets exist. (a) Implementer wall-clock envelope and per-command bounds (ADR 011; `exec_budget.py` header and `command_budget` signature read: deadline, ceiling, reserve, floor); `budget_exhausted` outcomes in the completion record. (b) SDK `max_budget_usd` per query, set in the `options.py` builders (GREP, e.g. `IMPLEMENTER_BUDGET_USD` at `options.py:1394`) and documented as SDK-enforced at `run_shepherd.py:5365-5367` (SRC, comment only, for the shepherd loop). (c) Shepherd loop-level `SHEPHERD_BUDGET_USD` estimate cap (SRC, `run_shepherd.py:5361-5376`) | DOC + SRC + GREP (completion mapping read at `run_implementer.py:5540-5568`; `exec_budget.py` read only in part; how the SDK enforces the USD cap UNK) | No file-count, line-count or paths budget was seen in the bounded reads (not an exhaustive search). Which budget bounds the implementer run in practice beyond the above: UNK |
+| Expected results | `tasks.md` in the digest set; ADR 021 names follow-up F1 `task_coverage` that "compares the pushed head with the approved `tasks.md`" and says it does not exist | DOC; GREP (`task_coverage` seen only in docs and a module docstring, `implementation_completion.py:17`) | An expected-vs-observed comparison is named as F1 in ADR 021. Whether it is built now: GREP-negative only, unverified |
 | Observed outcome | `ImplementationCompletion`: sealed record from the exit and observations, four required gates `commits_present`, `chart_major_guard`, `push_succeeded`, `claim_valid_at_push` (`run_implementer.py:5581-5635`) | SRC | `complete` means "gates passed", never "scope done" (ADR 021 DOC). No changed-path list in the record |
-| Consumer of the observed outcome | ADR 021 lists shepherd shadow (#679) and Temporal observe-only (#680) as follow-ups | DOC; grep of `run_shepherd.py` and `orchestrator/temporal/` for `completion` consumers found none (GREP) | Whether anything reads the record today: GREP-negative only |
+| Consumer of the observed outcome | ADR 021 lists shepherd shadow (#679) and Temporal observe-only (#680) as follow-ups | DOC; grep of `run_shepherd.py` and `orchestrator/temporal/` for `completion` consumers matched none (GREP) | Whether anything reads the record today: UNK (GREP-negative over two locations only) |
 | Lifecycle ownership vs authorization | ADR 010: ownership and claims fence who may act, "Ownership never implies authorization"; epoch and head fences | DOC; fencing call sites cited in the ADR (not re-read here) | Out of scope for drift. Reuse, do not extend |
 | Runtime action gate | ADR 014 checkpoint: ALLOW/DENY/REQUIRE_APPROVAL before the side effect, args digest, approval receipt bound to action, one record per decision | DOC; call sites enumerated in ADR §5. Bash is explicitly ungoverned (ADR 014 open decision 4) | Governs actions, not the agent's file edits. The checkpoint binds `push` to branch and lease, not the pushed commit (ADR 014 §5) |
 | Decision record | `decision_records.py`: durable records of policy decisions, producer half of mctl-api#701 | SRC (module list read; internals not read) | Records gate decisions, not intent-vs-outcome |
@@ -94,12 +94,13 @@ strong the evidence is. The "gap" column says what is not covered.
 
 Intention is bound to approval by digest and verified at execution (SRC).
 Approval, ownership and action gating are separate authorities by design (DOC).
-An observed-outcome record exists and says "gates passed" only (SRC). The
-single missing link is a comparison between the approved intent and the
-observed change, and the repo already names it twice: ADR 021 F1
-`task_coverage`, and the #670 follow-up "post-implementation drift check". So
-the drift idea is a duplicate of two existing, owned, unbuilt follow-ups. It is
-not a new capability.
+An observed-outcome record exists and its `complete` means "gates passed"
+(SRC, ADR 021). In the bounded reads, no comparison between the approved
+intent and the observed change was found, and the docs name one twice: ADR 021
+F1 `task_coverage`, and the #670 follow-up "post-implementation drift check".
+So the drift idea overlaps two documented follow-ups and could possibly reuse
+them. Whether those are built, open or scheduled was not read (UNK), so this
+is overlap and possible reuse, not a proven duplicate.
 
 ### Where the owners are
 
@@ -112,7 +113,9 @@ not a new capability.
 - Review binding: ADR 025, issue #905.
 - Lifecycle: ADR 010, #350 and phases.
 
-Owner status of the follow-up issues (open, closed, merged): UNK, not read.
+Owner status of the follow-up issues (open, closed, merged) and the
+implementation status of the owner issues (#428, #670 follow-ups, #679, #680,
+#905 and others): UNK, not read. Only source-local files were used.
 
 ## Source-read path: scope, claims, approval, digest, freshness
 
@@ -133,14 +136,15 @@ The path as read in source, in order. Each step is SRC unless stated.
 4. The ExecutionClaim and checkpoint are checked immediately before the push
    (ADR 010, ADR 014 DOC; implementer call sites cited in the ADRs, not
    re-read here).
-5. Between steps 3 and 4 the agent runs under the prompt, a wall-clock
-   envelope and the Bash budget. Nothing in the read path inspects which files
-   the agent changed against the proposal, other than the chart guard
-   (`run_implementer.py:5137`).
+5. Between steps 3 and 4 the agent runs under the prompt and the budgets
+   listed in the ownership table (wall-clock envelope, per-command bounds, SDK
+   USD cap). In the regions read, nothing compares the files the agent changed
+   with the proposal; the chart guard (`run_implementer.py:5137`) checks one
+   named risk only. Regions not read may differ.
 6. After the attempt, the completion record is sealed from observations.
 7. The shepherd reads changed paths at merge time for the protected-prefix
-   rule (`run_shepherd.py:1874`, GREP at the definition; summary SRC at
-   `:715-765`).
+   rule (`_read_changed_paths`, `run_shepherd.py:1874-1925`, read in full, with
+   `_rename_sources` at `:1928-1959`; summary SRC at `:715-765`).
 
 Freshness: `decision_context.freshness()` returns `fresh`, `stale` or
 `unknown`, with a missing current value `unknown` (DOC in the #670 report,
@@ -159,8 +163,9 @@ not read). The approval path's freshness is the digest equality in step 3
 
 ## Options
 
-All three keep one rule: any drift output is advisory evidence only, never
-permission, and never a second authorization gate, identity, decision store or
+All three keep one rule: any drift output is advisory evidence. It may inform
+a human or reviewer decision, but it grants no authority, changes no automatic
+gate, and is not a second authorization gate, identity, decision store or
 generic canvas runtime. No option authorizes any run or merge.
 
 ### REUSE_EXISTING_DECISION_CONTEXT
@@ -187,11 +192,17 @@ A pure offline function comparing an approved scope statement to the observed
 changed-path list, emitting `ok` / `drift` / `unknown`. It would live as the
 ADR 021 F1 check, not as a new module family, and read `tasks.md`.
 
-- Pro: closes the one named gap with a deterministic, replayable check.
-- Con: needs a machine-readable scope inside prose `tasks.md`. That is either
-  a schema change to the proposal contract (out of bounds for this task and a
-  digest-set change) or a model-extracted scope, which makes the oracle
-  probabilistic.
+- Pro: addresses the intent-vs-change gap named in the docs with a
+  deterministic, replayable check.
+- Con: needs a machine-readable scope. `tasks.md` is already in
+  `PROPOSAL_DIGEST_FILES` (`proposal_state.py:165`), so adding scope syntax
+  inside it changes the approved bytes and therefore the digest the human
+  approved; file-set membership does not change. That would make the scope
+  part of normative approved content, a proposal-contract question for the
+  owner (out of bounds here; no contract is adopted by this report). The
+  alternative is a scope kept outside the approved files, which would be a
+  nonauthoritative explanatory artifact that cannot define allowed scope, or a
+  model-extracted scope, which makes the oracle probabilistic.
 - Con: textual path scope cannot see behaviour (see false negatives).
 - Not authorized now. Only after the experiment below shows a measurable gap.
 
@@ -208,8 +219,8 @@ step until a measured miss exists in the existing pipeline.
 | Aspect | REUSE | NARROW | DEFER |
 | --- | --- | --- | --- |
 | New authority or store | none | none (pure function, advisory) | none |
-| Touches approval, policy, digest set | no | only if a scope field enters `PROPOSAL_DIGEST_FILES` (to be avoided, see #670 Q5 rationale) | no |
-| Gap closed | none directly | path-level intent vs change | none |
+| Touches approval, policy, digest | no | yes if scope syntax goes inside `tasks.md` (already a digest file: approved bytes and digest change). A scope outside the approved files is nonauthoritative and cannot define allowed scope | no |
+| Gap addressed | none directly | path-level intent vs change, if a scope is authorized | none |
 | Gap measured | no | by the experiment below | no |
 | Duplicates an existing owner | no | overlaps F1 unless it is F1 | no |
 | Cost, latency, success gain | unmeasured | unmeasured | unmeasured |
@@ -222,12 +233,13 @@ All are UNK until measured.
 Two different checks, kept apart so one is never mistaken for the other.
 
 - Textual scope check: changed paths against an allowed pattern list.
-  Deterministic, cheap, covers only "where". The shepherd's protected-prefix
-  rule is this kind (SRC) and fails closed on an unreadable list.
+  Deterministic, covers only "where". The shepherd's protected-prefix
+  rule is this kind (SRC) and fails closed on a truncated or unreadable list.
 - Semantic check: does the change do what the approved intent says, and nothing
-  else. Needs reading the diff and `tasks.md`. Not deterministic; the only
-  semantic evidence in the repo is the explainer's claims, spot-checked by
-  hand on one subject (DOC, #670).
+  else. Needs reading the diff and `tasks.md`. Not deterministic. The semantic
+  evidence seen in the bounded reads is the #670 explainer's claims,
+  spot-checked by hand on one subject (DOC); other semantic evidence may exist
+  and was not searched for.
 
 A textual pass says nothing about semantic correctness. Reporting a combined
 "no drift" from a path check alone would be a false assurance; the output
@@ -235,24 +247,34 @@ space must keep `unknown` for what was not checked.
 
 ## False-positive examples (drift flagged, nothing wrong)
 
+Passing the chart or protected-prefix guards does not authorize scope; those
+guards answer other questions. An item below is a false positive only where
+an operator or the proposal explicitly authorized the change.
+
 1. Operator-authorized amendment. A human edits `tasks.md` after approval, then
    re-approves. The new digest is a different intent (SRC: mismatch is
    refused until re-approved). A drift check anchored on the old scope flags
    every change as drift. It must read the digest the grant is bound to, and
    treat "approval superseded" as its own state, not as drift.
-2. Allowed test changes. The proposal says "fix X" and the agent adds tests.
-   Test files are outside any path list that came from `tasks.md` prose. A
-   path-list check flags them; a semantic reviewer would not.
-3. Generated or lock files. A dependency or lockfile change follows from an
-   in-scope edit (for example, regenerated files). Flagged by path, in scope by
-   cause.
-4. Chart bump with a `crd-migration*` file. The chart guard allows it by design
-   (SRC `run_implementer.py:5138`). A drift check that re-flags it duplicates a
-   decision the proposal author already made.
+2. Test files. The proposal says "fix X" and the agent adds tests. "Fix X" and
+   causality alone are not permission. A path-list check would flag the tests;
+   they are a false positive only if the operator or the proposal explicitly
+   authorizes test changes. Without that authorization, flagging is correct.
+3. Generated or lock files. A dependency or lockfile change may follow from an
+   in-scope edit. The same rule applies: it is a false positive only when
+   explicitly authorized by the operator or the proposal. Causal
+   follow-from-an-edit is not authorization.
+4. Chart bump with a `crd-migration*` file. The chart guard lets the push
+   proceed (SRC `run_implementer.py:5138`). That is a validity guard outcome,
+   not a scope grant. Whether the bump is in scope is a separate question
+   that the guard does not answer; a drift check re-flagging it is not
+   necessarily a duplicate.
 5. Review-remediation phase. Review-feedback runs change code for findings
-   that were not in `tasks.md`. Their scope is the findings, not the proposal
-   (SRC prompt `run_implementer.py:2154` "fixing the {work_items} only").
-   Comparing them with the original proposal scope is the wrong baseline.
+   that were not in `tasks.md`. The prompt text says "fixing the
+   {work_items} only" (SRC `run_implementer.py:2154`), but that is prompt text,
+   not a verified authorization binding. The baseline must be the actual
+   authorized binding of that phase (which was not read: UNK), not a presumed
+   blanket permission to change anything the findings touch.
 
 ## False-negative scenarios (drift present, not flagged)
 
@@ -274,11 +296,20 @@ space must keep `unknown` for what was not checked.
    writable tree is forgeable by whoever can write that tree. The experiment
    must include a forged-input mutation and the check must answer `unknown`,
    not `ok`.
-4. Truncated or unreadable observation. A 100-path page limit exists on the
-   changed-path read (`CHANGED_PATHS_PAGE = 100`, SRC). A check that treats a
-   truncated list as complete answers `ok` for the paths it never saw. The
-   shepherd handles this with three states (SRC); a drift check must reuse
-   the same three-state shape, not collapse it.
+4. Truncated or unreadable observation. `_read_changed_paths` was read in
+   full (`run_shepherd.py:1874-1925`). The GraphQL snapshot fetches
+   `files(first:100)`. The result is COMPLETE only when `hasNextPage` is
+   literally false and the node count equals `changedFiles`. It is TRUNCATED
+   when `hasNextPage` is true or `changedFiles` exceeds the nodes read, and
+   UNREADABLE when any field is missing or malformed, the counts disagree the
+   other way, or a rename's source path cannot be read or the REST and GraphQL
+   path sets disagree (`_rename_sources`, `:1928-1959`, REST
+   `per_page=CHANGED_PATHS_PAGE`, only called for lists known to fit one
+   page). `tests/test_definition_merge_gate.py` has cases for each state
+   (names and fixtures read at lines 279-400; not run). A drift check that
+   treats a truncated or unreadable list as complete would answer `ok` for
+   paths it never saw. It must keep the three states distinct, not collapse
+   them.
 5. Agent Bash outside the checkpoint. A side effect made from the agent's
    shell is not governed (ADR 014 open decision 4, DOC). No drift check of
    the file diff sees an external side effect.
@@ -291,13 +322,17 @@ Three distinct outcomes, never merged.
 
 - `ok`: every checked dimension was observed and matched.
 - `drift`: a checked dimension was observed and differed. Advisory only.
-- `unknown`: an input was missing, truncated, stale, unreadable or unverified.
-  This is not `ok` and not `drift`. It is not a denial.
+- `unknown`: an input was missing, stale, unreadable, unverified or truncated.
+  This is not `ok`, not `drift`, and not a denial. Stale, unverified and
+  truncated are separate causes and the output should name which one applied,
+  not fold them together or into scope drift.
 
-A denial is a gate outcome (ADR 014 DENY, ADR 021 refusals). The drift output
-is never a gate input: no merge, approval, claim, budget or ownership decision
-may read it. This mirrors `freshness()` returning `unknown` for a missing value
-(DOC) and ADR 025's rule that unobserved evidence is never `PASS` (DOC).
+A denial is a gate outcome (ADR 014 DENY, ADR 021 refusals). Drift output is
+advisory evidence: a human or reviewer may weigh it, but it grants no
+authority and does not change any automatic gate by itself; changing a gate
+would be a separate owner decision. This mirrors `freshness()` returning
+`unknown` for a missing value (DOC) and ADR 025's rule that unobserved evidence
+is never `PASS` (DOC).
 
 ## Smallest future offline synthetic experiment (NOT_RUN)
 
@@ -321,38 +356,53 @@ using no live data, no model call and no network.
 
 Both arms read the same frozen cases.
 
-- Baseline arm: what exists today, replayed as pure functions over the case
+- Baseline arm: the existing guards, replayed as pure functions over the case
   inputs: digest verdict (`approval_digest_verdict` logic), the chart major
-  guard logic, and `touches_agent_definitions`-style path classification.
-  Each baseline output is mapped to `ok`/`drift`/`unknown` by a fixed table
-  written before the run.
-- Candidate arm: the narrow comparison (changed paths versus scope statement)
-  as a pure function.
+  guard logic, and `touches_agent_definitions`-style path classification. These
+  answer different questions (is the approval digest valid, is a chart bump
+  permitted to push, does a PR touch a protected prefix). They do not assess
+  scope. So baseline outputs are recorded in their own vocabulary
+  (validity/permission outcome: pass, refuse, uncertain), never mapped to
+  `ok`/`drift`. A guard pass means scope was not assessed, not scope `ok`. No
+  drift outcome is invented for a guard. Stale, unverified and truncated
+  uncertainty stay distinct from a denial and from scope drift.
+- Candidate arm: the narrow comparison (changed paths versus an authorized
+  scope statement) as a pure function, with scope coverage as its own output:
+  `ok` / `drift` / `unknown`.
 
-A baseline reused as-is must not be modified to match the candidate.
+Scope-coverage measurements use the candidate arm against the frozen labels.
+The baseline arm is compared only on what its guards actually decide
+(validity, permission), reported separately. The question "do existing guards
+already cover scope drift" is answered by observing that they report no scope
+result, not by translating their output. A baseline reused as-is must not be
+modified to match the candidate.
 
 ### Measurements
 
 All counts, never rates presented as gains, with `n` shown:
 
-- false positives: `in_scope` cases flagged `drift`, per arm;
-- false negatives: `path_drift`, `behaviour_drift`, `stale_binding` cases
-  answered `ok`, per arm;
-- `unknown` handling: share of `unobservable` and `forged_input` cases answered
-  `unknown` rather than `ok`;
-- agreement matrix between arms;
-- every disagreement listed as a counterexample with its case id.
+- scope coverage (candidate arm): `in_scope` cases flagged `drift`;
+  `path_drift` cases answered `ok`; `behaviour_drift` cases answered `ok`;
+- `unknown` handling (candidate arm): share of `unobservable`, `forged_input`
+  and `stale_binding` cases answered `unknown` rather than `ok`, with the
+  cause (stale, unverified, truncated) recorded;
+- baseline guards (validity/permission, own vocabulary): per case, what each
+  guard returned, with `n` shown; no scope claim is derived from it;
+- every case where a guard passed and the candidate reported `drift` or
+  `unknown`, listed with its case id as a counterexample to "guards cover
+  scope".
 
-Cost, latency and reviewer time: UNK, not measured. The candidate arm is pure
-so cost and latency would be near zero by construction, but that is not a
-measurement and is not claimed. Reviewer effort belongs to #974 and #848; no
-human timing here.
+Cost, latency and reviewer time: UNK, not measured. Reviewer effort belongs to
+#974 and #848; no human timing here.
 
 ### Counterexamples and mutations to include
 
 - Operator amendment with re-approval (false-positive example 1).
-- Allowed test additions (example 2).
-- Path list truncated at the 100-path page (false negative 4).
+- Test additions with and without explicit operator/proposal authorization
+  (example 2).
+- Changed-path read in each state: complete, truncated (`hasNextPage` true or
+  `changedFiles` above the nodes read), unreadable (malformed field, count
+  mismatch, rename source unreadable), per false negative 4.
 - Approval digest matches, target head moved (false negative 2).
 - Mutations: flip one byte of `tasks.md` after approval; drop one changed path
   from the observation; replace the observation with an unsealed copy; swap
@@ -362,25 +412,31 @@ human timing here.
 
 ### Falsification and stop rules
 
-- If the baseline already answers every frozen `path_drift` and
-  `stale_binding` case correctly, there is no measured gap: outcome DEFER or
-  REUSE.
-- If the candidate matches the baseline on every case, same.
-- If the candidate flags a false positive on an operator amendment or allowed
-  test, the narrow design is rejected as specified.
-- Behaviour drift cases are expected to defeat both arms. That is the point:
-  it shows what a path check cannot claim.
+- If the candidate adds no scope information on any frozen `path_drift` or
+  `stale_binding` case beyond what the guards' own outputs already state,
+  there is no measured gap: outcome DEFER or REUSE.
+- If the candidate flags an `in_scope` case, such as an operator amendment
+  after re-approval or an explicitly authorized test, the narrow design is
+  rejected as specified.
+- Behaviour drift cases are expected to defeat a path check. That is the
+  point: it shows what a path check cannot claim.
 - A synthetic corpus proves nothing about the production workload. A positive
   result earns only a follow-up on real, authorized data, not a rollout.
 
 ## Invariants
 
-- Drift output is advisory evidence only, never permission.
+- Drift output is advisory evidence. It can inform a human or reviewer
+  decision; it grants no authority and changes no automatic gate.
 - No second authorization gate, identity, decision store or generic canvas
   runtime. Reuse ADR 010 ownership, ADR 014 approvals and ADR 018 evidence.
-- Any scope statement stays outside `PROPOSAL_DIGEST_FILES` unless the owner
-  chooses a contract change deliberately (the #670 Q5 reasoning: approving an
-  explanation must not become approving the change).
+- Normative versus explanatory scope. `tasks.md` is already in
+  `PROPOSAL_DIGEST_FILES` (`proposal_state.py:165`). Scope syntax added inside
+  it changes the approved bytes and digest, so it would be normative approved
+  scope, adopted only by an owner decision on the proposal contract. This
+  report adopts no new contract. A scope or explanation kept outside the
+  approved files is a nonauthoritative explanatory artifact: it can be
+  compared against, but cannot define or widen allowed scope (the #670 Q5
+  reasoning: approving an explanation must not become approving the change).
 - #747 is not activated and is not treated as memory ownership. #989 is not
   duplicated.
 
@@ -403,11 +459,14 @@ Neither was verified in running code.
 
 Proposed: `REUSE_EXISTING_DECISION_CONTEXT`.
 
-Reasoning from source: intent, approval, content freshness, budget, outcome and
-review binding each already have an owner and a mechanism. The one unfilled
-link, intent versus observed change, is already named twice as an unbuilt
-follow-up (ADR 021 F1; #670 post-implementation drift check). The question as
-posed does not justify a new design or runtime.
+Reasoning from the bounded source reads: intent, approval, content freshness,
+budget, outcome and review binding each appear to have an owner and a
+mechanism. A comparison of intent versus observed change was not found, and
+the docs name it twice as a follow-up (ADR 021 F1; #670 post-implementation
+drift check). The proposed design overlaps those and could possibly reuse
+them; their implementation status was not read (UNK). On this evidence the
+question does not by itself justify a new design or runtime. REUSE stays the
+proposal under these limits.
 
 Owner decisions remaining:
 
@@ -422,8 +481,10 @@ Owner decisions remaining:
    worth a read-only look by the lifecycle owner; currently UNK.
 4. Treatment of the article: provide the text if it should inform the work.
 
-Not claimed anywhere: success, cost, latency or reliability gain; that the
-completion record has a consumer; that any guard exists beyond what is cited.
+Not claimed anywhere: success, cost, latency or reliability gain (none
+measured); that the completion record has a consumer; that any guard exists
+beyond what is cited; that the follow-ups are unbuilt (unverified). The
+experiment is NOT_RUN and the article is NOT_OBSERVED.
 
 ## Source index
 
@@ -433,6 +494,12 @@ DOC: `docs/spikes/670-decision-context.md`,
 `docs/adr/014-policy-checkpoint.md`,
 `docs/adr/021-implementation-completion-contract.md`,
 `docs/adr/025-independent-review-receipts.md`.
+
+SRC (added in the correction pass): `orchestrator/run_shepherd.py:1874-1959`
+(`_read_changed_paths`, `_rename_sources`) and `:5355-5380`,
+`tests/test_definition_merge_gate.py:270-400`, `orchestrator/exec_budget.py`
+header and `command_budget` signature only; GREP for `max_budget_usd` in
+`orchestrator/options.py`.
 
 SRC (regions read): `orchestrator/proposal_state.py:150-230`,
 `orchestrator/approval_evidence.py` (whole file),
