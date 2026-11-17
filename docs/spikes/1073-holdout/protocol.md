@@ -1,8 +1,13 @@
 # Independent log-span holdout protocol (Refs #1073)
 
-**Status: PROPOSED / NOT_RUN.**
+**Status: PROPOSED. Execution state: NOT_RUN. Readiness: PREREQUISITE_UNMET.
+Execution authorization: none.**
 This is a documentation-only protocol. No holdout has been authored, locked or
 run. Nothing here is merged, runtime-observed, or a measured benefit.
+`NOT_RUN` means only that no experiment has been executed and no outcome was
+measured; it says nothing about whether prerequisites are met. Readiness and
+authorization are separate facts (section 9, status vocabulary). Currently no
+author is selected, no criteria are recorded and no execution is authorized.
 
 - The operator approved the *direction* (an independent log-span holdout that
   keeps coverage on head/tail positive controls). The operator did **not**
@@ -91,8 +96,13 @@ The spec is frozen as bytes (hash recorded, section 5) before the author starts.
   the pilot or `ci_checks`, and which tools they used. Any access to the
   pilot/selector/outcomes is recorded and graded: **not-exposed**,
   **possibly-exposed** or **exposed**.
-- If exposure is `exposed`, the run is not an independent holdout and is
-  reported as such (it may still run as a non-independent check, labelled so).
+- If exposure is `exposed`, this independent holdout cannot proceed and no
+  independence claim may be made. Any separately labelled non-independent check
+  is outside this protocol and needs its own separate owner permission; this
+  protocol does not permit it.
+- If exposure is `possibly-exposed`, the owner must explicitly accept that
+  exposure grade, in a record outside this file, before any run. There is no
+  implicit or hidden permission to proceed.
 - Because #1073 is public to the repository, "not shown" is a process
   commitment, not a technical guarantee. State that limitation in the report.
 
@@ -107,7 +117,9 @@ record, in one pinned manifest:
 - harness: commit SHA and blob hashes of the scorer/runner;
 - interpreter and dependency versions used by the run;
 - the frozen author input spec hash;
-- the cap value in characters.
+- the cap value in characters;
+- the exact relevant environment configuration read at import by
+  `orchestrator.ci_checks` (section 11).
 
 **Hashes fix bytes, not provenance.** A SHA-256 of a fixture proves the bytes
 did not change; it does not prove who wrote them, that the author was
@@ -219,13 +231,21 @@ Reporting rules for everything else:
 
 ### Status vocabulary
 
-- **PREREQUISITE_UNMET**: any of these is missing: an owner-selected
-  independent author, recorded author access declaration, frozen input spec,
-  locked pins/manifest, owner-recorded criteria, or execution authorization.
-  The run does not happen. This is **never reported as NO_GAIN**: NO_GAIN is a
-  measured outcome and PREREQUISITE_UNMET means nothing was measured.
-- **NOT_RUN**: authorized prerequisites exist but the run has not occurred (the
-  current state of this document is PROPOSED / NOT_RUN).
+Three separate facts; none implies another.
+
+- **Readiness: PREREQUISITE_UNMET / READY.** PREREQUISITE_UNMET: any of these
+  is missing: an owner-selected independent author, recorded author access
+  declaration (with an exposure grade acceptable under section 4), frozen input
+  spec, locked pins/manifest, owner-recorded criteria, an accepted pilot
+  dependency arrangement (section 11), or a satisfied safe-import check. READY
+  means all are present. Currently PREREQUISITE_UNMET. It is **never reported
+  as NO_GAIN**: NO_GAIN is a measured outcome and PREREQUISITE_UNMET means
+  nothing was measured.
+- **Execution authorization: none / granted.** A separate owner act. READY does
+  not grant it. Currently none.
+- **Execution state: NOT_RUN / RUN.** NOT_RUN means no experiment was executed,
+  irrespective of prerequisites; it does not mean prerequisites are approved.
+  Currently NOT_RUN.
 - **NO_GAIN / MIXED / GAIN / REGRESSION**: only after a real run, per the
   pilot's definitions applied to the pre-recorded owner criteria.
 
@@ -251,20 +271,39 @@ review; none is created by this change:
 - a holdout runner/scorer test such as `tests/test_log_span_holdout.py`;
 - a recorded pin manifest and the one result record.
 
-**Dependency on the unmerged pilot.** The pilot's selector, scorer,
-`resolve_oracle`, `compare` and baseline interval recovery live only on the
-unmerged branch at the head above. A holdout runner would depend on that code.
-Rules for such a dependency:
+**Dependency on the pilot.** The pilot's selector, scorer,
+`resolve_oracle`, `compare` and baseline interval recovery live on the branch
+`test/synthetic-log-span-pilot-1073` at the head above. Merge status on GitHub
+was not verified here (only local ref ancestry was considered, and not as proof
+of merge); treat the pilot as not confirmed merged. A holdout runner would
+depend on that code. One consistent prerequisite applies:
 
-- import the pilot symbols from a pinned, reviewed revision; do **not** copy
+- **Required before readiness:** the owner has accepted a reviewed, immutable
+  dependency arrangement: either the pilot is merged, or a separately
+  authorized pinned test environment provides the pilot code at the pinned
+  revision. Merge is not required if the pinned arrangement is accepted instead;
+  neither is created or mandated by this document.
+- no automatic use of the branch, no copying of pilot code, and no new merge
+  gate is introduced by this protocol;
+- import pilot symbols only from that accepted pinned revision; do **not** copy
   the baseline function or the pilot's baseline arithmetic into new files;
 - import `orchestrator.ci_checks._bound_log` and `CI_LOG_MAX_CHARS` from the
   shipped module, so the baseline is the real one;
-- **safe-import check**: before running, verify the module being imported has
-  no import-time side effects (no network, filesystem writes, subprocess,
-  clock/env reads at import) and that the imported object is the pinned one
-  (identity check, as the pilot does for `_bound_log`);
-- if the pilot is never merged, the dependency is unmet and the status is
+- **safe-import check**: before running, inspect the selected/imported code
+  paths (pilot modules and `orchestrator.ci_checks`) for import-time network or
+  credential access, filesystem writes, and subprocess execution. Import-time
+  environment reads are not forbidden outright: `orchestrator.ci_checks` reads
+  bounded configuration from the environment at module level
+  (`SHEPHERD_CI_LOG_TIMEOUT_SECONDS`, `SHEPHERD_CI_LOG_BUDGET_SECONDS`,
+  `SHEPHERD_CI_LOG_FETCH`, via `_positive_seconds` / `_env_flag`), so zero env
+  reads cannot be required while importing the real baseline. Record these
+  exact variables and their values in the manifest (section 5); an environment
+  that sets other relevant configuration unsupported by this list is recorded as
+  unknown and counts as prerequisite not met. The module is not to be changed.
+  Python object identity (`imported is pinned`) verifies that an import alias
+  resolves to the expected object; it is not Git SHA provenance. File-hash and
+  revision pins are separate checks, and hashes are not proof of authorship;
+- if no accepted dependency arrangement exists, the readiness is
   PREREQUISITE_UNMET, not a reason to reimplement a copy;
 - the pilot's oracle resolver would need a repeated-line-safe replacement
   (section 6); that is a proposal and is not designed here.
@@ -288,12 +327,15 @@ the primary run, needs a new fresh holdout (section 10).
 
 ## 13. Remaining owner decisions
 
-1. Select the independent author and the exposure grading accepted.
+1. Select the independent author and the exposure grading accepted
+   (`possibly-exposed` needs explicit acceptance; `exposed` cannot proceed as
+   independent, and any non-independent check needs separate permission).
 2. Choose the oracle identification design (line number vs occurrence index).
 3. Set minimum cases per category.
 4. Set the threshold for a favorable overall conclusion, before the test.
 5. Confirm the cap and baseline revision to pin.
-6. Decide how the unmerged pilot dependency is satisfied (merge, pin, or other).
+6. Accept a reviewed, immutable pilot dependency arrangement (merge, or a
+   separately authorized pinned test environment), per section 11.
 7. **Separately authorize** future execution. This document does not.
 
 ## 14. Evidence statement
