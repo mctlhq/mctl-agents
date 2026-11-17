@@ -11,8 +11,19 @@ information. One record per review of one unit.
 
 Legend. Req: R = required, O = optional. Who: C = coordinator, V = reviewer,
 S = scorer, P = artifact producer run. A value never captured is written
-`unobserved`. A value that could not be determined is `unknown`. Neither is
-ever `0` or `pass`.
+`unobserved`. A value that could not be determined is `unknown`. A field that
+is structurally irrelevant to this record (for example artifact digest in the
+baseline arm) is `not_applicable`. These three are distinct from each other and
+from `0`. None is ever `0` or `pass`.
+
+This master template stays blank. Only a later, authorized copy is filled.
+Pseudonyms and reference codes are allowed. Direct identities and private
+content are prohibited. Prefer brief category codes for risks.
+
+Validity rule (artifact arm): an invalid, stale or unknown-freshness artifact
+is not used to approve. Record regeneration from pinned inputs or fallback to
+the full-proposal baseline, the arm actually used, and any deviation. Fallback
+human time is counted once; machine latency is separate.
 
 The instrument does not capture section reads or times automatically. Each
 time and read field below is filled by a person, and "Capture method" says
@@ -89,10 +100,12 @@ Risks noticed is not full ground truth.
 |---|---|---|---|
 | link to oracle assessment (access-separated, not stored here) | R for synthetic | S | |
 | scorer pseudonym | R for synthetic | S | |
-| scorer blind to arm (yes / no) | R for synthetic | S | |
+| scoring packet held arm-free (coordinator-built; no arm, timing, artifact metadata) (yes / no) | R for synthetic | C | |
+| scorer blind to arm (yes / no / partial; residual inference disclosed) | R for synthetic | S | |
 | oracle classes excluded from scoring (report, not pass) | R for synthetic | S | |
 
-Do not write defect counts or match results in this file. They stay in the
+The scorer receives only the coordinator's scoring packet, never this full
+form. Do not write defect counts or match results in this file. They stay in the
 access-separated assessment.
 
 ## G. Missingness and provenance
@@ -101,6 +114,8 @@ access-separated assessment.
 |---|---|---|---|
 | fields `unobserved` (list) | R | C | |
 | fields `unknown` (list) | R | C | |
+| fields `not_applicable` (list) | R | C | |
+| arm actually used, regeneration or fallback, failures | R | C | |
 | artifact provenance (producer, inputs, pinned only, no implementation visible) | R for artifact arm | P | |
 | deviations from protocol | R | C | |
 | authorization reference for this run (execution authorization ID) | R | C | |

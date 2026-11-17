@@ -104,7 +104,23 @@ synthetic cases exist:
   excluded, not scored as pass. The class taxonomy from
   `docs/spikes/918-finding-oracle-classes.md` may be reused.
 - Realistic limit: a small team may not have enough separate people. State the
-  collapsed roles in the record rather than hiding it.
+  collapsed roles in the record rather than hiding it. Different Claude
+  sessions alone are not proof of independence.
+
+**Blind scoring method (synthetic cases).** The scorer never receives the full
+review form, because it contains arm, artifact, timing and pointer fields.
+
+- The coordinator holds the full record and the pseudonymous join.
+- The coordinator builds a separate scoring packet per review. It contains only
+  the anonymized proposal-level responses (decision and risks noticed) and the
+  oracle criterion references the scorer needs. It contains no arm, no machine
+  time, no artifact metadata and no pointer list.
+- The oracle author and the scorer are different role holders, with separated
+  access to the oracle and the join.
+- Residual inference: if the responses themselves reveal the arm (for example
+  by naming artifact pointers), blindness is partial. Record that disclosure.
+- No new storage or permission contract is adopted here. The owner chooses
+  authorized locations later (section 9).
 
 ## 5. Synthetic controls and containment
 
@@ -119,7 +135,21 @@ Containment:
 
 - They exist only as synthetic, non-sending material: not posted to GitHub,
   not sent to mctl-api, not placed in any live approval, grant, queue or
-  gitops tree.
+  gitops tree. Harmful controls use only synthetic, non-sending context. No
+  live grant is changed.
+
+Pre-review artifact validity and freshness behavior (artifact arm):
+
+- If, before review, the artifact is invalid, stale or of unknown freshness,
+  the reviewer must not use it to approve. The coordinator records either a
+  regeneration from the pinned inputs or a fallback to the full-proposal
+  baseline.
+- Human fallback time is counted once, inside reviewer effort. Machine latency
+  of any regeneration is recorded separately and never added to reviewer time.
+- Record the arm actually used, any deviation from the assigned arm, and any
+  failures. Unknown freshness is recorded as `unknown`, never reinterpreted as
+  fresh or present.
+- This is a recording rule for a proposed protocol. No study was executed.
 - **No seeded defects and no deliberately harmful artifact in a live
   approval.** Real approvals (phase 2) use real, unmodified material only.
 - A synthetic unit must be visibly marked synthetic to the study staff so it
@@ -131,7 +161,9 @@ Containment:
   requirements and review rules are unchanged.
 - **The artifact is never permission.** It does not skip, satisfy or waive any
   gate. A reviewer who relies on the artifact and skips reading is a measured
-  outcome, not an allowed policy.
+  outcome, not an allowed policy. This adds no new reading mandate and no new
+  authority: the full proposal stays available and the existing mandatory
+  reviews are unchanged. Observed behavior is not authority.
 - Ownership, policy, approval and merge stay separate (ADR 010).
 - "Context first, full proposal optional" is only a presentation order in the
   experiment.
@@ -179,8 +211,9 @@ Containment:
 - Real reviews use different units, so a with/without comparison across them
   is confounded by unit difficulty.
 - Learning effects: a reviewer who has seen one arm is not naive for the next.
-  Record the review index. Counterbalancing is not possible with 2 or 3 real
-  cases.
+  Record the review index. With 2 or 3 real cases, order control is
+  insufficient or incomplete and confounding is strong. Results are
+  descriptive only, with no causal savings inference.
 - The reviewer may be the owner who knows the system. This does not
   generalize.
 - Counts are tiny. Results are descriptive only (individual records). No
@@ -197,9 +230,13 @@ No new storage contract is created. If a study is later authorized:
 - Records use pseudonymous reviewer IDs. The ID-to-person mapping is held by
   the study coordinator in an access-controlled place the owner chooses, apart
   from the records and apart from the oracle.
-- Records hold no credentials, tokens, user identities, real proposal text or
-  private information. Real-case records reference a proposal by digest and
-  pinned SHA only.
+- Records hold no credentials, tokens, direct identities, real proposal text
+  or private content. Pseudonyms and reference codes are allowed as designed.
+  Brief category codes are preferable to free-text risk descriptions.
+  Real-case records reference a proposal by digest and pinned SHA only.
+- The master template stays blank. Only a later, authorized record copy is
+  filled. Time and read capture stays honest: no hidden automatic
+  instrumentation, and who recorded each value is stated.
 - The frozen oracle and the access-separated link are readable by the scorer
   and coordinator only, until scoring ends.
 - Where the records are stored, who can read them and how long they are kept
