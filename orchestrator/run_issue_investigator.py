@@ -1392,15 +1392,16 @@ def post_proposal_comment(
     so it agrees with the derived id, and is preferred as the loop's own word."""
     # Render the CONCRETE workflow id (single source: issue_ref.workflow_id_for,
     # a temporalio-free module — this function runs inside the agent container)
-    # so the approve commands below are copy-pasteable — placeholder text
-    # sent operators chasing an invalid id (codex P2 on PR #212).
+    # so the routes below are copy-pasteable — placeholder text sent
+    # operators chasing an invalid id (codex P2 on PR #212).
     #
-    # The REST route referenced below lives in the SIBLING repo, not here:
-    # mctl-api internal/api/router.go registers
-    # `POST /api/v1/agents/dev-loop/{workflow_id}/approve` →
-    # handlers_dev_loop.go ApproveDevLoopWorkflow → TemporalClient.SignalApprove
-    # (shipped with the phase-4 dev-loop endpoints), so no grep of THIS repo
-    # can find it.
+    # The REST routes referenced below live in the SIBLING repo, not here
+    # (mctl-api internal/api/router.go), so no grep of THIS repo can find
+    # them. Owner decision 2026-11-18: a pending DevLoop grant is decided
+    # only on mctl-api's decide page (fresh ZITADEL sign-in, second factor);
+    # mctl-api#1127 makes the POST approve route refuse it with 403
+    # `decide_page_required`, so the comment hands out the GET approval
+    # route that returns `decide_url` instead of an approve command.
     from orchestrator.temporal.issue_ref import loop_workflow_id
 
     workflow_id = loop_workflow_id(issue_url, temporal_workflow_id)
@@ -1408,34 +1409,30 @@ def post_proposal_comment(
         "mctl-agents issue-investigator has analyzed this issue and created "
         "a proposal:\n\n"
         f"{_gitops_tree_url(service, slug)}\n\n"
-        "Status: `proposed` — pending human approval. Review `requirements.md`, "
-        "`design.md` and `tasks.md`, then approve: signal this issue's "
-        f"DevLoopWorkflow (mctl-api `POST /api/v1/agents/dev-loop/{workflow_id}/approve`, "
-        f"or `python -m orchestrator.temporal.cli approve {workflow_id} "
-        "--approver <your-identity>`) — the "
-        "workflow flips `.status.yaml` to `accepted` via the "
-        "`mctl-agents-approve` operation and runs the Tier 2 implementer. "
-        "If no DevLoopWorkflow is running for this issue (pre-Temporal "
-        "proposal), run the `mctl-agents-approve` operation directly with "
-        f"`service={service} slug={slug}` and "
-        "`expected_content_digest=<digest>`, the digest of the content you "
-        "reviewed: in an mctl-gitops checkout, "
-        "`python3 scripts/proposal-content-digest.py --rev <reviewed-commit> "
-        f"platform-gitops/agents-state/{service}/proposals/{slug}`. Without it "
-        "the approve is refused (`approval_content_unbound`), and it is "
-        "refused at the flip if the proposal changed after the commit you "
-        "reviewed. See mctl-gitops "
-        "`docs/runbooks/proposal-approval-content-digest.md`.\n\n"
-        "The approver is recorded in `.status.yaml` and in the gitops commit, "
-        "and the implementer refuses a proposal whose "
-        "`control.requires_human_approval` carries no named approver — so "
-        "prefer the mctl-api endpoint, which takes the approver from the "
-        "authenticated caller rather than from what the caller types.\n\n"
+        "Status: `proposed` — pending the owner's decision. Review "
+        "`requirements.md`, `design.md` and `tasks.md`. The owner approves "
+        "on the DevLoop decide page, which asks for a fresh sign-in with a "
+        "second factor. Its link is the `decide_url` field of "
+        f"`GET /api/v1/agents/dev-loop/{workflow_id}/approval` (MCP: "
+        f"`mctl_get_dev_loop_approval` for `{workflow_id}`), present while "
+        "the grant is pending. Hand that link to the owner on its own line; "
+        "if a terminal wraps it, copy the whole link. The decision flips "
+        "`.status.yaml` to `accepted` and runs the Tier 2 implementer, "
+        "with the approver taken from that sign-in.\n\n"
+        "Do not approve by calling the API. From mctl-api 4.170.0, "
+        f"`POST /api/v1/agents/dev-loop/{workflow_id}/approve` "
+        "(`mctl_approve_dev_loop`) and a direct `mctl-agents-approve` "
+        "operation (`mctl_trigger_approve`) refuse a pending grant with 403 "
+        "`decide_page_required`, returning the same `decide_url`. "
+        "If no DevLoopWorkflow is running for this issue, restart it "
+        "(mctl-agents `docs/runbooks/dev-loop-restart-after-abandon.md`); "
+        "the new run parks at a fresh decision with its own decide page.\n\n"
         "To approve with amendments, edit `requirements.md`, `design.md` or "
         "`tasks.md` on mctl-gitops main through a PR first. The edit "
         "supersedes the pending grant, and the loop asks for a decision on "
-        "the new one: approve that, and the implementer works from the "
-        "amended files. The approve `reason` is recorded for audit only and "
+        "the new one on a new decide page: approve that, and the implementer "
+        "works from the amended files. The decision's `reason` is recorded "
+        "for audit only and "
         "never reaches the implementer, and `@MCTL reinvestigate` carries no "
         "text, so neither can carry amendments."
     )

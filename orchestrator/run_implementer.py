@@ -3704,11 +3704,12 @@ def _approval_blocked_message(ref: ProposalRef) -> tuple[str, str]:
                 remedy = (
                     f"{no_op_and_recovery} A DevLoopWorkflow {workflow_id} may "
                     f"exist for this issue; only if that execution is still "
-                    f"running would signalling POST "
-                    f"/api/v1/agents/dev-loop/{workflow_id}/approve do "
-                    f"anything, and that signal is what is most likely to "
-                    f"have produced this exact blocked state, so treat it as "
-                    f"a secondary check, not the fix."
+                    f"running and parked at a pending grant would a decision "
+                    f"on its decide page (the decide_url from GET "
+                    f"/api/v1/agents/dev-loop/{workflow_id}/approval) do "
+                    f"anything, and an approve signal is what is most likely "
+                    f"to have produced this exact blocked state, so treat it "
+                    f"as a secondary check, not the fix."
                 )
                 return message, remedy
 
@@ -4482,7 +4483,8 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
 
 
 _GRANT_REMEDY = (
-    "Approve the proposal through its DevLoop (mctl-api POST /api/v1/agents/dev-loop/<workflow>/approve), "
+    "Have the owner approve the proposal on its DevLoop decide page (the decide_url returned by "
+    "mctl-api GET /api/v1/agents/dev-loop/<workflow>/approval while the grant is pending), "
     "which records a human decision bound to this proposal's current content."
 )
 

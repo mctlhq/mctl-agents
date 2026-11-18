@@ -1358,10 +1358,10 @@ async def test_offline_end_to_end_request_to_a_snapshot_sealed_for_the_dispatche
     # ...correlated to the loop that really ran it (#461 gap 2, #451).
     sealed = api.document(we)["execution"]
     assert sealed["temporal_workflow_id"] == loop_id and sealed["temporal_run_id"] == run_id
-    # The approve instructions name that same loop.
+    # The approval instructions name that same loop.
     assert len(comments) == 1
-    assert f"/dev-loop/{loop_id}/approve" in comments[0]["body"]
-    assert f"cli approve {loop_id} " in comments[0]["body"]
+    assert f"/dev-loop/{loop_id}/approval" in comments[0]["body"]
+    assert f"`mctl_get_dev_loop_approval` for `{loop_id}`" in comments[0]["body"]
     # The loop carries the same identity.
     assert state.work_item_id == WID and state.execution_id == we and state.execution_sequence == 1
     audit = _audit(capsys.readouterr().out)

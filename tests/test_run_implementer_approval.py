@@ -239,7 +239,10 @@ def test_blocked_remedy_names_the_devloop_workflow_for_a_github_issue(
 
     assert "requires_human_approval" in message
     assert "dev-loop-mctlhq-mctl-design-21" in remedy
-    assert "/approve" in remedy
+    # The live-loop route is the decide page (mctl-api#1127), reached via
+    # the GET approval route that returns its `decide_url`.
+    assert "dev-loop/dev-loop-mctlhq-mctl-design-21/approval" in remedy
+    assert "decide_url" in remedy
     assert "if that execution is still running" in remedy
     assert "no-op" in remedy
     assert "proposed" in remedy
@@ -297,21 +300,19 @@ def test_update_status_file_still_permits_the_incident_responder_shape(
     assert load_status(path)["status"] == "accepted"
 
 
-# --- the approve command the investigator posts to real issues -------------
+# --- the approval route the investigator posts to real issues --------------
 
-def test_the_posted_approve_command_is_valid(monkeypatch) -> None:
-    """The comment tells a human exactly what to run, on a real GitHub issue.
+def test_the_posted_comment_hands_out_the_decide_page_not_an_approve_command(monkeypatch) -> None:
+    """The comment on a real GitHub issue says how the proposal gets decided.
 
-    Requiring --approver on the CLI silently invalidated that copy-pasteable
-    command (claude P2). Asserting the text against the CLI's own parser keeps
-    the two from drifting again, rather than fixing the one line and leaving
-    the next change to break it.
+    Owner decision 2026-11-18 (mctl-api#1127): a pending DevLoop grant is
+    decided only on mctl-api's decide page (fresh sign-in with a second
+    factor). The comment therefore names the GET route whose `decide_url`
+    links to that page, and no longer offers a copy-pasteable approve
+    command: the CLI `approve` signals Temporal with an asserted approver,
+    which is exactly the bypass the decide page exists to close.
     """
-    import re
-    import shlex
-
     from orchestrator import run_issue_investigator
-    from orchestrator.temporal import cli as temporal_cli
 
     posted: dict[str, str] = {}
 
@@ -323,15 +324,13 @@ def test_the_posted_approve_command_is_valid(monkeypatch) -> None:
     run_issue_investigator.post_proposal_comment(
         "https://github.com/mctlhq/mctl-web/issues/1", "mctl-web", "issue-1-x")
 
-    m = re.search(r"`python -m orchestrator\.temporal\.cli (approve [^`]+)`",
-                  posted["body"])
-    assert m, f"no approve command found in the posted comment:\n{posted['body']}"
-
-    argv = shlex.split(m.group(1).replace("<your-identity>", "someone"))
-    parser = temporal_cli.build_parser()
-    args = parser.parse_args(argv)          # raises SystemExit if it drifted
-    assert args.command == "approve"
-    assert args.approver == "someone"
+    body = posted["body"]
+    assert "GET /api/v1/agents/dev-loop/dev-loop-mctlhq-mctl-web-1/approval" in body
+    assert "`decide_url`" in body
+    assert "`mctl_get_dev_loop_approval`" in body
+    assert "decide_page_required" in body
+    assert "orchestrator.temporal.cli approve" not in body
+    assert "--approver" not in body
 
 
 def test_cli_parses_the_abandon_command() -> None:

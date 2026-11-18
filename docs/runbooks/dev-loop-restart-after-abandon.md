@@ -55,8 +55,16 @@ It runs investigate again on the same issue:
 
 - The new run gets its own `we_` execution (per-run engine ref) and, because the previous
   one ended, the next `wi_`. Nothing of the abandoned run is reused.
-- It parks at approval like any first run. A human approves it
-  (`mctl_approve_dev_loop` or `POST /api/v1/agents/dev-loop/{workflow_id}/approve`).
+- It parks at approval like any first run. The owner approves it on the DevLoop decide
+  page, which asks for a fresh sign-in with a second factor. Get the link from
+  `mctl_get_dev_loop_approval` (or `GET /api/v1/agents/dev-loop/{workflow_id}/approval`):
+  its `decide_url` is set while the grant is pending. Hand the link over on its own line;
+  if a terminal wraps it, copy the whole link.
+- Do not approve through the API. From mctl-api 4.170.0,
+  `POST /api/v1/agents/dev-loop/{workflow_id}/approve` (`mctl_approve_dev_loop`) and a
+  direct `mctl_trigger_approve` refuse a pending grant with 403 `decide_page_required`
+  and return the same `decide_url`. Re-sending a grant that was already approved
+  (`approval_ref`) still works, as recovery when the signal was lost.
 
 ## Pending restarts (from the #636 cutover)
 

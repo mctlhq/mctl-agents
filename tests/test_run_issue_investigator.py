@@ -786,15 +786,12 @@ def test_post_proposal_comment_renders_concrete_workflow_id(monkeypatch):
     assert "dev-loop-mctlhq-mctl-telegram-123" in body
     assert "{workflow_id}" not in body
     assert "<workflow-id>" not in body
-    assert "service=mctl-telegram slug=issue-123-fix-foo" in body
-    # A direct approve must carry the digest of the reviewed content, or the
-    # approve CWFT and mctl-api refuse it (mctl-gitops#1979, mctl-api#722);
-    # the instructions name the parameter and the exact command for it.
-    assert "expected_content_digest=<digest>" in body
-    assert (
-        "scripts/proposal-content-digest.py --rev <reviewed-commit> "
-        "platform-gitops/agents-state/mctl-telegram/proposals/issue-123-fix-foo"
-    ) in body
+    assert "GET /api/v1/agents/dev-loop/dev-loop-mctlhq-mctl-telegram-123/approval" in body
+    # A pending grant is decided on the decide page only (mctl-api#1127):
+    # the comment no longer tells anyone to run a direct approve with a
+    # content digest, because from mctl-api 4.170.0 that route refuses a
+    # pending grant with `decide_page_required`.
+    assert "expected_content_digest" not in body
 
 
 def test_neutralize_prompt_tags_strips_forged_delimiters():
