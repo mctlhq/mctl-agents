@@ -34,8 +34,8 @@ MENTION_TOKENS = ("@mctl-agents[bot]", "@mctl-agents", "@mctl")
 
 # Closed vocabulary. Every other imperative-looking word (`approve`,
 # `implement`, `cancel`, `retry`, ...) is deliberately NOT here: each has its
-# own authorization story elsewhere (`mctl_approve_dev_loop`,
-# `mctl_trigger_implementer`), and leaving them out of this set is what
+# own authorization story elsewhere (a DevLoop grant is decided only by the
+# owner on mctl-api's decide page; `mctl_trigger_implementer`), and leaving them out of this set is what
 # keeps them refused (`verb=None`, an `unrecognised` reply) instead of
 # silently half-supported.
 VERBS = frozenset({"investigate", "reinvestigate"})

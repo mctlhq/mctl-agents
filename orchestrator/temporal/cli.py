@@ -248,14 +248,18 @@ def build_parser() -> argparse.ArgumentParser:
     # here would only produce proposals it declines to act on.
     #
     # This is an operator escape hatch against the Temporal frontend, so the
-    # value is asserted rather than verified. The endpoint that takes the
-    # approver from the authenticated caller is the trustworthy path:
-    # POST /api/v1/agents/dev-loop/{workflow_id}/approve.
+    # value is asserted rather than verified. The trustworthy path is the
+    # owner's decision on mctl-api's DevLoop decide page (fresh sign-in with
+    # a second factor; link = `decide_url` from
+    # GET /api/v1/agents/dev-loop/{workflow_id}/approval). From mctl-api
+    # 4.170.0 the POST .../approve route refuses a pending grant with 403
+    # `decide_page_required` (mctl-api#1127).
     p_approve.add_argument(
         "--approver",
         required=True,
-        help="Identity to record as the approver (not verified here; prefer "
-             "the mctl-api approve endpoint, which takes it from the caller)",
+        help="Identity to record as the approver (not verified here; the "
+             "owner decides on the mctl-api DevLoop decide page instead, "
+             "which takes it from a fresh MFA sign-in)",
     )
 
     p_abandon = sub.add_parser(

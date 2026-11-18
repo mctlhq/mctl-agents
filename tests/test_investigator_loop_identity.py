@@ -124,14 +124,14 @@ def _comment_body(monkeypatch, **kwargs) -> str:
 
 def test_the_approve_instructions_name_the_passed_loop(monkeypatch):
     body = _comment_body(monkeypatch, temporal_workflow_id=LOOP)
-    assert f"POST /api/v1/agents/dev-loop/{LOOP}/approve" in body
-    assert f"cli approve {LOOP} --approver" in body
+    assert f"GET /api/v1/agents/dev-loop/{LOOP}/approval" in body
+    assert f"`mctl_get_dev_loop_approval` for `{LOOP}`" in body
     assert ISSUE_KEYED not in body
 
 
 def test_the_approve_instructions_still_derive_without_a_passed_loop(monkeypatch):
     body = _comment_body(monkeypatch)
-    assert f"POST /api/v1/agents/dev-loop/{ISSUE_KEYED}/approve" in body
+    assert f"GET /api/v1/agents/dev-loop/{ISSUE_KEYED}/approval" in body
 
 
 def _correlation(**kwargs):
