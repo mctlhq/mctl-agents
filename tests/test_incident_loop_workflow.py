@@ -135,64 +135,40 @@ class TestIncidentLoopWorkflow:
         assert result.responder_result.phase == "Failed"
         assert result.responder_result.succeeded is False
 
-    async def test_the_responder_image_is_pinned_from_the_registry(self, env):
-        """The scheduled loop must pin like every other agent run.
+    async def test_the_responder_image_is_not_pinned(self, env):
+        """The image comes only from gitops (mctlhq/mctl-gitops#1980).
 
-        Without this it took whatever image cwft-mctl-agents-run had baked
-        in, so a promotion or rollback reached every agent EXCEPT the one
-        that runs unattended and writes auto-accepted proposals — the one
-        whose version nobody is watching (#149).
+        The responder is the template holding MCTL_TOKEN, and every release
+        before its session was built without Bash still has a shell. A pin
+        from the registry, a promotion or a rollback could bring one back
+        next to the token, so the loop neither asks the registry nor sends
+        agent_image or agent_version. This replaces the registry pin of #149
+        for this agent only.
         """
         fake_submit, seen = _capturing_submit()
         fake_resolve, resolved = _capturing_resolve(PINNED)
-        fake_record, _ = _capturing_record()
-
-        await _run(env, fake_submit, fake_resolve, fake_record)
-
-        assert resolved == [("incident-responder", "production")]
-        assert seen[0].params["agent_image"] == "ghcr.io/mctlhq/mctl-agents:1.35.0"
-        assert seen[0].params["agent_version"] == "incident-responder@1.35.0"
-
-    async def test_an_unpinned_responder_still_runs(self, env):
-        """Deliberately NOT the dev loop's fail-closed gate.
-
-        A scheduled tick has no operator waiting to read the error and
-        republish, so failing here would silently stop incident response
-        until someone noticed the schedule going red. The run proceeds on
-        the CWFT default and the missing pin stays visible as an empty
-        version on the execution record.
-        """
-        fake_submit, seen = _capturing_submit()
-        fake_resolve, _ = _capturing_resolve(None)
         fake_record, recorded = _capturing_record()
 
         result = await _run(env, fake_submit, fake_resolve, fake_record)
 
         assert result.responder_result.succeeded is True
-        assert "agent_image" not in seen[0].params
+        assert resolved == []
+        assert set(seen[0].params) == {"mode"}
+        # The execution record says nothing about a version it did not choose.
         assert recorded[0].version == ""
         assert recorded[0].image_ref == ""
 
-    async def test_a_registry_outage_does_not_skip_the_tick(self, env):
-        """The registry being DOWN must fail open, like it being empty.
-
-        Without the guard the resolve activity's ActivityError propagates
-        out of the workflow and the tick ends before submit_and_wait ever
-        runs — an mctl-api blip silently costing an hour of incident
-        response, which is the exact trade the unpinned branch above was
-        written to avoid (codex P2 + agy P2 on #254).
-        """
+    async def test_a_registry_outage_cannot_stop_the_tick(self, env):
+        """The registry is not asked at all, so it being down changes nothing."""
         fake_submit, seen = _capturing_submit()
         fake_resolve, attempts = _failing_resolve()
-        fake_record, recorded = _capturing_record()
+        fake_record, _ = _capturing_record()
 
         result = await _run(env, fake_submit, fake_resolve, fake_record)
 
-        assert len(attempts) > 1, "the lookup should be retried before giving up"
+        assert attempts == []
         assert result.responder_result.succeeded is True
-        assert "agent_image" not in seen[0].params
-        # The tick still leaves a trace, with the missing pin visible on it.
-        assert [r.version for r in recorded] == [""]
+        assert set(seen[0].params) == {"mode"}
 
     async def test_the_run_is_traceable_to_its_argo_workflow(self, env):
         """#149's acceptance criterion: Temporal workflow ID -> Argo name.
@@ -212,7 +188,6 @@ class TestIncidentLoopWorkflow:
         assert recorded[0].argo_workflow_name == "mctl-agents-incidents-fake"
         assert recorded[0].phase == "Succeeded"
         assert recorded[0].temporal_workflow_id.startswith("incident-loop-test-")
-        assert recorded[0].version == "1.35.0"
 
     async def test_a_failed_run_is_recorded_too(self, env):
         """A tick that failed is exactly the one worth being able to trace."""
