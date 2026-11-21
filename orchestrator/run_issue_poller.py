@@ -106,6 +106,12 @@ _REF_RE = re.compile(
     r"|(?<![\w/])#(?P<n>\d+)"
 )
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+# A declaration that opens its line (optionally behind a list marker, heading
+# hashes or bold markers) is a real declaration; the same phrase mid-sentence
+# ("the pod is blocked by NetworkPolicy") is prose unless it names a ref.
+_ANCHORED_PREFIX_RE = re.compile(r"^\s*(?:[-*+>]\s*|#{1,6}\s+)*(?:\*\*|__)?\s*$")
+_NEGATED_PREFIX_RE = re.compile(r"\b(?:not|no\s+longer|never)\s+$", re.IGNORECASE)
+_HEADING_LINE_RE = re.compile(r"^\s{0,3}#{1,6}\s")
 
 
 @dataclass
@@ -154,6 +160,17 @@ def search_labeled_issues(label: str) -> list[IssueRef]:
     return refs
 
 
+def _add_ref(refs: list[tuple[str, str, int]], m: re.Match, owner: str, repo: str) -> None:
+    if m.group("un"):
+        ref = (m.group("uo"), m.group("ur"), int(m.group("un")))
+    elif m.group("sn"):
+        ref = (m.group("so"), m.group("sr"), int(m.group("sn")))
+    else:
+        ref = (owner, repo, int(m.group("n")))
+    if ref not in refs:
+        refs.append(ref)
+
+
 def parse_dependencies(body: str, owner: str, repo: str) -> tuple[list[tuple[str, str, int]], list[str]]:
     """Dependencies declared in an issue body (#290).
 
@@ -173,18 +190,29 @@ def parse_dependencies(body: str, owner: str, repo: str) -> tuple[list[tuple[str
     refs: list[tuple[str, str, int]] = []
     unparseable: list[str] = []
     for decl in _DECLARATION_RE.finditer(body):
+        line_start = body.rfind("\n", 0, decl.start()) + 1
+        prefix = body[line_start:decl.start()]
+        if _NEGATED_PREFIX_RE.search(prefix):
+            continue  # "Not blocked by #3 anymore" declares nothing
+        anchored = bool(_ANCHORED_PREFIX_RE.match(prefix))
         found = False
         for m in _REF_RE.finditer(decl.group("rest")):
             found = True
-            if m.group("un"):
-                ref = (m.group("uo"), m.group("ur"), int(m.group("un")))
-            elif m.group("sn"):
-                ref = (m.group("so"), m.group("sr"), int(m.group("sn")))
-            else:
-                ref = (owner, repo, int(m.group("n")))
-            if ref not in refs:
-                refs.append(ref)
-        if not found:
+            _add_ref(refs, m, owner, repo)
+        if not found and anchored:
+            # "Blocked by:" / "## Depends on" followed by a list or a
+            # paragraph: scan after the declaration line, skipping blank
+            # lines, up to the next blank line or heading.
+            tail = body[decl.end():].split("\n")[1:]
+            while tail and not tail[0].strip():
+                tail.pop(0)
+            for line in tail:
+                if not line.strip() or _HEADING_LINE_RE.match(line):
+                    break
+                for m in _REF_RE.finditer(line):
+                    found = True
+                    _add_ref(refs, m, owner, repo)
+        if not found and anchored:
             unparseable.append(decl.group(0).strip())
     return refs, unparseable
 

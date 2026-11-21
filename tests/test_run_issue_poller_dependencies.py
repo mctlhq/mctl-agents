@@ -111,3 +111,35 @@ def test_poll_skips_blocked_keeps_label_and_frees_cap(monkeypatch, capsys) -> No
     assert started == [free.url] and removed == [free.url]
     assert result.failures == 0
     assert "BLOCKED:" in capsys.readouterr().out
+
+
+import pytest
+
+
+@pytest.mark.parametrize("body", [
+    "Blocked by:\n- #12\n- #13",
+    "## Depends on\n- #12\n- #13\n\n## Other\n#99",
+    "Depends on:\n\n#12 and #13\n",
+    "**Blocked by**\n* mctlhq/mctl-telegram#12\n* #13",
+])
+def test_multiline_declaration_forms_yield_refs(body) -> None:
+    refs, bad = parse_dependencies(body, "mctlhq", "mctl-telegram")
+    assert bad == []
+    assert ("mctlhq", "mctl-telegram", 12) in refs and ("mctlhq", "mctl-telegram", 13) in refs
+    assert ("mctlhq", "mctl-telegram", 99) not in refs
+
+
+def test_multiline_closed_deps_release_the_issue(monkeypatch) -> None:
+    _gh(monkeypatch, body="Blocked by:\n- #12\n- #13",
+        states={"mctlhq/mctl-telegram#12": "closed", "mctlhq/mctl-telegram#13": "closed"})
+    assert dependency_block_reason(_ref()) is None
+
+
+def test_prose_phrases_do_not_block_or_misparse() -> None:
+    body = "The pod is blocked by NetworkPolicy.\nNot blocked by #3 anymore.\nbut depends on nothing"
+    assert parse_dependencies(body, "mctlhq", "x") == ([], [])
+
+
+def test_heading_with_nothing_beneath_is_unparseable() -> None:
+    refs, bad = parse_dependencies("## Depends on\n\n## Notes\n#5", "mctlhq", "x")
+    assert refs == [] and len(bad) == 1
