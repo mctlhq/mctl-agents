@@ -23,7 +23,7 @@
     "operation": "push:new-branch",
     "profile_version": "profile-v0",
     "resource_kind": "git-branch",
-    "target": "main",
+    "target": "mctlhq/mctl-agents:main",
     "tool_description": ""
   },
   "scenario": "A"

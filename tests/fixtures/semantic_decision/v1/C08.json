@@ -30,7 +30,7 @@
     "operation": "push:new-branch",
     "profile_version": "profile-v0",
     "resource_kind": "git-branch",
-    "target": "feat/agents-synthetic-2",
+    "target": "mctlhq/mctl-agents:feat/agents-synthetic-2",
     "tool_description": ""
   },
   "scenario": "C"
