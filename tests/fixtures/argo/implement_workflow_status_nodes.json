@@ -1,0 +1,47 @@
+{
+  "_comment": "Argo Workflow status.nodes in the shape the Argo server API returns for the implement CWFT (hand-reduced to the fields the taxonomy reads plus the neighbours Argo always emits; not a verbatim cluster capture). Keys are node ids. exitCode is a STRING in real Argo output.",
+  "scenarios": {
+    "ran_on_node_failed_workflow": {
+      "expect_ran": true,
+      "expect_phase": "Succeeded",
+      "expect_reason": null,
+      "nodes": {
+        "wf-1": {"id": "wf-1", "name": "wf-1", "displayName": "wf-1", "type": "Steps", "phase": "Failed", "children": ["wf-1-a"]},
+        "wf-1-a": {"id": "wf-1-a", "name": "wf-1[0].implement", "displayName": "implement", "type": "Pod", "templateName": "run-implementer", "templateScope": "local/wf-1", "phase": "Succeeded", "startedAt": "2026-11-20T10:00:00Z", "finishedAt": "2026-11-20T10:30:00Z", "hostNodeName": "k3s-worker-1", "outputs": {"exitCode": "0"}},
+        "wf-1-b": {"id": "wf-1-b", "name": "wf-1[1].commit", "displayName": "commit", "type": "Pod", "templateName": "commit-and-push", "phase": "Failed", "startedAt": "2026-11-20T10:30:01Z", "hostNodeName": "k3s-worker-1", "outputs": {"exitCode": "1"}}
+      }
+    },
+    "ran_but_graph_has_no_hostnodename": {
+      "expect_ran": true,
+      "expect_phase": "Failed",
+      "expect_reason": null,
+      "nodes": {
+        "wf-2-a": {"id": "wf-2-a", "type": "Pod", "templateName": "run-implementer", "phase": "Failed", "startedAt": "2026-11-20T10:00:00Z", "finishedAt": "2026-11-20T10:05:00Z", "outputs": {"exitCode": "137"}}
+      }
+    },
+    "succeeded_with_no_host_and_no_outputs": {
+      "expect_ran": true,
+      "expect_phase": "Succeeded",
+      "expect_reason": null,
+      "nodes": {
+        "wf-3-a": {"id": "wf-3-a", "type": "Pod", "templateName": "run-implementer", "phase": "Succeeded", "startedAt": "2026-11-20T10:00:00Z"}
+      }
+    },
+    "blocked_on_claims_mutex": {
+      "expect_ran": false,
+      "expect_phase": "Pending",
+      "expect_reason": "lock_wait",
+      "nodes": {
+        "wf-4-a": {"id": "wf-4-a", "type": "Pod", "templateName": "run-implementer", "phase": "Pending", "startedAt": "2026-11-20T10:00:00Z", "message": "Waiting for argo-workflows/Mutex/mctl-agents-proposal-claims. Lock status: 0/1", "synchronizationStatus": {"waiting": "argo-workflows/Mutex/mctl-agents-proposal-claims"}}
+      }
+    },
+    "started_at_only_is_not_ran": {
+      "expect_ran": false,
+      "expect_phase": "Failed",
+      "expect_reason": "unscheduled",
+      "nodes": {
+        "wf-5-a": {"id": "wf-5-a", "type": "Pod", "templateName": "run-implementer", "phase": "Failed", "startedAt": "2026-11-20T10:00:00Z", "finishedAt": "2026-11-20T10:00:01Z", "message": "workflow shutdown with strategy: Terminate"}
+      }
+    }
+  }
+}
