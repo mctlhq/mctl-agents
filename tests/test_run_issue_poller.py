@@ -436,3 +436,11 @@ def test_poll_dry_run_treats_mctl_claude_remote_as_known(monkeypatch, capsys):
 # Keep an explicit reference so an accidental removal of a public helper
 # trips the import at collection time.
 assert callable(remove_label)
+
+
+@pytest.fixture(autouse=True)
+def _stub_dependency_gate(monkeypatch):
+    """The dependency gate (#290) calls `gh`; these tests are about dispatch,
+    so nothing is blocked here. tests/test_run_issue_poller_dependencies.py
+    exercises the gate itself."""
+    monkeypatch.setattr(run_issue_poller, "dependency_block_reason", lambda ref: None)
