@@ -297,12 +297,26 @@ def _capability_discovery_prompt_block() -> str:
 # (re-)investigated. Anything past that means the implementer/shepherd has
 # taken ownership — re-running the investigator would clobber in-flight work.
 #
-# `needs-triage` and `review-stuck` are terminal FAILURE states: nothing is in
-# flight, and without this a re-investigation (label or `@MCTL reinvestigate`)
-# was refused forever, so the only way out was hand-editing gitops
-# (mctl-agents#335). Rewriting from one of them is audited at the guard below.
+# `needs-triage` and `review-stuck` are stuck states the shepherd still
+# resumes (RECONCILE_INPUT_STATUSES), and they can carry an open PR. Without
+# a way out a re-investigation (label or `@MCTL reinvestigate`) was refused
+# forever (mctl-agents#335), but rewriting one that records a `pr` would lose
+# the link and orphan that PR. So they are rewritable only while no `pr` is
+# recorded (`_rewrite_allowed`); the previous status is persisted as
+# `reopened_from` in the new .status.yaml. `_OVERWRITABLE_STATUSES` stays the
+# plain status set the workflow mirror and the directive poller key on.
+_OVERWRITABLE_STATUSES = {"proposed"}
 _REOPENED_FROM_FAILURE_STATUSES = frozenset({"needs-triage", "review-stuck"})
-_OVERWRITABLE_STATUSES = {"proposed"} | _REOPENED_FROM_FAILURE_STATUSES
+
+
+def _rewrite_allowed(status_doc: dict[str, Any]) -> bool:
+    """Whether a proposal with this `.status.yaml` may be rewritten."""
+    if not status_doc:
+        return True
+    status = status_doc.get("status")
+    if status in _OVERWRITABLE_STATUSES:
+        return True
+    return status in _REOPENED_FROM_FAILURE_STATUSES and not status_doc.get("pr")
 
 
 def _is_dispatched_resume(
@@ -1259,6 +1273,7 @@ def write_status_yaml(
     snapshot: ContextSnapshot | None = None,
     requested_by: str | None = None,
     requested_comment_url: str | None = None,
+    reopened_from: dict[str, Any] | None = None,
 ) -> Path:
     """Write the initial .status.yaml for an issue-driven proposal.
 
@@ -1335,6 +1350,9 @@ def write_status_yaml(
             "comment": requested_comment_url or "",
             "received_at": _now_iso(),
         }
+    if reopened_from:
+        # mctl-agents#335: the failure status this run replaced.
+        payload["reopened_from"] = dict(reopened_from)
     proposal_dir.mkdir(parents=True, exist_ok=True)
     status_path = proposal_dir / ".status.yaml"
     # Atomic: serialise to a sibling temp file, then rename over the target.
@@ -3528,10 +3546,17 @@ def _investigate(
     # `proposal_dir` on that path.
     existing = _load_status(status_path)
     existing_status = existing.get("status")
-    rewrite_allowed = not existing or existing_status in _OVERWRITABLE_STATUSES
+    rewrite_allowed = _rewrite_allowed(existing)
     context_only_pending = False
-    if existing_status in _REOPENED_FROM_FAILURE_STATUSES:
-        # Audit trail for the overwrite: the old status is otherwise lost.
+    reopened_from: dict[str, Any] | None = None
+    if rewrite_allowed and existing_status in _REOPENED_FROM_FAILURE_STATUSES:
+        # Audit trail for the overwrite: the old status is otherwise lost, so
+        # it is also persisted into the new .status.yaml (`reopened_from`).
+        reopened_from = {
+            "status": existing_status,
+            "updated_by": existing.get("updated_by"),
+            "updated_at": existing.get("updated_at"),
+        }
         print(
             f"audit: re-investigating {service}/{slug} from terminal failure "
             f"status '{existing_status}' (previous updated_by="
@@ -4090,6 +4115,8 @@ def _investigate(
         #    identity is always passed: it is loaded unconditionally above
         #    (mctlhq/mctl-agents#196, ADR 011).
         status_kwargs: dict[str, Any] = {}
+        if reopened_from:
+            status_kwargs["reopened_from"] = reopened_from
         if requested_by:
             status_kwargs["requested_by"] = requested_by
             status_kwargs["requested_comment_url"] = requested_comment_url
@@ -4205,8 +4232,9 @@ def _investigate(
                 # of merely fresh: the proposal is no longer at the path an
                 # approver writes to, so nothing can change it between this
                 # read and the swap.
-                live_status = _load_status(aside / ".status.yaml").get("status")
-                if live_status and live_status not in _OVERWRITABLE_STATUSES:
+                live_doc = _load_status(aside / ".status.yaml")
+                live_status = live_doc.get("status")
+                if live_status and not _rewrite_allowed(live_doc):
                     raise _ProposalAdvanced(live_status)
 
                 # Anything the agent did not rewrite is carried into

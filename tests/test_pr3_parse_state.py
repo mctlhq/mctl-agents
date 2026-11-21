@@ -28,19 +28,31 @@ def test_try_parse_json_single_and_fenced_and_garbage():
 
 
 # --- #335 -----------------------------------------------------------------
-@pytest.mark.parametrize("status", ["proposed", "needs-triage", "review-stuck"])
-def test_failure_states_are_overwritable(status):
-    assert status in inv._OVERWRITABLE_STATUSES
-    assert status in dev_loop._OVERWRITABLE_PROPOSAL_STATUSES
+@pytest.mark.parametrize("status", ["needs-triage", "review-stuck"])
+def test_failure_states_rewritable_only_without_pr(status):
+    assert inv._rewrite_allowed({"status": status})
+    assert not inv._rewrite_allowed({"status": status, "pr": "https://github.com/o/r/pull/1"})
 
 
 @pytest.mark.parametrize("status", ["accepted", "implemented", "merged"])
 def test_in_flight_states_stay_protected(status):
-    assert status not in inv._OVERWRITABLE_STATUSES
+    assert not inv._rewrite_allowed({"status": status})
+    assert inv._rewrite_allowed({}) and inv._rewrite_allowed({"status": "proposed"})
 
 
-def test_workflow_mirror_matches_investigator():
-    assert set(dev_loop._OVERWRITABLE_PROPOSAL_STATUSES) == set(inv._OVERWRITABLE_STATUSES)
+def test_workflow_set_is_not_widened():
+    # Replay safety and "refused rewrite keeps ending early" (see dev_loop).
+    assert set(dev_loop._OVERWRITABLE_PROPOSAL_STATUSES) == {"proposed"}
+
+
+def test_reopened_from_is_persisted(tmp_path):
+    from tests.test_run_issue_investigator import _issue
+
+    marker = {"status": "review-stuck", "updated_by": "shepherd", "updated_at": "t0"}
+    path = inv.write_status_yaml(tmp_path / "p", _issue(), reopened_from=marker)
+    assert yaml.safe_load(path.read_text())["reopened_from"] == marker
+    plain = inv.write_status_yaml(tmp_path / "q", _issue())
+    assert "reopened_from" not in yaml.safe_load(plain.read_text())
 
 
 # --- #308 -----------------------------------------------------------------
