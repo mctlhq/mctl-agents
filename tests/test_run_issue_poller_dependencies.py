@@ -6,6 +6,8 @@ import json
 import subprocess
 from types import SimpleNamespace
 
+import pytest
+
 from orchestrator import run_issue_poller as rip
 from orchestrator.run_issue_investigator import IssueRef
 from orchestrator.run_issue_poller import dependency_block_reason, parse_dependencies
@@ -113,7 +115,6 @@ def test_poll_skips_blocked_keeps_label_and_frees_cap(monkeypatch, capsys) -> No
     assert "BLOCKED:" in capsys.readouterr().out
 
 
-import pytest
 
 
 @pytest.mark.parametrize("body", [

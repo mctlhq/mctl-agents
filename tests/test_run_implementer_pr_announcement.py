@@ -86,3 +86,51 @@ def test_comment_failure_is_swallowed(tmp_path: Path, gh: dict[str, Any], monkey
 
     monkeypatch.setattr(ri, "_run", boom)
     assert ri._announce_pr_on_source_issue(ref, PR_URL) is False
+
+
+def test_open_pr_adoption_on_rerun_announces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A crash after PR creation but before step 9 reruns through the 'open'
+    adoption path, which must announce (the marker keeps it idempotent)."""
+    ref = _ref(tmp_path, SOURCE)
+    monkeypatch.setattr(
+        ri, "_preflight_existing_result",
+        lambda _ref: ri.ExistingResult(action="open", pr_url=PR_URL, head_sha="abc"),
+    )
+    monkeypatch.setattr(ri, "_run_implementer_agent",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("model must not run")))
+    seen: list[str] = []
+    monkeypatch.setattr(ri, "_announce_pr_on_source_issue", lambda r, url: seen.append(url) or True)
+    result = ri.implement_one(ref)
+    assert result.pr_url == PR_URL
+    assert seen == [PR_URL]
+
+
+def test_implement_attempt_announces_after_push(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wiring: step 9 of _implement_attempt calls the announcer with the PR."""
+    from types import SimpleNamespace
+
+    ref = _ref(tmp_path, SOURCE)
+    noop = lambda *a, **k: None  # noqa: E731
+    monkeypatch.setattr(ri, "_clone_target", lambda *a, **k: tmp_path)
+    monkeypatch.setattr(ri, "_run", noop)
+    monkeypatch.setattr(ri, "_stage_implementer_agent", noop)
+    monkeypatch.setattr(ri, "_resolve_implementer_service_skills",
+                        lambda *a, **k: SimpleNamespace(to_prompt_block=lambda **kw: ""))
+    monkeypatch.setattr(ri, "_build_prompt", lambda *a, **k: "")
+    monkeypatch.setattr(ri.anyio, "run", noop)
+    monkeypatch.setattr(ri, "_has_new_commits", lambda *a, **k: True)
+    monkeypatch.setattr(ri, "_detect_chart_major_bumps", lambda *a, **k: [])
+    monkeypatch.setattr(ri, "_run_pre_push_typecheck", noop)
+    monkeypatch.setattr(ri, "_push_and_open_pr", lambda *a, **k: PR_URL)
+    for name in ("_note_pushed_head", "_note_subject_pr", "_note_pushed", "update_status_yaml", "_release_claim"):
+        monkeypatch.setattr(ri, name, noop)
+    seen: list[str] = []
+    monkeypatch.setattr(ri, "_announce_pr_on_source_issue", lambda r, url: seen.append(url) or True)
+    obs = ri._AttemptObservations(phase="implement", branch="feat/agents-issue-510-x")
+    ctx = SimpleNamespace(context_id="c", trace_id="t", executor=SimpleNamespace(agent="implementer", version="1"))
+    result = ri._implement_attempt(
+        ref, obs, attempt={}, attempt_id="a", claim_ctx=None,
+        execution_context=ctx, prior_rate_limited=None,
+    )
+    assert result.pr_url == PR_URL
+    assert seen == [PR_URL]

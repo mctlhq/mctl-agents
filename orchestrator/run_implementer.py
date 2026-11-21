@@ -4765,6 +4765,10 @@ def _implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             attempt=None,
             rate_limited=None,
         )
+        # A crash between PR creation and step 9 of the first attempt lands
+        # here on rerun; the marker makes announcing again safe (#314).
+        if existing.pr_url:
+            _announce_pr_on_source_issue(ref, existing.pr_url)
         return ImplementResult(ref=ref, pr_url=existing.pr_url, pr_head_sha=existing.head_sha)
     if existing.action == "merged":
         update_status_yaml(
