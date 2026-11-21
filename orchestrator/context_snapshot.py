@@ -1011,7 +1011,11 @@ class ContextSnapshot:
         `execution` block must equal its parent's. `budget.truncated=true`
         only excuses the max_sources/max_bytes/max_bytes_per_source overrun
         checks; used_sources/used_bytes must always reconcile with the
-        actual `sources` list. Raises `ContextSnapshotError`; never silently
+        actual `sources` list. `truncated` means assembly dropped or clipped
+        candidates to fit the budget, so it excuses aggregate overruns only
+        as stated above; the per-source ceiling is checked against INCLUDED
+        sources only, because an excluded source consumes no budget (ADR
+        009 sec. 6). Raises `ContextSnapshotError`; never silently
         coerces or drops a field."""
         if self.api_version != API_VERSION:
             raise ContextSnapshotError(f"api_version must be {API_VERSION!r}, got {self.api_version!r}")
@@ -1040,7 +1044,7 @@ class ContextSnapshot:
                     f"budget.used_bytes ({budget.used_bytes}) exceeds max_bytes "
                     f"({budget.max_bytes}) without truncated=true"
                 )
-            for source in self.sources:
+            for source in (s for s in self.sources if s.selection.included):
                 if source.byte_count > budget.max_bytes_per_source:
                     raise ContextSnapshotError(
                         f"source {source.source_id!r}: byte_count ({source.byte_count}) exceeds "

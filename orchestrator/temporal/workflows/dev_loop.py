@@ -477,7 +477,7 @@ CONTEXT_ONLY_RESUME_ENDED_REASON = "investigate context-only: proposal-terminal"
 #: `run_issue_investigator._OVERWRITABLE_STATUSES` (that module's own status
 #: word is never imported here: it drags in anyio/claude_agent_sdk and the
 #: rest of a non-workflow-safe module tree into the sandbox).
-_OVERWRITABLE_PROPOSAL_STATUSES = {"proposed"}
+_OVERWRITABLE_PROPOSAL_STATUSES = {"proposed", "needs-triage", "review-stuck"}
 #: Guards the correlation params added to the implement and shepherd submits
 #: (mctlhq/mctl-agents#505, owner decision 4 on mctlhq/.github#50). Depends on
 #: mctl-gitops#1408 declaring `temporal_workflow_id` / `temporal_run_id` /

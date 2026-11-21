@@ -296,7 +296,13 @@ def _capability_discovery_prompt_block() -> str:
 # A proposal whose .status.yaml is missing or still `proposed` can be
 # (re-)investigated. Anything past that means the implementer/shepherd has
 # taken ownership — re-running the investigator would clobber in-flight work.
-_OVERWRITABLE_STATUSES = {"proposed"}
+#
+# `needs-triage` and `review-stuck` are terminal FAILURE states: nothing is in
+# flight, and without this a re-investigation (label or `@MCTL reinvestigate`)
+# was refused forever, so the only way out was hand-editing gitops
+# (mctl-agents#335). Rewriting from one of them is audited at the guard below.
+_REOPENED_FROM_FAILURE_STATUSES = frozenset({"needs-triage", "review-stuck"})
+_OVERWRITABLE_STATUSES = {"proposed"} | _REOPENED_FROM_FAILURE_STATUSES
 
 
 def _is_dispatched_resume(
@@ -3524,6 +3530,13 @@ def _investigate(
     existing_status = existing.get("status")
     rewrite_allowed = not existing or existing_status in _OVERWRITABLE_STATUSES
     context_only_pending = False
+    if existing_status in _REOPENED_FROM_FAILURE_STATUSES:
+        # Audit trail for the overwrite: the old status is otherwise lost.
+        print(
+            f"audit: re-investigating {service}/{slug} from terminal failure "
+            f"status '{existing_status}' (previous updated_by="
+            f"{existing.get('updated_by')!r}, updated_at={existing.get('updated_at')!r})"
+        )
     if not rewrite_allowed:
         reason = (
             f"proposal {service}/{slug} already at status "
