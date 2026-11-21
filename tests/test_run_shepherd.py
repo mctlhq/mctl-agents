@@ -3071,6 +3071,8 @@ def test_find_pr_uses_explicit_state_dir(tmp_path) -> None:
         return sentinel
 
     with patch.object(run_shepherd, "DEFAULT_STATE_DIR", bogus_default), \
+         patch.object(run_shepherd, "_find_pr_url_by_branch",
+                      side_effect=AssertionError("explicit pr: url must not hit GitHub discovery")), \
          patch.object(run_shepherd, "_fetch_pr_snapshot", side_effect=fake_fetch):
         result = run_shepherd.find_pr_for_proposal(
             "mctl-web", "wrangler-cve", state_dir=custom_dir,
@@ -3081,7 +3083,10 @@ def test_find_pr_uses_explicit_state_dir(tmp_path) -> None:
 
     # Sanity: with no state_dir argument, the helper falls back to
     # DEFAULT_STATE_DIR, which we pointed at an empty tree -> None.
+    # Hermetic: the branch-discovery lookup would otherwise call real GitHub
+    # (CI has no usable token). Stub it as "GitHub answered, no PR exists".
     with patch.object(run_shepherd, "DEFAULT_STATE_DIR", bogus_default), \
+         patch.object(run_shepherd, "_find_pr_url_by_branch", return_value=None), \
          patch.object(run_shepherd, "_fetch_pr_snapshot",
                       side_effect=AssertionError("must not fetch — no PR url")):
         fallback = run_shepherd.find_pr_for_proposal("mctl-web", "wrangler-cve")
@@ -3281,9 +3286,14 @@ def test_discover_refs_skips_in_progress_with_no_pr(tmp_path) -> None:
         pr=None,
     )
 
-    refs = run_shepherd._discover_refs(tmp_path)
+    # Hermetic: with no `pr:` URL discovery falls back to the GitHub branch
+    # lookup; stub it as "GitHub answered, no PR" so CI needs no token.
+    with patch.object(run_shepherd, "_find_pr_url_by_branch",
+                      return_value=None) as by_branch:
+        refs = run_shepherd._discover_refs(tmp_path)
 
     assert refs == []
+    by_branch.assert_called_once_with("mctl-openclaw", "mid-creation")
 
 
 def test_process_one_in_progress_with_open_pr_repairs(tmp_path) -> None:
@@ -7037,3 +7047,41 @@ def test_reconcile_unstick_clears_the_outage_counters(tmp_path) -> None:
         "merge_unknown_ticks", "merge_unknown_head",
     ):
         assert key not in final, key
+
+
+# ---------------------------------------------------------------------------
+# #281: a transient gh failure is "unknown", never "branch absent"
+# ---------------------------------------------------------------------------
+
+
+class _Proc:
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_find_pr_url_by_branch_gh_failure_is_transient() -> None:
+    with patch.object(run_shepherd, "_run", return_value=_Proc(1, stderr="502")):
+        with pytest.raises(run_shepherd.PRDiscoveryTransientError):
+            run_shepherd._find_pr_url_by_branch("mctl-web", "x")
+
+
+def test_find_pr_url_by_branch_bad_json_is_transient() -> None:
+    with patch.object(run_shepherd, "_run", return_value=_Proc(0, stdout="{oops")):
+        with pytest.raises(run_shepherd.PRDiscoveryTransientError):
+            run_shepherd._find_pr_url_by_branch("mctl-web", "x")
+
+
+def test_find_pr_url_by_branch_empty_listing_is_absent() -> None:
+    with patch.object(run_shepherd, "_run", return_value=_Proc(0, stdout="[]")):
+        assert run_shepherd._find_pr_url_by_branch("mctl-web", "x") is None
+
+
+def test_reconcile_one_waits_on_transient_discovery(tmp_path) -> None:
+    ref = make_ref(tmp_path, status="in-progress", pr_url=None)
+    with patch.object(run_shepherd, "_run", return_value=_Proc(1, stderr="502")):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "wait"
+    assert "discovery failed" in (result.error or "")
+    assert read_status(ref)["status"] == "in-progress"

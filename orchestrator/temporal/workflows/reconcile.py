@@ -36,7 +36,15 @@ ACTIVITY_TIMEOUT = timedelta(minutes=5)
 # schedule would have two ticks classifying the same rows, and the second
 # would read epochs the first had just moved.
 LIFECYCLE_ACTIVITY_TIMEOUT = timedelta(minutes=10)
-ACTIVITY_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
+# Default 1s intervals gave a ~3s retry window, shorter than a typical GitHub
+# blip (#405). 5s -> 10s -> 20s -> 40s spans ~75s between attempts; worst case
+# stays well inside the tick because each attempt is bounded by ACTIVITY_TIMEOUT.
+ACTIVITY_RETRY_POLICY = RetryPolicy(
+    maximum_attempts=5,
+    initial_interval=timedelta(seconds=5),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(seconds=60),
+)
 
 # mctl-api operation wrapping cwft-mctl-agents-reconcile: clone-gitops ->
 # run_shepherd --reconcile -> commit-and-push under the

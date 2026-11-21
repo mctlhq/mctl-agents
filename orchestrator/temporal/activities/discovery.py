@@ -26,6 +26,7 @@ from orchestrator.run_issue_directive_poller import (
 )
 from orchestrator.run_shepherd import (
     RECONCILE_INPUT_STATUSES,
+    PRDiscoveryTransientError,
     _discover_refs,
     find_pr_for_proposal,
 )
@@ -97,7 +98,11 @@ def _sync_discover_and_project(state_dir: Path) -> ReconcileDiscoveryResult:
         if ref.status not in RECONCILE_INPUT_STATUSES:
             continue
 
-        pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
+        try:
+            pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
+        except PRDiscoveryTransientError:
+            # Unknown, not absent: skip this proposal, keep sweeping (#281/#405).
+            continue
         if pr is None:
             continue
 
