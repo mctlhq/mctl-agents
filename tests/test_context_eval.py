@@ -22,6 +22,13 @@ behaviour is DELIBERATELY changing, never to turn a red run green):
 a `# pragma: no cover` function behind `if __name__ == "__main__":`, exactly
 the `tests/test_execution_request_replay.py:397` pattern — never a pytest
 fixture, never a CI step.
+
+Update procedure: regenerate only for a deliberate change, with a written
+reason; the owner reviews the full `baseline.json` diff including `_header`.
+A changed `evaluator_version` or `metrics_contract_version` is a reviewed bump
+of the constants in `orchestrator/context_eval.py` plus a regenerated
+baseline, never a silent upgrade. A failing `test_baseline_matches` is never
+fixed by regenerating the baseline to get a green run.
 """
 from __future__ import annotations
 
@@ -164,36 +171,147 @@ if __name__ == "__main__":  # pragma: no cover
 # ---------------------------------------------------------------------------
 
 
-def test_baseline_matches():
-    baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
-    records = _all_records()
-    failures: list[str] = []
-    for case_id, by_strategy in records.items():
-        for strategy, record in by_strategy.items():
-            actual = record.metrics.to_dict()
-            expected = baseline[case_id][strategy]
-            for metric, expected_value in expected.items():
-                if actual.get(metric) != expected_value:
-                    failures.append(
-                        f"{case_id}/{strategy}/{metric}: actual={actual.get(metric)!r} expected={expected_value!r}"
+_HEADER_KEY = "_header"
+_EXPECTED_HEADER = {
+    "evaluator_name": ce.EVALUATOR_NAME,
+    "evaluator_version": ce.EVALUATOR_VERSION,
+    "metrics_contract_version": ce.METRICS_CONTRACT_VERSION,
+}
+
+
+def _record_dict(record: ce.EvalRecord) -> dict[str, Any]:
+    """The form `_regenerate` stores for a record."""
+    return record.metrics.to_dict() if record.metrics is not None else {"verdict": record.verdict}
+
+
+def _baseline_differences(baseline: dict[str, Any], records: dict[str, dict[str, ce.EvalRecord]]) -> list[str]:
+    """Symmetric, identity-aware comparison of the baseline and current records.
+
+    Checks the `_header` identity, then membership of cases, strategies and
+    metrics in both directions (membership, not `.get`, so an explicit `None`
+    differs from an absent key), then exact `!=` on shared values. No tolerance.
+    Returns sorted named paths; never touches the baseline file.
+    """
+    diffs: list[str] = []
+    header = baseline.get(_HEADER_KEY)
+    if not isinstance(header, dict):
+        diffs.append(f"{_HEADER_KEY}: missing")
+    else:
+        for field, current in _EXPECTED_HEADER.items():
+            if field not in header:
+                diffs.append(f"{_HEADER_KEY}/{field}: missing")
+            elif header[field] != current:
+                diffs.append(f"{_HEADER_KEY}/{field}: baseline={header[field]!r} current={current!r}")
+
+    base_cases = {k: v for k, v in baseline.items() if k != _HEADER_KEY}
+    for case_id in base_cases.keys() - records.keys():
+        diffs.append(f"{case_id}: missing in actual")
+    for case_id in records.keys() - base_cases.keys():
+        diffs.append(f"{case_id}: missing in baseline")
+    for case_id in base_cases.keys() & records.keys():
+        expected_by_strategy = base_cases[case_id]
+        actual_by_strategy = records[case_id]
+        for strategy in expected_by_strategy.keys() - actual_by_strategy.keys():
+            diffs.append(f"{case_id}/{strategy}: missing in actual")
+        for strategy in actual_by_strategy.keys() - expected_by_strategy.keys():
+            diffs.append(f"{case_id}/{strategy}: missing in baseline")
+        for strategy in expected_by_strategy.keys() & actual_by_strategy.keys():
+            expected = expected_by_strategy[strategy]
+            actual = _record_dict(actual_by_strategy[strategy])
+            for metric in expected.keys() - actual.keys():
+                diffs.append(f"{case_id}/{strategy}/{metric}: missing in actual")
+            for metric in actual.keys() - expected.keys():
+                diffs.append(f"{case_id}/{strategy}/{metric}: missing in baseline")
+            for metric in expected.keys() & actual.keys():
+                if actual[metric] != expected[metric]:
+                    diffs.append(
+                        f"{case_id}/{strategy}/{metric}: actual={actual[metric]!r} expected={expected[metric]!r}"
                     )
+    return sorted(diffs)
+
+
+def _load_baseline() -> dict[str, Any]:
+    return json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+
+
+def test_baseline_matches():
+    failures = _baseline_differences(_load_baseline(), _all_records())
     assert not failures, "\n".join(failures)
 
 
 def test_baseline_drift_is_detected_and_named():
-    baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
     case_id, strategy, metric = "02-stale-source", ca.STRATEGY_NAME, "stale_rate"
-    mutated = copy.deepcopy(baseline)
+    mutated = copy.deepcopy(_load_baseline())
     mutated[case_id][strategy][metric] = 999.0
+    failures = _baseline_differences(mutated, _all_records())
+    assert len(failures) == 1
+    assert failures[0].startswith(f"{case_id}/{strategy}/{metric}:")
 
+
+def test_baseline_differences_membership_is_symmetric():
+    baseline = _load_baseline()
     records = _all_records()
-    actual = records[case_id][strategy].metrics.to_dict()
-    failures = [
-        f"{case_id}/{strategy}/{key}"
-        for key, expected_value in mutated[case_id][strategy].items()
-        if actual.get(key) != expected_value
-    ]
-    assert failures == [f"{case_id}/{strategy}/{metric}"]
+    case_id = "02-stale-source"
+    strategy = ca.STRATEGY_NAME
+    assert _baseline_differences(baseline, records) == []
+
+    mutated = copy.deepcopy(baseline)
+    del mutated[case_id][strategy]["stale_rate"]
+    assert _baseline_differences(mutated, records) == [f"{case_id}/{strategy}/stale_rate: missing in baseline"]
+
+    mutated = copy.deepcopy(baseline)
+    mutated[case_id][strategy]["new_metric"] = 1
+    assert _baseline_differences(mutated, records) == [f"{case_id}/{strategy}/new_metric: missing in actual"]
+
+    mutated = copy.deepcopy(baseline)
+    del mutated[case_id][strategy]
+    assert _baseline_differences(mutated, records) == [f"{case_id}/{strategy}: missing in baseline"]
+
+    mutated = copy.deepcopy(baseline)
+    mutated[case_id]["ghost-strategy"] = {}
+    assert _baseline_differences(mutated, records) == [f"{case_id}/ghost-strategy: missing in actual"]
+
+    mutated = copy.deepcopy(baseline)
+    del mutated[case_id]
+    assert _baseline_differences(mutated, records) == [f"{case_id}: missing in baseline"]
+
+    mutated = copy.deepcopy(baseline)
+    mutated["99-ghost"] = {}
+    assert _baseline_differences(mutated, records) == ["99-ghost: missing in actual"]
+
+
+def test_baseline_differences_refuses_incompatible_header():
+    baseline = _load_baseline()
+    records = _all_records()
+    for field in _EXPECTED_HEADER:
+        mutated = copy.deepcopy(baseline)
+        mutated[_HEADER_KEY][field] = "other"
+        diffs = _baseline_differences(mutated, records)
+        assert len(diffs) == 1
+        assert diffs[0].startswith(f"{_HEADER_KEY}/{field}:")
+        del mutated[_HEADER_KEY][field]
+        assert _baseline_differences(mutated, records) == [f"{_HEADER_KEY}/{field}: missing"]
+    mutated = copy.deepcopy(baseline)
+    del mutated[_HEADER_KEY]
+    assert _baseline_differences(mutated, records) == [f"{_HEADER_KEY}: missing"]
+
+
+def test_baseline_differences_exact_values_and_none_vs_absent():
+    baseline = _load_baseline()
+    records = _all_records()
+    case_id, strategy = "02-stale-source", ca.STRATEGY_NAME
+
+    mutated = copy.deepcopy(baseline)
+    mutated[case_id][strategy]["stale_rate"] += 1e-12
+    assert len(_baseline_differences(mutated, records)) == 1
+
+    mutated = copy.deepcopy(baseline)
+    mutated[case_id][strategy]["coverage_by_kind"][0]["bytes"] += 1
+    assert len(_baseline_differences(mutated, records)) == 1
+
+    mutated = copy.deepcopy(baseline)
+    mutated[case_id][strategy]["new_metric"] = None
+    assert _baseline_differences(mutated, records) == [f"{case_id}/{strategy}/new_metric: missing in actual"]
 
 
 def test_fixture_harness_ignores_context_env_vars(monkeypatch):
