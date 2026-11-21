@@ -144,3 +144,29 @@ def test_prose_phrases_do_not_block_or_misparse() -> None:
 def test_heading_with_nothing_beneath_is_unparseable() -> None:
     refs, bad = parse_dependencies("## Depends on\n\n## Notes\n#5", "mctlhq", "x")
     assert refs == [] and len(bad) == 1
+
+
+@pytest.mark.parametrize("body", [
+    "Depends on: none",
+    "Blocked by: N/A",
+    "Depends on: -",
+    "Depends on: nothing",
+    "- **Blocked by**: No.",
+    "Depends on: \u2014",
+    "DEPENDS ON: None",
+    "Depends on:\n\n## Notes\n#5",
+    "Depends on:",
+])
+def test_explicit_empty_value_is_no_dependencies(body) -> None:
+    assert parse_dependencies(body, "mctlhq", "x") == ([], [])
+
+
+@pytest.mark.parametrize("body", [
+    "Depends on: none of the above work, see the auth rework",
+    "Depends on: the auth rework",
+    "Depends on:\n\nthe auth rework",
+    "Blocked by: not yet decided",
+])
+def test_prose_after_empty_looking_marker_still_blocks(body) -> None:
+    refs, bad = parse_dependencies(body, "mctlhq", "x")
+    assert refs == [] and len(bad) == 1

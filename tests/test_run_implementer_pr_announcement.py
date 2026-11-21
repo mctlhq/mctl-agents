@@ -134,3 +134,13 @@ def test_implement_attempt_announces_after_push(tmp_path: Path, monkeypatch: pyt
     )
     assert result.pr_url == PR_URL
     assert seen == [PR_URL]
+
+
+def test_announcement_does_not_claim_the_issue_closes(tmp_path: Path, gh: dict[str, Any]) -> None:
+    # `Refs` (spike / unclassifiable issues) does not close on merge, so the
+    # comment must not promise it unconditionally.
+    ref = _ref(tmp_path, SOURCE)
+    assert ri._announce_pr_on_source_issue(ref, PR_URL) is True
+    body = gh["posted"][0][-1]
+    assert "The issue closes when the PR merges" not in body
+    assert "closing keyword" in body and "Refs" in body

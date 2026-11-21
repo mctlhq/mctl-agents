@@ -3857,7 +3857,9 @@ def _announce_pr_on_source_issue(ref: ProposalRef, pr_url: str) -> bool:
             "mctl-agents Tier 2 implementer opened a PR for the accepted proposal "
             f"`{ref.service}/{ref.slug}`:\n\n{pr_url}\n\n"
             "Review it as you would any PR: it was opened automatically and the "
-            "spec may have gaps. The issue closes when the PR merges.\n\n"
+            "spec may have gaps. Whether merging it closes this issue depends on the "
+            "closing keyword in the PR description (`Closes` closes it, `Refs` does "
+            "not).\n\n"
             f"{marker}"
         )
         policy_checkpoint.require(policy_checkpoint.checkpoint(

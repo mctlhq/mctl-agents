@@ -112,6 +112,14 @@ _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _ANCHORED_PREFIX_RE = re.compile(r"^\s*(?:[-*+>]\s*|#{1,6}\s+)*(?:\*\*|__)?\s*$")
 _NEGATED_PREFIX_RE = re.compile(r"\b(?:not|no\s+longer|never)\s+$", re.IGNORECASE)
 _HEADING_LINE_RE = re.compile(r"^\s{0,3}#{1,6}\s")
+# An explicit "no dependencies" value after the phrase: "Depends on: none",
+# "Blocked by: N/A", "Depends on: -". Only honoured on an anchored
+# declaration, and only the whole remainder of the line may be the marker.
+_EMPTY_VALUE_RE = re.compile(
+    r"^[\s:*_]*(?:none|n/a|na|nothing|no|-|\u2014|\u2013)[\s.*_]*$", re.IGNORECASE
+)
+# "Depends on:" with nothing after the colon on the line.
+_COLON_ONLY_RE = re.compile(r"^[\s*_]*:[\s*_]*$")
 
 
 @dataclass
@@ -184,7 +192,9 @@ def parse_dependencies(body: str, owner: str, repo: str) -> tuple[list[tuple[str
     exists to prevent, whereas holding one issue is visible in the poll log
     and fixed by rewording the line or adding a concrete `#N`. HTML comments
     are dropped first so issue templates ("<!-- Depends on #N -->") do not
-    block forever; code fences are not stripped.
+    block forever; code fences are not stripped. An explicit empty value on
+    an anchored declaration ("Depends on: none", "Blocked by: N/A", "-",
+    or a bare colon followed by a blank/heading) means "no dependencies".
     """
     body = _HTML_COMMENT_RE.sub("", body or "")
     refs: list[tuple[str, str, int]] = []
@@ -199,6 +209,9 @@ def parse_dependencies(body: str, owner: str, repo: str) -> tuple[list[tuple[str
         for m in _REF_RE.finditer(decl.group("rest")):
             found = True
             _add_ref(refs, m, owner, repo)
+        if not found and anchored and _EMPTY_VALUE_RE.match(decl.group("rest")):
+            continue  # "Depends on: none" affirmatively declares no dependencies
+        colon_empty = bool(_COLON_ONLY_RE.match(decl.group("rest")))
         if not found and anchored:
             # "Blocked by:" / "## Depends on" followed by a list or a
             # paragraph: scan after the declaration line, skipping blank
@@ -206,6 +219,8 @@ def parse_dependencies(body: str, owner: str, repo: str) -> tuple[list[tuple[str
             tail = body[decl.end():].split("\n")[1:]
             while tail and not tail[0].strip():
                 tail.pop(0)
+            if colon_empty and (not tail or _HEADING_LINE_RE.match(tail[0])):
+                continue  # "Depends on:" then nothing / next heading: none declared
             for line in tail:
                 if not line.strip() or _HEADING_LINE_RE.match(line):
                     break
