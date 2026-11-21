@@ -3071,6 +3071,8 @@ def test_find_pr_uses_explicit_state_dir(tmp_path) -> None:
         return sentinel
 
     with patch.object(run_shepherd, "DEFAULT_STATE_DIR", bogus_default), \
+         patch.object(run_shepherd, "_find_pr_url_by_branch",
+                      side_effect=AssertionError("explicit pr: url must not hit GitHub discovery")), \
          patch.object(run_shepherd, "_fetch_pr_snapshot", side_effect=fake_fetch):
         result = run_shepherd.find_pr_for_proposal(
             "mctl-web", "wrangler-cve", state_dir=custom_dir,
@@ -3081,7 +3083,10 @@ def test_find_pr_uses_explicit_state_dir(tmp_path) -> None:
 
     # Sanity: with no state_dir argument, the helper falls back to
     # DEFAULT_STATE_DIR, which we pointed at an empty tree -> None.
+    # Hermetic: the branch-discovery lookup would otherwise call real GitHub
+    # (CI has no usable token). Stub it as "GitHub answered, no PR exists".
     with patch.object(run_shepherd, "DEFAULT_STATE_DIR", bogus_default), \
+         patch.object(run_shepherd, "_find_pr_url_by_branch", return_value=None), \
          patch.object(run_shepherd, "_fetch_pr_snapshot",
                       side_effect=AssertionError("must not fetch — no PR url")):
         fallback = run_shepherd.find_pr_for_proposal("mctl-web", "wrangler-cve")
@@ -3281,9 +3286,14 @@ def test_discover_refs_skips_in_progress_with_no_pr(tmp_path) -> None:
         pr=None,
     )
 
-    refs = run_shepherd._discover_refs(tmp_path)
+    # Hermetic: with no `pr:` URL discovery falls back to the GitHub branch
+    # lookup; stub it as "GitHub answered, no PR" so CI needs no token.
+    with patch.object(run_shepherd, "_find_pr_url_by_branch",
+                      return_value=None) as by_branch:
+        refs = run_shepherd._discover_refs(tmp_path)
 
     assert refs == []
+    by_branch.assert_called_once_with("mctl-openclaw", "mid-creation")
 
 
 def test_process_one_in_progress_with_open_pr_repairs(tmp_path) -> None:
