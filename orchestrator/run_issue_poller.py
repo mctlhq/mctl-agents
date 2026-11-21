@@ -16,6 +16,12 @@ Pipeline for one poll cycle:
     2. For each issue, in turn:
        a. Skip (label left in place) if the repo is not a known service —
           a misconfiguration the operator should see.
+       a'. Skip (label left in place) if the issue is blocked (#290): it
+          carries ``agents:blocked``, or its body declares ``Depends on`` /
+          ``Blocked by`` references that are still open, cannot be read, or
+          cannot be parsed. A blocked issue is a normal "not now", logged
+          distinctly from a misconfiguration, is not counted as a failure and
+          does not consume the ``--max-issues`` budget.
        b. Start (or attach to) that issue's DevLoopWorkflow. Temporal's own
           workflow-ID dedup (`dev-loop-{owner}-{repo}-{issue}`,
           ALLOW_DUPLICATE_FAILED_ONLY + USE_EXISTING) makes a repeated start
@@ -58,6 +64,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -83,6 +90,22 @@ DEFAULT_LABEL = "agents:intake"
 # keep their label and are handled by a later cycle. `--max-issues 0`
 # disables the cap.
 DEFAULT_MAX_ISSUES = 5
+
+
+# An operator parks an issue with this label without losing its place in the
+# queue: `agents:intake` stays, the poller just does not dispatch it (#290).
+BLOCKED_LABEL = "agents:blocked"
+
+# A declaration is any line containing one of these phrases. The rest of the
+# line is searched for references.
+_DECLARATION_RE = re.compile(r"\b(?:depends\s+on|blocked\s+by)\b(?P<rest>[^\n]*)", re.IGNORECASE)
+# Reference forms, most specific first: full URL, owner/repo#N, bare #N.
+_REF_RE = re.compile(
+    r"https://github\.com/(?P<uo>[\w.-]+)/(?P<ur>[\w.-]+)/(?:issues|pull)/(?P<un>\d+)"
+    r"|(?P<so>[\w.-]+)/(?P<sr>[\w.-]+)#(?P<sn>\d+)"
+    r"|(?<![\w/])#(?P<n>\d+)"
+)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
 @dataclass
@@ -131,6 +154,74 @@ def search_labeled_issues(label: str) -> list[IssueRef]:
     return refs
 
 
+def parse_dependencies(body: str, owner: str, repo: str) -> tuple[list[tuple[str, str, int]], list[str]]:
+    """Dependencies declared in an issue body (#290).
+
+    Returns ``(refs, unparseable)``: ``refs`` are ``(owner, repo, number)``
+    triples; ``unparseable`` holds every declaration line (``Depends on`` /
+    ``Blocked by``) that yielded no reference at all.
+
+    The choice for unparseable declarations is deliberate: they BLOCK. A
+    declaration we cannot resolve ("depends on the auth rework") could hide a
+    real dependency, and dispatching anyway is the exact fan-out this gate
+    exists to prevent, whereas holding one issue is visible in the poll log
+    and fixed by rewording the line or adding a concrete `#N`. HTML comments
+    are dropped first so issue templates ("<!-- Depends on #N -->") do not
+    block forever; code fences are not stripped.
+    """
+    body = _HTML_COMMENT_RE.sub("", body or "")
+    refs: list[tuple[str, str, int]] = []
+    unparseable: list[str] = []
+    for decl in _DECLARATION_RE.finditer(body):
+        found = False
+        for m in _REF_RE.finditer(decl.group("rest")):
+            found = True
+            if m.group("un"):
+                ref = (m.group("uo"), m.group("ur"), int(m.group("un")))
+            elif m.group("sn"):
+                ref = (m.group("so"), m.group("sr"), int(m.group("sn")))
+            else:
+                ref = (owner, repo, int(m.group("n")))
+            if ref not in refs:
+                refs.append(ref)
+        if not found:
+            unparseable.append(decl.group(0).strip())
+    return refs, unparseable
+
+
+def dependency_block_reason(ref: IssueRef) -> str | None:
+    """Why ``ref`` must not be dispatched now, or None when it is free (#290).
+
+    Order: the explicit ``agents:blocked`` label first (no parsing), then
+    declared dependencies. Anything that cannot be observed -- the issue
+    itself, or a referenced issue -- blocks: "could not read" is never read
+    as "no dependency". Raises nothing; every failure becomes a reason.
+    """
+    try:
+        proc = _run(["gh", "issue", "view", ref.url, "--json", "labels,body"])
+        data = json.loads(proc.stdout or "")
+        labels = {(lb or {}).get("name") for lb in data["labels"]}
+        body = data["body"] or ""
+    except Exception as e:  # noqa: BLE001 - unreadable issue is blocked, not free
+        return f"could not read the issue to check dependencies ({e})"
+    if BLOCKED_LABEL in labels:
+        return f"carries the '{BLOCKED_LABEL}' label"
+    refs, unparseable = parse_dependencies(body, ref.owner, ref.repo)
+    if unparseable:
+        return f"declares a dependency it does not name as an issue ({unparseable[0]!r})"
+    for owner, repo, number in refs:
+        if (owner, repo, number) == (ref.owner, ref.repo, ref.number):
+            continue
+        try:
+            dep = json.loads(_run(["gh", "api", f"repos/{owner}/{repo}/issues/{number}"]).stdout or "")
+            state = dep["state"]
+        except Exception as e:  # noqa: BLE001
+            return f"dependency {owner}/{repo}#{number} could not be read ({e})"
+        if state != "closed":
+            return f"depends on {owner}/{repo}#{number} which is {state}"
+    return None
+
+
 def remove_label(issue_url: str, label: str) -> None:
     """Drop ``label`` from the issue so the next poll cycle skips it.
 
@@ -167,6 +258,21 @@ async def poll(
     # a valid one out of every cycle.
     service_refs = [r for r in refs if r.repo in SERVICES]
     other_refs = [r for r in refs if r.repo not in SERVICES]
+
+    # Dependency gate (#290), BEFORE the cap so blocked issues do not consume
+    # the budget and a blocked head of the queue cannot starve the rest. A
+    # blocked issue keeps its label and is retried on a later cycle.
+    blocked: list[tuple[IssueRef, str]] = []
+    ready: list[IssueRef] = []
+    for r in service_refs:
+        reason = dependency_block_reason(r)
+        if reason:
+            blocked.append((r, reason))
+        else:
+            ready.append(r)
+    service_refs = ready
+    for r, reason in blocked:
+        print(f"BLOCKED: {r.full_repo}#{r.number} {reason} — '{label}' kept, not dispatched this cycle.")
 
     if max_issues > 0 and len(service_refs) > max_issues:
         # The dropped issues keep their label (they are never passed to
