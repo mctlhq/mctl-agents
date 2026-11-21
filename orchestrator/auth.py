@@ -14,7 +14,25 @@ from dotenv import load_dotenv
 
 from orchestrator.credential_files import read_credential
 
-load_dotenv()
+
+def _load_dotenv_if_local() -> bool:
+    """Load a `.env` for local dev only; True when it was consulted.
+
+    In a cluster the credentials come from mounted Secrets (credential_files),
+    and a stray `.env` in the working tree must not be able to add variables
+    to the process env that every SDK session and child inherits.
+    `KUBERNETES_SERVICE_HOST` is set by the kubelet in every pod;
+    `MCTL_AGENTS_SKIP_DOTENV` is an explicit opt-out for anywhere else.
+    """
+    if os.environ.get("KUBERNETES_SERVICE_HOST"):
+        return False
+    if os.environ.get("MCTL_AGENTS_SKIP_DOTENV", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return False
+    load_dotenv()
+    return True
+
+
+_load_dotenv_if_local()
 
 
 @dataclass

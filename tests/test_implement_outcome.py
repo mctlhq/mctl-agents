@@ -8,9 +8,13 @@ an activity test.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from orchestrator.temporal.implement_outcome import (
+    _pod_ran,
     classify,
     finalization_evidence,
     observe_implementer,
@@ -145,3 +149,42 @@ class TestPreStartReason:
         assert pre_start_reason(None) == "unknown"
         assert pre_start_reason("lock_wait") == "lock_wait"
         assert pre_start_reason("unscheduled") == "unscheduled"
+
+
+_ARGO_FIXTURE = json.loads(
+    (Path(__file__).parent / "fixtures" / "argo" / "implement_workflow_status_nodes.json").read_text()
+)
+
+
+class TestApiRecordedShape:
+    """#406: the taxonomy against Argo `status.nodes` as the API shapes them,
+    including graphs whose Pod nodes carry no `hostNodeName`."""
+
+    @pytest.mark.parametrize("name", sorted(_ARGO_FIXTURE["scenarios"]))
+    def test_scenario(self, name: str) -> None:
+        scenario = _ARGO_FIXTURE["scenarios"][name]
+        observation = observe_implementer({"nodes": scenario["nodes"]})
+        assert observation.ran is scenario["expect_ran"]
+        assert observation.phase == scenario["expect_phase"]
+        assert observation.pre_start_reason == scenario["expect_reason"]
+
+    @pytest.mark.parametrize(
+        ("node", "expected"),
+        [
+            ({"hostNodeName": "k3s-worker-1", "phase": "Failed"}, True),
+            ({"outputs": {"exitCode": "0"}, "phase": "Failed"}, True),
+            ({"outputs": {"exitCode": "137"}, "phase": "Failed"}, True),
+            ({"phase": "Succeeded"}, True),
+            ({"phase": "Failed", "startedAt": "2026-11-20T10:00:00Z"}, False),
+            ({"phase": "Pending", "startedAt": "2026-11-20T10:00:00Z"}, False),
+            ({"phase": "Running"}, False),
+            ({"outputs": {}, "phase": "Failed"}, False),
+            ({"outputs": "not-a-mapping", "phase": "Failed"}, False),
+            ({"hostNodeName": "", "phase": "Failed"}, False),
+        ],
+    )
+    def test_pod_ran_field_contract(self, node: dict, expected: bool) -> None:
+        """The only evidence `_pod_ran` accepts: a non-empty `hostNodeName`,
+        `outputs.exitCode` present, or phase Succeeded. `startedAt` and a
+        bare Running/Pending/Failed phase are not evidence."""
+        assert _pod_ran(node) is expected
