@@ -3836,7 +3836,11 @@ def _announce_pr_on_source_issue(ref: ProposalRef, pr_url: str) -> bool:
     "could not observe" is not "no comment yet", and a duplicate is worse
     than a missing courtesy note.
     """
-    source = _load_status(ref.status_path).get("source")
+    try:
+        source = (_load_status(ref.status_path) or {}).get("source")
+    except Exception as exc:  # noqa: BLE001 - best-effort notification
+        print(f"warn: could not read status to announce PR: {exc}", file=sys.stderr)
+        return False
     if not isinstance(source, dict) or source.get("type") != "github_issue":
         return False
     repo, issue = source.get("repo"), source.get("issue")

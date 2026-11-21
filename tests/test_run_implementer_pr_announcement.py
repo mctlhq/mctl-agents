@@ -144,3 +144,15 @@ def test_announcement_does_not_claim_the_issue_closes(tmp_path: Path, gh: dict[s
     body = gh["posted"][0][-1]
     assert "The issue closes when the PR merges" not in body
     assert "closing keyword" in body and "Refs" in body
+
+
+@pytest.mark.parametrize("raw", ["", "# only a comment\n", "{ not: [valid"])
+def test_unreadable_status_never_fails_the_implement_step(
+    tmp_path: Path, gh: dict[str, Any], raw: str
+) -> None:
+    """An empty, comment-only or malformed .status.yaml must not raise: the PR
+    already exists and the announcement is best-effort."""
+    ref = _ref(tmp_path, SOURCE)
+    (ref.proposal_dir / ".status.yaml").write_text(raw, encoding="utf-8")
+    assert ri._announce_pr_on_source_issue(ref, PR_URL) is False
+    assert gh["posted"] == []
