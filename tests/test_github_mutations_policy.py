@@ -106,7 +106,7 @@ LEASE = "a" * 40
     (pc.GITHUB_ISSUE_COMMENT, "comment", "github-issue-comment"),
 ])
 def test_builtin_policy_allows_each_github_mutation(kind: str, operation: str, rule_id: str) -> None:
-    decision = pc.checkpoint(kind, operation, "mctlhq/x", {"a": 1})
+    decision = pc.checkpoint(kind, operation, "mctlhq/mctl-web:feat/x", {"a": 1})
     assert decision.permitted
     assert decision.rule_id == rule_id
 
@@ -691,3 +691,31 @@ def test_investigate_survives_a_refused_proposal_comment(tmp_path, monkeypatch, 
 
     assert result.error is None
     assert "the policy checkpoint refused the issue comment" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Push target: only mctlhq/<service in SERVICES> (mctlhq/mctl-agents#200)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("repo_name", ["attacker/mctl-web", "mctlhq/not-a-service", "mctlhq/mctl-web-evil"])
+@pytest.mark.parametrize("lease", [None, LEASE], ids=["new-branch", "with-lease"])
+def test_push_to_non_service_repo_is_refused(monkeypatch, repo_name, lease) -> None:
+    with pytest.raises(pc.PolicyRefused) as exc:
+        run_implementer._require_push_policy(repo_name, "feat/agents-slug", lease=lease)
+    assert exc.value.decision.code == pc.CODE_NO_RULE
+
+
+@pytest.mark.parametrize("lease", [None, LEASE], ids=["new-branch", "with-lease"])
+def test_push_to_service_repo_is_allowed(lease) -> None:
+    run_implementer._require_push_policy("mctlhq/mctl-web", "feat/agents-slug", lease=lease)
+
+
+def test_clone_target_is_unpredictable_and_fresh(monkeypatch) -> None:
+    monkeypatch.setattr(run_implementer, "_run", lambda *_a, **_kw: None)
+    a = run_implementer._clone_target("mctl-web", "slug")
+    b = run_implementer._clone_target("mctl-web", "slug")
+    try:
+        assert a != b and a.is_dir() and b.is_dir()
+    finally:
+        import shutil
+        shutil.rmtree(a, ignore_errors=True)
+        shutil.rmtree(b, ignore_errors=True)

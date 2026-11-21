@@ -170,7 +170,13 @@ class Rule:
     `ActionRequest.operation`. With `requires_grant`, the operation must
     also match one of the request's grants, or the decision is DENY. With
     `explicit_grant` as well, only a grant with no wildcard counts: a
-    blanket grant such as `mcp__mctl__*` does not cover the operation."""
+    blanket grant such as `mcp__mctl__*` does not cover the operation.
+
+    With `targets` (a provider of fnmatch patterns over `ActionRequest.target`,
+    called at evaluation so this module stays stdlib-only at import), the rule
+    applies only to a request whose target matches one of them; any other
+    target skips the rule, so with no later rule it ends in `no_matching_rule`
+    (fail closed). None means any target."""
 
     rule_id: str
     action_kind: str
@@ -178,6 +184,7 @@ class Rule:
     verdict: str
     requires_grant: bool = False
     explicit_grant: bool = False
+    targets: Callable[[], tuple[str, ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -375,6 +382,13 @@ MERGE_OPERATION_AGENT_DEFINITION = "merge:agent-definition"
 MERGE_OPERATION_OWNER_GO = "merge:owner-go"
 _MERGE_RULE_IDS = frozenset({"github-pr-merge", "github-pr-merge-agent-definition", "github-pr-merge-owner-go"})
 
+def _push_targets() -> tuple[str, ...]:
+    # Lazy: config.settings pulls in yaml, which this module must not load at import.
+    from config.settings import SERVICES
+
+    return tuple(f"mctlhq/{service}:*" for service in SERVICES)
+
+
 BUILTIN_POLICY = Policy(
     version="mctl-agents/policy/v1",
     rules=(
@@ -384,8 +398,11 @@ BUILTIN_POLICY = Policy(
         # behind REQUIRE_APPROVAL, say) is one rule change, not a code change.
         # The implementer pushes only its own `feat/agents-<slug>` branch:
         # a new branch plainly, an existing one under `--force-with-lease`.
-        Rule("github-push-new-branch", GITHUB_GIT_PUSH, "push:new-branch", ALLOW),
-        Rule("github-push-with-lease", GITHUB_GIT_PUSH, "push:force-with-lease", ALLOW),
+        # Only into `mctlhq/<service>` for a service in SERVICES (#200): the
+        # target is `<repo>:<branch>`, so any other repo has no rule and is
+        # refused.
+        Rule("github-push-new-branch", GITHUB_GIT_PUSH, "push:new-branch", ALLOW, targets=_push_targets),
+        Rule("github-push-with-lease", GITHUB_GIT_PUSH, "push:force-with-lease", ALLOW, targets=_push_targets),
         Rule("github-pr-create", GITHUB_PR_CREATE, "create", ALLOW),
         # A merge of a PR that changes agent definitions is a human decision
         # (mctlhq/mctl-agents#470, owner decision 2026-10-05; ADR 016
@@ -509,6 +526,8 @@ def evaluate(policy: Policy, request: ActionRequest) -> tuple[Rule | None, str, 
         if rule.verdict not in VERDICTS:
             raise ValueError(f"rule {rule.rule_id!r} has unknown verdict {rule.verdict!r}")
         if rule.action_kind != request.action_kind or not fnmatch.fnmatchcase(request.operation, rule.operation):
+            continue
+        if rule.targets is not None and not any(fnmatch.fnmatchcase(request.target, t) for t in rule.targets()):
             continue
         if rule.requires_grant and not any(
             fnmatch.fnmatchcase(request.operation, g)
