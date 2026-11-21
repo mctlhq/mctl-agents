@@ -1786,10 +1786,9 @@ def _gh_api_json(args: list[str]) -> Any:
 
 def _clone_target(service: str, slug: str) -> Path:
     """gh repo clone the target sibling repo to a fresh tmp dir."""
-    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
-    target = Path(tempfile.gettempdir()) / f"impl-{service}-{slug}-{ts}"
-    if target.exists():
-        shutil.rmtree(target)
+    # mkdtemp: an unpredictable, freshly created 0700 dir, so a pre-planted
+    # path or symlink cannot be reused (#177).
+    target = Path(tempfile.mkdtemp(prefix=f"impl-{service}-{slug}-"))
     # gh CLI honors GITHUB_TOKEN automatically.
     _run(["gh", "repo", "clone", f"mctlhq/{service}", str(target), "--", "--depth=10"])
     # Identify as the bot for commits made by the implementer agent (it runs

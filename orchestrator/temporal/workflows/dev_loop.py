@@ -477,6 +477,12 @@ CONTEXT_ONLY_RESUME_ENDED_REASON = "investigate context-only: proposal-terminal"
 #: `run_issue_investigator._OVERWRITABLE_STATUSES` (that module's own status
 #: word is never imported here: it drags in anyio/claude_agent_sdk and the
 #: rest of a non-workflow-safe module tree into the sandbox).
+#:
+#: Deliberately NOT widened to the failure states the investigator can reopen
+#: (mctl-agents#335): this is read AFTER the investigate CWFT succeeded, so a
+#: reopened proposal already reads `proposed`; one still at `needs-triage` /
+#: `review-stuck` was refused (it records a PR) and must keep ending here.
+#: Widening it would also change replay for in-flight histories.
 _OVERWRITABLE_PROPOSAL_STATUSES = {"proposed"}
 #: Guards the correlation params added to the implement and shepherd submits
 #: (mctlhq/mctl-agents#505, owner decision 4 on mctlhq/.github#50). Depends on

@@ -129,3 +129,16 @@ spec:
       kind: none
       ref: null
       evaluatorVersion: null
+  - revision: 11
+    strategy: deterministic-fixed-order
+    version: 1.0.0
+    contentHash: sha256:362821eb8c722cd1dfa7c835d641ee1757249677eca965d264a3c087c86938ce
+    implementationHash: sha256:60412bf4c4b02648929b9a20d106c640aed24eda844a128e19a9e04de638abf0
+    promotedBy: mashkovd
+    promotedAt: '2026-11-21T18:05:17Z'
+    reason: republish pins after mctl-agents#347 (per-source ceiling checks included
+      sources only)
+    evidence:
+      kind: none
+      ref: null
+      evaluatorVersion: null

@@ -6,12 +6,14 @@ writer must therefore preserve fields it does not explicitly change.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import re
 import secrets
 import stat
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -374,6 +376,26 @@ class UnrunnableProposalError(RuntimeError):
     """
 
 
+@contextmanager
+def _status_lock(path: Path) -> Iterator[None]:
+    """Advisory exclusive lock serialising read-modify-write on one proposal.
+
+    The lock is taken on the proposal DIRECTORY, not on the status file:
+    `_write_status_atomic` replaces the file's inode, so a lock on the file
+    would not exclude a writer that opened the old one. Locking the directory
+    also adds no sidecar file to the gitops worktree, where the investigate
+    CWFT's `git add ':(glob)...'` would stage it (mctl-agents#308). Advisory
+    only: it protects cooperating writers using this helper.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing releases the flock
+
+
 def update_status_file(
     path: Path,
     new_status: str,
@@ -393,30 +415,31 @@ def update_status_file(
     state. Annotating a proposal that is already in that state (for
     example the implementer's ``blocked`` marker) is unaffected.
     """
-    previous = load_status(path)
-    payload = dict(previous)
-    payload["status"] = new_status
-    payload["updated_at"] = now_iso()
-    payload["updated_by"] = actor
-    for key, value in fields.items():
-        if value is UNSET:
-            continue
-        if value is None:
-            payload.pop(key, None)
-        else:
-            payload[key] = value
+    with _status_lock(path):
+        previous = load_status(path)
+        payload = dict(previous)
+        payload["status"] = new_status
+        payload["updated_at"] = now_iso()
+        payload["updated_by"] = actor
+        for key, value in fields.items():
+            if value is UNSET:
+                continue
+            if value is None:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
 
-    if unrunnable_reason(payload) is not None and unrunnable_reason(previous) is None:
-        raise UnrunnableProposalError(
-            f"{path}: refusing to write status={new_status!r} -- "
-            "control.requires_human_approval is set with no verified "
-            "approval.approved_by, and no supported path can ever run "
-            "that combination (mctl-agents#349); re-publish the proposal "
-            "in 'proposed' status instead of writing 'accepted' directly"
-        )
+        if unrunnable_reason(payload) is not None and unrunnable_reason(previous) is None:
+            raise UnrunnableProposalError(
+                f"{path}: refusing to write status={new_status!r} -- "
+                "control.requires_human_approval is set with no verified "
+                "approval.approved_by, and no supported path can ever run "
+                "that combination (mctl-agents#349); re-publish the proposal "
+                "in 'proposed' status instead of writing 'accepted' directly"
+            )
 
-    _write_status_atomic(path, payload)
-    return payload
+        _write_status_atomic(path, payload)
+        return payload
 
 
 def _write_status_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -439,10 +462,9 @@ def _write_status_atomic(path: Path, payload: dict[str, Any]) -> None:
     This closes the truncation, partial-read and crash-corruption windows.
     It does NOT make the surrounding read-modify-write exclusive: two
     writers that both load before either replaces still lose one update.
-    Closing that needs a lock, and the obvious place for one — a sidecar
-    beside the file — is inside the gitops worktree, where the investigate
-    CWFT's `git add ':(glob)…/proposals/*/**'` would stage it. Tracked in
-    mctlhq/mctl-agents#307 rather than improvised here.
+    `update_status_file` closes that with an advisory directory flock
+    (`_status_lock`, mctl-agents#308); this function stays lock-free so a
+    caller that already holds the lock does not deadlock on itself.
 
     Mirrors `run_issue_investigator.write_status_yaml`, which was given the
     same treatment for the same reason; not shared with it because that one
