@@ -665,6 +665,9 @@ def test_poll_counts_a_refused_label_removal_as_a_failure(monkeypatch) -> None:
     monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: [ref])
     monkeypatch.setattr(run_issue_poller, "connect", connect)
     monkeypatch.setattr(run_issue_poller, "start_dev_loop_workflow", start)
+    # The dependency gate (#290) is not what this test is about; with `_run`
+    # stubbed it could not read the issue and would hold it back.
+    monkeypatch.setattr(run_issue_poller, "dependency_block_reason", lambda ref: None)
     monkeypatch.setattr(run_issue_poller, "_run", lambda cmd, **_kw: calls.append(cmd))
     _refuse_with(monkeypatch)
 
