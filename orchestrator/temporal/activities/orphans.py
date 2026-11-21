@@ -21,6 +21,7 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from orchestrator.run_shepherd import (
+    PRDiscoveryTransientError,
     _discover_refs,
     find_pr_for_proposal,
 )
@@ -171,7 +172,11 @@ def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None =
 
     pr_seen: set[tuple[str, str]] = set()
     for ref in actionable_refs:
-        pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
+        try:
+            pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
+        except PRDiscoveryTransientError:
+            # Unknown, not orphaned: per-item isolation (#281/#405).
+            continue
         if pr is None or pr.closed_unmerged or pr.merged:
             continue
         pr_seen.add((ref.service, ref.slug))

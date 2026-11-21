@@ -7037,3 +7037,41 @@ def test_reconcile_unstick_clears_the_outage_counters(tmp_path) -> None:
         "merge_unknown_ticks", "merge_unknown_head",
     ):
         assert key not in final, key
+
+
+# ---------------------------------------------------------------------------
+# #281: a transient gh failure is "unknown", never "branch absent"
+# ---------------------------------------------------------------------------
+
+
+class _Proc:
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_find_pr_url_by_branch_gh_failure_is_transient() -> None:
+    with patch.object(run_shepherd, "_run", return_value=_Proc(1, stderr="502")):
+        with pytest.raises(run_shepherd.PRDiscoveryTransientError):
+            run_shepherd._find_pr_url_by_branch("mctl-web", "x")
+
+
+def test_find_pr_url_by_branch_bad_json_is_transient() -> None:
+    with patch.object(run_shepherd, "_run", return_value=_Proc(0, stdout="{oops")):
+        with pytest.raises(run_shepherd.PRDiscoveryTransientError):
+            run_shepherd._find_pr_url_by_branch("mctl-web", "x")
+
+
+def test_find_pr_url_by_branch_empty_listing_is_absent() -> None:
+    with patch.object(run_shepherd, "_run", return_value=_Proc(0, stdout="[]")):
+        assert run_shepherd._find_pr_url_by_branch("mctl-web", "x") is None
+
+
+def test_reconcile_one_waits_on_transient_discovery(tmp_path) -> None:
+    ref = make_ref(tmp_path, status="in-progress", pr_url=None)
+    with patch.object(run_shepherd, "_run", return_value=_Proc(1, stderr="502")):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "wait"
+    assert "discovery failed" in (result.error or "")
+    assert read_status(ref)["status"] == "in-progress"

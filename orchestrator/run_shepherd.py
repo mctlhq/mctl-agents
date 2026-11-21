@@ -1546,7 +1546,12 @@ def _discover_refs(
                 continue
             pr_url = data.get("pr")
             if not pr_url and not reconcile:
-                pr_url = _find_pr_url_by_branch(service, slug)
+                try:
+                    pr_url = _find_pr_url_by_branch(service, slug)
+                except PRDiscoveryTransientError as e:
+                    # Unknown, not absent: leave the proposal for the next tick.
+                    print(f"warn: {service}/{slug}: {e}; skipping this tick")
+                    continue
                 if pr_url:
                     if not dry_run:
                         update_status_file(
@@ -1635,8 +1640,21 @@ def _gh_api_list(path: str) -> list[dict]:
     return items
 
 
+class PRDiscoveryTransientError(RuntimeError):
+    """GitHub PR discovery could not be observed (gh failed or bad JSON).
+
+    Distinct from "no PR exists for the branch": callers must treat this as an
+    unknown state (wait / skip the item), never as an absent branch
+    (mctlhq/mctl-agents#281).
+    """
+
+
 def _find_pr_url_by_branch(service: str, slug: str) -> str | None:
-    """Find the canonical implementer PR even when YAML lost its URL."""
+    """Find the canonical implementer PR even when YAML lost its URL.
+
+    Returns None only when GitHub answered and no matching PR exists. Raises
+    ``PRDiscoveryTransientError`` when the lookup itself failed.
+    """
     branch = f"feat/agents-{slug}"
     proc = _run([
         "gh", "pr", "list",
@@ -1649,12 +1667,20 @@ def _find_pr_url_by_branch(service: str, slug: str) -> str | None:
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         print(f"warn: GitHub PR discovery failed for {service}/{slug}: {detail}")
-        return None
+        raise PRDiscoveryTransientError(
+            f"GitHub PR discovery failed for {service}/{slug}: {detail}"
+        )
     try:
         prs = json.loads(proc.stdout or "[]")
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
         print(f"warn: invalid GitHub PR discovery JSON for {service}/{slug}")
-        return None
+        raise PRDiscoveryTransientError(
+            f"invalid GitHub PR discovery JSON for {service}/{slug}"
+        ) from exc
+    if not isinstance(prs, list):
+        raise PRDiscoveryTransientError(
+            f"unexpected GitHub PR discovery payload for {service}/{slug}"
+        )
     marker = f"agents-state/{service}/proposals/{slug}/"
     exact = [
         pr for pr in prs
@@ -3915,9 +3941,12 @@ def process_one(
     ``execution_id`` is this tick's ExecutionContext id, for the usage
     records of the summariser session (mctlhq/mctl-agents#499).
     """
-    pr = find_pr_for_proposal(
-        ref.service, ref.slug, state_dir=state_dir, status_path=ref.status_path,
-    )
+    try:
+        pr = find_pr_for_proposal(
+            ref.service, ref.slug, state_dir=state_dir, status_path=ref.status_path,
+        )
+    except PRDiscoveryTransientError as e:
+        return ShepherdResult(ref=ref, decision="wait", error=str(e))
     if pr is None:
         return ShepherdResult(
             ref=ref,
@@ -4784,8 +4813,13 @@ def reconcile_one(
             decision="needs-triage",
             notes="branch collision requires explicit operator resolution",
         )
-    discovered_url = ref.pr_url or _find_pr_url_by_branch(ref.service, ref.slug)
-    pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
+    try:
+        discovered_url = ref.pr_url or _find_pr_url_by_branch(ref.service, ref.slug)
+        pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
+    except PRDiscoveryTransientError as e:
+        # A failed lookup is not an absent branch: do not fall through to
+        # the no-PR recovery paths (mctlhq/mctl-agents#281).
+        return ShepherdResult(ref=ref, decision="wait", error=str(e))
     if pr is None:
         # A recorded/discovered URL that cannot be fetched is a transient
         # GitHub read failure, not proof that the PR disappeared.
