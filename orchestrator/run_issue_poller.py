@@ -110,7 +110,7 @@ _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 # hashes or bold markers) is a real declaration; the same phrase mid-sentence
 # ("the pod is blocked by NetworkPolicy") is prose unless it names a ref.
 _ANCHORED_PREFIX_RE = re.compile(r"^\s*(?:[-*+>]\s*|#{1,6}\s+)*(?:\*\*|__)?\s*$")
-_NEGATED_PREFIX_RE = re.compile(r"\b(?:not|no\s+longer|never)\s+$", re.IGNORECASE)
+_NEGATED_PREFIX_RE = re.compile(r"\b(?:not|no\s+longer|never)\s+\Z", re.IGNORECASE)
 _HEADING_LINE_RE = re.compile(r"^\s{0,3}#{1,6}\s")
 # An explicit "no dependencies" value after the phrase: "Depends on: none",
 # "Blocked by: N/A", "Depends on: -". Only honoured on an anchored
@@ -204,14 +204,14 @@ def parse_dependencies(body: str, owner: str, repo: str) -> tuple[list[tuple[str
         prefix = body[line_start:decl.start()]
         if _NEGATED_PREFIX_RE.search(prefix):
             continue  # "Not blocked by #3 anymore" declares nothing
-        anchored = bool(_ANCHORED_PREFIX_RE.match(prefix))
+        anchored = bool(_ANCHORED_PREFIX_RE.fullmatch(prefix))
         found = False
         for m in _REF_RE.finditer(decl.group("rest")):
             found = True
             _add_ref(refs, m, owner, repo)
-        if not found and anchored and _EMPTY_VALUE_RE.match(decl.group("rest")):
+        if not found and anchored and _EMPTY_VALUE_RE.fullmatch(decl.group("rest")):
             continue  # "Depends on: none" affirmatively declares no dependencies
-        colon_empty = bool(_COLON_ONLY_RE.match(decl.group("rest")))
+        colon_empty = bool(_COLON_ONLY_RE.fullmatch(decl.group("rest")))
         if not found and anchored:
             # "Blocked by:" / "## Depends on" followed by a list or a
             # paragraph: scan after the declaration line, skipping blank
