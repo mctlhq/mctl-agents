@@ -171,11 +171,15 @@ def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None =
     active_ids = active_workflow_ids or set()
 
     pr_seen: set[tuple[str, str]] = set()
+    # PR lookup could not be observed: unknown, so it must reach neither the
+    # orphan list nor the never-started classifier.
+    transient: set[tuple[str, str]] = set()
     for ref in actionable_refs:
         try:
             pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
         except PRDiscoveryTransientError:
             # Unknown, not orphaned: per-item isolation (#281/#405).
+            transient.add((ref.service, ref.slug))
             continue
         if pr is None or pr.closed_unmerged or pr.merged:
             continue
@@ -201,7 +205,8 @@ def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None =
     if active_workflow_ids is not None:
         state_refs, unreadable = _local_state_refs(
             state_dir,
-            [r for r in actionable_refs if (r.service, r.slug) not in pr_seen],
+            [r for r in actionable_refs if (r.service, r.slug) not in pr_seen
+             and (r.service, r.slug) not in transient],
         )
         never_started, unauthorized = _classify_never_started(
             state_refs,

@@ -58,3 +58,22 @@ def test_retry_window_spans_more_than_a_github_blip() -> None:
     assert p.maximum_attempts >= 5
     assert p.initial_interval >= timedelta(seconds=5)
     assert p.backoff_coefficient > 1
+
+
+def test_transient_lookup_not_classified_never_started(tmp_path, monkeypatch) -> None:
+    """Unobserved PR lookup is unknown, not 'no PR': it must not reach the
+    never-started classifier."""
+    d = tmp_path / "mctl-web" / "proposals" / "issue-1-x"
+    d.mkdir(parents=True)
+    (d / ".status.yaml").write_text(
+        yaml.safe_dump({"status": "accepted", "updated_at": "2020-01-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    seen: list = []
+    monkeypatch.setattr(orphans, "find_pr_for_proposal", _flaky("issue-1-x", None))
+    monkeypatch.setattr(
+        orphans, "_classify_never_started",
+        lambda refs, *a, **k: seen.extend(refs) or ([], 0),
+    )
+    orphans._sync_detect_orphans(tmp_path, set())
+    assert seen == []
