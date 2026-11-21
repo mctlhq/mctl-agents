@@ -88,10 +88,20 @@ class Scenario:
     # and used as the test id, so a green run says what it covered.
     covers: str = ""
     notes: tuple[str, ...] = field(default_factory=tuple)
+    # A scenario born after the exec-queue flip has no pre-flip recording to
+    # keep: it is recorded once, with `--kind patched`, and `path` is that
+    # same file. It is exempt from the assertions that only a pre-flip
+    # recording can satisfy (`test_prepatch_histories_predate_the_exec_queue_
+    # flip`), and replays once, not twice.
+    patched_only: bool = False
 
     @property
     def path(self) -> Path:
-        """History recorded BEFORE the exec-queue flip. Never re-record."""
+        """History recorded BEFORE the exec-queue flip. Never re-record.
+
+        For a `patched_only` scenario, its one recording."""
+        if self.patched_only:
+            return self.patched_path
         return HISTORY_DIR / f"{self.name}.prepatch.json"
 
     @property
@@ -106,7 +116,14 @@ class Scenario:
         return HISTORY_DIR / f"{self.name}.patched.json"
 
     def path_for(self, kind: str) -> Path:
+        if self.patched_only and kind == "prepatch":
+            raise ValueError(f"{self.name} is patched_only: it has no prepatch recording")
         return self.path if kind == "prepatch" else self.patched_path
+
+    @property
+    def kinds(self) -> tuple[str, ...]:
+        """The recordings this scenario has."""
+        return ("patched",) if self.patched_only else ("prepatch", "patched")
 
 
 async def record(client: Client, scenario: Scenario) -> WorkflowHandle:
@@ -237,6 +254,19 @@ SCENARIOS: tuple[Scenario, ...] = (
             "_run_cwft three times and records the atomic-approve, "
             "slug-scoped-implement and merge-detection markers"
         ),
+    ),
+    Scenario(
+        name="dev_loop_implement_execution",
+        workflows=[DevLoopWorkflow],
+        build=_dev_loop_build,
+        start=_dev_loop_start,
+        drive=_dev_loop_drive,
+        covers=(
+            "mctlhq/mctl-agents#991: a canonical loop recorded with the "
+            "implement-execution-id marker, so its implement submit carries "
+            "the loop's `we_` and the `we_` ends after the implement run"
+        ),
+        patched_only=True,
     ),
     Scenario(
         name="incident_loop",
