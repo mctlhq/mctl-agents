@@ -448,6 +448,28 @@ BUILTIN_POLICY = Policy(
     ),
 )
 
+#: The `independent-review` policy (`policyRef` of the review-worker profile,
+#: mctlhq/mctl-agents#986, ADR 025 "Producer"). Default deny: the reviewer
+#: holds no GitHub write, merge, label, comment or rerun capability, and no
+#: `mcp__mctl__*` rule exists. The explicit DENY rules only name what is
+#: refused, so a decision carries a rule id; deleting them changes nothing
+#: but the code (`no_matching_rule` instead of `denied_by_rule`).
+REVIEW_WORKER_POLICY = Policy(
+    version="mctl-agents/policy/independent-review/v1",
+    rules=tuple(
+        Rule(f"review-worker-deny-{kind}", kind, "*", DENY)
+        for kind in (
+            GITHUB_GIT_PUSH,
+            GITHUB_PR_CREATE,
+            GITHUB_PR_MERGE,
+            GITHUB_PR_COMMENT,
+            GITHUB_ISSUE_COMMENT,
+            GITHUB_ISSUE_LABEL,
+            GITHUB_RUN_RERUN,
+        )
+    ),
+)
+
 #: Selects the merge policy (mctlhq/mctl-agents#519, docs/adr/016-shepherd-
 #: merge-approval.md). Unset, empty or `none`: BUILTIN_POLICY, unchanged —
 #: the shepherd's merge stays byte-for-byte what it is today. `require`:

@@ -344,6 +344,28 @@ agents:
     riskLevel: low
     triggeredBy: []
 
+  # mctlhq/mctl-agents#986: the producer of autonomous independent review
+  # receipts (ADR 025 "Producer"). Read-only reviewer session; the deterministic
+  # request/attach/mint/submit/evidence flow is orchestrator/review_worker/.
+  - name: review-worker
+    driver: orchestrator/run_review_worker.py
+    entrypoint: orchestrator.run_review_worker:main
+    optionsBuilder: orchestrator.options:build_review_worker_options
+    promptSources:
+      - inline: orchestrator/review_worker/session.py:build_prompt
+      - file: agents/_review_worker/.claude/agents/review-worker.md
+    modelPolicyTask: service_agent
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-run   # nominal until the mctl-gitops companion CWFT lands
+    writes: nothing (opens a review request and submits a receipt through mctl-api)
+    riskLevel: low
+    triggeredBy: []
+    notes: >-
+      No GitHub credential and no mctl MCP server; the policy checkpoint
+      (independent-review) refuses every github.* action kind. The worker route
+      answers 501 review_worker_ingest_disabled until an operator enables it.
+
   # mctlhq/mctl-agents#797: daily ranked tech-news digest to Telegram.
   # Tool-free model calls; docs/operations/scout.md.
   - name: scout

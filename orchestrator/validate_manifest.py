@@ -99,6 +99,9 @@ _AGENT_BY_CATALOG_PROFILE = {
     # mctlhq/mctl-agents#797: mapped ahead of the profile (mctl-gitops
     # scout-default), for the same reason as the #470 entries above.
     "scout-default": "scout",
+    # mctlhq/mctl-agents#986: mapped ahead of the profile (the mctl-gitops
+    # companion), for the same reason as the #470 entries above.
+    "independent-review": "review-worker",
 }
 
 # Every build_*_options() builder consults mctl_mcp_config()/_mctl_tool_globs(),
