@@ -3821,6 +3821,57 @@ def _open_pr_for_branch(
     return pr_url
 
 
+def _pr_announcement_marker(ref: ProposalRef, pr_url: str) -> str:
+    """Hidden marker that makes the issue comment idempotent per PR."""
+    return f"<!-- mctl-agents:implementer-pr {ref.service}/{ref.slug} {pr_url} -->"
+
+
+def _announce_pr_on_source_issue(ref: ProposalRef, pr_url: str) -> bool:
+    """Post ONE comment on the source issue saying the implementer opened
+    ``pr_url`` (#314). Best-effort: the PR already exists, so nothing here
+    may fail the implement step. Returns True only when a comment was posted.
+
+    Idempotent per PR via a hidden marker in the comment body: the existing
+    comments are read first and, if the marker is present, nothing is
+    posted. If the comments cannot be read, nothing is posted either --
+    "could not observe" is not "no comment yet", and a duplicate is worse
+    than a missing courtesy note.
+    """
+    source = _load_status(ref.status_path).get("source")
+    if not isinstance(source, dict) or source.get("type") != "github_issue":
+        return False
+    repo, issue = source.get("repo"), source.get("issue")
+    if not repo or not issue:
+        return False
+    issue_url = f"https://github.com/{repo}/issues/{issue}"
+    marker = _pr_announcement_marker(ref, pr_url)
+    try:
+        data = _github_json(["gh", "issue", "view", issue_url, "--json", "comments"])
+        comments = data.get("comments") if isinstance(data, dict) else None
+        if not isinstance(comments, list):
+            raise GitHubPreflightError("gh issue view returned no comments list")
+        if any(marker in (c.get("body") or "") for c in comments if isinstance(c, dict)):
+            print(f"info: PR announcement already on {repo}#{issue}; not repeating")
+            return False
+        body = (
+            "mctl-agents Tier 2 implementer opened a PR for the accepted proposal "
+            f"`{ref.service}/{ref.slug}`:\n\n{pr_url}\n\n"
+            "Review it as you would any PR: it was opened automatically and the "
+            "spec may have gaps. The issue closes when the PR merges.\n\n"
+            f"{marker}"
+        )
+        policy_checkpoint.require(policy_checkpoint.checkpoint(
+            policy_checkpoint.GITHUB_ISSUE_COMMENT, "comment", issue_url, {"body": body},
+            metadata={"service": ref.service, "slug": ref.slug},
+        ))
+        _run(["gh", "issue", "comment", issue_url, "--body", body])
+    except Exception as exc:  # noqa: BLE001 - best-effort notification
+        print(f"warn: could not announce PR on {repo}#{issue}: {exc}", file=sys.stderr)
+        return False
+    print(f"ok: announced {pr_url} on {repo}#{issue}")
+    return True
+
+
 def _preflight_existing_result(
     ref: ProposalRef,
     *,
@@ -5198,6 +5249,8 @@ def _implement_attempt(
             rate_limited=None,
         )
         _release_claim(claim_ctx, reason="implemented")
+        # 9. Tell the source issue about the PR (#314); best-effort, once.
+        _announce_pr_on_source_issue(ref, pr_url)
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
