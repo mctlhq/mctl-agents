@@ -3057,15 +3057,24 @@ def _try_parse_json(blob: str) -> Any:
         # Drop the opening fence and (if present) the closing one.
         lines = [ln for ln in lines if not ln.strip().startswith("```")]
         candidate = "\n".join(lines).strip()
-    # Find the first { and last } — the SDK occasionally wraps with prose.
-    start = candidate.find("{")
-    end = candidate.rfind("}")
-    if start == -1 or end == -1 or end < start:
-        return None
-    try:
-        return json.loads(candidate[start:end + 1])
-    except json.JSONDecodeError:
-        return None
+    # The SDK occasionally wraps the object with prose, and a multi-message
+    # blob can hold several objects (an early draft, braces inside prose, then
+    # the final answer). Spanning first-`{` to last-`}` glues them into one
+    # invalid document (mctl-agents#338), so decode object by object and keep
+    # the last one that parses.
+    decoder = json.JSONDecoder()
+    last: Any = None
+    pos = candidate.find("{")
+    while pos != -1:
+        try:
+            obj, end = decoder.raw_decode(candidate, pos)
+        except json.JSONDecodeError:
+            pos = candidate.find("{", pos + 1)
+            continue
+        if isinstance(obj, dict):
+            last = obj
+        pos = candidate.find("{", end)
+    return last
 
 
 def _serialise_findings(findings: list[CodexFinding]) -> str:

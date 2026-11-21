@@ -248,7 +248,12 @@ loads stdlib only.
 **Budget — sources and bytes, never tokens.** `ContextBudget` is
 model-independent by construction: `max_sources`, `max_bytes`,
 `max_bytes_per_source`, plus observed `used_sources`/`used_bytes` and a
-`truncated` flag. This is the assembly budget, **not** the model's maximum
+`truncated` flag. `truncated=true` means assembly dropped or clipped
+candidates to fit; it excuses the `max_sources`/`max_bytes`/
+`max_bytes_per_source` overrun checks, never the reconciliation of
+`used_*` against the sources. When it is false, the per-source ceiling is
+checked against included sources only: an excluded source consumes no
+budget. This is the assembly budget, **not** the model's maximum
 context window. Token-denominated budgets are explicitly deferred: token
 counts depend on a tokenizer and model that `config/model-policy.yaml` may
 change under an already-sealed snapshot, which would make a historical
