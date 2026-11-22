@@ -232,6 +232,7 @@ def test_every_generated_probe_records_provenance_generator_and_source_observati
     assert (probe.parent_run_id, probe.parent_result_id) == (parent.run.run_id, parent.result.result_id)
     assert (probe.run_id, probe.result_id) == (child.run.run_id, child.result.result_id) and probe.depth == 1
     assert probe.generator == aa.GeneratorIdentity("related-report-stub", "1.0.0", "none")
+    assert probe.to_dict()["generator"]["model_version"] == "none"
     assert probe.candidate["template_id"] == ada.TEMPLATE and probe.candidate["evidence"]
     (source,) = probe.source_observations
     assert source["run_id"] == parent.run.run_id and source["tool"] == GET and source["status"] == "ok"
@@ -668,6 +669,43 @@ def test_the_tool_pool_is_the_scenarios_and_is_checked_before_generating():
     assert report.stop_reason == aa.ADAPT_TOOL_BUDGET and generator.requests == [] and len(target.calls) == 1
 
 
+def test_the_tool_pool_is_shared_across_follow_ups_so_they_cannot_raise_it():
+    """Two follow-ups that each try 5 calls against a scenario budget of 8: the
+    second one only gets what the parent and the first left over."""
+    def five(_params):
+        def probe(ctx):
+            for _ in range(5):
+                ctx.call_tool(GET, {"report": "rpt-b-1"})
+        return probe
+
+    ceiling = ra.Budgets(max_attempts=1, max_tool_calls=8, max_wall_clock_seconds=60, max_followups=2)
+    generator = Scripted(two_distinct)
+    report, target = go(generator, followups={ada.TEMPLATE: five}, ceiling=ceiling,
+                        limits=aa.AdaptiveLimits(max_depth=2, max_followups=2))
+    first, second = report.followups
+    assert first.run.granted_budgets.max_tool_calls == 7
+    assert second.run.granted_budgets.max_tool_calls == 7 - first.result.consumed.tool_calls == 2
+    assert len(target.calls) <= 8, "parent plus follow-ups never exceed the scenario's tool budget"
+
+
+def test_a_follow_up_is_granted_only_the_wall_clock_left_in_the_pool():
+    clock = ah.ManualClock()
+    rig = ada.make_rig()
+    config = ada.make_config(rig, clock=clock)
+
+    def spends_forty(ctx):
+        ctx.call_tool(GET, {"report": "rpt-a-1"})
+        clock.advance(40)
+
+    generator = Scripted(lambda request: base_candidate(request))
+    report = aa.execute_adaptive(SCENARIO, spends_forty, config, seed=0, generator=generator,
+                                 followups=ada.FOLLOWUPS)
+    (child,) = report.followups
+    remaining = SCENARIO.budgets.max_wall_clock_seconds - 40
+    assert child.run.granted_budgets.max_wall_clock_seconds <= remaining
+    assert child.run.granted_budgets.max_wall_clock_seconds < SCENARIO.budgets.max_wall_clock_seconds
+
+
 def test_a_slow_generator_spends_the_wall_clock_pool_and_nothing_runs():
     clock = ah.ManualClock()
 
@@ -981,3 +1019,18 @@ def test_every_reject_code_and_stop_reason_the_module_emits_is_in_its_closed_set
     for name, value in re.findall(r'^(ADAPT_[A-Z_]+) = "([a-z_]+)"', source, re.M):
         assert value in aa.ADAPT_STOPS, name
     assert aa.VIOLATION_CODES | aa.MALFORMED_CODES <= aa.REJECT_CODES
+
+
+def test_the_exact_model_version_is_recorded_sealed_and_reported():
+    versioned = aa.GeneratorIdentity("related-report-stub", "1.0.0", "m-2026-11")
+    generator = Scripted(lambda request: base_candidate(request), identity=versioned)
+    report, _target = go(generator)
+    (probe,) = report.generated
+    assert probe.to_dict()["generator"]["model_version"] == "m-2026-11"
+    assert report.generator == versioned and report.generator.to_dict()["model_version"] == "m-2026-11"
+    assert probe.verify()
+    # The hash covers the model version: the same probe with another version has another hash.
+    other = dataclasses.replace(probe, generator=aa.GeneratorIdentity("related-report-stub", "1.0.0", "none"))
+    assert not other.verify()
+    stub_report, _ = go(Scripted(lambda request: base_candidate(request)))
+    assert stub_report.generated[0].record_hash != probe.record_hash
