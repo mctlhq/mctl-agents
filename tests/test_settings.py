@@ -84,6 +84,14 @@ def test_mctl_support_is_an_issue_driven_service():
     assert "mctl-support" not in ROTATING_SERVICES
 
 
+
+def test_mctl_glovo_is_issue_driven_and_non_rotating():
+    """mctl-glovo#42 needs DevLoop; no agents/mctl-glovo/ rotation scaffold."""
+    assert "mctl-glovo" in SERVICES
+    assert tenant_for_service("mctl-glovo") == PLATFORM_TENANT
+    assert "mctl-glovo" in NON_ROTATING_SERVICES
+    assert "mctl-glovo" not in ROTATING_SERVICES
+
 def test_no_service_name_is_shell_glob_hostile_beyond_a_leading_dot():
     """A service name becomes a path segment under agents-state/.
 
