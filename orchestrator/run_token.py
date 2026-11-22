@@ -69,6 +69,9 @@ class RunToken:
     scope: str
     execution_id: str
     expires_at: str
+    #: The one DevLoop grant the token is pinned to, for a run with no
+    #: execution (mctlhq/mctl-gitops#1980). Empty on every other token.
+    grant_id: str = ""
 
 
 @dataclass
@@ -183,6 +186,7 @@ def exchange(sa_token_file: str | None = None, post=_post) -> RunToken:
         scope=field("scope"),
         execution_id=field("execution_id"),
         expires_at=field("expires_at"),
+        grant_id=field("grant_id"),
     )
 
 
@@ -263,6 +267,13 @@ def mctl_api_bearer(static_token: str | None = None) -> str:
     if static_token is None:
         static_token = read_credential("MCTL_TOKEN")
     return static_token.strip()
+
+
+def pinned_grant_id() -> str:
+    """The grant this run's enforced token is pinned to, or "". Such a token
+    sees that grant only, so mctl-api's 404 for any other id says nothing about
+    whether that one exists."""
+    return _state.token.grant_id if _state.token is not None else ""
 
 
 def _reset_for_tests() -> None:
