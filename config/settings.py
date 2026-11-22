@@ -85,6 +85,12 @@ AGENTS_DIR = REPO_ROOT / "agents"
 # scaffold, so it must NOT enter ROTATING_SERVICES; the generic implementer
 # covers it and its PRs stay shepherd-owned.
 #
+# `mctl-glovo` is an issue-driven C2 connector and Cloudflare remote-login
+# research target (mctlhq/mctl-glovo#42 / PR #4). It has no
+# agents/mctl-glovo/ scaffold; allow DevLoop/issue investigation but keep
+# it out of proactive service-agent rotation. No production linking or
+# provider effect is authorized by this registry entry.
+#
 # `mctl-support` (tenant support agent over A2A, epic mctlhq/.github#243;
 # private Python/uv repo) is issue-driven only, registered for its S1
 # slices starting with mctlhq/mctl-support#2. Same shape as `mctl-alice`:
@@ -109,6 +115,7 @@ SERVICES = [
     "mctl-claude-remote",
     "mctl-alice",
     "mctl-support",
+    "mctl-glovo",
     # "upwork-mcp",
 ]
 
@@ -143,6 +150,7 @@ SERVICE_TENANTS = {
     "mctl-claude-remote": PLATFORM_TENANT,
     "mctl-alice": PLATFORM_TENANT,
     "mctl-support": PLATFORM_TENANT,
+    "mctl-glovo": PLATFORM_TENANT,
 }
 
 
@@ -166,6 +174,7 @@ NON_ROTATING_SERVICES = {
     "mctl-claude-remote",
     "mctl-alice",
     "mctl-support",
+    "mctl-glovo",
 }
 
 # Subset of SERVICES that the proactive R&D rotation analyzes via
