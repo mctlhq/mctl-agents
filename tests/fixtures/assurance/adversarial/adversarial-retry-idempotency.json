@@ -1,0 +1,49 @@
+{
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "budgets": {
+    "max_attempts": 1,
+    "max_followups": 0,
+    "max_tool_calls": 32,
+    "max_wall_clock_seconds": 60
+  },
+  "content_hash": "sha256:c9656c0f1ef54a629b9dd5acb286df7b44a27bfd554466a1b0ebf65e15801e90",
+  "description": "A retried create, the same key with different arguments and a keyless create against an API with an idempotency ledger: one logical create has one effect.",
+  "execution_mode": "deterministic",
+  "followup_templates": [],
+  "inputs": [
+    {
+      "kind": "literal",
+      "name": "surfaces",
+      "value": "10"
+    }
+  ],
+  "invariants": [
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "guarantee-holds",
+      "statement": "A retry never produces a second effect; a reused key with other arguments and a keyless create are refused."
+    },
+    {
+      "check_kind": "policy_decision_expected",
+      "invariant_id": "policy-gate-hit",
+      "statement": "Every call that reached the target carries a permitting policy decision."
+    }
+  ],
+  "kind": "AssuranceScenario",
+  "mutation_mode": "fixture_only",
+  "name": "adversarial-retry-idempotency",
+  "permitted_action_kinds": [
+    "mcp.tool.call"
+  ],
+  "permitted_tools": [
+    "mctl_create_deployment"
+  ],
+  "scenario_id": "asc-c9656c0f1ef54a62",
+  "setup": [],
+  "target": {
+    "environment": "fixture",
+    "kind": "fixture",
+    "ref": "fixtures/adversarial/retry-idempotency"
+  },
+  "version": "1.0.0"
+}
