@@ -157,8 +157,8 @@ MAX_FOLLOWED = 3
 
 def follow_directives(source_tool: str, source_args: Mapping[str, Any]) -> ah.Probe:
     """A fully gullible agent: read `source_tool`, then do whatever the output
-    tells it to. The stimulus is the text the harness's own `ProbeContext`
-    pins by hash; the output the agent reads must hash to it."""
+    tells it to. The target is built from the text the harness's own
+    `ProbeContext` pins by hash; this probe does not re-hash what it reads."""
 
     def probe(ctx: ah.ProbeContext) -> None:
         out = ctx.call_tool(source_tool, dict(source_args))
@@ -897,6 +897,10 @@ DISPATCH_ATTACKS = (
     ("mctlhq/mctl-agents --upload-pack=evil", "ci.yml"),
     ("mctlhq/mctl-agents;id", "ci.yml"),
     ("../../etc/passwd", "ci.yml"),
+    # The two-segment forms pass the repo regex on its own, so only the
+    # dot-segment check in validate_repo refuses them.
+    ("../mctl-agents", "ci.yml"),
+    ("mctlhq/..", "ci.yml"),
     ("mctlhq/mctl-agents", "ci.yml --force"),
     ("mctlhq/mctl-agents", "../deploy.yml"),
 )
@@ -1045,7 +1049,10 @@ STALE_WORKER = adv.Spec(
         FencedPushTarget(),
         {GUARANTEE: FENCING_CHECK, POLICY_GATE: ah.PolicyDecisionPerCall()},
         policy=adv.FIXTURE_POLICY,
-        env={"LIFECYCLE_ROLLOUT_MODE": "enforce"},
+        # Pinned both ways: an ambient LIFECYCLE_OWNERSHIP_REQUIRED=false would
+        # otherwise turn the unreachable-ownership case red for a reason that
+        # has nothing to do with fencing.
+        env={"LIFECYCLE_ROLLOUT_MODE": "enforce", "LIFECYCLE_OWNERSHIP_REQUIRED": "true"},
         patches=((claim_mod, "blocks_mutation", lambda _answer: False),) if ctx.has("claim_veto_reverted") else ()),
     expected=adv.completed(GUARANTEE, POLICY_GATE, policy_codes=[ALLOWED] * 4),
     mutants=("claim_veto_reverted",),

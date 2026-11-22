@@ -118,6 +118,18 @@ Acceptance criteria of #696 and where they are checked
   without it. They do not prove the other service (mctl-telegram, mctl-api)
   has the guard. A defect there is that service's finding, confirmed by a
   replay against it, not by this suite.
+- The CI subset is the whole suite today: every scenario is `ci_subset: true`
+  because all of them run in-process with no socket and no credential. The
+  flag is the mechanism for a later scenario that needs more, not a selection
+  that exists yet.
+- `adversarial-approval-mismatch` shows that B, hashing to another idempotency
+  key, gets a fresh pending approval; it does not exercise the receipt's
+  intent-hash binding. That binding is pinned by
+  `adversarial-approval-receipt-confusion` alone (mutation: drop the
+  `intent_hash` comparison in `redeem`, and only that scenario goes red).
+- A stopped run reports every invariant `unknown` (ADR 023), so for the
+  `refused` scenarios the oracle is the exact stop reason, the policy codes and
+  the target's effects ledger. Their invariant detectors are not evidence.
 - `AssuranceRun.approvals` stays empty (ADR 023): approvals are checked through
   the policy decision codes the run records, not through `ApprovalRef`s.
 - Defence in depth is pinned, not hidden. Reverting only the scenario gate in
