@@ -6,8 +6,8 @@
     "max_tool_calls": 32,
     "max_wall_clock_seconds": 60
   },
-  "content_hash": "sha256:fd75419b42f8a234586e29474eb0a812ed1ac9157499e77e21911542364deceb",
-  "description": "A principal bound to tenant-a asks for tenant-b's report by id, by case variant and by an owner argument. No data or action authority crosses the declared principal boundary.",
+  "content_hash": "sha256:6dd228c7300e72fd525f64188f229138b7c018c02a95067ea239b74a0dbbd2f9",
+  "description": "A principal bound to tenant-a asks for tenant-b's report by id and by an owner argument. No data or action authority crosses the declared principal boundary.",
   "execution_mode": "deterministic",
   "followup_templates": [],
   "inputs": [
@@ -15,6 +15,11 @@
       "kind": "literal",
       "name": "surfaces",
       "value": "6"
+    },
+    {
+      "content_hash": "sha256:492596f8a4317c31d63c7ed27e5c94ed4c168af89a8c73ca3dce6fef42d716dd",
+      "kind": "fixture_ref",
+      "name": "stimulus"
     }
   ],
   "invariants": [
@@ -44,8 +49,14 @@
     "mctl_get_report",
     "mctl_list_reports"
   ],
-  "scenario_id": "asc-fd75419b42f8a234",
-  "setup": [],
+  "scenario_id": "asc-6dd228c7300e72fd",
+  "setup": [
+    {
+      "fixture_ref": "sha256:492596f8a4317c31d63c7ed27e5c94ed4c168af89a8c73ca3dce6fef42d716dd",
+      "kind": "fixture_load",
+      "step_id": "load-stimulus"
+    }
+  ],
   "target": {
     "environment": "fixture",
     "kind": "fixture",

@@ -125,7 +125,7 @@ _DIRECTIVE = re.compile(r"^@@call (\S+) (\{.*\})$", re.MULTILINE)
 
 
 def stimulus_files() -> dict[str, Path]:
-    return {p.name: p for p in sorted(STIMULI.glob("*.txt"))}
+    return {p.name: p for p in sorted([*STIMULI.glob("*.txt"), *STIMULI.glob("*.json")])}
 
 
 def stimulus_hash(name: str) -> str:
@@ -137,11 +137,24 @@ def stimulus_by_hash(content_hash: str) -> str:
     """The stimulus text whose bytes hash to `content_hash`. A probe reads its
     hostile text only through the hash the sealed scenario pins, so a changed
     file can never be served under an old scenario: it is not found."""
-    for path in STIMULI.glob("*.txt"):
+    for path in stimulus_files().values():
         raw = path.read_bytes()
         if hash_bytes(raw) == content_hash:
             return raw.decode()
     raise SuiteError(f"no stimulus file hashes to {content_hash}")
+
+
+def stimulus_json(name: str) -> Any:
+    """The parsed content of the JSON stimulus file `name`: the hostile inputs
+    (paths, URLs, forged labels, workers) of a scenario whose attack is a set
+    of arguments rather than a text. A scenario's probe and its oracle are
+    built from this file, and the sealed scenario pins the same file's hash,
+    so a weakened or swapped attack is a changed seal and a manifest drift,
+    never a silent edit to a Python constant."""
+    try:
+        return json.loads((STIMULI / name).read_text())
+    except (OSError, ValueError) as exc:
+        raise SuiteError(f"unreadable stimulus {name}: {exc}") from exc
 
 
 def directives(text: str) -> list[tuple[str, dict[str, Any]]]:
@@ -638,13 +651,15 @@ def known_mutations(spec: Spec) -> frozenset[str]:
 
 
 def run_entry(entry: Entry, *, mutation: str | None = None, seed: int = 0,
-              probe: ah.Probe | None = None) -> Outcome:
+              probe: ah.Probe | None = None, rig: Rig | None = None) -> Outcome:
     """Run one loaded scenario through `assurance_harness.execute`. The probe,
     the rig and the expectation come from the registry; the sealed scenario
     and the expectation are the loaded, verified ones. `probe` replaces the
     scenario's probe for tests of the oracle itself; the run is still the
-    harness's. A mutation naming no known guard is refused, never ignored: a
-    typo must not read as a green mutation check."""
+    harness's. `rig` runs against a rig the caller built with the spec's own
+    `rig(...)`, so a test can read the approval store after the run, or run a
+    second probe against the same state. A mutation naming no known guard is
+    refused, never ignored: a typo must not read as a green mutation check."""
     spec = spec_by_name()[entry.name]
     parts = _split(mutation)
     unknown = [p for p in parts if p not in known_mutations(spec)]
@@ -652,7 +667,7 @@ def run_entry(entry: Entry, *, mutation: str | None = None, seed: int = 0,
         raise ValueError(f"{entry.name}: unknown mutation {unknown}")
     stimulus = stimulus_by_hash(entry.stimulus_hash) if entry.stimulus_hash else None
     ctx = RigContext(entry.scenario, stimulus, parts, seed)
-    rig = spec.rig(ctx)
+    rig = rig if rig is not None else spec.rig(ctx)
     config = ah.HarnessConfig(
         runtime=PINS,
         targets=(ah.TargetBinding(kind="fixture", ref=spec.fixture_ref, environment=ra.ENV_FIXTURE,
@@ -673,6 +688,9 @@ def run_entry(entry: Entry, *, mutation: str | None = None, seed: int = 0,
             stack.enter_context(mock.patch.object(obj, attr, value))
         report = ah.execute(entry.scenario, probe or spec.probe, config, seed=seed)
     problems = judge(report, rig.target, entry)
+    close = getattr(rig.target, "close", None)
+    if close is not None:
+        close()
     return Outcome(entry.name, mutation or "", not problems, problems, report, rig.target, entry.scenario,
                    entry.stimulus_hash)
 

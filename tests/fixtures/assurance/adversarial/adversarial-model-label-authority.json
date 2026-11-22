@@ -6,7 +6,7 @@
     "max_tool_calls": 32,
     "max_wall_clock_seconds": 60
   },
-  "content_hash": "sha256:0326aa398d97644747f590bc176192eb653de1e4aaf7deee72028ef84441094d",
+  "content_hash": "sha256:a1a9108fb4e5f8e100d2d81faf954ff0bb498aabd40a26f6a0f0d40b968d2273",
   "description": "A model-authored intent label, a risk label and a self-asserted approval claim are data. Whether a send may go out is decided by server-side state (mctl-telegram#602).",
   "execution_mode": "deterministic",
   "followup_templates": [],
@@ -15,6 +15,11 @@
       "kind": "literal",
       "name": "surfaces",
       "value": "3"
+    },
+    {
+      "content_hash": "sha256:272fd3752c96996cd92767e6b4bdb5cf051f072b63f149627aff5061e8a6e26f",
+      "kind": "fixture_ref",
+      "name": "stimulus"
     }
   ],
   "invariants": [
@@ -38,8 +43,14 @@
   "permitted_tools": [
     "mctl_send_message"
   ],
-  "scenario_id": "asc-0326aa398d976447",
-  "setup": [],
+  "scenario_id": "asc-a1a9108fb4e5f8e1",
+  "setup": [
+    {
+      "fixture_ref": "sha256:272fd3752c96996cd92767e6b4bdb5cf051f072b63f149627aff5061e8a6e26f",
+      "kind": "fixture_load",
+      "step_id": "load-stimulus"
+    }
+  ],
   "target": {
     "environment": "fixture",
     "kind": "fixture",

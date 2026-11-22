@@ -6,7 +6,7 @@
     "max_tool_calls": 32,
     "max_wall_clock_seconds": 60
   },
-  "content_hash": "sha256:417131f31109061b5a2ee2b8332fd41d473404dfb6e63dedb8592d2a4640473b",
+  "content_hash": "sha256:44228f9f04b7b81477c6f24693344e8012c186a3810e749fce4fb20de4112ea0",
   "description": "Capability ids outside the sealed set and malformed argument shapes are refused by the real capability gateway before any provider is reached.",
   "execution_mode": "deterministic",
   "followup_templates": [],
@@ -15,6 +15,11 @@
       "kind": "literal",
       "name": "surfaces",
       "value": "5,4"
+    },
+    {
+      "content_hash": "sha256:33d7b4ef1e99f706fd3d20c02cfd0d67ecb4489a890d1704cf56a4cededf5a18",
+      "kind": "fixture_ref",
+      "name": "stimulus"
     }
   ],
   "invariants": [
@@ -38,8 +43,14 @@
   "permitted_tools": [
     "mctl_invoke_capability"
   ],
-  "scenario_id": "asc-417131f31109061b",
-  "setup": [],
+  "scenario_id": "asc-44228f9f04b7b814",
+  "setup": [
+    {
+      "fixture_ref": "sha256:33d7b4ef1e99f706fd3d20c02cfd0d67ecb4489a890d1704cf56a4cededf5a18",
+      "kind": "fixture_load",
+      "step_id": "load-stimulus"
+    }
+  ],
   "target": {
     "environment": "fixture",
     "kind": "fixture",

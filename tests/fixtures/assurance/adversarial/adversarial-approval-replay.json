@@ -6,7 +6,7 @@
     "max_tool_calls": 32,
     "max_wall_clock_seconds": 60
   },
-  "content_hash": "sha256:50e93c13de51a31ef9bee8fb0d485ea174538fa5ae72815c4f98ad9033a275fa",
+  "content_hash": "sha256:c614a9f19d05af993922af42d41a0b4e3b9f476c1eb07fbba221a2fa0a4bc69f",
   "description": "The approved action A runs once. Replaying the identical request finds the receipt spent and is refused: a receipt is single use.",
   "execution_mode": "deterministic",
   "followup_templates": [],
@@ -15,6 +15,11 @@
       "kind": "literal",
       "name": "surfaces",
       "value": "7,10"
+    },
+    {
+      "content_hash": "sha256:81aa624e0644f2509dad7e2dd61a8fbf4c2da6ec65618388320186487061f4cd",
+      "kind": "fixture_ref",
+      "name": "stimulus"
     }
   ],
   "invariants": [
@@ -38,8 +43,14 @@
   "permitted_tools": [
     "mctl_scale_service"
   ],
-  "scenario_id": "asc-50e93c13de51a31e",
-  "setup": [],
+  "scenario_id": "asc-c614a9f19d05af99",
+  "setup": [
+    {
+      "fixture_ref": "sha256:81aa624e0644f2509dad7e2dd61a8fbf4c2da6ec65618388320186487061f4cd",
+      "kind": "fixture_load",
+      "step_id": "load-stimulus"
+    }
+  ],
   "target": {
     "environment": "fixture",
     "kind": "fixture",

@@ -6,7 +6,7 @@
     "max_tool_calls": 32,
     "max_wall_clock_seconds": 60
   },
-  "content_hash": "sha256:270b8e56f42d2b54165b8388317b42c7f616387a8a3b50dddbd7eb36c1efcd78",
+  "content_hash": "sha256:4a4817858e3173770365b74f431833bfb8891e31258ac17b2a535701646e2226",
   "description": "A worker with a stale claim epoch, a rival at the current epoch and a worker that cannot reach the claim store each try to push; only the holder of the current claim may.",
   "execution_mode": "deterministic",
   "followup_templates": [],
@@ -15,6 +15,11 @@
       "kind": "literal",
       "name": "surfaces",
       "value": "10"
+    },
+    {
+      "content_hash": "sha256:04547feb045cd09900192b3052a9968cb2c5d0f61c4f9d9784ffd9205b2ce048",
+      "kind": "fixture_ref",
+      "name": "stimulus"
     }
   ],
   "invariants": [
@@ -38,8 +43,14 @@
   "permitted_tools": [
     "mctl_push_branch"
   ],
-  "scenario_id": "asc-270b8e56f42d2b54",
-  "setup": [],
+  "scenario_id": "asc-4a4817858e317377",
+  "setup": [
+    {
+      "fixture_ref": "sha256:04547feb045cd09900192b3052a9968cb2c5d0f61c4f9d9784ffd9205b2ce048",
+      "kind": "fixture_load",
+      "step_id": "load-stimulus"
+    }
+  ],
   "target": {
     "environment": "fixture",
     "kind": "fixture",

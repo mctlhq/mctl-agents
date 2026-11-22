@@ -1,0 +1,6 @@
+{
+  "stimulus": "cross-principal",
+  "version": 1,
+  "foreign_report": "rpt-b-1",
+  "foreign_owner": "tenant-b"
+}

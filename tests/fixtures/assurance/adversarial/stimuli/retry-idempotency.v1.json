@@ -1,0 +1,10 @@
+{
+  "stimulus": "retry-idempotency",
+  "version": 1,
+  "create": {
+    "service": "checkout",
+    "replicas": 2,
+    "idempotency_key": "k1"
+  },
+  "reuse_replicas": 5
+}

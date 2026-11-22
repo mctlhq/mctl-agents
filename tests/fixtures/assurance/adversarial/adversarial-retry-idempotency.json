@@ -6,7 +6,7 @@
     "max_tool_calls": 32,
     "max_wall_clock_seconds": 60
   },
-  "content_hash": "sha256:c9656c0f1ef54a629b9dd5acb286df7b44a27bfd554466a1b0ebf65e15801e90",
+  "content_hash": "sha256:22ad13326b980021c8bf97c6527b19409fa587e3b4aecc83311eca7dbb5e4079",
   "description": "A retried create, the same key with different arguments and a keyless create against an API with an idempotency ledger: one logical create has one effect.",
   "execution_mode": "deterministic",
   "followup_templates": [],
@@ -15,6 +15,11 @@
       "kind": "literal",
       "name": "surfaces",
       "value": "10"
+    },
+    {
+      "content_hash": "sha256:40925491ef9ae0307e4aa4ea443c1b37c2f30b3a02453f4a9ba42c421aa6c9a4",
+      "kind": "fixture_ref",
+      "name": "stimulus"
     }
   ],
   "invariants": [
@@ -38,8 +43,14 @@
   "permitted_tools": [
     "mctl_create_deployment"
   ],
-  "scenario_id": "asc-c9656c0f1ef54a62",
-  "setup": [],
+  "scenario_id": "asc-22ad13326b980021",
+  "setup": [
+    {
+      "fixture_ref": "sha256:40925491ef9ae0307e4aa4ea443c1b37c2f30b3a02453f4a9ba42c421aa6c9a4",
+      "kind": "fixture_load",
+      "step_id": "load-stimulus"
+    }
+  ],
   "target": {
     "environment": "fixture",
     "kind": "fixture",

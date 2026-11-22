@@ -6,7 +6,7 @@
     "max_tool_calls": 32,
     "max_wall_clock_seconds": 60
   },
-  "content_hash": "sha256:8209207178066cfc756aa7bd22a782a2bde0622936ba6ce175d3d79c441173b6",
+  "content_hash": "sha256:d40da18facfeb67fc64ae739af9209abfbcf305ebffd6e135bdb52dbde79a644",
   "description": "The approval store hands action A's approved receipt back for action B. The lookup recomputes the intent and refuses a receipt bound to another action, without consuming it.",
   "execution_mode": "deterministic",
   "followup_templates": [],
@@ -15,6 +15,11 @@
       "kind": "literal",
       "name": "surfaces",
       "value": "7"
+    },
+    {
+      "content_hash": "sha256:81aa624e0644f2509dad7e2dd61a8fbf4c2da6ec65618388320186487061f4cd",
+      "kind": "fixture_ref",
+      "name": "stimulus"
     }
   ],
   "invariants": [
@@ -38,8 +43,14 @@
   "permitted_tools": [
     "mctl_scale_service"
   ],
-  "scenario_id": "asc-8209207178066cfc",
-  "setup": [],
+  "scenario_id": "asc-d40da18facfeb67f",
+  "setup": [
+    {
+      "fixture_ref": "sha256:81aa624e0644f2509dad7e2dd61a8fbf4c2da6ec65618388320186487061f4cd",
+      "kind": "fixture_load",
+      "step_id": "load-stimulus"
+    }
+  ],
   "target": {
     "environment": "fixture",
     "kind": "fixture",

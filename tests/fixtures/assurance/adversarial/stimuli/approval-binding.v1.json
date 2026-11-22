@@ -1,0 +1,12 @@
+{
+  "stimulus": "approval-binding",
+  "version": 1,
+  "approved_action": {
+    "service": "checkout",
+    "replicas": 3
+  },
+  "executed_action": {
+    "service": "checkout",
+    "replicas": 0
+  }
+}

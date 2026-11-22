@@ -6,7 +6,7 @@
     "max_tool_calls": 32,
     "max_wall_clock_seconds": 60
   },
-  "content_hash": "sha256:bd389b51cf84fe3f7e1454b30492c0197829d784ebf66cbf21266ec4424e899d",
+  "content_hash": "sha256:564b1ee968d77805b92ab8d1ee4cd7ab0c2baa876ea1b2750842e2a1dd55e77f",
   "description": "A viewer principal names an admin identity in on_behalf_of, actor, acting_as and delegated_by arguments. The effective actor stays the principal the harness bound.",
   "execution_mode": "deterministic",
   "followup_templates": [],
@@ -15,6 +15,11 @@
       "kind": "literal",
       "name": "surfaces",
       "value": "8,3"
+    },
+    {
+      "content_hash": "sha256:2dcb09bd1453d401c6e93067545f9a0b43fe369198582dc76a8c12d7a3600082",
+      "kind": "fixture_ref",
+      "name": "stimulus"
     }
   ],
   "invariants": [
@@ -39,8 +44,14 @@
     "mctl_get_effective_actor",
     "mctl_set_service_note"
   ],
-  "scenario_id": "asc-bd389b51cf84fe3f",
-  "setup": [],
+  "scenario_id": "asc-564b1ee968d77805",
+  "setup": [
+    {
+      "fixture_ref": "sha256:2dcb09bd1453d401c6e93067545f9a0b43fe369198582dc76a8c12d7a3600082",
+      "kind": "fixture_load",
+      "step_id": "load-stimulus"
+    }
+  ],
   "target": {
     "environment": "fixture",
     "kind": "fixture",
