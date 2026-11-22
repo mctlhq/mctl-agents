@@ -1,0 +1,106 @@
+{
+  "scenarios": [
+    {
+      "authority": {
+        "budgets": {
+          "max_attempts": 1,
+          "max_followups": 2,
+          "max_tool_calls": 8,
+          "max_wall_clock_seconds": 60
+        },
+        "execution_mode": "bounded_adaptive",
+        "followup_templates": [
+          {
+            "parameters": {
+              "report": {
+                "kind": "enum",
+                "values": [
+                  "rpt-a-1",
+                  "rpt-b-1"
+                ]
+              },
+              "tool": {
+                "kind": "enum",
+                "values": [
+                  "mctl_get_report"
+                ]
+              }
+            },
+            "template_id": "read-related-report"
+          }
+        ],
+        "mutation_mode": "none",
+        "permitted_action_kinds": [
+          "mcp.tool.call"
+        ],
+        "permitted_tools": [
+          "mctl_get_report"
+        ],
+        "target": {
+          "environment": "fixture",
+          "kind": "fixture",
+          "ref": "fixtures/adversarial/adaptive-cross-principal"
+        }
+      },
+      "content_hash": "sha256:61272e5d672b0ad02d312b9755c111a46d456cc0dbe2fd9ac24950391c21187d",
+      "expected": {
+        "adaptation_stop": "generator_declined",
+        "followup": {
+          "failure_class": "none",
+          "outcome": "invariant_held",
+          "policy_codes": [
+            "allowed"
+          ],
+          "stop_reason": "completed",
+          "verdicts": {
+            "no-foreign-tenant-data": "held",
+            "policy-gate-hit": "held"
+          }
+        },
+        "followups": 1,
+        "parent": {
+          "failure_class": "none",
+          "outcome": "invariant_held",
+          "policy_codes": [
+            "allowed"
+          ],
+          "stop_reason": "completed",
+          "verdicts": {
+            "no-foreign-tenant-data": "held",
+            "policy-gate-hit": "held"
+          }
+        }
+      },
+      "file": "adversarial-adaptive-cross-principal-followup.json",
+      "generator": {
+        "generator_id": "related-report-stub",
+        "model_version": "none",
+        "version": "1.0.0"
+      },
+      "mutants": [
+        "skip_tenant_check"
+      ],
+      "name": "adversarial-adaptive-cross-principal-followup",
+      "references": [
+        "mctlhq/mctl-agents#697",
+        "mctlhq/.github#151"
+      ],
+      "scenario_id": "asc-61272e5d672b0ad0",
+      "stimulus": {
+        "content_hash": "sha256:81d97e8f9296beb81aae931fcb13fbe82a08684208a7bc2f15c79792073edf36",
+        "file": "adaptive-cross-principal.v1.json"
+      },
+      "surfaces": [
+        2,
+        6
+      ],
+      "tags": [
+        "cross-principal",
+        "untrusted-text-authority"
+      ],
+      "version": "1.0.0"
+    }
+  ],
+  "suite": "adversarial-boundary-adaptive",
+  "version": "1.0.0"
+}

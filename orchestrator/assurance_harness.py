@@ -88,6 +88,7 @@ STOP_TARGET_NOT_CONFIGURED = "target_not_configured"
 STOP_DETECTOR_MISSING = "detector_missing"
 STOP_ATTEMPTS_EXHAUSTED = "attempts_exhausted"
 STOP_ACTION_KIND_NOT_PERMITTED = "action_kind_not_permitted"
+STOP_FOLLOWUP_NOT_PERMITTED = "followup_not_permitted"
 # During the run (a run and result are emitted).
 STOP_TOOL_NOT_PERMITTED = "tool_not_permitted"
 STOP_REQUEST_INVALID = "request_invalid"
@@ -111,6 +112,7 @@ _STOPS: Mapping[str, tuple[str, str | None]] = {
     STOP_DETECTOR_MISSING: (FAILURE_HARNESS, None),
     STOP_ATTEMPTS_EXHAUSTED: (FAILURE_BUDGET_EXHAUSTED, None),
     STOP_ACTION_KIND_NOT_PERMITTED: (FAILURE_OUT_OF_ENVELOPE, None),
+    STOP_FOLLOWUP_NOT_PERMITTED: (FAILURE_OUT_OF_ENVELOPE, None),
     STOP_TOOL_NOT_PERMITTED: (FAILURE_OUT_OF_ENVELOPE, "refused"),
     STOP_REQUEST_INVALID: (FAILURE_OUT_OF_ENVELOPE, "refused"),
     STOP_RESERVED_ARGUMENT: (FAILURE_OUT_OF_ENVELOPE, "refused"),
@@ -371,12 +373,29 @@ class ToolOutput:
 
 
 @dataclass(frozen=True)
+class FollowupLineage:
+    """Where a follow-up run sits: the run it follows, the proposal that was
+    validated for it, and its 1-based ordinal in the chain. Supplied only by
+    the bounded adaptive layer (`orchestrator.assurance_adaptive`, #697); the
+    harness re-validates it against the sealed scenario before the target is
+    touched, so a caller cannot use it to widen anything."""
+
+    parent_run_id: str
+    proposal: ra.FollowupProposal
+    ordinal: int
+
+
+@dataclass(frozen=True)
 class HarnessReport:
     failure_class: str
     stop_reason: str
     detail: str
     run: ra.AssuranceRun | None = None
     result: ra.AssuranceResult | None = None
+    #: The harness transcript, untrusted target output included, kept in
+    #: memory for the adaptive layer. Not part of `authoritative()`,
+    #: `to_dict()` or equality: records carry `output_hash` only.
+    calls: tuple[CallRecord, ...] = field(default=(), repr=False, compare=False)
 
     @property
     def outcome(self) -> str | None:
@@ -642,13 +661,21 @@ class ProbeContext:
 # ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
-def _report(stop: str, detail: str, run: Any = None, result: Any = None, failure: str | None = None) -> HarnessReport:
+def _report(
+    stop: str,
+    detail: str,
+    run: Any = None,
+    result: Any = None,
+    failure: str | None = None,
+    calls: tuple[CallRecord, ...] = (),
+) -> HarnessReport:
     return HarnessReport(
         failure_class=failure or _STOPS[stop][0],
         stop_reason=stop,
         detail=ra.redact_text(detail, max_chars=_MAX_DETAIL_CHARS),
         run=run,
         result=result,
+        calls=calls,
     )
 
 
@@ -671,18 +698,29 @@ def _narrow(budgets: ra.Budgets, ceiling: ra.Budgets | None) -> ra.Budgets:
     )
 
 
-def runtime_execution_id(scenario: ra.AssuranceScenario, revision: str, seed: int, attempt: int) -> str:
-    """Deterministic `ex-` id of one attempt."""
-    digest = hash_bytes(
-        canonical_json(
-            {"scenario": scenario.content_hash, "revision": revision, "seed": seed, "attempt": attempt}
-        )
-    )
+def runtime_execution_id(
+    scenario: ra.AssuranceScenario,
+    revision: str,
+    seed: int,
+    attempt: int,
+    lineage: FollowupLineage | None = None,
+) -> str:
+    """Deterministic `ex-` id of one attempt. A follow-up run is keyed by its
+    parent and proposal as well, so it never shares an id with the run it
+    follows; without a lineage the id is exactly what it always was."""
+    key: dict[str, Any] = {"scenario": scenario.content_hash, "revision": revision, "seed": seed, "attempt": attempt}
+    if lineage is not None:
+        key["followup"] = {
+            "parent_run_id": lineage.parent_run_id,
+            "ordinal": lineage.ordinal,
+            "proposal": lineage.proposal.to_dict(),
+        }
+    digest = hash_bytes(canonical_json(key))
     return "ex-" + digest.removeprefix("sha256:")[:16]
 
 
 def _admit(
-    scenario: Any, config: HarnessConfig, attempt: int
+    scenario: Any, config: HarnessConfig, attempt: int, lineage: FollowupLineage | None = None
 ) -> tuple[ra.AssuranceScenario, TargetBinding, ra.Budgets] | HarnessReport:
     """Every refusal that must happen before the target is touched."""
     try:
@@ -709,20 +747,55 @@ def _admit(
         if detector is None or detector.check_kind != inv.check_kind:
             return _report(STOP_DETECTOR_MISSING, f"no {inv.check_kind} detector for {inv.invariant_id!r}")
     granted = _narrow(parsed.budgets, config.budget_ceiling)
+    if lineage is not None:
+        refusal = _check_lineage(parsed, granted, lineage)
+        if refusal:
+            return _report(STOP_FOLLOWUP_NOT_PERMITTED, refusal)
     if isinstance(attempt, bool) or not isinstance(attempt, int) or not 1 <= attempt <= granted.max_attempts:
         return _report(STOP_ATTEMPTS_EXHAUSTED, f"attempt {attempt!r} is outside 1..{granted.max_attempts}")
     return parsed, binding, granted
 
 
-def execute(scenario: Any, probe: Probe, config: HarnessConfig, *, seed: int, attempt: int = 1) -> HarnessReport:
-    """Run one attempt of `scenario`. Never raises: every failure is a report."""
+def _check_lineage(scenario: ra.AssuranceScenario, granted: ra.Budgets, lineage: Any) -> str:
+    """Why a follow-up run is not admitted, or an empty string. The scenario
+    must be `bounded_adaptive`, the ordinal inside the granted `max_followups`,
+    and the proposal one of its declared templates within bounds."""
+    if not isinstance(lineage, FollowupLineage) or not isinstance(lineage.proposal, ra.FollowupProposal):
+        return "lineage is not a FollowupLineage"
+    if scenario.execution_mode != ra.EXEC_ADAPTIVE:
+        return "the scenario is not bounded_adaptive"
+    if isinstance(lineage.ordinal, bool) or not isinstance(lineage.ordinal, int):
+        return "the follow-up ordinal is not an integer"
+    if not 1 <= lineage.ordinal <= granted.max_followups:
+        return f"follow-up {lineage.ordinal} is outside 1..{granted.max_followups}"
+    try:
+        ra.validate_followup(scenario, lineage.proposal)
+    except ra.RuntimeAssuranceError as exc:
+        return str(exc)
+    if not isinstance(lineage.parent_run_id, str) or not re.fullmatch(r"arn-[0-9a-f]{16}", lineage.parent_run_id):
+        return "a follow-up run requires the id of its parent run"
+    return ""
+
+
+def execute(
+    scenario: Any,
+    probe: Probe,
+    config: HarnessConfig,
+    *,
+    seed: int,
+    attempt: int = 1,
+    lineage: FollowupLineage | None = None,
+) -> HarnessReport:
+    """Run one attempt of `scenario`. Never raises: every failure is a report.
+    `lineage` is for the bounded adaptive layer; without it the behaviour is
+    exactly the fixed, deterministic harness."""
     try:
         if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= MAX_SEED:
             return _report(STOP_SCENARIO_INVALID, "seed must be an integer within 0..2**63-1")
-        admitted = _admit(scenario, config, attempt)
+        admitted = _admit(scenario, config, attempt, lineage)
         if isinstance(admitted, HarnessReport):
             return admitted
-        return _run(*admitted, probe=probe, config=config, seed=seed, attempt=attempt)
+        return _run(*admitted, probe=probe, config=config, seed=seed, attempt=attempt, lineage=lineage)
     except Exception as exc:  # noqa: BLE001 — the harness reports its own failure instead of raising
         return _report(STOP_HARNESS_ERROR, f"harness error: {type(exc).__name__}")
 
@@ -752,9 +825,10 @@ def _run(
     config: HarnessConfig,
     seed: int,
     attempt: int,
+    lineage: FollowupLineage | None = None,
 ) -> HarnessReport:
     clock = config.clock
-    exec_id = runtime_execution_id(scenario, binding.revision, seed, attempt)
+    exec_id = runtime_execution_id(scenario, binding.revision, seed, attempt, lineage)
     version_binding = ra.VersionBinding(
         scenario=ra.ScenarioRef(
             scenario_id=scenario.scenario_id,
@@ -803,7 +877,7 @@ def _run(
         attempts=attempt,
         tool_calls=sum(1 for c in calls if c.executed),
         wall_clock_seconds=min(wall, ra.MAX_WALL_CLOCK_CAP * 100),
-        followups=0,
+        followups=lineage.ordinal if lineage else 0,
     )
     overrun = not consumed.within(granted)
     if stop_reason == STOP_COMPLETED and overrun:
@@ -844,6 +918,11 @@ def _run(
             ended_at=ended_at,
             observations=observations,
             policy_decisions=decisions,
+            **(
+                {"relation": ra.RELATION_FOLLOWUP, "parent_run_id": lineage.parent_run_id, "followup": lineage.proposal}
+                if lineage
+                else {}
+            ),
         )
         result = ra.seal_result(
             run_id=run.run_id,
@@ -856,7 +935,7 @@ def _run(
         ra.check_result_against_run(result, run, scenario)
     except ra.RuntimeAssuranceError as exc:
         return _report(STOP_HARNESS_ERROR, f"records failed the contract: {exc}")
-    return _report(stop_reason, detail, run, result, failure=failure)
+    return _report(stop_reason, detail, run, result, failure=failure, calls=calls)
 
 
 def _unobserved(
