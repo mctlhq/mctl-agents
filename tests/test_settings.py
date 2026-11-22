@@ -92,6 +92,7 @@ def test_mctl_glovo_is_issue_driven_and_non_rotating():
     assert "mctl-glovo" in NON_ROTATING_SERVICES
     assert "mctl-glovo" not in ROTATING_SERVICES
 
+
 def test_no_service_name_is_shell_glob_hostile_beyond_a_leading_dot():
     """A service name becomes a path segment under agents-state/.
 
