@@ -592,6 +592,9 @@ def _ask(generator: ProbeGenerator, request: GenerationRequest, timeout: float) 
     return _OK, box.get("value")
 
 
+OBSERVATION_WITHHELD = "[output withheld: credential shape]"
+
+
 def _observations_of(report: ah.HarnessReport) -> tuple[Observation, ...]:
     if report.run is None:
         return ()
@@ -601,6 +604,12 @@ def _observations_of(report: ah.HarnessReport) -> tuple[Observation, ...]:
         if not call.executed:
             continue
         text = call.output or ""
+        # The generator never sees a credential (module contract): a target
+        # output with a credential shape is replaced whole, screened before the
+        # truncation so a cut cannot hide one. output_hash still covers the
+        # original bytes, so the record stays checkable.
+        if contains_credential(text):
+            text = OBSERVATION_WITHHELD
         out.append(Observation(
             run_id=run_id, index=call.index, tool=call.tool, status=call.status, output_hash=call.output_hash,
             args_digest=call.args_digest, output=text[:MAX_OBSERVATION_CHARS],

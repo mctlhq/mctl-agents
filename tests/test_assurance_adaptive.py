@@ -1034,3 +1034,28 @@ def test_the_exact_model_version_is_recorded_sealed_and_reported():
     assert not other.verify()
     stub_report, _ = go(Scripted(lambda request: base_candidate(request)))
     assert stub_report.generated[0].record_hash != probe.record_hash
+
+
+# ---------------------------------------------------------------------------
+# The generator never receives a credential from a target output (module contract)
+# ---------------------------------------------------------------------------
+def _fake_report(output: str):
+    from types import SimpleNamespace as NS
+    call = NS(executed=True, index=0, tool=GET, status="ok", output=output,
+              output_hash="sha256:" + "1" * 64, args_digest="sha256:" + "2" * 64)
+    return NS(run=NS(run_id="run-parent"), calls=(call,))
+
+
+@pytest.mark.parametrize("pad", [0, aa.MAX_OBSERVATION_CHARS])
+def test_a_credential_in_a_target_output_never_reaches_the_generator(pad):
+    """A credential shape is screened on the whole text before the truncation,
+    so a cut that would hide it still cannot let it through. The hash still
+    covers the original output."""
+    token = adv.SYNTHETIC_TOKEN
+    text = "x" * pad + " leaked " + token
+    (obs,) = aa._observations_of(_fake_report(text))
+    assert token not in obs.output and obs.output == aa.OBSERVATION_WITHHELD
+    assert obs.output_hash == "sha256:" + "1" * 64
+    (clean,) = aa._observations_of(_fake_report("a plain answer listing rpt-b-1"))
+    assert clean.output == "a plain answer listing rpt-b-1"
+
