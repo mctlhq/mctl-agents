@@ -152,8 +152,133 @@ Acceptance criteria of #696 and where they are checked
   of its workspace, because a symlink escape is only real on a real path. It
   holds no file (content is served from memory by resolved path) and is removed
   after the run; it is the one place the suite touches the filesystem.
-- Non-goals of #696: adaptive probe generation, fixing historical defects,
-  production mutations.
+- Non-goals of #696: adaptive probe generation (done separately in #697, see
+  below; the suite 1.0.0 above stays fixed and deterministic), fixing historical
+  defects, production mutations.
+
+## Bounded adaptive follow-up probes (#697)
+
+> **Issue:** mctlhq/mctl-agents#697 (epic: mctlhq/.github#151; depends on #696 above)
+> **Code:** `orchestrator/assurance_adaptive.py`, `tests/assurance_adversarial_adaptive.py`,
+> `tests/test_assurance_adaptive.py`
+> **Fixtures:** `tests/fixtures/assurance/adversarial/adaptive/` (`suite.json`, one sealed
+> scenario, `stimuli/`)
+> **Suite:** `adversarial-boundary-adaptive` version `1.0.0`, separate from `adversarial-boundary`
+> `1.0.0`, which is untouched
+
+A generator may look at what a completed run observed and propose the next
+probe. It is advice, never authority: every power stays in the sealed scenario
+and the harness, and the generator can only choose among values the scenario
+declared.
+
+### What a generator can author
+
+A `ProbeCandidate` has five fields: `template_id`, `parameters`, `reason`,
+`evidence` and `expected_invariant`. Underneath it is the contract's
+`FollowupProposal` (ADR 022), so it has no field for a target, tenant,
+principal, credential, tool list, mutation mode or budget. A candidate that
+names one is rejected, not trimmed. The sealed scenario is `bounded_adaptive`
+and declares `followup_templates`: each parameter is an enum, an integer range
+or a declared fixture ref. A tool or capability choice is an enum parameter
+named `tool`, and admission requires every value of it to be in the scenario's
+`permitted_tools`. A server-side builder, registered per template, turns the
+validated parameters into the probe, so the generator never supplies a call.
+The probe then runs through `assurance_harness.execute` with its gate, policy
+checkpoint, credential screen and budgets.
+
+### Validation, in this order, before anything runs
+
+| Check | Closed code | What follows |
+|---|---|---|
+| Not an object | `malformed` | adaptation stops (`generator_malformed`) |
+| An unknown field, a missing field or a wrong type | `unknown_field`, `schema_invalid` | adaptation stops |
+| A field that names an authority (target, tenant, principal, credential, tool, mutation, budget, timeout, ...) | `authority_field` | adaptation stops (`generator_violation`) |
+| A parameter named like an authority, or a credential-shaped value | `reserved_parameter`, `credential_value` | adaptation stops |
+| A `tool` outside the scenario's `permitted_tools` | `tool_not_permitted` | adaptation stops |
+| Template unknown, parameter undeclared, missing or out of its bound | `out_of_bounds` | skipped, counted as an attempt |
+| An invariant the scenario does not have | `unknown_invariant` | skipped, counted |
+| No evidence, or a reference to an observation the runs did not make | `evidence_missing`, `evidence_unknown` | skipped, counted |
+| The same probe already ran | `duplicate_candidate` | skipped, counted |
+
+The harness then re-validates a follow-up on its own (`FollowupLineage`: the
+scenario must be `bounded_adaptive`, the ordinal inside `max_followups`, the
+proposal inside its template), and the contract check of the sealed run
+validates it a third time. A test removes the candidate guards and shows the
+next layer refusing the tool before the target is touched.
+
+### Bounds
+
+Depth, generation attempts, follow-up runs, tool calls and wall time are all
+bounded, and every bound can only be narrowed. `AdaptiveLimits` (depth,
+attempts, follow-ups, generator timeout) refuses a value above an absolute
+ceiling. Follow-ups, tool calls and wall time are then taken from the
+scenario's own budget (narrowed by the harness `budget_ceiling`): the parent and
+every follow-up share one pool, and each follow-up is granted only what is
+left. The generator runs under a real-time watchdog; the clock it spends counts
+against the pool.
+
+### What stops adaptation
+
+A generator that raises, exits, times out (a late answer is never read),
+returns something that is not a candidate, or reaches for authority. A parent
+that did not complete, or a follow-up that did not complete: a refused,
+policy-denied, over-budget or failed run is not "observed absent" and is never
+an invitation to try a weaker route, so the generator is not asked again. A
+generator without an exact identity and version is not asked at all. Nothing
+falls back to a wider or unrestricted path; the parent report stays the
+authoritative result.
+
+### Untrusted output
+
+Target output reaches the generator only as data: an immutable
+`GenerationRequest` holding bounded text and its hash, with no credential,
+policy or budget handle. A generator talked into copying a hostile directive
+into a field is rejected by the table above, and the sealed scenario, its
+tools and the config are unchanged afterwards (tested).
+
+### Provenance
+
+Every generated probe that ran has a sealed `GeneratedProbe` record: the parent
+scenario (id, content hash) and parent run and result, the depth, the exact
+generator id, version and model version (`none` for a deterministic stub), the
+validated candidate, the source observations (run, call index, tool, status,
+output hash, arguments digest; never the target text) and the resulting run and
+result ids. The contract's `AssuranceRun` carries `relation: followup`, the
+`parent_run_id` and the `FollowupProposal`, and `consumed.followups` is the
+ordinal. ADR 022 has no field for the generator, so that part is the sidecar
+record, keyed by `run_id`.
+
+### The scenario, and the deterministic path
+
+`adversarial-adaptive-cross-principal-followup` (surfaces 2 and 6) reads the
+caller's own report. The answer also lists a related report of another tenant
+and a hostile note claiming the scope was widened. The deterministic stub
+generator reads the answer as data, picks the related id from the template's
+allowed domain, and the follow-up reads it. The oracle is the fixed suite's
+detector: no foreign-tenant marker in any output. With `skip_tenant_check` the
+first probe stays green and only the follow-up goes red, which is the second
+probe the first observation made useful (`test_the_second_probe_finds_what_the_first_cannot`).
+Its stimulus is `adaptive-cross-principal.v1.json`, pinned by hash in the sealed
+scenario and the manifest like the fixed suite's.
+
+Without a generator (`generator=None`, the default) `execute_adaptive` is one
+call to `assurance_harness.execute`: the report is byte-identical to a fixed run
+(`test_without_a_generator_the_run_is_exactly_the_fixed_harness_run`). Nothing in
+`orchestrator/` imports the adaptive layer, and no model-backed generator exists:
+one may only be supplied by a caller behind the `ProbeGenerator` interface.
+
+```
+uv run --locked pytest -q tests/test_assurance_adaptive.py
+uv run --locked python -m tests.assurance_adversarial_adaptive                  # JSON report, with provenance
+uv run --locked python -m tests.assurance_adversarial_adaptive --no-adaptation  # only the fixed first probe
+uv run --locked python -m tests.assurance_adversarial_adaptive --write          # regenerate the sealed scenario and manifest
+```
+
+Not claimed: the stub does not show that a real model is safe, only that
+whatever a generator returns cannot widen what a run may do. Validating a
+finding by exact-version deterministic replay and false-positive handling is
+the next step of the issue and is not done here; a model never confirms a
+finding.
 
 ## Running it
 
