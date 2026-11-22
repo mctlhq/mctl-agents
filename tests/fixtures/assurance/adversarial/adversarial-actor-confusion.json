@@ -1,0 +1,61 @@
+{
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "budgets": {
+    "max_attempts": 1,
+    "max_followups": 0,
+    "max_tool_calls": 32,
+    "max_wall_clock_seconds": 60
+  },
+  "content_hash": "sha256:564b1ee968d77805b92ab8d1ee4cd7ab0c2baa876ea1b2750842e2a1dd55e77f",
+  "description": "A viewer principal names an admin identity in on_behalf_of, actor, acting_as and delegated_by arguments. The effective actor stays the principal the harness bound.",
+  "execution_mode": "deterministic",
+  "followup_templates": [],
+  "inputs": [
+    {
+      "kind": "literal",
+      "name": "surfaces",
+      "value": "8,3"
+    },
+    {
+      "content_hash": "sha256:2dcb09bd1453d401c6e93067545f9a0b43fe369198582dc76a8c12d7a3600082",
+      "kind": "fixture_ref",
+      "name": "stimulus"
+    }
+  ],
+  "invariants": [
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "guarantee-holds",
+      "statement": "The effective actor of every call is the bound principal; an identity claimed in the arguments never gains its authority."
+    },
+    {
+      "check_kind": "policy_decision_expected",
+      "invariant_id": "policy-gate-hit",
+      "statement": "Every call that reached the target carries a permitting policy decision."
+    }
+  ],
+  "kind": "AssuranceScenario",
+  "mutation_mode": "fixture_only",
+  "name": "adversarial-actor-confusion",
+  "permitted_action_kinds": [
+    "mcp.tool.call"
+  ],
+  "permitted_tools": [
+    "mctl_get_effective_actor",
+    "mctl_set_service_note"
+  ],
+  "scenario_id": "asc-564b1ee968d77805",
+  "setup": [
+    {
+      "fixture_ref": "sha256:2dcb09bd1453d401c6e93067545f9a0b43fe369198582dc76a8c12d7a3600082",
+      "kind": "fixture_load",
+      "step_id": "load-stimulus"
+    }
+  ],
+  "target": {
+    "environment": "fixture",
+    "kind": "fixture",
+    "ref": "fixtures/adversarial/actor-confusion"
+  },
+  "version": "1.0.0"
+}

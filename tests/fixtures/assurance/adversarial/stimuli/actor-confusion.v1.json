@@ -1,0 +1,11 @@
+{
+  "stimulus": "actor-confusion",
+  "version": 1,
+  "claimed_identity": "user:admin",
+  "claim_keys": [
+    "on_behalf_of",
+    "actor",
+    "acting_as",
+    "delegated_by"
+  ]
+}

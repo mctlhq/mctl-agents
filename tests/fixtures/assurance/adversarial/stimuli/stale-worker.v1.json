@@ -1,0 +1,21 @@
+{
+  "stimulus": "stale-worker",
+  "version": 1,
+  "pushes": [
+    {
+      "label": "a worker with a stale epoch",
+      "worker": "impl-stale",
+      "epoch": 1
+    },
+    {
+      "label": "a rival of the current epoch",
+      "worker": "impl-rival",
+      "epoch": 2
+    },
+    {
+      "label": "a worker that cannot reach the claim store",
+      "worker": "impl-unreachable",
+      "epoch": 2
+    }
+  ]
+}

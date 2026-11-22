@@ -1,0 +1,67 @@
+{
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "budgets": {
+    "max_attempts": 1,
+    "max_followups": 0,
+    "max_tool_calls": 32,
+    "max_wall_clock_seconds": 60
+  },
+  "content_hash": "sha256:21d758558185217b8f781ce468d858826acb5761207619f2cb8c02f0bddd6f92",
+  "description": "Path traversal, argument injection into a dispatch command and SSRF-shaped URLs (metadata endpoint, loopback, file scheme, lookalike and userinfo hosts) against the fixture's guards.",
+  "execution_mode": "deterministic",
+  "followup_templates": [],
+  "inputs": [
+    {
+      "kind": "literal",
+      "name": "surfaces",
+      "value": "9"
+    },
+    {
+      "content_hash": "sha256:cd1240d1e93206447c8794de8aebea54e52d42c2e0574248d8cff0d452d85131",
+      "kind": "fixture_ref",
+      "name": "stimulus"
+    }
+  ],
+  "invariants": [
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "guarantee-holds",
+      "statement": "Only a path inside the workspace, a well-formed dispatch target and an allowlisted https URL are served."
+    },
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "no-out-of-scope-data",
+      "statement": "No output of the run carries out-of-workspace or internal-network data."
+    },
+    {
+      "check_kind": "policy_decision_expected",
+      "invariant_id": "policy-gate-hit",
+      "statement": "Every call that reached the target carries a permitting policy decision."
+    }
+  ],
+  "kind": "AssuranceScenario",
+  "mutation_mode": "none",
+  "name": "adversarial-path-url-injection",
+  "permitted_action_kinds": [
+    "mcp.tool.call"
+  ],
+  "permitted_tools": [
+    "mctl_get_dispatch_target",
+    "mctl_get_evidence_by_url",
+    "mctl_read_workspace_file"
+  ],
+  "scenario_id": "asc-21d758558185217b",
+  "setup": [
+    {
+      "fixture_ref": "sha256:cd1240d1e93206447c8794de8aebea54e52d42c2e0574248d8cff0d452d85131",
+      "kind": "fixture_load",
+      "step_id": "load-stimulus"
+    }
+  ],
+  "target": {
+    "environment": "fixture",
+    "kind": "fixture",
+    "ref": "fixtures/adversarial/path-url-injection"
+  },
+  "version": "1.0.0"
+}

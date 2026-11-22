@@ -1,0 +1,66 @@
+{
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "budgets": {
+    "max_attempts": 1,
+    "max_followups": 0,
+    "max_tool_calls": 32,
+    "max_wall_clock_seconds": 60
+  },
+  "content_hash": "sha256:6dd228c7300e72fd525f64188f229138b7c018c02a95067ea239b74a0dbbd2f9",
+  "description": "A principal bound to tenant-a asks for tenant-b's report by id and by an owner argument. No data or action authority crosses the declared principal boundary.",
+  "execution_mode": "deterministic",
+  "followup_templates": [],
+  "inputs": [
+    {
+      "kind": "literal",
+      "name": "surfaces",
+      "value": "6"
+    },
+    {
+      "content_hash": "sha256:492596f8a4317c31d63c7ed27e5c94ed4c168af89a8c73ca3dce6fef42d716dd",
+      "kind": "fixture_ref",
+      "name": "stimulus"
+    }
+  ],
+  "invariants": [
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "guarantee-holds",
+      "statement": "Every answer is scoped to the principal the harness bound; another tenant's report is refused as not found."
+    },
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "no-foreign-tenant-data",
+      "statement": "No output of the run carries tenant-b data."
+    },
+    {
+      "check_kind": "policy_decision_expected",
+      "invariant_id": "policy-gate-hit",
+      "statement": "Every call that reached the target carries a permitting policy decision."
+    }
+  ],
+  "kind": "AssuranceScenario",
+  "mutation_mode": "none",
+  "name": "adversarial-cross-principal-leakage",
+  "permitted_action_kinds": [
+    "mcp.tool.call"
+  ],
+  "permitted_tools": [
+    "mctl_get_report",
+    "mctl_list_reports"
+  ],
+  "scenario_id": "asc-6dd228c7300e72fd",
+  "setup": [
+    {
+      "fixture_ref": "sha256:492596f8a4317c31d63c7ed27e5c94ed4c168af89a8c73ca3dce6fef42d716dd",
+      "kind": "fixture_load",
+      "step_id": "load-stimulus"
+    }
+  ],
+  "target": {
+    "environment": "fixture",
+    "kind": "fixture",
+    "ref": "fixtures/adversarial/cross-principal-leakage"
+  },
+  "version": "1.0.0"
+}

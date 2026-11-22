@@ -1,0 +1,73 @@
+{
+  "stimulus": "capability-confusion",
+  "version": 1,
+  "eligible_id": "mctl://mcp-local/fixture-ops/mctl_get_service_status",
+  "requests": [
+    {
+      "label": "a capability excluded from the sealed set",
+      "request": {
+        "capability_id": "mctl://mcp-local/fixture-ops/mctl_scale_service",
+        "arguments": {}
+      },
+      "code": "not-eligible"
+    },
+    {
+      "label": "a path-confused id",
+      "request": {
+        "capability_id": "mctl://mcp-local/fixture-ops/mctl_get_service_status/../mctl_scale_service",
+        "arguments": {}
+      },
+      "code": "not-eligible"
+    },
+    {
+      "label": "another provider's id for the same tool name",
+      "request": {
+        "capability_id": "mctl://mcp-remote/mctl-api/mctl_scale_service",
+        "arguments": {}
+      },
+      "code": "not-eligible"
+    },
+    {
+      "label": "a case-confused id",
+      "request": {
+        "capability_id": "MCTL://MCP-LOCAL/FIXTURE-OPS/MCTL_GET_SERVICE_STATUS",
+        "arguments": {}
+      },
+      "code": "not-eligible"
+    },
+    {
+      "label": "a non-string capability id",
+      "request": {
+        "capability_id": 7,
+        "arguments": {}
+      },
+      "code": "invalid-arguments"
+    },
+    {
+      "label": "arguments that are a list",
+      "request": {
+        "capability_id": "mctl://mcp-local/fixture-ops/mctl_get_service_status",
+        "arguments": [
+          "a",
+          "b"
+        ]
+      },
+      "code": "invalid-arguments"
+    },
+    {
+      "label": "arguments that are a string",
+      "request": {
+        "capability_id": "mctl://mcp-local/fixture-ops/mctl_get_service_status",
+        "arguments": "x=1"
+      },
+      "code": "invalid-arguments"
+    },
+    {
+      "label": "missing arguments",
+      "request": {
+        "capability_id": "mctl://mcp-local/fixture-ops/mctl_get_service_status"
+      },
+      "code": "invalid-arguments"
+    }
+  ]
+}

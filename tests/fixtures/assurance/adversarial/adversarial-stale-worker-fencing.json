@@ -1,0 +1,60 @@
+{
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "budgets": {
+    "max_attempts": 1,
+    "max_followups": 0,
+    "max_tool_calls": 32,
+    "max_wall_clock_seconds": 60
+  },
+  "content_hash": "sha256:4a4817858e3173770365b74f431833bfb8891e31258ac17b2a535701646e2226",
+  "description": "A worker with a stale claim epoch, a rival at the current epoch and a worker that cannot reach the claim store each try to push; only the holder of the current claim may.",
+  "execution_mode": "deterministic",
+  "followup_templates": [],
+  "inputs": [
+    {
+      "kind": "literal",
+      "name": "surfaces",
+      "value": "10"
+    },
+    {
+      "content_hash": "sha256:04547feb045cd09900192b3052a9968cb2c5d0f61c4f9d9784ffd9205b2ce048",
+      "kind": "fixture_ref",
+      "name": "stimulus"
+    }
+  ],
+  "invariants": [
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "guarantee-holds",
+      "statement": "Only the holder of the current claim mutates; a fence, a rival and an unreadable claim store block it."
+    },
+    {
+      "check_kind": "policy_decision_expected",
+      "invariant_id": "policy-gate-hit",
+      "statement": "Every call that reached the target carries a permitting policy decision."
+    }
+  ],
+  "kind": "AssuranceScenario",
+  "mutation_mode": "fixture_only",
+  "name": "adversarial-stale-worker-fencing",
+  "permitted_action_kinds": [
+    "mcp.tool.call"
+  ],
+  "permitted_tools": [
+    "mctl_push_branch"
+  ],
+  "scenario_id": "asc-4a4817858e317377",
+  "setup": [
+    {
+      "fixture_ref": "sha256:04547feb045cd09900192b3052a9968cb2c5d0f61c4f9d9784ffd9205b2ce048",
+      "kind": "fixture_load",
+      "step_id": "load-stimulus"
+    }
+  ],
+  "target": {
+    "environment": "fixture",
+    "kind": "fixture",
+    "ref": "fixtures/adversarial/stale-worker-fencing"
+  },
+  "version": "1.0.0"
+}

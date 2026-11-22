@@ -1,0 +1,60 @@
+{
+  "api_version": "assurance.mctl.ai/v1alpha1",
+  "budgets": {
+    "max_attempts": 1,
+    "max_followups": 0,
+    "max_tool_calls": 32,
+    "max_wall_clock_seconds": 60
+  },
+  "content_hash": "sha256:44228f9f04b7b81477c6f24693344e8012c186a3810e749fce4fb20de4112ea0",
+  "description": "Capability ids outside the sealed set and malformed argument shapes are refused by the real capability gateway before any provider is reached.",
+  "execution_mode": "deterministic",
+  "followup_templates": [],
+  "inputs": [
+    {
+      "kind": "literal",
+      "name": "surfaces",
+      "value": "5,4"
+    },
+    {
+      "content_hash": "sha256:33d7b4ef1e99f706fd3d20c02cfd0d67ecb4489a890d1704cf56a4cededf5a18",
+      "kind": "fixture_ref",
+      "name": "stimulus"
+    }
+  ],
+  "invariants": [
+    {
+      "check_kind": "deterministic_check",
+      "invariant_id": "guarantee-holds",
+      "statement": "Only a capability of the sealed set with an object argument reaches a provider."
+    },
+    {
+      "check_kind": "policy_decision_expected",
+      "invariant_id": "policy-gate-hit",
+      "statement": "Every call that reached the target carries a permitting policy decision."
+    }
+  ],
+  "kind": "AssuranceScenario",
+  "mutation_mode": "fixture_only",
+  "name": "adversarial-capability-confusion",
+  "permitted_action_kinds": [
+    "mcp.tool.call"
+  ],
+  "permitted_tools": [
+    "mctl_invoke_capability"
+  ],
+  "scenario_id": "asc-44228f9f04b7b814",
+  "setup": [
+    {
+      "fixture_ref": "sha256:33d7b4ef1e99f706fd3d20c02cfd0d67ecb4489a890d1704cf56a4cededf5a18",
+      "kind": "fixture_load",
+      "step_id": "load-stimulus"
+    }
+  ],
+  "target": {
+    "environment": "fixture",
+    "kind": "fixture",
+    "ref": "fixtures/adversarial/capability-confusion"
+  },
+  "version": "1.0.0"
+}
