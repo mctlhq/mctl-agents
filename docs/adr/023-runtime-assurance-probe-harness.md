@@ -118,4 +118,4 @@ or a citation of a call that does not exist.
 - **Decision records.** The harness keeps the `PolicyDecisionRef` of each call in `AssuranceRun.policy_decisions`. Durable decision records (mctl-api#701) come from `policy_checkpoint` once that producer lands, with no harness change.
 - **`ApprovalRef`.** `AssuranceRun.approvals` stays empty: `Decision` carries `approval_ref` but not the intent hash an `ApprovalRef` needs.
 - **Evidence ids.** Observations cite a transcript `ArtifactRef`, not `ev-` evidence ids. Sealing the transcript as `ExecutionEvidence` is a later step.
-- Follow-up execution (`bounded_adaptive`), the adversarial boundary suite, and any runner, CLI or Temporal wiring.
+- Follow-up execution (`bounded_adaptive`), and any runner, CLI or Temporal wiring. The adversarial boundary suite (#696) is [docs/assurance-adversarial-suite.md](../assurance-adversarial-suite.md): it runs through `execute` unchanged.
