@@ -160,7 +160,10 @@ async def test_recorded_history_replays_against_current_definitions(
     await Replayer(workflows=scenario.workflows).replay_workflow(history)
 
 
-@pytest.mark.parametrize("scenario", SCENARIOS, ids=_IDS)
+_PREPATCH_SCENARIOS = [s for s in SCENARIOS if not s.patched_only]
+
+
+@pytest.mark.parametrize("scenario", _PREPATCH_SCENARIOS, ids=[s.name for s in _PREPATCH_SCENARIOS])
 def test_prepatch_histories_predate_the_exec_queue_flip(scenario: Scenario) -> None:
     """A fixture re-recorded after the flip must fail here, not pass quietly.
 
@@ -313,7 +316,12 @@ def test_patched_histories_show_submit_and_wait_on_the_execution_queue(
     scheduled = _scheduled_activities(events)
     submits = [(name, queue) for name, queue in scheduled if name == "submit_and_wait"]
     assert submits, f"{scenario.patched_path.name} records no submit_and_wait"
-    assert all(queue == EXECUTION_TASK_QUEUE for _, queue in submits), (
+    # A scenario recorded after #395 sends the implement submit to the
+    # admission queue; the older recordings predate that and keep it on exec.
+    allowed = {EXECUTION_TASK_QUEUE}
+    if scenario.patched_only:
+        allowed.add(IMPLEMENTATION_TASK_QUEUE)
+    assert all(queue in allowed for _, queue in submits), (
         f"{scenario.patched_path.name} still schedules {submits} on the "
         "control queue"
     )
@@ -321,10 +329,12 @@ def test_patched_histories_show_submit_and_wait_on_the_execution_queue(
     # worker exists to keep responsive; routing one of them to exec would
     # put it behind the long Argo polls, which is the starvation ADR-008
     # removes, reintroduced from the other side.
+    # The delegated approve flip (#636) is on the execution queue too, so a
+    # canonical recording legitimately routes it.
     strays = [
         (name, queue)
         for name, queue in scheduled
-        if name != "submit_and_wait" and queue != workflow_queue
+        if name not in ("submit_and_wait", "submit_delegated_approve") and queue != workflow_queue
     ]
     assert not strays, f"{scenario.patched_path.name} also routed {strays}"
 
@@ -411,6 +421,7 @@ async def test_todays_dev_loop_full_carries_the_launch_correlation_marker() -> N
         "the implement/shepherd correlation params are unguarded, so a "
         "rollback could not be replayed."
     )
+    assert "implement-execution-id" in _patch_ids(events)
     implement_submits = _submit_params(events, "mctl-agents-implement")
     assert implement_submits, "no mctl-agents-implement submit was recorded"
     for params in implement_submits:
@@ -420,7 +431,7 @@ async def test_todays_dev_loop_full_carries_the_launch_correlation_marker() -> N
         # only `issue_url`); since #636 the loop resolves its own, so the
         # implementer is told which, and still no execution id.
         assert params.get("work_item_id") == "wi_test"
-        assert "execution_id" not in params
+        assert params.get("execution_id") == "we_test_own"
     # The flip is the delegated operation now (#636): the workflow submits no
     # approve CWFT itself, so no `approver` is left to travel.
     assert not _submit_params(events, "mctl-agents-approve")
@@ -612,3 +623,128 @@ def test_every_recorded_fixture_belongs_to_a_scenario() -> None:
     )
     assert on_disk == expected
 
+
+
+# ---------------------------------------------------------------------------
+# mctlhq/mctl-agents#991 (#717 S5): `implement-execution-id`
+#
+# The marker is evaluated at the approve flip. A history that passed the flip
+# without it ended the canonical `we_` right there and submitted the implement
+# run without an `execution_id`; one that records it holds the `we_` open and
+# ends it after the implement run. Neither shape may wedge the other.
+# ---------------------------------------------------------------------------
+IMPLEMENT_EXECUTION_MARKER = "implement-execution-id"
+IMPLEMENT_EXECUTION_SCENARIO = "dev_loop_implement_execution"
+
+
+def _recorded_histories_but_the_new_one() -> list[Path]:
+    from tests.replay_scenarios import HISTORY_DIR
+
+    new = scenario_by_name(IMPLEMENT_EXECUTION_SCENARIO).path
+    return sorted(p for p in HISTORY_DIR.glob("*.json") if p != new)
+
+
+def _dev_loop_histories_but_the_new_one() -> list[Path]:
+    return [p for p in _recorded_histories_but_the_new_one() if p.name.startswith("dev_loop_")]
+
+
+def _scheduled_order(events: list[dict]) -> list[str]:
+    """Activities in the order the workflow scheduled them; a `submit_and_wait`
+    is named by its operation, so the implement submit can be placed relative
+    to the flip and the `we_`'s advance."""
+    out = []
+    for event in events:
+        if event["eventType"] != "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED":
+            continue
+        attrs = event["activityTaskScheduledEventAttributes"]
+        name = attrs["activityType"]["name"]
+        if name == "submit_and_wait":
+            name = json.loads(base64.b64decode(attrs["input"]["payloads"][0]["data"]))["operation"]
+        out.append(name)
+    return out
+
+
+def test_no_recorded_history_but_the_new_one_carries_the_implement_execution_marker() -> None:
+    """T6/T7: the marker must exist only in the history recorded for it.
+    Every other fixture, `dev_loop_full.prepatch.json` first, is evidence of
+    the command sequence BEFORE it (canonical end at the flip, implement
+    submitted without `execution_id`), and a regenerated one would pass every
+    replay while no longer exercising that branch. Restore it from git rather
+    than re-recording."""
+    others = _recorded_histories_but_the_new_one()
+    assert len(others) >= 10, f"expected the whole fixture directory, found {others}"
+    for path in others:
+        events = _events_at(path)
+        assert IMPLEMENT_EXECUTION_MARKER not in _patch_ids(events), (
+            f"{path.name} records {IMPLEMENT_EXECUTION_MARKER}, so it no longer exercises the unpatched branch."
+        )
+        for params in _submit_params(events, "mctl-agents-implement"):
+            assert "execution_id" not in params, f"{path.name}'s implement submit carries an execution_id"
+
+
+def test_the_prepatch_dev_loop_history_still_has_implement_submits_without_an_execution_id() -> None:
+    """Not vacuous: the fixture T6 leans on does contain an implement submit."""
+    events = _events(scenario_by_name("dev_loop_full"))
+    submits = _submit_params(events, "mctl-agents-implement")
+    assert submits, "dev_loop_full.prepatch.json records no implement submit"
+    assert all("execution_id" not in params for params in submits)
+
+
+@pytest.mark.parametrize("name", ["dev_loop_delegated.json", "dev_loop_issue_started_delegated.json"])
+def test_the_canonical_pre_marker_histories_end_the_we_at_the_flip(name: str) -> None:
+    """These two are the canonical-loop histories recorded before the marker:
+    the flip, then the `we_`'s advance, then the implement run. They are what
+    makes replay exercise the unpatched branch AT the flip site; if either
+    stopped having that order the guard below would be testing nothing."""
+    order = _scheduled_order(_events_at(_recorded_histories_dir() / name))
+    flip = order.index("submit_delegated_approve")
+    advance = order.index("advance_dispatched_execution", flip)
+    implement = order.index("mctl-agents-implement")
+    assert flip < advance < implement, order
+
+
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _recorded_histories_dir() -> Path:
+    from tests.replay_scenarios import HISTORY_DIR
+
+    return HISTORY_DIR
+
+
+@pytest.mark.parametrize(
+    "path", _dev_loop_histories_but_the_new_one(), ids=lambda p: p.name
+)
+async def test_every_pre_marker_dev_loop_history_replays_against_todays_definitions(path: Path) -> None:
+    """T6: the marker is a new `patched()` call at the flip; a history
+    recorded without it must replay on the old command sequence. A
+    NondeterminismError here means the marker moved relative to the advance."""
+    text = _read(path)
+    history = WorkflowHistory.from_json(f"replay-{path.stem}", text)
+    await Replayer(workflows=scenario_by_name("dev_loop_full").workflows).replay_workflow(history)
+
+
+def test_the_implement_execution_history_carries_the_marker_and_the_canonical_we() -> None:
+    """T7: the recorded history of the new branch. The marker, an
+    `execution_id` on the implement submit (the loop's own `we_`) and none on
+    the shepherd's, and the order the design fixes: flip, implement run, then
+    the one advance that ends the `we_`."""
+    scenario = scenario_by_name(IMPLEMENT_EXECUTION_SCENARIO)
+    events = _events_at(scenario.path)
+    ids = _patch_ids(events)
+    assert IMPLEMENT_EXECUTION_MARKER in ids
+    assert "canonical-approval" in ids
+    implement_submits = _submit_params(events, "mctl-agents-implement")
+    assert implement_submits, f"{scenario.path.name} records no implement submit"
+    for params in implement_submits:
+        assert params.get("execution_id") == "we_test_own"
+    for params in _submit_params(events, "mctl-agents-shepherd"):
+        assert "execution_id" not in params
+    order = _scheduled_order(events)
+    flip = order.index("submit_delegated_approve")
+    implement = order.index("mctl-agents-implement")
+    advances = [i for i, name in enumerate(order) if name == "advance_dispatched_execution"]
+    assert advances, order
+    assert flip < implement < advances[0], order
+    assert len(advances) == 1, order
