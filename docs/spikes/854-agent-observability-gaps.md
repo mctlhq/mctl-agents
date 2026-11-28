@@ -180,6 +180,7 @@ run_issue_directive_poller | no | no
 run_issue_investigator | yes | yes
 run_issue_poller | no | no
 run_mentor | yes | no
+run_review_worker | yes | yes
 run_scout | yes | no
 run_security_verifier | no | no
 run_service_agent | yes | no
