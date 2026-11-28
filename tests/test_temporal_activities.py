@@ -1977,6 +1977,65 @@ class TestReconcileReadsGitHub:
         assert result.projections[0].service == "mctl-web"
         assert result.projections[0].current_status == "implemented"
 
+    @pytest.mark.parametrize(
+        "status",
+        ["review-stuck", "accepted", "in-progress", "error", "needs-triage", "rejected"],
+    )
+    async def test_a_merged_pr_is_projected_from_every_reconcile_status(
+        self, env, monkeypatch, status
+    ):
+        """mctl-gitops#2993: a `review-stuck` proposal whose PR a human
+        merged was never projected, so the apply step never ran and the
+        status stayed stuck. Every reconcile input status must project."""
+        from orchestrator.run_shepherd import RECONCILE_INPUT_STATUSES
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        assert status in RECONCILE_INPUT_STATUSES
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-gitops/proposals/issue-2993-runners/.status.yaml", "sha-stuck")]
+            ),
+            blobs={
+                "sha-stuck": (
+                    f"status: {status}\n"
+                    "pr: https://github.com/mctlhq/mctl-gitops/pull/2995\n"
+                )
+            },
+            pulls={"mctlhq/mctl-gitops/pulls/2995": {"merged": True, "state": "closed"}},
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert [p.projected_status for p in result.projections] == ["merged"]
+        assert result.projections[0].current_status == status
+
+    async def test_a_merged_pr_on_a_merged_proposal_projects_nothing(
+        self, env, monkeypatch
+    ):
+        """Already converged: no projection, so no apply submit."""
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-gitops/proposals/issue-2993-runners/.status.yaml", "sha-done")]
+            ),
+            blobs={
+                "sha-done": (
+                    "status: merged\n"
+                    "pr: https://github.com/mctlhq/mctl-gitops/pull/2995\n"
+                )
+            },
+            pulls={"mctlhq/mctl-gitops/pulls/2995": {"merged": True, "state": "closed"}},
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert result.projections == []
+
     async def test_a_pr_closed_unmerged_projects_rejected(self, env, monkeypatch):
         from orchestrator.temporal.activities.discovery import discover_and_project
 
