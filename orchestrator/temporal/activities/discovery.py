@@ -134,7 +134,13 @@ def _project(status: str, merged: bool, closed_unmerged: bool, repo: str, number
     Returns the status this proposal should carry and the note explaining
     why, or the status unchanged and None.
     """
-    if merged and status in {"implemented", "review-fixing"}:
+    # Every reconcile input status, not only implemented/review-fixing: the
+    # apply step (`run_shepherd.reconcile_one`) flips any of them to merged
+    # when GitHub says the PR merged, but it is only submitted when this
+    # projection reports drift. With the narrower set a proposal parked in
+    # `review-stuck` whose PR a human merged stayed stuck indefinitely
+    # (mctl-gitops#2993 / PR #2995, mctl-api#958 / PR #977).
+    if merged and status in RECONCILE_INPUT_STATUSES:
         return "merged", f"PR {repo}#{number} merged on GitHub"
     if closed_unmerged and status in RECONCILE_INPUT_STATUSES:
         return "rejected", f"PR {repo}#{number} closed unmerged on GitHub"
